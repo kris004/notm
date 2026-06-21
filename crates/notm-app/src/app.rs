@@ -150,7 +150,7 @@ fn fixture_smoke() -> anyhow::Result<()> {
         limit: 20,
         offset: 0,
         sort: SortOrder::NewestFirst,
-        excluded_tags: vec!["deleted".to_string(), "spam".to_string()],
+        excluded_tags: vec!["trash".to_string(), "spam".to_string()],
     };
     let threads = db.search_threads("tag:inbox", &options)?;
     anyhow::ensure!(

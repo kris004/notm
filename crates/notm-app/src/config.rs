@@ -46,8 +46,8 @@ impl Default for NotmuchConfig {
             database_path: None,
             config_path: None,
             profile: None,
-            default_query: "tag:inbox and not tag:deleted".to_string(),
-            excluded_tags: vec!["deleted".to_string(), "spam".to_string()],
+            default_query: "tag:inbox and not tag:trash and not tag:spam".to_string(),
+            excluded_tags: vec!["trash".to_string(), "spam".to_string()],
             open_readwrite_only_for_mutations: true,
             sync_maildir_flags_after_tag_change: true,
         }
@@ -307,11 +307,11 @@ fn default_true() -> bool {
 }
 
 fn default_notmuch_query() -> String {
-    "tag:inbox and not tag:deleted".to_string()
+    "tag:inbox and not tag:trash and not tag:spam".to_string()
 }
 
 fn default_excluded_tags() -> Vec<String> {
-    vec!["deleted".to_string(), "spam".to_string()]
+    vec!["trash".to_string(), "spam".to_string()]
 }
 
 fn default_theme() -> String {

@@ -8,7 +8,7 @@ fn searches_fixture_threads() -> anyhow::Result<()> {
         limit: 50,
         offset: 0,
         sort: SortOrder::NewestFirst,
-        excluded_tags: vec!["deleted".into(), "spam".into()],
+        excluded_tags: vec!["trash".into(), "spam".into()],
     };
     let threads = db.search_threads("tag:inbox", &options)?;
     assert!(threads.iter().any(|t| t.subject.contains("Unread inbox")));

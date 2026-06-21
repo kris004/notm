@@ -34,7 +34,7 @@ pub struct UiState {
 impl Default for UiState {
     fn default() -> Self {
         Self {
-            current_query: "tag:inbox and not tag:deleted".to_string(),
+            current_query: "tag:inbox and not tag:trash and not tag:spam".to_string(),
             visible_saved_search: Some("Inbox".to_string()),
             thread_list_items: Vec::new(),
             thread_total_count: 0,

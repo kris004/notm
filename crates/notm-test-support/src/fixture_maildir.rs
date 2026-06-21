@@ -29,7 +29,7 @@ impl FixtureDatabase {
         fs::write(
             &config_path,
             format!(
-                "[database]\npath={}\n\n[user]\nname=Fixture User\nprimary_email=fixture@example.test\nother_email=alt@example.test\n\n[new]\ntags=\nignore=\n\n[search]\nexclude_tags=deleted;spam\n\n[maildir]\nsynchronize_flags=true\n",
+                "[database]\npath={}\n\n[user]\nname=Fixture User\nprimary_email=fixture@example.test\nother_email=alt@example.test\n\n[new]\ntags=\nignore=\n\n[search]\nexclude_tags=trash;spam\n\n[maildir]\nsynchronize_flags=true\n",
                 root.display()
             ),
         )?;
@@ -187,12 +187,12 @@ fn fixture_messages() -> Vec<FixtureMessage> {
             None,
         ),
         msg(
-            "spam-deleted",
+            "spam-trash",
             "spam@example.test",
             "fixture@example.test",
-            "Spam deleted message",
+            "Spam trash message",
             "Spam body.",
-            &["spam", "deleted"],
+            &["spam", "trash"],
             now - Duration::minutes(6),
             None,
             None,

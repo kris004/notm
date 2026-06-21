@@ -93,8 +93,8 @@ impl Default for LaunchOptions {
             database_path: None,
             config_path: None,
             profile: None,
-            default_query: "tag:inbox and not tag:deleted".to_string(),
-            excluded_tags: vec!["deleted".to_string(), "spam".to_string()],
+            default_query: "tag:inbox and not tag:trash and not tag:spam".to_string(),
+            excluded_tags: vec!["trash".to_string(), "spam".to_string()],
             page_size: 100,
             identity_name: None,
             primary_email: None,
@@ -362,7 +362,9 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     search_entry.set_widget_name("notm-search-entry");
     search_entry.set_hexpand(true);
     search_entry.set_text(&options.default_query);
-    search_entry.set_placeholder_text(Some("Notmuch query, e.g. tag:inbox and not tag:deleted"));
+    search_entry.set_placeholder_text(Some(
+        "Notmuch query, e.g. tag:inbox and not tag:trash and not tag:spam",
+    ));
     let search_button = gtk::Button::with_label("Search");
     search_button.set_widget_name("notm-search-button");
     search_row.append(&search_entry);
@@ -770,11 +772,11 @@ fn built_in_saved_searches() -> Vec<SavedSearch> {
     vec![
         SavedSearch {
             name: "Inbox".to_string(),
-            query: "tag:inbox and not tag:deleted".to_string(),
+            query: "tag:inbox and not tag:trash and not tag:spam".to_string(),
         },
         SavedSearch {
             name: "Unread".to_string(),
-            query: "tag:unread and not tag:deleted".to_string(),
+            query: "tag:unread and not tag:trash and not tag:spam".to_string(),
         },
         SavedSearch {
             name: "Flagged".to_string(),
@@ -1526,12 +1528,12 @@ fn open_saved_search_name(
 
 fn saved_search_query(name: &str) -> &'static str {
     match name {
-        "Unread" => "tag:unread and not tag:deleted",
+        "Unread" => "tag:unread and not tag:trash and not tag:spam",
         "Flagged" => "tag:flagged",
         "Sent" => "tag:sent",
         "Drafts" => "tag:draft",
         "All" => "*",
-        _ => "tag:inbox and not tag:deleted",
+        _ => "tag:inbox and not tag:trash and not tag:spam",
     }
 }
 
@@ -2947,8 +2949,8 @@ fn connect_actions(
         widgets,
         state,
         undo_state,
-        &["deleted"],
-        &["inbox"],
+        &["trash"],
+        &["inbox", "spam"],
     );
     connect_tag_button(
         spam_button,
@@ -4318,8 +4320,8 @@ fn handle_automation_request(
                 state,
                 undo_state,
                 TagMutation {
-                    add: vec!["deleted".to_string()],
-                    remove: vec!["inbox".to_string()],
+                    add: vec!["trash".to_string()],
+                    remove: vec!["inbox".to_string(), "spam".to_string()],
                     sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
                 },
             );
@@ -4840,8 +4842,8 @@ fn run_named_command(
                 state,
                 undo_state,
                 TagMutation {
-                    add: vec!["deleted".to_string()],
-                    remove: vec!["inbox".to_string()],
+                    add: vec!["trash".to_string()],
+                    remove: vec!["inbox".to_string(), "spam".to_string()],
                     sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
                 },
             );
