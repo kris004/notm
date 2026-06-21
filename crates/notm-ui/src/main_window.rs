@@ -3035,7 +3035,7 @@ table {{
 }}
 td, th {{
   border: 0;
-  padding: 3px 6px;
+  padding: 0;
   vertical-align: top;
 }}
 </style>
