@@ -1,5 +1,7 @@
 pub const SHORTCUTS: &[(&str, &str)] = &[
     ("/", "Focus search"),
+    ("i", "Input mode: focus search"),
+    ("Esc", "Normal mode from text input"),
     ("j/k", "Select thread"),
     ("Enter", "Open thread"),
     ("a", "Archive"),

@@ -1326,14 +1326,13 @@ fn install_shortcuts(
     state: &SharedState,
     undo_state: &UndoState,
 ) {
-    let controller = gtk::EventControllerKey::new();
-    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let capture_controller = gtk::EventControllerKey::new();
+    capture_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
     let undo = undo_state.clone();
-    let pending_go = Rc::new(RefCell::new(false));
-    controller.connect_key_pressed(move |_, key, _, mods| {
+    capture_controller.connect_key_pressed(move |_, key, _, mods| {
         let ctrl = mods.contains(gtk::gdk::ModifierType::CONTROL_MASK);
         if ctrl && (key == gtk::gdk::Key::k || key == gtk::gdk::Key::K) {
             show_command_palette(&opts, &w, &st, &undo);
@@ -1345,6 +1344,34 @@ fn install_shortcuts(
         {
             send_compose(&opts, &w, &st);
             return gtk::glib::Propagation::Stop;
+        }
+        if focused_is_text(&w) {
+            if key == gtk::gdk::Key::Escape {
+                w.thread_list.grab_focus();
+                w.status_label.set_text("Normal mode");
+                return gtk::glib::Propagation::Stop;
+            }
+            return gtk::glib::Propagation::Proceed;
+        }
+        if key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter {
+            let idx = selected_thread_index(&w).unwrap_or(0);
+            open_thread_by_index(&opts, &w, &st, idx);
+            return gtk::glib::Propagation::Stop;
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    widgets.window.add_controller(capture_controller);
+
+    let controller = gtk::EventControllerKey::new();
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let undo = undo_state.clone();
+    let pending_go = Rc::new(RefCell::new(false));
+    controller.connect_key_pressed(move |_, key, _, mods| {
+        let ctrl = mods.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+        if ctrl {
+            return gtk::glib::Propagation::Proceed;
         }
         if focused_is_text(&w) {
             return gtk::glib::Propagation::Proceed;
@@ -1375,8 +1402,10 @@ fn install_shortcuts(
                 gtk::glib::Propagation::Proceed
             };
         }
-        let handled = if key == gtk::gdk::Key::slash {
+        let handled = if key == gtk::gdk::Key::slash || key == gtk::gdk::Key::i {
             w.search_entry.grab_focus();
+            w.status_label
+                .set_text("Input mode: search (Esc for normal)");
             true
         } else if key == gtk::gdk::Key::g {
             *pending_go.borrow_mut() = true;
@@ -1467,7 +1496,12 @@ fn connect_auto_load_more(options: &LaunchOptions, widgets: &Widgets, state: &Sh
 
 fn focused_is_text(widgets: &Widgets) -> bool {
     gtk::prelude::GtkWindowExt::focus(&widgets.window)
-        .map(|focus| focus.is::<gtk::Entry>() || focus.is::<gtk::TextView>())
+        .map(|focus| {
+            focus.is::<gtk::Entry>()
+                || focus.is::<gtk::TextView>()
+                || focus.ancestor(gtk::Entry::static_type()).is_some()
+                || focus.ancestor(gtk::TextView::static_type()).is_some()
+        })
         .unwrap_or(false)
 }
 
