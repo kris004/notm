@@ -2996,30 +2996,32 @@ fn visual_html_document(body: &str) -> String {
 <html>
 <head>
 <meta charset="utf-8">
-<meta name="color-scheme" content="light dark">
+<meta name="color-scheme" content="light">
 <style>
 :root {{
-  color-scheme: light dark;
+  color-scheme: light;
   font: 15px system-ui, sans-serif;
-  background: transparent;
-  color: CanvasText;
+  background: #ffffff;
+  color: #111111;
 }}
 body {{
   margin: 0;
   padding: 16px;
   line-height: 1.45;
   overflow-wrap: anywhere;
+  background: #ffffff;
+  color: #111111;
 }}
 .notm-blocked-image {{
   display: inline;
   margin: 0;
   padding: 0;
   background: transparent;
-  color: color-mix(in srgb, CanvasText 70%, transparent);
+  color: #666666;
   font-size: 12px;
   font-style: italic;
 }}
-a {{ color: LinkText; }}
+a {{ color: #1155cc; }}
 pre, code {{
   font-family: ui-monospace, monospace;
   white-space: pre-wrap;
@@ -3027,7 +3029,7 @@ pre, code {{
 blockquote {{
   margin-inline-start: 0.8em;
   padding-inline-start: 0.8em;
-  color: color-mix(in srgb, CanvasText 78%, transparent);
+  color: #555555;
 }}
 table {{
   border-collapse: collapse;
@@ -5809,5 +5811,15 @@ mod tests {
         );
         assert!(rendered.contains("In-Reply-To: <original@example.test>\r\n"));
         assert!(rendered.contains("References: <older@example.test> <original@example.test>\r\n"));
+    }
+
+    #[test]
+    fn visual_html_document_uses_light_default_canvas() {
+        let document = visual_html_document("<p>Hello</p>");
+
+        assert!(document.contains(r#"<meta name="color-scheme" content="light">"#));
+        assert!(document.contains("background: #ffffff;"));
+        assert!(document.contains("color: #111111;"));
+        assert!(!document.contains("CanvasText"));
     }
 }
