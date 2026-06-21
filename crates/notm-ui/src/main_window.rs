@@ -159,10 +159,8 @@ struct Widgets {
     message_stack: gtk::Stack,
     message_view: gtk::TextView,
     html_view: webkit6::WebView,
-    rendered_button: gtk::Button,
-    html_visual_button: gtk::Button,
-    load_images_once_button: gtk::Button,
-    trust_sender_images_button: gtk::Button,
+    view_toggle_button: gtk::Button,
+    image_policy_button: gtk::Button,
     full_headers_button: gtk::Button,
     raw_source_button: gtk::Button,
     collapse_quotes_button: gtk::Button,
@@ -441,14 +439,10 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
 
     let message_actions = button_flow(4);
     message_actions.set_widget_name("notm-message-actions");
-    let rendered_button = gtk::Button::with_label("Rendered");
-    rendered_button.set_widget_name("notm-rendered-button");
-    let html_visual_button = gtk::Button::with_label("Visual HTML");
-    html_visual_button.set_widget_name("notm-html-visual-button");
-    let load_images_once_button = gtk::Button::with_label("Load images once");
-    load_images_once_button.set_widget_name("notm-load-images-once-button");
-    let trust_sender_images_button = gtk::Button::with_label("Trust sender images");
-    trust_sender_images_button.set_widget_name("notm-trust-sender-images-button");
+    let view_toggle_button = gtk::Button::with_label("Visual HTML");
+    view_toggle_button.set_widget_name("notm-view-toggle-button");
+    let image_policy_button = gtk::Button::with_label("Load images once");
+    image_policy_button.set_widget_name("notm-image-policy-button");
     let full_headers_button = gtk::Button::with_label("Full headers");
     full_headers_button.set_widget_name("notm-full-headers-button");
     let raw_source_button = gtk::Button::with_label("Raw source");
@@ -464,10 +458,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     let copy_thread_id_button = gtk::Button::with_label("Copy thread id");
     copy_thread_id_button.set_widget_name("notm-copy-thread-id-button");
     for b in [
-        &rendered_button,
-        &html_visual_button,
-        &load_images_once_button,
-        &trust_sender_images_button,
+        &view_toggle_button,
+        &image_policy_button,
         &full_headers_button,
         &raw_source_button,
         &collapse_quotes_button,
@@ -648,10 +640,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         message_stack,
         message_view,
         html_view,
-        rendered_button,
-        html_visual_button,
-        load_images_once_button,
-        trust_sender_images_button,
+        view_toggle_button,
+        image_policy_button,
         full_headers_button,
         raw_source_button,
         collapse_quotes_button,
@@ -684,6 +674,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
             .clone()
             .unwrap_or_else(default_drafts_dir),
     };
+    update_message_action_buttons(&options, &widgets, &state);
     if let Some(id) = identity(&options) {
         widgets.compose_from.set_text(&id.formatted());
     }
@@ -1160,43 +1151,29 @@ fn connect_message_actions(options: &LaunchOptions, widgets: &Widgets, state: &S
     let w = widgets.clone();
     let st = state.clone();
     widgets
-        .rendered_button
-        .connect_clicked(move |_| show_rendered_selected_thread(&opts, &w, &st));
+        .view_toggle_button
+        .connect_clicked(move |_| toggle_text_visual_view(&opts, &w, &st));
 
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
     widgets
-        .html_visual_button
-        .connect_clicked(move |_| show_visual_html_selected_message(&opts, &w, &st));
+        .image_policy_button
+        .connect_clicked(move |_| activate_image_policy_button(&opts, &w, &st));
 
     let opts = options.clone();
-    let w = widgets.clone();
-    let st = state.clone();
-    widgets.load_images_once_button.connect_clicked(move |_| {
-        show_visual_html_with_image_policy(&opts, &w, &st, ImagePolicy::Once)
-    });
-
-    let opts = options.clone();
-    let w = widgets.clone();
-    let st = state.clone();
-    widgets
-        .trust_sender_images_button
-        .connect_clicked(move |_| {
-            show_visual_html_with_image_policy(&opts, &w, &st, ImagePolicy::TrustSender)
-        });
-
     let w = widgets.clone();
     let st = state.clone();
     widgets
         .raw_source_button
-        .connect_clicked(move |_| show_raw_source(&w, &st));
+        .connect_clicked(move |_| show_raw_source(&opts, &w, &st));
 
+    let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
     widgets
         .full_headers_button
-        .connect_clicked(move |_| show_full_headers(&w, &st));
+        .connect_clicked(move |_| show_full_headers(&opts, &w, &st));
 
     let opts = options.clone();
     let w = widgets.clone();
@@ -2210,6 +2187,85 @@ fn show_rendered_selected_thread(options: &LaunchOptions, widgets: &Widgets, sta
     }
 }
 
+fn toggle_text_visual_view(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    if html_view_is_visible(widgets) {
+        show_rendered_selected_thread(options, widgets, state);
+    } else {
+        show_visual_html_selected_message(options, widgets, state);
+    }
+}
+
+fn activate_image_policy_button(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    if selected_message_allows_images(options, state) {
+        update_message_action_buttons(options, widgets, state);
+        return;
+    }
+    if html_view_is_visible(widgets) && html_view_images_allowed(widgets) {
+        show_visual_html_with_image_policy(options, widgets, state, ImagePolicy::TrustSender);
+    } else {
+        show_visual_html_with_image_policy(options, widgets, state, ImagePolicy::Once);
+    }
+}
+
+fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    let html_visible = html_view_is_visible(widgets);
+    let has_html = selected_message_has_html(state);
+    widgets
+        .view_toggle_button
+        .set_label(if html_visible { "Text" } else { "Visual HTML" });
+    widgets
+        .view_toggle_button
+        .set_sensitive(has_html || html_visible);
+
+    if !has_html {
+        widgets.image_policy_button.set_label("Load images once");
+        widgets.image_policy_button.set_sensitive(false);
+        return;
+    }
+
+    if selected_message_allows_images(options, state) {
+        let sender = selected_sender_email(state);
+        let sender_trusted = sender
+            .as_deref()
+            .is_some_and(|sender| image_sender_is_trusted(state, sender));
+        widgets.image_policy_button.set_label(if sender_trusted {
+            "Images trusted"
+        } else {
+            "Images allowed"
+        });
+        widgets.image_policy_button.set_sensitive(false);
+    } else if html_visible && html_view_images_allowed(widgets) {
+        widgets.image_policy_button.set_label("Trust sender images");
+        widgets
+            .image_policy_button
+            .set_sensitive(selected_sender_email(state).is_some());
+    } else {
+        widgets.image_policy_button.set_label("Load images once");
+        widgets.image_policy_button.set_sensitive(true);
+    }
+}
+
+fn html_view_is_visible(widgets: &Widgets) -> bool {
+    widgets
+        .message_stack
+        .visible_child_name()
+        .is_some_and(|name| name.as_str() == "html")
+}
+
+fn html_view_images_allowed(widgets: &Widgets) -> bool {
+    WebViewExt::settings(&widgets.html_view)
+        .map(|settings| settings.is_auto_load_images())
+        .unwrap_or(false)
+}
+
+fn selected_message_has_html(state: &SharedState) -> bool {
+    selected_message_filename(state)
+        .and_then(parse_file)
+        .ok()
+        .and_then(|parsed| parsed.html_body)
+        .is_some_and(|html| !html.trim().is_empty())
+}
+
 fn open_selected_attachment(widgets: &Widgets, state: &SharedState, index: usize) {
     match save_selected_attachment(widgets, state, index, None) {
         Ok(path) => {
@@ -2284,14 +2340,14 @@ fn open_saved_attachment_path(widgets: &Widgets, state: &SharedState, path: Path
     update_debug(widgets, state);
 }
 
-fn show_raw_source(widgets: &Widgets, state: &SharedState) {
+fn show_raw_source(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     let result = (|| -> anyhow::Result<String> {
         let filename = selected_message_filename(state)?;
         Ok(std::fs::read_to_string(filename)?)
     })();
     match result {
         Ok(raw) => {
-            show_text_message_view(widgets);
+            show_text_message_view(options, widgets, state);
             widgets.message_view.set_monospace(true);
             widgets.message_view.buffer().set_text(&raw);
             widgets.status_label.set_text("Raw message source shown");
@@ -2307,7 +2363,7 @@ fn show_raw_source(widgets: &Widgets, state: &SharedState) {
     update_debug(widgets, state);
 }
 
-fn show_full_headers(widgets: &Widgets, state: &SharedState) {
+fn show_full_headers(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     let result = (|| -> anyhow::Result<String> {
         let filename = selected_message_filename(state)?;
         let raw = std::fs::read_to_string(filename)?;
@@ -2315,7 +2371,7 @@ fn show_full_headers(widgets: &Widgets, state: &SharedState) {
     })();
     match result {
         Ok(headers) => {
-            show_text_message_view(widgets);
+            show_text_message_view(options, widgets, state);
             widgets.message_view.set_monospace(true);
             widgets.message_view.buffer().set_text(&headers);
             widgets.status_label.set_text("Full message headers shown");
@@ -2396,8 +2452,9 @@ fn selected_message_filename(state: &SharedState) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("selected message has no file"))
 }
 
-fn show_text_message_view(widgets: &Widgets) {
+fn show_text_message_view(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     widgets.message_stack.set_visible_child_name("text");
+    update_message_action_buttons(options, widgets, state);
 }
 
 fn configure_html_webview(view: &webkit6::WebView, allow_remote_images: bool) {
@@ -2525,6 +2582,7 @@ fn show_visual_html_with_image_policy(
                 .set_text(&format!("Visual HTML failed: {err}"));
         }
     }
+    update_message_action_buttons(options, widgets, state);
     update_debug(widgets, state);
 }
 
@@ -3416,6 +3474,7 @@ fn select_thread_by_index(
             open_thread_by_index(options, widgets, state, index);
         }
     }
+    update_message_action_buttons(options, widgets, state);
     update_debug(widgets, state);
 }
 
@@ -3487,7 +3546,7 @@ fn open_thread_by_index(
     })();
     match result {
         Ok(rendered) => {
-            show_text_message_view(widgets);
+            show_text_message_view(options, widgets, state);
             widgets.message_view.set_monospace(false);
             widgets.message_view.buffer().set_text(&rendered);
             refresh_thread_attachment_list(widgets, state);
@@ -4543,22 +4602,39 @@ fn handle_automation_request(
             json!({"ok": true, "debug_visible": widgets.debug_view.is_visible()})
         }
         "show_raw_source" | "open_raw_source" => {
-            show_raw_source(widgets, state);
+            show_raw_source(options, widgets, state);
             json!({"ok": state.borrow().last_error.is_none(), "last_error": state.borrow().last_error})
         }
         "show_full_headers" | "full_headers" => {
-            show_full_headers(widgets, state);
+            show_full_headers(options, widgets, state);
             json!({"ok": state.borrow().last_error.is_none(), "last_error": state.borrow().last_error})
         }
-        "show_rendered_thread" => {
+        "show_rendered_thread" | "show_text_thread" | "text_view" => {
             show_rendered_selected_thread(options, widgets, state);
             json!({"ok": true, "state": &*state.borrow()})
+        }
+        "toggle_text_visual" | "toggle_visual_html" => {
+            toggle_text_visual_view(options, widgets, state);
+            json!({
+                "ok": state.borrow().last_error.is_none(),
+                "html_view": html_view_state(options, widgets, state),
+                "last_error": state.borrow().last_error,
+            })
         }
         "show_visual_html" | "show_html_visual" | "visual_html" => {
             show_visual_html_selected_message(options, widgets, state);
             json!({
                 "ok": state.borrow().last_error.is_none(),
                 "html_view": html_view_state(options, widgets, state),
+                "last_error": state.borrow().last_error,
+            })
+        }
+        "image_policy" => {
+            activate_image_policy_button(options, widgets, state);
+            json!({
+                "ok": state.borrow().last_error.is_none(),
+                "html_view": html_view_state(options, widgets, state),
+                "trusted_image_senders": state.borrow().trusted_image_senders,
                 "last_error": state.borrow().last_error,
             })
         }
@@ -4857,22 +4933,39 @@ fn run_named_command(
             json!({"ok": true, "debug_visible": widgets.debug_view.is_visible()})
         }
         "raw_source" | "open_raw_source" => {
-            show_raw_source(widgets, state);
+            show_raw_source(options, widgets, state);
             json!({"ok": state.borrow().last_error.is_none(), "last_error": state.borrow().last_error})
         }
         "full_headers" | "show_full_headers" => {
-            show_full_headers(widgets, state);
+            show_full_headers(options, widgets, state);
             json!({"ok": state.borrow().last_error.is_none(), "last_error": state.borrow().last_error})
         }
-        "rendered" | "show_rendered_thread" => {
+        "text" | "rendered" | "show_rendered_thread" | "show_text_thread" => {
             show_rendered_selected_thread(options, widgets, state);
             json!({"ok": true, "state": &*state.borrow()})
+        }
+        "toggle_text_visual" | "toggle_visual_html" => {
+            toggle_text_visual_view(options, widgets, state);
+            json!({
+                "ok": state.borrow().last_error.is_none(),
+                "html_view": html_view_state(options, widgets, state),
+                "last_error": state.borrow().last_error,
+            })
         }
         "visual_html" | "show_visual_html" | "show_html_visual" => {
             show_visual_html_selected_message(options, widgets, state);
             json!({
                 "ok": state.borrow().last_error.is_none(),
                 "html_view": html_view_state(options, widgets, state),
+                "last_error": state.borrow().last_error,
+            })
+        }
+        "image_policy" => {
+            activate_image_policy_button(options, widgets, state);
+            json!({
+                "ok": state.borrow().last_error.is_none(),
+                "html_view": html_view_state(options, widgets, state),
+                "trusted_image_senders": state.borrow().trusted_image_senders,
                 "last_error": state.borrow().last_error,
             })
         }
@@ -5145,7 +5238,7 @@ fn command_palette_commands() -> &'static [&'static str] {
         "inbox, unread, flagged, sent, all",
         "search, compose, reply, reply_all, forward, forward_as_attachment",
         "archive, mark_read, mark_unread, flag, unflag, trash, undo",
-        "raw_source, full_headers, rendered, visual_html, load_images_once, trust_sender_images, collapse_quotes",
+        "raw_source, full_headers, text, visual_html, image_policy, collapse_quotes",
         "save_attachment, open_attachment",
         "copy_message_id, copy_thread_id",
         "debug, settings, shortcuts, manual_sync (only if explicitly enabled)",

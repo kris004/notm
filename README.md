@@ -36,7 +36,7 @@ The installed desktop entry launches `Exec=/home/user/.local/bin/notm launch`.
 
 ## Runtime/build dependencies
 
-In addition to Rust and libnotmuch, visual HTML rendering requires WebKitGTK 6 development files (`pkg-config webkitgtk-6.0`). The app still has the safe text fallback for messages without HTML or if the user stays on the rendered text view.
+In addition to Rust and libnotmuch, visual HTML rendering requires WebKitGTK 6 development files (`pkg-config webkitgtk-6.0`). The app still has the safe text fallback for messages without HTML or if the user stays on the text view.
 
 ## Test
 
@@ -61,7 +61,7 @@ CARGO_HOME=$PWD/.cargo-home cargo run -p notm-app -- live-self-send
 - No automatic `notmuch new`.
 - No receive/sync commands unless explicitly configured and manually invoked with the manual sync action.
 - Automation disabled by default and token-gated when enabled.
-- Remote images disabled by default; Visual HTML has explicit `Load images once` and `Trust sender images` controls. Trusted senders are stored in `[ui].trusted_image_senders`.
+- Remote images disabled by default; Visual HTML uses one image-policy button that starts as `Load images once` and changes to `Trust sender images` after one-shot loading. Trusted senders are stored in `[ui].trusted_image_senders`.
 - Sending uses an explicit external transport abstraction and fake transport contract tests.
 - Trash/spam/archive are tag operations only; message files are not deleted.
 - Sent Maildir saving/indexing and draft Maildir saving/indexing are disabled unless explicitly configured.
@@ -72,7 +72,7 @@ This repository builds and runs a native GTK4 Notmuch client. Implemented daily-
 
 - global Notmuch search and saved searches,
 - thread rows with unread/flagged/attachment/encrypted/signed indicators and body previews,
-- thread/message view with rendered safe text, visual sanitized WebKitGTK HTML rendering, one-shot/trusted-sender remote image controls, HTML-to-text fallback, full headers, raw source, filenames, tags, MIME tree, selectable attachment list, and quote collapse,
+- thread/message view with safe text and visual sanitized WebKitGTK HTML toggle, one-shot/trusted-sender remote image controls, HTML-to-text fallback, full headers, raw source, filenames, tags, MIME tree, selectable attachment list, and quote collapse,
 - tag operations and undo through libnotmuch,
 - compose, reply, reply-all, inline forward, and forward-as-`message/rfc822` attachment,
 - external send transport with stdin/file/template/auto modes and lieer helper auto `-t`,
