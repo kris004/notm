@@ -1,0 +1,16 @@
+#[test]
+fn extracts_attachment_bytes_from_fixture_message() -> anyhow::Result<()> {
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let db = fixture.open_readonly()?;
+    let msg = db
+        .search_messages(
+            "subject:\"Attachment message\"",
+            &notm_notmuch::QueryOptions::default(),
+        )?
+        .remove(0);
+    let attachments = notm_mail::mime::extract_attachments_from_file(&msg.filenames[0])?;
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0].filename, "note.txt");
+    assert!(String::from_utf8_lossy(&attachments[0].bytes).contains("attached text"));
+    Ok(())
+}

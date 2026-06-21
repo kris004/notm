@@ -1,0 +1,18 @@
+pub const SHORTCUTS: &[(&str, &str)] = &[
+    ("/", "Focus search"),
+    ("j/k", "Select thread"),
+    ("Enter", "Open thread"),
+    ("a", "Archive"),
+    ("u", "Toggle unread"),
+    ("f", "Toggle flagged"),
+    ("r", "Reply"),
+    ("R", "Reply all"),
+    ("c", "Compose"),
+    ("F", "Forward"),
+    ("g i/u/f/s/a", "Inbox/Unread/Flagged/Sent/All"),
+    ("Raw source button", "Show selected message source"),
+    ("Save attachment", "Save selected thread attachment"),
+    ("Ctrl+K", "Command palette"),
+    ("Ctrl+Enter", "Send compose"),
+    ("?", "Shortcuts overlay"),
+];

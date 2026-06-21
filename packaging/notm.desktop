@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=notm
+GenericName=Notmuch Mail Client
+Comment=Native GTK4 Notmuch email client
+Exec=/home/user/.local/bin/notm launch
+TryExec=/home/user/.local/bin/notm
+Terminal=false
+Categories=Network;Email;GTK;
+StartupNotify=true
+StartupWMClass=dev.notm.Notm
+Keywords=Email;Mail;Notmuch;GTK;

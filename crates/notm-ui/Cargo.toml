@@ -1,0 +1,21 @@
+[package]
+name = "notm-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+gtk4 = "0.11"
+notm-mail = { path = "../notm-mail" }
+notm-notmuch = { path = "../notm-notmuch" }
+parking_lot.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+webkit6.workspace = true

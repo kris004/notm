@@ -1,0 +1,15 @@
+[package]
+name = "notm-test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+notm-mail = { path = "../notm-mail" }
+notm-notmuch = { path = "../notm-notmuch" }
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+uuid.workspace = true

@@ -1,0 +1,6 @@
+/target/
+/.cargo-home/
+/artifacts/*
+!/artifacts/logs/
+!/artifacts/logs/.gitkeep
+*.tmp

@@ -1,0 +1,11 @@
+pub mod command_palette;
+pub mod composer;
+pub mod debug_panel;
+pub mod message_view;
+pub mod saved_searches;
+pub mod search_bar;
+pub mod settings;
+pub mod status_bar;
+pub mod tag_editor;
+pub mod thread_list;
+pub mod thread_view;

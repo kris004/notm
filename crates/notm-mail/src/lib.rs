@@ -1,0 +1,16 @@
+pub mod address;
+pub mod attachments;
+pub mod compose;
+pub mod forward;
+pub mod html_sanitize;
+pub mod mime;
+pub mod reply;
+pub mod rfc5322;
+pub mod send;
+pub mod transport;
+
+pub use compose::{AttachmentInput, ComposedMessage, Identity};
+pub use mime::{Attachment, ParsedMessage};
+pub use reply::{ReplyKind, build_reply};
+pub use send::{ProbeReport, SendReport, TransportDescription};
+pub use transport::{ExternalCommandTransport, FakeSendTransport, SendTransport, TransportMode};
