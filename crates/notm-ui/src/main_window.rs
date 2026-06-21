@@ -187,7 +187,6 @@ struct Widgets {
     draft_path: PathBuf,
     debug_view: gtk::TextView,
     status_label: gtk::Label,
-    composer_box: gtk::Box,
     compose_from: gtk::Entry,
     compose_to: gtk::Entry,
     compose_cc: gtk::Entry,
@@ -195,7 +194,7 @@ struct Widgets {
     compose_subject: gtk::Entry,
     compose_body: gtk::TextView,
     compose_attachments: gtk::Label,
-    address_suggestions_label: gtk::Label,
+    address_suggestions_popover: gtk::Popover,
     address_suggestions_list: gtk::ListBox,
     draft_list: gtk::ListBox,
     drafts_dir: PathBuf,
@@ -566,7 +565,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
 
     let composer_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     composer_box.set_widget_name("notm-composer");
-    composer_box.set_visible(false);
+    composer_box.set_hexpand(true);
+    composer_box.set_vexpand(true);
     let compose_from = entry_with_placeholder("From");
     let compose_to = entry_with_placeholder("To");
     let compose_cc = entry_with_placeholder("Cc");
@@ -589,17 +589,17 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         .max_content_height(COMPOSE_BODY_NATURAL_HEIGHT)
         .child(&compose_body)
         .build();
-    let address_suggestions_label = gtk::Label::new(Some(
-        "Address suggestions load from recent Notmuch headers.",
-    ));
-    address_suggestions_label.set_widget_name("notm-address-suggestions");
-    address_suggestions_label.set_xalign(0.0);
-    address_suggestions_label.set_wrap(true);
-    address_suggestions_label.add_css_class("dim-label");
     let address_suggestions_list = gtk::ListBox::new();
     address_suggestions_list.set_widget_name("notm-address-suggestions-list");
     address_suggestions_list.set_selection_mode(gtk::SelectionMode::Single);
     address_suggestions_list.add_css_class("boxed-list");
+    address_suggestions_list.set_size_request(360, -1);
+    let address_suggestions_popover = gtk::Popover::new();
+    address_suggestions_popover.set_widget_name("notm-address-suggestions");
+    address_suggestions_popover.set_has_arrow(false);
+    address_suggestions_popover.set_autohide(true);
+    address_suggestions_popover.set_child(Some(&address_suggestions_list));
+    address_suggestions_popover.set_parent(&compose_to);
     let compose_attachments = gtk::Label::new(Some("No attachments"));
     compose_attachments.set_widget_name("notm-compose-attachments");
     compose_attachments.set_xalign(0.0);
@@ -607,20 +607,10 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     compose_attachments.add_css_class("dim-label");
     let composer_actions = button_flow(4);
     let add_attachment_button = gtk::Button::with_label("Add attachment…");
-    let save_draft_button = gtk::Button::with_label("Save draft");
-    let load_draft_button = gtk::Button::with_label("Load draft");
-    let delete_draft_button = gtk::Button::with_label("Delete draft");
-    let clear_draft_button = gtk::Button::with_label("Clear draft");
+    let clear_draft_button = gtk::Button::with_label("Discard draft");
     let send_button = gtk::Button::with_label("Send");
     send_button.set_widget_name("notm-send-button");
-    for b in [
-        &add_attachment_button,
-        &save_draft_button,
-        &load_draft_button,
-        &delete_draft_button,
-        &clear_draft_button,
-        &send_button,
-    ] {
+    for b in [&add_attachment_button, &clear_draft_button, &send_button] {
         composer_actions.insert(b, -1);
     }
     for w in [
@@ -632,21 +622,13 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     ] {
         composer_box.append(w);
     }
-    composer_box.append(&address_suggestions_label);
-    composer_box.append(&address_suggestions_list);
     composer_box.append(&scrolled_compose_body);
     composer_box.append(&compose_attachments);
-    let draft_title = gtk::Label::new(Some("Local drafts"));
-    draft_title.set_xalign(0.0);
-    draft_title.add_css_class("dim-label");
     let draft_list = gtk::ListBox::new();
     draft_list.set_widget_name("notm-draft-list");
     draft_list.set_selection_mode(gtk::SelectionMode::Single);
-    draft_list.set_size_request(-1, 96);
-    composer_box.append(&draft_title);
-    composer_box.append(&draft_list);
     composer_box.append(&composer_actions);
-    right.append(&composer_box);
+    message_stack.add_named(&composer_box, Some("compose"));
 
     let debug_view = gtk::TextView::new();
     debug_view.set_widget_name("notm-debug-panel");
@@ -715,7 +697,6 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
             .unwrap_or_else(default_draft_path),
         debug_view,
         status_label,
-        composer_box,
         compose_from,
         compose_to,
         compose_cc,
@@ -723,7 +704,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         compose_subject,
         compose_body,
         compose_attachments,
-        address_suggestions_label,
+        address_suggestions_popover,
         address_suggestions_list,
         draft_list,
         drafts_dir: options
@@ -790,15 +771,10 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         &widgets,
         &state,
         &add_attachment_button,
-        &save_draft_button,
-        &load_draft_button,
-        &delete_draft_button,
         &clear_draft_button,
     );
     connect_message_actions(&options, &widgets, &state);
     connect_recipient_autocomplete(&widgets.compose_to, &widgets, &state);
-    connect_recipient_autocomplete(&widgets.compose_cc, &widgets, &state);
-    connect_recipient_autocomplete(&widgets.compose_bcc, &widgets, &state);
     connect_address_suggestion_list(&widgets, &state);
     connect_search_debounce(&options, &widgets, &state);
     install_shortcuts(&options, &widgets, &state, &undo_state);
@@ -1106,13 +1082,10 @@ fn widget_token(value: &str) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn connect_compose_helpers(
-    options: &LaunchOptions,
+    _options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
     add_attachment_button: &gtk::Button,
-    save_draft_button: &gtk::Button,
-    load_draft_button: &gtk::Button,
-    delete_draft_button: &gtk::Button,
     clear_draft_button: &gtk::Button,
 ) {
     for entry in [
@@ -1135,38 +1108,6 @@ fn connect_compose_helpers(
 
     let w = widgets.clone();
     let st = state.clone();
-    let opts = options.clone();
-    save_draft_button.connect_clicked(move |_| {
-        match save_current_draft(&opts, &w, &st) {
-            Ok(report) => w
-                .status_label
-                .set_text(&format!("Draft saved to {}", report.local_path.display())),
-            Err(err) => w
-                .status_label
-                .set_text(&format!("Draft save failed: {err}")),
-        }
-        refresh_draft_list(&w);
-    });
-
-    let w = widgets.clone();
-    let st = state.clone();
-    load_draft_button.connect_clicked(move |_| match load_selected_named_draft(&w, &st) {
-        Ok(()) => w.status_label.set_text("Draft loaded"),
-        Err(err) => w
-            .status_label
-            .set_text(&format!("Load draft failed: {err}")),
-    });
-
-    let w = widgets.clone();
-    delete_draft_button.connect_clicked(move |_| match delete_selected_named_draft(&w) {
-        Ok(()) => w.status_label.set_text("Draft deleted"),
-        Err(err) => w
-            .status_label
-            .set_text(&format!("Delete draft failed: {err}")),
-    });
-
-    let w = widgets.clone();
-    let st = state.clone();
     clear_draft_button.connect_clicked(move |_| {
         clear_draft_widgets(&w, &st);
         match clear_draft_file(&w.draft_path) {
@@ -1179,7 +1120,6 @@ fn connect_compose_helpers(
 
     let w = widgets.clone();
     let st = state.clone();
-    let _opts = options.clone();
     add_attachment_button.connect_clicked(move |_| {
         let dialog = gtk::FileChooserNative::new(
             Some("Add attachment"),
@@ -1296,13 +1236,21 @@ fn connect_recipient_autocomplete(entry: &gtk::Entry, widgets: &Widgets, state: 
     let st = state.clone();
     controller.connect_key_pressed(move |_, key, _, _| {
         if key == gtk::gdk::Key::Tab && apply_recipient_completion(&entry_clone, &st) {
-            update_address_suggestions_label(&w, &st, &entry_clone.text());
+            w.address_suggestions_popover.popdown();
             autosave_draft_from_widgets(&w, &st);
+            return gtk::glib::Propagation::Stop;
+        } else if key == gtk::gdk::Key::Escape {
+            w.address_suggestions_popover.popdown();
             return gtk::glib::Propagation::Stop;
         }
         gtk::glib::Propagation::Proceed
     });
     entry.add_controller(controller);
+
+    let w = widgets.clone();
+    let focus = gtk::EventControllerFocus::new();
+    focus.connect_leave(move |_| w.address_suggestions_popover.popdown());
+    entry.add_controller(focus);
 }
 
 fn connect_address_suggestion_list(widgets: &Widgets, state: &SharedState) {
@@ -1318,7 +1266,7 @@ fn connect_address_suggestion_list(widgets: &Widgets, state: &SharedState) {
                 return;
             };
             apply_recipient_suggestion(&w.compose_to, &label.text());
-            update_address_suggestions_label(&w, &st, &w.compose_to.text());
+            w.address_suggestions_popover.popdown();
             autosave_draft_from_widgets(&w, &st);
         });
 }
@@ -1385,7 +1333,7 @@ fn install_shortcuts(
         }
         if ctrl
             && (key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter)
-            && w.composer_box.is_visible()
+            && compose_view_is_visible(&w)
         {
             send_compose(&opts, &w, &st);
             return gtk::glib::Propagation::Stop;
@@ -1702,21 +1650,18 @@ fn refresh_address_suggestions(options: &LaunchOptions, widgets: &Widgets, state
 fn update_address_suggestions_label(widgets: &Widgets, state: &SharedState, input: &str) {
     let suggestions = matching_address_suggestions(input, &state.borrow().address_suggestions, 6);
     if suggestions.is_empty() {
-        widgets
-            .address_suggestions_label
-            .set_text("Address suggestions: type a recipient and press Tab to complete.");
+        populate_address_suggestions_list(widgets, &[]);
+        widgets.address_suggestions_popover.popdown();
     } else {
-        widgets
-            .address_suggestions_label
-            .set_text(&format!("Suggestions: {}", suggestions.join("  ·  ")));
+        populate_address_suggestions_list(widgets, &suggestions);
+        widgets.address_suggestions_popover.popup();
     }
-    populate_address_suggestions_list(widgets, &suggestions);
 }
 
 fn matching_address_suggestions(input: &str, suggestions: &[String], limit: usize) -> Vec<String> {
     let prefix = current_recipient_prefix(input).to_lowercase();
     if prefix.is_empty() {
-        return suggestions.iter().take(limit).cloned().collect();
+        return Vec::new();
     }
     suggestions
         .iter()
@@ -1957,7 +1902,7 @@ fn selected_named_draft(widgets: &Widgets) -> anyhow::Result<(PathBuf, ComposeFi
 fn load_selected_named_draft(widgets: &Widgets, state: &SharedState) -> anyhow::Result<()> {
     let (_, fields) = selected_named_draft(widgets)?;
     apply_compose_fields(widgets, state, fields);
-    widgets.composer_box.set_visible(true);
+    show_compose_view(widgets);
     Ok(())
 }
 
@@ -1978,7 +1923,7 @@ fn restore_draft_if_present(widgets: &Widgets, state: &SharedState) {
     };
     if fields_has_content(&fields) {
         apply_compose_fields(widgets, state, fields);
-        widgets.composer_box.set_visible(true);
+        show_compose_view(widgets);
         widgets
             .status_label
             .set_text(&format!("Recovered draft from {}", path.display()));
@@ -1998,7 +1943,9 @@ fn clear_draft_widgets(widgets: &Widgets, state: &SharedState) {
         ..ComposeFields::default()
     };
     apply_compose_fields(widgets, state, fields);
-    widgets.composer_box.set_visible(false);
+    widgets.address_suggestions_popover.popdown();
+    widgets.message_stack.set_visible_child_name("text");
+    refresh_thread_attachment_list(widgets, state);
 }
 
 fn apply_compose_fields(widgets: &Widgets, state: &SharedState, fields: ComposeFields) {
@@ -2543,6 +2490,13 @@ fn html_view_is_visible(widgets: &Widgets) -> bool {
         .is_some_and(|name| name.as_str() == "html")
 }
 
+fn compose_view_is_visible(widgets: &Widgets) -> bool {
+    widgets
+        .message_stack
+        .visible_child_name()
+        .is_some_and(|name| name.as_str() == "compose")
+}
+
 fn html_view_images_allowed(widgets: &Widgets) -> bool {
     WebViewExt::settings(&widgets.html_view)
         .map(|settings| settings.is_auto_load_images())
@@ -2728,7 +2682,16 @@ fn selected_message_filename(state: &SharedState) -> anyhow::Result<String> {
 
 fn show_text_message_view(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     widgets.message_stack.set_visible_child_name("text");
+    refresh_thread_attachment_list(widgets, state);
     update_message_action_buttons(options, widgets, state);
+}
+
+fn show_compose_view(widgets: &Widgets) {
+    widgets.address_suggestions_popover.popdown();
+    widgets.html_policy_row.set_visible(false);
+    widgets.attachment_title.set_visible(false);
+    widgets.attachment_scrolled.set_visible(false);
+    widgets.message_stack.set_visible_child_name("compose");
 }
 
 fn configure_html_webview(view: &webkit6::WebView, allow_remote_images: bool) {
@@ -4069,7 +4032,7 @@ fn run_manual_sync(options: &LaunchOptions, widgets: &Widgets, state: &SharedSta
 }
 
 fn open_compose(widgets: &Widgets, state: &SharedState) {
-    widgets.composer_box.set_visible(true);
+    show_compose_view(widgets);
     widgets.compose_subject.grab_focus();
     {
         let mut state = state.borrow_mut();
@@ -4191,7 +4154,7 @@ fn forward_as_attachment_selected(options: &LaunchOptions, widgets: &Widgets, st
 }
 
 fn fill_composer(widgets: &Widgets, state: &SharedState, message: ComposedMessage) {
-    widgets.composer_box.set_visible(true);
+    show_compose_view(widgets);
     widgets.compose_from.set_text(&message.from);
     widgets.compose_to.set_text(&message.to.join(", "));
     widgets.compose_cc.set_text(&message.cc.join(", "));
@@ -4310,6 +4273,7 @@ fn send_compose(options: &LaunchOptions, widgets: &Widgets, state: &SharedState)
                 .unwrap_or(false)
             {
                 let _ = clear_draft_file(&widgets.draft_path);
+                clear_draft_widgets(widgets, state);
             }
         }
         Err(err) => {
