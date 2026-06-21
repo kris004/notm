@@ -57,6 +57,7 @@ pub struct LaunchOptions {
     pub send_command: Option<PathBuf>,
     pub send_args: Vec<String>,
     pub send_mode: TransportMode,
+    pub fake_send_capture_dir: Option<PathBuf>,
     pub save_sent: bool,
     pub sent_maildir: Option<PathBuf>,
     pub sent_tags: Vec<String>,
@@ -102,6 +103,7 @@ impl Default for LaunchOptions {
             send_command: None,
             send_args: Vec::new(),
             send_mode: TransportMode::Auto,
+            fake_send_capture_dir: None,
             save_sent: false,
             sent_maildir: None,
             sent_tags: vec!["sent".to_string()],
@@ -3961,29 +3963,15 @@ fn send_compose(options: &LaunchOptions, widgets: &Widgets, state: &SharedState)
         }
     }
     let message_for_persistence = message.clone();
-    let result = (|| -> anyhow::Result<notm_mail::SendReport> {
-        let rt = tokio::runtime::Runtime::new()?;
-        if let Some(command) = &options.send_command {
-            let transport = ExternalCommandTransport {
-                command: command.clone(),
-                args: options.send_args.clone(),
-                mode: options.send_mode.clone(),
-                working_dir: None,
-                env: Default::default(),
-                timeout: Duration::from_secs(120),
-            };
-            rt.block_on(transport.send(message))
-        } else {
-            let transport = FakeSendTransport {
-                capture_dir: PathBuf::from("artifacts/captured-send"),
-            };
-            rt.block_on(transport.send(message))
-        }
-    })();
+    let result = send_message_with_config(options, message);
     match result {
         Ok(mut report) => {
             widgets.status_label.set_text(if report.accepted {
-                "Send accepted"
+                if report.captured_path.is_some() && options.send_command.is_none() {
+                    "Fake send captured"
+                } else {
+                    "Send accepted"
+                }
             } else {
                 "Send failed"
             });
@@ -4031,6 +4019,34 @@ fn send_compose(options: &LaunchOptions, widgets: &Widgets, state: &SharedState)
         }
     }
     update_debug(widgets, state);
+}
+
+fn send_message_with_config(
+    options: &LaunchOptions,
+    message: ComposedMessage,
+) -> anyhow::Result<notm_mail::SendReport> {
+    if let Some(command) = &options.send_command {
+        let rt = tokio::runtime::Runtime::new()?;
+        let transport = ExternalCommandTransport {
+            command: command.clone(),
+            args: options.send_args.clone(),
+            mode: options.send_mode.clone(),
+            working_dir: None,
+            env: Default::default(),
+            timeout: Duration::from_secs(120),
+        };
+        return rt.block_on(transport.send(message));
+    }
+    if let Some(capture_dir) = &options.fake_send_capture_dir {
+        let rt = tokio::runtime::Runtime::new()?;
+        let transport = FakeSendTransport {
+            capture_dir: capture_dir.clone(),
+        };
+        return rt.block_on(transport.send(message));
+    }
+    anyhow::bail!(
+        "send.command is not configured; refusing to fake-send outside fixture/test mode"
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -5439,4 +5455,26 @@ fn table_entry<'a>(
         *value = toml::Value::Table(Default::default());
     }
     value.as_table_mut().expect("table entry is table")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_send_without_command_or_fixture_capture_fails() {
+        let options = LaunchOptions::default();
+        let message = ComposedMessage::new(
+            "sender@example.test".to_string(),
+            vec!["recipient@example.test".to_string()],
+            "test subject".to_string(),
+            "test body".to_string(),
+        );
+        let err = send_message_with_config(&options, message).unwrap_err();
+
+        assert!(
+            err.to_string().contains("refusing to fake-send"),
+            "unexpected error: {err}"
+        );
+    }
 }

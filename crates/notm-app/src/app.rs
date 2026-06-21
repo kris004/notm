@@ -32,6 +32,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 options.config_path = Some(fixture.config_path.clone());
                 options.default_query = "tag:inbox".to_string();
                 options.send_command = None;
+                options.fake_send_capture_dir = Some(fixture.root.join("captured-send"));
                 options.draft_path = Some(fixture.root.join(".notm-fixture-draft.json"));
                 options.drafts_dir = Some(fixture.root.join(".notm-fixture-drafts"));
                 options.app_config_path = Some(fixture.root.join(".notm-fixture-config.toml"));
@@ -82,6 +83,7 @@ fn launch_options(cfg: &config::AppConfig, app_config_path: Option<PathBuf>) -> 
         send_command: cfg.send.command.clone(),
         send_args: cfg.send.args.clone(),
         send_mode: config::transport_mode(&cfg.send.mode),
+        fake_send_capture_dir: None,
         save_sent: cfg.send.save_sent,
         sent_maildir: cfg.send.sent_maildir.clone(),
         sent_tags: cfg.send.sent_tags.clone(),

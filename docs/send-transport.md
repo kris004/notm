@@ -9,6 +9,10 @@
 
 Auto mode only runs harmless probes and never sends mail. Fake transport tests prove valid RFC5322 bytes, including attachment MIME parts, before any real transport is used.
 
+The live UI refuses to fall back to the fake capture transport when no
+`send.command` is configured. Fake capture is only enabled for fixture/test
+launches so a real compose window cannot report success for an unsent message.
+
 For detected lieer helpers like `aerc-gmail-send`, auto mode uses stdin-RFC5322 and appends `-t` when no explicit recipient/template args are configured, because `gmi send` requires `-t` to trust RFC5322 recipients from headers.
 
 Optional post-send persistence is explicit:
