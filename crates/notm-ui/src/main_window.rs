@@ -161,6 +161,8 @@ struct Widgets {
     html_view: webkit6::WebView,
     view_toggle_button: gtk::Button,
     image_policy_button: gtk::Button,
+    html_policy_row: gtk::Box,
+    html_policy_label: gtk::Label,
     full_headers_button: gtk::Button,
     raw_source_button: gtk::Button,
     collapse_quotes_button: gtk::Button,
@@ -169,6 +171,8 @@ struct Widgets {
     copy_message_id_button: gtk::Button,
     copy_thread_id_button: gtk::Button,
     quote_collapse: Rc<Cell<bool>>,
+    attachment_title: gtk::Label,
+    attachment_scrolled: gtk::ScrolledWindow,
     attachment_list: gtk::ListBox,
     attachment_items: Rc<RefCell<Vec<ThreadAttachmentItem>>>,
     draft_path: PathBuf,
@@ -459,7 +463,6 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     copy_thread_id_button.set_widget_name("notm-copy-thread-id-button");
     for b in [
         &view_toggle_button,
-        &image_policy_button,
         &full_headers_button,
         &raw_source_button,
         &collapse_quotes_button,
@@ -475,19 +478,33 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     let attachment_title = gtk::Label::new(Some("Attachments in thread"));
     attachment_title.set_xalign(0.0);
     attachment_title.add_css_class("dim-label");
+    attachment_title.set_visible(false);
     right.append(&attachment_title);
     let attachment_list = gtk::ListBox::new();
     attachment_list.set_widget_name("notm-attachment-list");
     attachment_list.set_selection_mode(gtk::SelectionMode::Single);
-    attachment_list.set_size_request(-1, 86);
     attachment_list.add_css_class("boxed-list");
     let scrolled_attachments = gtk::ScrolledWindow::builder()
         .hexpand(true)
         .vexpand(false)
-        .min_content_height(86)
         .child(&attachment_list)
         .build();
+    scrolled_attachments.set_visible(false);
     right.append(&scrolled_attachments);
+
+    let html_policy_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    html_policy_row.set_widget_name("notm-html-policy-row");
+    html_policy_row.set_visible(false);
+    let html_policy_label = gtk::Label::new(None);
+    html_policy_label.set_widget_name("notm-html-policy-label");
+    html_policy_label.set_xalign(0.0);
+    html_policy_label.set_wrap(true);
+    html_policy_label.set_hexpand(true);
+    html_policy_label.add_css_class("dim-label");
+    image_policy_button.set_halign(gtk::Align::End);
+    html_policy_row.append(&html_policy_label);
+    html_policy_row.append(&image_policy_button);
+    right.append(&html_policy_row);
 
     let message_view = gtk::TextView::new();
     message_view.set_widget_name("notm-message-view");
@@ -642,6 +659,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         html_view,
         view_toggle_button,
         image_policy_button,
+        html_policy_row,
+        html_policy_label,
         full_headers_button,
         raw_source_button,
         collapse_quotes_button,
@@ -650,6 +669,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         copy_message_id_button,
         copy_thread_id_button,
         quote_collapse,
+        attachment_title,
+        attachment_scrolled: scrolled_attachments,
         attachment_list,
         attachment_items: Rc::new(RefCell::new(Vec::new())),
         draft_path: options
@@ -2103,6 +2124,22 @@ fn refresh_thread_attachment_list(widgets: &Widgets, state: &SharedState) {
             widgets.attachment_items.borrow_mut().push(item);
         }
     }
+    let attachment_count = widgets.attachment_items.borrow().len();
+    let has_attachments = attachment_count > 0;
+    widgets.attachment_title.set_visible(has_attachments);
+    widgets.attachment_scrolled.set_visible(has_attachments);
+    if has_attachments {
+        widgets.attachment_title.set_text(&format!(
+            "{} attachment{} in thread",
+            attachment_count,
+            if attachment_count == 1 { "" } else { "s" }
+        ));
+        let visible_rows = attachment_count.min(4) as i32;
+        let row_height = 34;
+        let height = visible_rows * row_height;
+        widgets.attachment_scrolled.set_min_content_height(height);
+        widgets.attachment_scrolled.set_max_content_height(height);
+    }
     if let Some(row) = widgets.attachment_list.row_at_index(0) {
         widgets.attachment_list.select_row(Some(&row));
     }
@@ -2210,6 +2247,26 @@ fn activate_image_policy_button(options: &LaunchOptions, widgets: &Widgets, stat
 fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     let html_visible = html_view_is_visible(widgets);
     let has_html = selected_message_has_html(state);
+    widgets
+        .html_policy_row
+        .set_visible(html_visible && has_html);
+    widgets
+        .image_policy_button
+        .set_visible(html_visible && has_html);
+    if html_visible && has_html {
+        let image_policy = if html_view_images_allowed(widgets) {
+            if selected_message_allows_images(options, state) {
+                "remote images allowed"
+            } else {
+                "remote images loaded for this view"
+            }
+        } else {
+            "remote images blocked"
+        };
+        widgets.html_policy_label.set_text(&format!(
+            "Sanitized HTML view: JavaScript disabled; {image_policy}; link navigation blocked in-app."
+        ));
+    }
     widgets
         .view_toggle_button
         .set_label(if html_visible { "Text" } else { "Visual HTML" });
@@ -2469,7 +2526,6 @@ fn configure_html_webview(view: &webkit6::WebView, allow_remote_images: bool) {
     view.load_html(
         &visual_html_document(
             "<p class=\"notm-empty-html\">Open an HTML message and choose Visual HTML.</p>",
-            allow_remote_images,
         ),
         Some("about:blank"),
     );
@@ -2545,7 +2601,7 @@ fn show_visual_html_with_image_policy(
             .ok_or_else(|| anyhow::anyhow!("selected message has no HTML body"))?;
         let sanitized = sanitize_html_for_visual(&html, allow_remote_images);
         Ok((
-            visual_html_document(&sanitized, allow_remote_images),
+            visual_html_document(&sanitized),
             html,
             allow_remote_images,
             sender,
@@ -2717,12 +2773,7 @@ fn strip_img_tags(html: &str) -> String {
     out
 }
 
-fn visual_html_document(body: &str, allow_remote_images: bool) -> String {
-    let image_policy = if allow_remote_images {
-        "remote images allowed by config"
-    } else {
-        "images blocked"
-    };
+fn visual_html_document(body: &str) -> String {
     format!(
         r#"<!doctype html>
 <html>
@@ -2742,22 +2793,14 @@ body {{
   line-height: 1.45;
   overflow-wrap: anywhere;
 }}
-.notm-html-policy {{
-  margin: 0 0 12px 0;
-  padding: 6px 8px;
-  border-radius: 6px;
-  background: color-mix(in srgb, CanvasText 8%, transparent);
-  color: color-mix(in srgb, CanvasText 70%, transparent);
-  font-size: 12px;
-}}
 .notm-blocked-image {{
-  display: inline-block;
-  margin: 2px;
-  padding: 2px 6px;
-  border: 1px solid color-mix(in srgb, CanvasText 24%, transparent);
-  border-radius: 4px;
+  display: inline;
+  margin: 0;
+  padding: 0;
+  background: transparent;
   color: color-mix(in srgb, CanvasText 70%, transparent);
   font-size: 12px;
+  font-style: italic;
 }}
 a {{ color: LinkText; }}
 pre, code {{
@@ -2767,7 +2810,6 @@ pre, code {{
 blockquote {{
   margin-inline-start: 0.8em;
   padding-inline-start: 0.8em;
-  border-inline-start: 3px solid color-mix(in srgb, CanvasText 24%, transparent);
   color: color-mix(in srgb, CanvasText 78%, transparent);
 }}
 table {{
@@ -2775,13 +2817,13 @@ table {{
   max-width: 100%;
 }}
 td, th {{
-  border: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
+  border: 0;
   padding: 3px 6px;
+  vertical-align: top;
 }}
 </style>
 </head>
 <body>
-<div class="notm-html-policy">Sanitized HTML view: JavaScript disabled; {image_policy}; link navigation blocked in-app.</div>
 {body}
 </body>
 </html>"#
