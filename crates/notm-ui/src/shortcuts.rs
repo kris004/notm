@@ -13,7 +13,10 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("F", "Forward"),
     ("g i/u/f/s/a", "Inbox/Unread/Flagged/Sent/All"),
     ("Raw source button", "Show selected message source"),
-    ("Save attachment", "Save selected thread attachment"),
+    (
+        "Attachment right-click",
+        "Save or open selected thread attachment",
+    ),
     ("Ctrl+K", "Command palette"),
     ("Ctrl+Enter", "Send compose"),
     ("?", "Shortcuts overlay"),

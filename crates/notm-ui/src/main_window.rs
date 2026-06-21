@@ -166,8 +166,6 @@ struct Widgets {
     full_headers_button: gtk::Button,
     raw_source_button: gtk::Button,
     collapse_quotes_button: gtk::Button,
-    save_attachment_button: gtk::Button,
-    open_attachment_button: gtk::Button,
     copy_message_id_button: gtk::Button,
     copy_thread_id_button: gtk::Button,
     quote_collapse: Rc<Cell<bool>>,
@@ -453,10 +451,6 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     raw_source_button.set_widget_name("notm-raw-source-button");
     let collapse_quotes_button = gtk::Button::with_label("Collapse quotes");
     collapse_quotes_button.set_widget_name("notm-collapse-quotes-button");
-    let save_attachment_button = gtk::Button::with_label("Save attachment");
-    save_attachment_button.set_widget_name("notm-save-attachment-button");
-    let open_attachment_button = gtk::Button::with_label("Open attachment");
-    open_attachment_button.set_widget_name("notm-open-attachment-button");
     let copy_message_id_button = gtk::Button::with_label("Copy message id");
     copy_message_id_button.set_widget_name("notm-copy-message-id-button");
     let copy_thread_id_button = gtk::Button::with_label("Copy thread id");
@@ -466,8 +460,6 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         &full_headers_button,
         &raw_source_button,
         &collapse_quotes_button,
-        &save_attachment_button,
-        &open_attachment_button,
         &copy_message_id_button,
         &copy_thread_id_button,
     ] {
@@ -664,8 +656,6 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         full_headers_button,
         raw_source_button,
         collapse_quotes_button,
-        save_attachment_button,
-        open_attachment_button,
         copy_message_id_button,
         copy_thread_id_button,
         quote_collapse,
@@ -1202,28 +1192,6 @@ fn connect_message_actions(options: &LaunchOptions, widgets: &Widgets, state: &S
     widgets
         .collapse_quotes_button
         .connect_clicked(move |_| toggle_quote_collapse(&opts, &w, &st));
-
-    let w = widgets.clone();
-    let st = state.clone();
-    widgets.save_attachment_button.connect_clicked(move |_| {
-        let result = if let Some(item) = selected_thread_attachment(&w) {
-            save_thread_attachment(&w, &st, &item, None)
-        } else {
-            save_selected_attachment(&w, &st, 0, None)
-        };
-        if let Err(err) = result {
-            st.borrow_mut().last_error = Some(err.to_string());
-            w.status_label
-                .set_text(&format!("Save attachment failed: {err}"));
-            update_debug(&w, &st);
-        }
-    });
-
-    let w = widgets.clone();
-    let st = state.clone();
-    widgets
-        .open_attachment_button
-        .connect_clicked(move |_| open_selected_or_thread_attachment(&w, &st));
 
     let w = widgets.clone();
     let st = state.clone();
@@ -2120,6 +2088,7 @@ fn refresh_thread_attachment_list(widgets: &Widgets, state: &SharedState) {
             label.set_margin_top(3);
             label.set_margin_bottom(3);
             row.set_child(Some(&label));
+            connect_attachment_context_menu(widgets, state, &row, item.clone());
             widgets.attachment_list.append(&row);
             widgets.attachment_items.borrow_mut().push(item);
         }
@@ -2143,6 +2112,71 @@ fn refresh_thread_attachment_list(widgets: &Widgets, state: &SharedState) {
     if let Some(row) = widgets.attachment_list.row_at_index(0) {
         widgets.attachment_list.select_row(Some(&row));
     }
+}
+
+fn connect_attachment_context_menu(
+    widgets: &Widgets,
+    state: &SharedState,
+    row: &gtk::ListBoxRow,
+    item: ThreadAttachmentItem,
+) {
+    let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let save_button = gtk::Button::with_label("Save attachment");
+    save_button.set_widget_name("notm-attachment-menu-save");
+    let open_button = gtk::Button::with_label("Open attachment");
+    open_button.set_widget_name("notm-attachment-menu-open");
+    menu.append(&save_button);
+    menu.append(&open_button);
+
+    let popover = gtk::Popover::new();
+    popover.set_has_arrow(false);
+    popover.set_child(Some(&menu));
+    popover.set_parent(row);
+
+    let w = widgets.clone();
+    let st = state.clone();
+    let save_item = item.clone();
+    let save_popover = popover.clone();
+    save_button.connect_clicked(move |_| {
+        save_popover.popdown();
+        if let Err(err) = save_thread_attachment(&w, &st, &save_item, None) {
+            st.borrow_mut().last_error = Some(err.to_string());
+            w.status_label
+                .set_text(&format!("Save attachment failed: {err}"));
+            update_debug(&w, &st);
+        }
+    });
+
+    let w = widgets.clone();
+    let st = state.clone();
+    let open_popover = popover.clone();
+    open_button.connect_clicked(move |_| {
+        open_popover.popdown();
+        match save_thread_attachment(&w, &st, &item, None) {
+            Ok(path) => open_saved_attachment_path(&w, &st, path),
+            Err(err) => {
+                st.borrow_mut().last_error = Some(err.to_string());
+                w.status_label
+                    .set_text(&format!("Open attachment failed: {err}"));
+                update_debug(&w, &st);
+            }
+        }
+    });
+
+    let click = gtk::GestureClick::new();
+    click.set_button(3);
+    let menu_popover = popover.clone();
+    let menu_row = row.clone();
+    click.connect_pressed(move |_, _, x, y| {
+        if let Some(parent) = menu_row.parent()
+            && let Ok(list) = parent.downcast::<gtk::ListBox>()
+        {
+            list.select_row(Some(&menu_row));
+        }
+        menu_popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        menu_popover.popup();
+    });
+    row.add_controller(click);
 }
 
 fn selected_thread_attachment(widgets: &Widgets) -> Option<ThreadAttachmentItem> {
@@ -2354,23 +2388,6 @@ fn open_selected_attachment(widgets: &Widgets, state: &SharedState, index: usize
                 .set_text(&format!("Open attachment failed: {err}"));
             update_debug(widgets, state);
         }
-    }
-}
-
-fn open_selected_or_thread_attachment(widgets: &Widgets, state: &SharedState) {
-    if let Some(item) = selected_thread_attachment(widgets) {
-        match save_thread_attachment(widgets, state, &item, None) {
-            Ok(path) => open_saved_attachment_path(widgets, state, path),
-            Err(err) => {
-                state.borrow_mut().last_error = Some(err.to_string());
-                widgets
-                    .status_label
-                    .set_text(&format!("Open attachment failed: {err}"));
-                update_debug(widgets, state);
-            }
-        }
-    } else {
-        open_selected_attachment(widgets, state, 0);
     }
 }
 
