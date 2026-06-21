@@ -1713,7 +1713,10 @@ fn populate_address_suggestions_list(widgets: &Widgets, suggestions: &[String]) 
 
 fn compose_fields(widgets: &Widgets, state: &SharedState) -> ComposeFields {
     let mut fields = read_compose_fields(widgets);
-    fields.attachments = state.borrow().compose_fields.attachments.clone();
+    let stored = state.borrow().compose_fields.clone();
+    fields.attachments = stored.attachments;
+    fields.in_reply_to = stored.in_reply_to;
+    fields.references = stored.references;
     fields
 }
 
@@ -1991,6 +1994,17 @@ fn composed_message_from_fields(fields: &ComposeFields) -> anyhow::Result<Compos
     );
     message.cc = split_recipients(&fields.cc);
     message.bcc = split_recipients(&fields.bcc);
+    message.in_reply_to = fields
+        .in_reply_to
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    message.references = fields
+        .references
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
     message.attachments = load_compose_attachments(fields)?;
     Ok(message)
 }
@@ -3769,7 +3783,12 @@ fn run_manual_sync(options: &LaunchOptions, widgets: &Widgets, state: &SharedSta
 fn open_compose(widgets: &Widgets, state: &SharedState) {
     widgets.composer_box.set_visible(true);
     widgets.compose_subject.grab_focus();
-    state.borrow_mut().last_operation = Some("opened composer".to_string());
+    {
+        let mut state = state.borrow_mut();
+        state.compose_fields.in_reply_to = None;
+        state.compose_fields.references.clear();
+        state.last_operation = Some("opened composer".to_string());
+    }
     update_debug(widgets, state);
 }
 
@@ -3892,6 +3911,8 @@ fn fill_composer(widgets: &Widgets, state: &SharedState, message: ComposedMessag
     widgets.compose_subject.set_text(&message.subject);
     widgets.compose_body.buffer().set_text(&message.body);
     let mut fields = compose_fields(widgets, state);
+    fields.in_reply_to = message.in_reply_to;
+    fields.references = message.references;
     match cache_composer_attachments(&message.attachments) {
         Ok(paths) => {
             fields.attachments = paths;
@@ -3943,25 +3964,17 @@ fn default_attachment_cache_dir() -> PathBuf {
 fn send_compose(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     let fields = compose_fields(widgets, state);
     state.borrow_mut().compose_fields = fields.clone();
-    let mut message = ComposedMessage::new(
-        fields.from.clone(),
-        split_recipients(&fields.to),
-        fields.subject.clone(),
-        fields.body.clone(),
-    );
-    message.cc = split_recipients(&fields.cc);
-    message.bcc = split_recipients(&fields.bcc);
-    match load_compose_attachments(&fields) {
-        Ok(attachments) => message.attachments = attachments,
+    let message = match composed_message_from_fields(&fields) {
+        Ok(message) => message,
         Err(err) => {
             widgets
                 .status_label
-                .set_text(&format!("Attachment load failed: {err}"));
+                .set_text(&format!("Compose message build failed: {err}"));
             state.borrow_mut().last_error = Some(err.to_string());
             update_debug(widgets, state);
             return;
         }
-    }
+    };
     let message_for_persistence = message.clone();
     let result = send_message_with_config(options, message);
     match result {
@@ -5178,6 +5191,8 @@ fn read_compose_fields(widgets: &Widgets) -> ComposeFields {
         subject: widgets.compose_subject.text().to_string(),
         body,
         attachments: Vec::new(),
+        in_reply_to: None,
+        references: Vec::new(),
     }
 }
 
@@ -5476,5 +5491,38 @@ mod tests {
             err.to_string().contains("refusing to fake-send"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn composed_message_from_fields_preserves_reply_thread_headers() {
+        let fields = ComposeFields {
+            from: "Me <me@example.test>".to_string(),
+            to: "Alice <alice@example.test>".to_string(),
+            subject: "Re: Hello".to_string(),
+            body: "Reply body".to_string(),
+            in_reply_to: Some("<original@example.test>".to_string()),
+            references: vec![
+                "<older@example.test>".to_string(),
+                "<original@example.test>".to_string(),
+            ],
+            ..ComposeFields::default()
+        };
+
+        let message = composed_message_from_fields(&fields).expect("message");
+        let rendered = message.to_rfc5322();
+
+        assert_eq!(
+            message.in_reply_to.as_deref(),
+            Some("<original@example.test>")
+        );
+        assert_eq!(
+            message.references,
+            vec![
+                "<older@example.test>".to_string(),
+                "<original@example.test>".to_string(),
+            ]
+        );
+        assert!(rendered.contains("In-Reply-To: <original@example.test>\r\n"));
+        assert!(rendered.contains("References: <older@example.test> <original@example.test>\r\n"));
     }
 }

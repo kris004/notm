@@ -79,4 +79,8 @@ pub struct ComposeFields {
     pub body: String,
     #[serde(default)]
     pub attachments: Vec<String>,
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
+    #[serde(default)]
+    pub references: Vec<String>,
 }
