@@ -227,6 +227,8 @@ static THREAD_DETAIL_CACHE: OnceLock<Mutex<BTreeMap<String, ThreadUiDetails>>> =
 
 const SIDEBAR_MIN_WIDTH: i32 = 180;
 const THREAD_LIST_MIN_WIDTH: i32 = 320;
+const COMPOSE_BODY_MIN_HEIGHT: i32 = 160;
+const COMPOSE_BODY_NATURAL_HEIGHT: i32 = 260;
 
 fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     install_css();
@@ -532,8 +534,21 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     let compose_subject = entry_with_placeholder("Subject");
     let compose_body = gtk::TextView::new();
     compose_body.set_widget_name("notm-compose-body");
+    compose_body.set_hexpand(true);
     compose_body.set_wrap_mode(gtk::WrapMode::WordChar);
     compose_body.set_vexpand(true);
+    let scrolled_compose_body = gtk::ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_width(false)
+        .propagate_natural_height(false)
+        .min_content_width(240)
+        .min_content_height(COMPOSE_BODY_MIN_HEIGHT)
+        .max_content_height(COMPOSE_BODY_NATURAL_HEIGHT)
+        .child(&compose_body)
+        .build();
     let address_suggestions_label = gtk::Label::new(Some(
         "Address suggestions load from recent Notmuch headers.",
     ));
@@ -579,7 +594,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     }
     composer_box.append(&address_suggestions_label);
     composer_box.append(&address_suggestions_list);
-    composer_box.append(&compose_body);
+    composer_box.append(&scrolled_compose_body);
     composer_box.append(&compose_attachments);
     let draft_title = gtk::Label::new(Some("Local drafts"));
     draft_title.set_xalign(0.0);
