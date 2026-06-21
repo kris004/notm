@@ -12,7 +12,15 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("c", "Compose"),
     ("F", "Forward"),
     ("g i/u/f/s/a", "Inbox/Unread/Flagged/Sent/All"),
-    ("Raw source button", "Show selected message source"),
+    (
+        "Message menu",
+        "Choose which message in the thread is selected",
+    ),
+    ("View menu", "Show text, HTML, headers, or raw source"),
+    (
+        "Copy menu",
+        "Copy message/thread ids and selected message fields",
+    ),
     (
         "Attachment right-click",
         "Save or open selected thread attachment",

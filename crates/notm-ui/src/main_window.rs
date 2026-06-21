@@ -161,15 +161,24 @@ struct Widgets {
     message_stack: gtk::Stack,
     message_view: gtk::TextView,
     html_view: webkit6::WebView,
-    view_toggle_button: gtk::Button,
+    message_menu_button: gtk::MenuButton,
+    message_menu_box: gtk::Box,
+    view_menu_button: gtk::MenuButton,
+    view_text_button: gtk::Button,
+    view_html_button: gtk::Button,
+    view_headers_button: gtk::Button,
+    view_raw_button: gtk::Button,
     image_policy_button: gtk::Button,
     html_policy_row: gtk::Box,
     html_policy_label: gtk::Label,
-    full_headers_button: gtk::Button,
-    raw_source_button: gtk::Button,
     collapse_quotes_button: gtk::Button,
+    copy_menu_button: gtk::MenuButton,
     copy_message_id_button: gtk::Button,
     copy_thread_id_button: gtk::Button,
+    copy_from_email_button: gtk::Button,
+    copy_to_email_button: gtk::Button,
+    copy_cc_email_button: gtk::Button,
+    copy_subject_button: gtk::Button,
     quote_collapse: Rc<Cell<bool>>,
     attachment_title: gtk::Label,
     attachment_scrolled: gtk::ScrolledWindow,
@@ -443,30 +452,56 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
 
     let message_actions = button_flow(4);
     message_actions.set_widget_name("notm-message-actions");
-    let view_toggle_button = gtk::Button::with_label("Visual HTML");
-    view_toggle_button.set_widget_name("notm-view-toggle-button");
+    let (message_menu_button, message_menu_box) =
+        menu_button_with_box("Message", "notm-message-menu-button");
+    let (view_menu_button, view_menu_box) = menu_button_with_box("View", "notm-view-menu-button");
+    let view_text_button = gtk::Button::with_label("Text");
+    view_text_button.set_widget_name("notm-view-text-button");
+    let view_html_button = gtk::Button::with_label("Visual HTML");
+    view_html_button.set_widget_name("notm-view-html-button");
+    let view_headers_button = gtk::Button::with_label("Full headers");
+    view_headers_button.set_widget_name("notm-view-headers-button");
+    let view_raw_button = gtk::Button::with_label("Raw source");
+    view_raw_button.set_widget_name("notm-view-raw-button");
+    for b in [
+        &view_text_button,
+        &view_html_button,
+        &view_headers_button,
+        &view_raw_button,
+    ] {
+        view_menu_box.append(b);
+    }
     let image_policy_button = gtk::Button::with_label("Load images once");
     image_policy_button.set_widget_name("notm-image-policy-button");
-    let full_headers_button = gtk::Button::with_label("Full headers");
-    full_headers_button.set_widget_name("notm-full-headers-button");
-    let raw_source_button = gtk::Button::with_label("Raw source");
-    raw_source_button.set_widget_name("notm-raw-source-button");
     let collapse_quotes_button = gtk::Button::with_label("Collapse quotes");
     collapse_quotes_button.set_widget_name("notm-collapse-quotes-button");
+    let (copy_menu_button, copy_menu_box) = menu_button_with_box("Copy", "notm-copy-menu-button");
     let copy_message_id_button = gtk::Button::with_label("Copy message id");
     copy_message_id_button.set_widget_name("notm-copy-message-id-button");
     let copy_thread_id_button = gtk::Button::with_label("Copy thread id");
     copy_thread_id_button.set_widget_name("notm-copy-thread-id-button");
+    let copy_from_email_button = gtk::Button::with_label("Copy from email");
+    copy_from_email_button.set_widget_name("notm-copy-from-email-button");
+    let copy_to_email_button = gtk::Button::with_label("Copy to email");
+    copy_to_email_button.set_widget_name("notm-copy-to-email-button");
+    let copy_cc_email_button = gtk::Button::with_label("Copy cc email");
+    copy_cc_email_button.set_widget_name("notm-copy-cc-email-button");
+    let copy_subject_button = gtk::Button::with_label("Copy subject");
+    copy_subject_button.set_widget_name("notm-copy-subject-button");
     for b in [
-        &view_toggle_button,
-        &full_headers_button,
-        &raw_source_button,
-        &collapse_quotes_button,
         &copy_message_id_button,
         &copy_thread_id_button,
+        &copy_from_email_button,
+        &copy_to_email_button,
+        &copy_cc_email_button,
+        &copy_subject_button,
     ] {
-        message_actions.insert(b, -1);
+        copy_menu_box.append(b);
     }
+    message_actions.insert(&message_menu_button, -1);
+    message_actions.insert(&view_menu_button, -1);
+    message_actions.insert(&collapse_quotes_button, -1);
+    message_actions.insert(&copy_menu_button, -1);
     right.append(&message_actions);
 
     let attachment_title = gtk::Label::new(Some("Attachments in thread"));
@@ -651,15 +686,24 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         message_stack,
         message_view,
         html_view,
-        view_toggle_button,
+        message_menu_button,
+        message_menu_box,
+        view_menu_button,
+        view_text_button,
+        view_html_button,
+        view_headers_button,
+        view_raw_button,
         image_policy_button,
         html_policy_row,
         html_policy_label,
-        full_headers_button,
-        raw_source_button,
         collapse_quotes_button,
+        copy_menu_button,
         copy_message_id_button,
         copy_thread_id_button,
+        copy_from_email_button,
+        copy_to_email_button,
+        copy_cc_email_button,
+        copy_subject_button,
         quote_collapse,
         attachment_title,
         attachment_scrolled: scrolled_attachments,
@@ -1164,8 +1208,29 @@ fn connect_message_actions(options: &LaunchOptions, widgets: &Widgets, state: &S
     let w = widgets.clone();
     let st = state.clone();
     widgets
-        .view_toggle_button
-        .connect_clicked(move |_| toggle_text_visual_view(&opts, &w, &st));
+        .view_text_button
+        .connect_clicked(move |_| show_rendered_selected_thread(&opts, &w, &st));
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets
+        .view_html_button
+        .connect_clicked(move |_| show_visual_html_selected_message(&opts, &w, &st));
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets
+        .view_headers_button
+        .connect_clicked(move |_| show_full_headers(&opts, &w, &st));
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets
+        .view_raw_button
+        .connect_clicked(move |_| show_raw_source(&opts, &w, &st));
 
     let opts = options.clone();
     let w = widgets.clone();
@@ -1173,20 +1238,6 @@ fn connect_message_actions(options: &LaunchOptions, widgets: &Widgets, state: &S
     widgets
         .image_policy_button
         .connect_clicked(move |_| activate_image_policy_button(&opts, &w, &st));
-
-    let opts = options.clone();
-    let w = widgets.clone();
-    let st = state.clone();
-    widgets
-        .raw_source_button
-        .connect_clicked(move |_| show_raw_source(&opts, &w, &st));
-
-    let opts = options.clone();
-    let w = widgets.clone();
-    let st = state.clone();
-    widgets
-        .full_headers_button
-        .connect_clicked(move |_| show_full_headers(&opts, &w, &st));
 
     let opts = options.clone();
     let w = widgets.clone();
@@ -1206,6 +1257,30 @@ fn connect_message_actions(options: &LaunchOptions, widgets: &Widgets, state: &S
     widgets
         .copy_thread_id_button
         .connect_clicked(move |_| copy_selected_thread_id(&w, &st));
+
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets
+        .copy_from_email_button
+        .connect_clicked(move |_| copy_selected_message_emails(&w, &st, MessageEmailField::From));
+
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets
+        .copy_to_email_button
+        .connect_clicked(move |_| copy_selected_message_emails(&w, &st, MessageEmailField::To));
+
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets
+        .copy_cc_email_button
+        .connect_clicked(move |_| copy_selected_message_emails(&w, &st, MessageEmailField::Cc));
+
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets
+        .copy_subject_button
+        .connect_clicked(move |_| copy_selected_message_subject(&w, &st));
 }
 
 fn connect_recipient_autocomplete(entry: &gtk::Entry, widgets: &Widgets, state: &SharedState) {
@@ -2248,6 +2323,10 @@ fn save_thread_attachment(
 }
 
 fn show_rendered_selected_thread(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    if state.borrow().selected_message.is_some() {
+        show_selected_message_text_view(options, widgets, state);
+        return;
+    }
     let Some(thread_id) = state
         .borrow()
         .selected_thread
@@ -2274,6 +2353,95 @@ fn show_rendered_selected_thread(options: &LaunchOptions, widgets: &Widgets, sta
     }
 }
 
+fn show_selected_message_text_view(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) {
+    match render_selected_message_text(widgets, state) {
+        Ok(rendered) => {
+            show_text_message_view(options, widgets, state);
+            widgets.message_view.set_monospace(false);
+            widgets.message_view.buffer().set_text(&rendered);
+            let index = selected_message_index(state)
+                .map(|index| index + 1)
+                .unwrap_or(1);
+            let total = state.borrow().messages.len().max(1);
+            widgets
+                .status_label
+                .set_text(&format!("Showing message {index} of {total}"));
+        }
+        Err(err) => {
+            state.borrow_mut().last_error = Some(err.to_string());
+            widgets
+                .status_label
+                .set_text(&format!("Text view failed: {err}"));
+        }
+    }
+    update_debug(widgets, state);
+}
+
+fn render_selected_message_text(widgets: &Widgets, state: &SharedState) -> anyhow::Result<String> {
+    let message = state
+        .borrow()
+        .selected_message
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("no selected message"))?;
+    let index = selected_message_index(state)
+        .map(|index| index + 1)
+        .unwrap_or(1);
+    let total = state.borrow().messages.len().max(1);
+    let mut rendered = format!(
+        "Message {index} of {total}\nFrom: {}\nTo: {}\nCc: {}\nSubject: {}\nDate: {}\nTags: {}\nMessage-ID: {}\nFilenames: {}\n\n",
+        message.from,
+        message.to,
+        message.cc,
+        message.subject,
+        message.date,
+        message.tags.join(" "),
+        message.message_id,
+        message.filenames.join(", ")
+    );
+    if let Some(path) = message.filenames.first() {
+        match parse_file(path) {
+            Ok(parsed) => {
+                rendered.push_str(&render_body_with_quote_collapse(
+                    &parsed.safe_body,
+                    widgets.quote_collapse.get(),
+                ));
+                if !parsed.attachments.is_empty() {
+                    rendered.push_str("\n\nAttachments:\n");
+                    for att in &parsed.attachments {
+                        rendered.push_str(&format!(
+                            "- {} ({}, {} bytes)\n",
+                            att.filename
+                                .clone()
+                                .unwrap_or_else(|| "unnamed".to_string()),
+                            att.content_type,
+                            att.size
+                        ));
+                    }
+                }
+                rendered.push_str("\n\nMIME tree:\n");
+                for node in parsed.mime_tree {
+                    rendered.push_str(&format!("  {node}\n"));
+                }
+            }
+            Err(err) => rendered.push_str(&format!("Could not parse body: {err}\n")),
+        }
+    }
+    Ok(rendered)
+}
+
+fn selected_message_index(state: &SharedState) -> Option<usize> {
+    let state = state.borrow();
+    let selected_id = &state.selected_message.as_ref()?.message_id;
+    state
+        .messages
+        .iter()
+        .position(|message| &message.message_id == selected_id)
+}
+
 fn toggle_text_visual_view(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     if html_view_is_visible(widgets) {
         show_rendered_selected_thread(options, widgets, state);
@@ -2297,12 +2465,34 @@ fn activate_image_policy_button(options: &LaunchOptions, widgets: &Widgets, stat
 fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     let html_visible = html_view_is_visible(widgets);
     let has_html = selected_message_has_html(state);
+    let has_message = state.borrow().selected_message.is_some();
+    let has_thread = state.borrow().selected_thread.is_some();
     widgets
         .html_policy_row
         .set_visible(html_visible && has_html);
     widgets
         .image_policy_button
         .set_visible(html_visible && has_html);
+    widgets.message_menu_button.set_sensitive(has_thread);
+    widgets
+        .view_menu_button
+        .set_sensitive(has_message || has_thread);
+    widgets
+        .view_text_button
+        .set_sensitive(has_message || has_thread);
+    widgets.view_html_button.set_visible(has_html);
+    widgets.view_html_button.set_sensitive(has_html);
+    widgets.view_headers_button.set_sensitive(has_message);
+    widgets.view_raw_button.set_sensitive(has_message);
+    widgets
+        .copy_menu_button
+        .set_sensitive(has_message || has_thread);
+    widgets.copy_message_id_button.set_sensitive(has_message);
+    widgets.copy_thread_id_button.set_sensitive(has_thread);
+    widgets.copy_from_email_button.set_sensitive(has_message);
+    widgets.copy_to_email_button.set_sensitive(has_message);
+    widgets.copy_cc_email_button.set_sensitive(has_message);
+    widgets.copy_subject_button.set_sensitive(has_message);
     if html_visible && has_html {
         let image_policy = if html_view_images_allowed(widgets) {
             if selected_message_allows_images(options, state) {
@@ -2317,12 +2507,6 @@ fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, sta
             "Sanitized HTML view: JavaScript disabled; {image_policy}; link navigation blocked in-app."
         ));
     }
-    widgets
-        .view_toggle_button
-        .set_label(if html_visible { "Text" } else { "Visual HTML" });
-    widgets
-        .view_toggle_button
-        .set_sensitive(has_html || html_visible);
 
     if !has_html {
         widgets.image_policy_button.set_label("Load images once");
@@ -2947,6 +3131,77 @@ fn copy_selected_thread_id(widgets: &Widgets, state: &SharedState) {
     update_debug(widgets, state);
 }
 
+#[derive(Debug, Clone, Copy)]
+enum MessageEmailField {
+    From,
+    To,
+    Cc,
+}
+
+fn copy_selected_message_emails(widgets: &Widgets, state: &SharedState, field: MessageEmailField) {
+    let value = {
+        let state = state.borrow();
+        let Some(message) = state.selected_message.as_ref() else {
+            widgets
+                .status_label
+                .set_text("No selected message to copy from");
+            return;
+        };
+        match field {
+            MessageEmailField::From => header_emails(&message.from),
+            MessageEmailField::To => header_emails(&message.to),
+            MessageEmailField::Cc => header_emails(&message.cc),
+        }
+    };
+    if value.trim().is_empty() {
+        widgets
+            .status_label
+            .set_text("Selected message field is empty");
+        return;
+    }
+    copy_to_clipboard(&value);
+    let label = match field {
+        MessageEmailField::From => "from email",
+        MessageEmailField::To => "to email",
+        MessageEmailField::Cc => "cc email",
+    };
+    widgets.status_label.set_text(&format!("Copied {label}"));
+    state.borrow_mut().last_operation = Some(format!("copied {label}"));
+    update_debug(widgets, state);
+}
+
+fn copy_selected_message_subject(widgets: &Widgets, state: &SharedState) {
+    let Some(subject) = state
+        .borrow()
+        .selected_message
+        .as_ref()
+        .map(|message| message.subject.clone())
+        .filter(|subject| !subject.trim().is_empty())
+    else {
+        widgets
+            .status_label
+            .set_text("No selected message subject to copy");
+        return;
+    };
+    copy_to_clipboard(&subject);
+    widgets.status_label.set_text("Copied subject");
+    state.borrow_mut().last_operation = Some("copied subject".to_string());
+    update_debug(widgets, state);
+}
+
+fn header_emails(value: &str) -> String {
+    let emails = parse_address_list(value)
+        .into_iter()
+        .map(|address| address.email)
+        .filter(|email| !email.trim().is_empty())
+        .collect::<Vec<_>>();
+    if emails.is_empty() {
+        value.trim().to_string()
+    } else {
+        emails.join(", ")
+    }
+}
+
 fn copy_to_clipboard(text: &str) {
     if let Some(display) = gtk::gdk::Display::default() {
         display.clipboard().set_text(text);
@@ -3297,6 +3552,7 @@ fn apply_search_data(
     }
     populate_thread_list(options, widgets, state);
     refresh_thread_attachment_list(widgets, state);
+    update_message_menu(options, widgets, state);
     widgets.status_label.set_text(&format!(
         "{} of {} thread(s) for {}{}",
         state.borrow().thread_loaded_count,
@@ -3541,12 +3797,22 @@ fn select_thread_by_index(
 ) {
     let thread = state.borrow().thread_list_items.get(index).cloned();
     if let Some(thread) = thread {
-        state.borrow_mut().selected_thread = Some(thread.clone());
+        {
+            let mut state = state.borrow_mut();
+            state.selected_thread = Some(thread.clone());
+            if !open {
+                state.selected_message = None;
+                state.messages.clear();
+            }
+        }
         widgets
             .status_label
             .set_text(&format!("Selected {}", thread.thread_id));
         if open {
             open_thread_by_index(options, widgets, state, index);
+        } else {
+            refresh_thread_attachment_list(widgets, state);
+            update_message_menu(options, widgets, state);
         }
     }
     update_message_action_buttons(options, widgets, state);
@@ -3562,69 +3828,24 @@ fn open_thread_by_index(
     let Some(thread) = state.borrow().thread_list_items.get(index).cloned() else {
         return;
     };
-    let result = (|| -> anyhow::Result<String> {
+    let result = (|| -> anyhow::Result<()> {
         let db = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
         let messages = db.thread_messages(&thread.thread_id)?;
-        let mut rendered = String::new();
-        for (i, message) in messages.iter().enumerate() {
-            rendered.push_str(&format!(
-                "Message {}\nFrom: {}\nTo: {}\nCc: {}\nSubject: {}\nDate: {}\nTags: {}\nMessage-ID: {}\nFilenames: {}\n\n",
-                i + 1,
-                message.from,
-                message.to,
-                message.cc,
-                message.subject,
-                message.date,
-                message.tags.join(" "),
-                message.message_id,
-                message.filenames.join(", ")
-            ));
-            if let Some(path) = message.filenames.first() {
-                match parse_file(path) {
-                    Ok(parsed) => {
-                        rendered.push_str(&render_body_with_quote_collapse(
-                            &parsed.safe_body,
-                            widgets.quote_collapse.get(),
-                        ));
-                        if !parsed.attachments.is_empty() {
-                            rendered.push_str("\n\nAttachments:\n");
-                            for att in &parsed.attachments {
-                                rendered.push_str(&format!(
-                                    "- {} ({}, {} bytes)\n",
-                                    att.filename
-                                        .clone()
-                                        .unwrap_or_else(|| "unnamed".to_string()),
-                                    att.content_type,
-                                    att.size
-                                ));
-                            }
-                        }
-                        rendered.push_str("\n\nMIME tree:\n");
-                        for node in parsed.mime_tree {
-                            rendered.push_str(&format!("  {node}\n"));
-                        }
-                    }
-                    Err(err) => rendered.push_str(&format!("Could not parse body: {err}\n")),
-                }
-            }
-            rendered.push_str("\n────────────────────────────────────────\n\n");
-        }
         {
             let mut s = state.borrow_mut();
             s.selected_thread = Some(thread.clone());
-            s.selected_message = messages.first().cloned();
+            s.selected_message = messages.last().cloned();
             s.messages = messages;
             s.last_operation = Some(format!("opened thread {}", thread.thread_id));
             s.last_error = None;
         }
-        Ok(rendered)
+        Ok(())
     })();
     match result {
-        Ok(rendered) => {
-            show_text_message_view(options, widgets, state);
-            widgets.message_view.set_monospace(false);
-            widgets.message_view.buffer().set_text(&rendered);
+        Ok(()) => {
             refresh_thread_attachment_list(widgets, state);
+            update_message_menu(options, widgets, state);
+            show_selected_message_text_view(options, widgets, state);
             widgets
                 .status_label
                 .set_text(&format!("Opened thread {}", thread.thread_id));
@@ -3684,6 +3905,71 @@ fn tag_selected(
             update_debug(widgets, state);
         }
     }
+}
+
+fn update_message_menu(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    while let Some(child) = widgets.message_menu_box.first_child() {
+        widgets.message_menu_box.remove(&child);
+    }
+    let messages = state.borrow().messages.clone();
+    let selected_index = selected_message_index(state);
+    let total = messages.len();
+    if total == 0 {
+        widgets.message_menu_button.set_label("Message");
+        widgets.message_menu_button.set_sensitive(false);
+        update_message_action_buttons(options, widgets, state);
+        return;
+    }
+    widgets.message_menu_button.set_sensitive(true);
+    let label = selected_index
+        .map(|index| format!("Message {}/{}", index + 1, total))
+        .unwrap_or_else(|| "Message".to_string());
+    widgets.message_menu_button.set_label(&label);
+    for (index, message) in messages.iter().enumerate() {
+        let subject = if message.subject.trim().is_empty() {
+            "(no subject)"
+        } else {
+            message.subject.trim()
+        };
+        let label = format!("{}: {}", index + 1, subject);
+        let button = gtk::Button::with_label(&label);
+        button.set_widget_name(&format!("notm-message-select-{}", index + 1));
+        if Some(index) == selected_index {
+            button.add_css_class("suggested-action");
+        }
+        let opts = options.clone();
+        let w = widgets.clone();
+        let st = state.clone();
+        button.connect_clicked(move |_| select_message_by_index(&opts, &w, &st, index));
+        widgets.message_menu_box.append(&button);
+    }
+    update_message_action_buttons(options, widgets, state);
+}
+
+fn select_message_by_index(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    index: usize,
+) {
+    let message = state.borrow().messages.get(index).cloned();
+    if message.is_none() {
+        widgets.status_label.set_text("Message index not found");
+        return;
+    }
+    state.borrow_mut().selected_message = message;
+    if let Some((attachment_row, _)) = widgets
+        .attachment_items
+        .borrow()
+        .iter()
+        .enumerate()
+        .find(|(_, item)| item.message_index == index)
+        && let Some(row) = widgets.attachment_list.row_at_index(attachment_row as i32)
+    {
+        widgets.attachment_list.select_row(Some(&row));
+    }
+    update_message_menu(options, widgets, state);
+    show_selected_message_text_view(options, widgets, state);
 }
 
 fn undo_last_tag(
@@ -4366,19 +4652,7 @@ fn handle_automation_request(
         }
         "select_message_by_index" => {
             let index = req.args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let message = state.borrow().messages.get(index).cloned();
-            state.borrow_mut().selected_message = message;
-            if let Some((attachment_row, _)) = widgets
-                .attachment_items
-                .borrow()
-                .iter()
-                .enumerate()
-                .find(|(_, item)| item.message_index == index)
-                && let Some(row) = widgets.attachment_list.row_at_index(attachment_row as i32)
-            {
-                widgets.attachment_list.select_row(Some(&row));
-            }
-            update_debug(widgets, state);
+            select_message_by_index(options, widgets, state, index);
             json!({"ok": true, "selected_message": state.borrow().selected_message})
         }
         "open_selected_thread" => {
@@ -5169,6 +5443,17 @@ fn button_flow(spacing: u32) -> gtk::FlowBox {
     flow.set_hexpand(true);
     flow.set_valign(gtk::Align::Start);
     flow
+}
+
+fn menu_button_with_box(label: &str, widget_name: &str) -> (gtk::MenuButton, gtk::Box) {
+    let button = gtk::MenuButton::new();
+    button.set_label(label);
+    button.set_widget_name(widget_name);
+    let popover = gtk::Popover::new();
+    let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    popover.set_child(Some(&menu));
+    button.set_popover(Some(&popover));
+    (button, menu)
 }
 
 fn entry_with_placeholder(placeholder: &str) -> gtk::Entry {
