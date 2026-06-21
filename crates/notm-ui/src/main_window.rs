@@ -225,6 +225,9 @@ struct SearchResponse {
 static SEARCH_CACHE: OnceLock<Mutex<BTreeMap<String, SearchData>>> = OnceLock::new();
 static THREAD_DETAIL_CACHE: OnceLock<Mutex<BTreeMap<String, ThreadUiDetails>>> = OnceLock::new();
 
+const SIDEBAR_MIN_WIDTH: i32 = 180;
+const THREAD_LIST_MIN_WIDTH: i32 = 320;
+
 fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     install_css();
 
@@ -262,7 +265,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     }
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let toolbar = button_flow(8);
     toolbar.set_margin_start(8);
     toolbar.set_margin_end(8);
     toolbar.set_margin_top(8);
@@ -288,14 +291,14 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         &palette_button,
         &settings_button,
     ] {
-        toolbar.append(b);
+        toolbar.insert(b, -1);
     }
     root.append(&toolbar);
 
     let outer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     let left = gtk::Box::new(gtk::Orientation::Vertical, 6);
     left.set_widget_name("notm-left-sidebar");
-    left.set_size_request(240, -1);
+    left.set_size_request(SIDEBAR_MIN_WIDTH, -1);
     left.set_margin_start(8);
     left.set_margin_end(8);
     left.set_margin_top(8);
@@ -350,7 +353,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     middle.set_margin_end(8);
     middle.set_margin_top(8);
     middle.set_margin_bottom(8);
-    middle.set_size_request(520, -1);
+    middle.set_size_request(THREAD_LIST_MIN_WIDTH, -1);
 
     let search_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let search_entry = gtk::Entry::new();
@@ -370,7 +373,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     helper.add_css_class("dim-label");
     middle.append(&helper);
 
-    let action_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    let action_row = button_flow(4);
     let archive_button = gtk::Button::with_label("Archive");
     let read_button = gtk::Button::with_label("Read");
     let unread_button = gtk::Button::with_label("Unread");
@@ -396,11 +399,11 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         &spam_button,
         &undo_button,
     ] {
-        action_row.append(b);
+        action_row.insert(b, -1);
     }
-    action_row.append(&custom_tag_entry);
-    action_row.append(&add_tag_button);
-    action_row.append(&remove_tag_button);
+    action_row.insert(&custom_tag_entry, -1);
+    action_row.insert(&add_tag_button, -1);
+    action_row.insert(&remove_tag_button, -1);
     middle.append(&action_row);
 
     let thread_list = gtk::ListBox::new();
@@ -432,7 +435,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     right.set_hexpand(true);
     right.set_vexpand(true);
 
-    let message_actions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    let message_actions = button_flow(4);
     message_actions.set_widget_name("notm-message-actions");
     let rendered_button = gtk::Button::with_label("Rendered");
     rendered_button.set_widget_name("notm-rendered-button");
@@ -469,7 +472,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         &copy_message_id_button,
         &copy_thread_id_button,
     ] {
-        message_actions.append(b);
+        message_actions.insert(b, -1);
     }
     right.append(&message_actions);
 
@@ -547,7 +550,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     compose_attachments.set_xalign(0.0);
     compose_attachments.set_wrap(true);
     compose_attachments.add_css_class("dim-label");
-    let composer_actions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    let composer_actions = button_flow(4);
     let add_attachment_button = gtk::Button::with_label("Add attachment…");
     let save_draft_button = gtk::Button::with_label("Save draft");
     let load_draft_button = gtk::Button::with_label("Load draft");
@@ -563,7 +566,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         &clear_draft_button,
         &send_button,
     ] {
-        composer_actions.append(b);
+        composer_actions.insert(b, -1);
     }
     for w in [
         &compose_from,
@@ -4922,6 +4925,18 @@ fn identity(options: &LaunchOptions) -> Option<Identity> {
         name: options.identity_name.clone(),
         email: email.clone(),
     })
+}
+
+fn button_flow(spacing: u32) -> gtk::FlowBox {
+    let flow = gtk::FlowBox::new();
+    flow.set_selection_mode(gtk::SelectionMode::None);
+    flow.set_min_children_per_line(1);
+    flow.set_max_children_per_line(24);
+    flow.set_column_spacing(spacing);
+    flow.set_row_spacing(spacing);
+    flow.set_hexpand(true);
+    flow.set_valign(gtk::Align::Start);
+    flow
 }
 
 fn entry_with_placeholder(placeholder: &str) -> gtk::Entry {
