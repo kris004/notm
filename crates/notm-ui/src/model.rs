@@ -22,6 +22,8 @@ pub struct UiState {
     pub trusted_image_senders: Vec<String>,
     pub compose_fields: ComposeFields,
     pub active_draft: Option<ActiveDraft>,
+    pub input_mode: InputMode,
+    pub active_pane: ActivePane,
     pub last_send_report: Option<SendReport>,
     pub last_error: Option<String>,
     pub last_operation: Option<String>,
@@ -51,6 +53,8 @@ impl Default for UiState {
             trusted_image_senders: Vec::new(),
             compose_fields: ComposeFields::default(),
             active_draft: None,
+            input_mode: InputMode::Normal,
+            active_pane: ActivePane::Threads,
             last_send_report: None,
             last_error: None,
             last_operation: None,
@@ -69,6 +73,19 @@ pub struct ThreadUiDetails {
     pub has_encrypted: bool,
     pub has_signed: bool,
     pub preview: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum InputMode {
+    Normal,
+    Insert,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ActivePane {
+    Sidebar,
+    Threads,
+    Message,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

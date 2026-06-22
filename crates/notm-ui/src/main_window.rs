@@ -33,7 +33,7 @@ use webkit6::{
 
 use crate::{
     automation::{self, AutomationConfig, AutomationRequest},
-    model::{ActiveDraft, ComposeFields, ThreadUiDetails, UiState},
+    model::{ActiveDraft, ActivePane, ComposeFields, InputMode, ThreadUiDetails, UiState},
     screenshot, shortcuts,
 };
 
@@ -150,23 +150,36 @@ pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
 #[derive(Clone)]
 struct Widgets {
     window: gtk::ApplicationWindow,
+    left_pane: gtk::Box,
+    message_pane: gtk::Box,
     saved_box: gtk::Box,
     saved_name_entry: gtk::Entry,
     saved_query_entry: gtk::Entry,
     custom_tag_entry: gtk::Entry,
     search_entry: gtk::Entry,
+    search_button: gtk::Button,
     search_generation: Rc<Cell<u64>>,
     hidden_tag_searches: HiddenTagSearchStore,
     thread_list: gtk::ListBox,
     thread_result_label: gtk::Label,
     load_more_button: gtk::Button,
     thread_scrolled: gtk::ScrolledWindow,
+    compose_button: gtk::Button,
+    debug_button: gtk::Button,
+    palette_button: gtk::Button,
+    settings_button: gtk::Button,
+    archive_button: gtk::Button,
     read_toggle_button: gtk::Button,
     flag_toggle_button: gtk::Button,
+    trash_button: gtk::Button,
+    spam_button: gtk::Button,
+    tag_menu_button: gtk::MenuButton,
     undo_tag_button: gtk::Button,
     message_stack: gtk::Stack,
     message_view: gtk::TextView,
+    message_scrolled: gtk::ScrolledWindow,
     html_view: webkit6::WebView,
+    html_scrolled: gtk::ScrolledWindow,
     response_menu_button: gtk::MenuButton,
     message_menu_button: gtk::MenuButton,
     message_menu_box: gtk::Box,
@@ -202,9 +215,13 @@ struct Widgets {
     compose_bcc: gtk::Entry,
     compose_subject: gtk::Entry,
     compose_body: gtk::TextView,
+    compose_scrolled: gtk::ScrolledWindow,
     compose_attachments: gtk::Label,
+    add_attachment_button: gtk::Button,
+    save_draft_button: gtk::Button,
     clear_draft_button: gtk::Button,
     delete_local_draft_button: gtk::Button,
+    send_button: gtk::Button,
     address_suggestions_popover: gtk::Popover,
     address_suggestions_list: gtk::ListBox,
     draft_list: gtk::ListBox,
@@ -321,10 +338,10 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     }
     root.append(&toolbar);
 
-    let outer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     let left = gtk::Box::new(gtk::Orientation::Vertical, 6);
     left.set_widget_name("notm-left-sidebar");
     left.set_size_request(SIDEBAR_MIN_WIDTH, -1);
+    left.set_focusable(true);
     left.set_margin_start(8);
     left.set_margin_end(8);
     left.set_margin_top(8);
@@ -378,6 +395,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     middle.set_margin_top(8);
     middle.set_margin_bottom(8);
     middle.set_size_request(THREAD_LIST_MIN_WIDTH, -1);
+    middle.set_focusable(true);
 
     let search_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let search_entry = gtk::Entry::new();
@@ -478,6 +496,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     right.set_margin_bottom(8);
     right.set_hexpand(true);
     right.set_vexpand(true);
+    right.set_focusable(true);
 
     let message_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     message_actions.set_widget_name("notm-message-actions");
@@ -718,10 +737,22 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     debug_view.set_size_request(-1, 150);
     right.append(&debug_view);
 
-    outer.append(&left);
-    outer.append(&middle);
-    outer.append(&right);
-    root.append(&outer);
+    let content_paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+    content_paned.set_wide_handle(true);
+    content_paned.set_start_child(Some(&middle));
+    content_paned.set_end_child(Some(&right));
+    content_paned.set_position(560);
+    content_paned.set_hexpand(true);
+    content_paned.set_vexpand(true);
+
+    let outer_paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+    outer_paned.set_wide_handle(true);
+    outer_paned.set_start_child(Some(&left));
+    outer_paned.set_end_child(Some(&content_paned));
+    outer_paned.set_position(260);
+    outer_paned.set_hexpand(true);
+    outer_paned.set_vexpand(true);
+    root.append(&outer_paned);
 
     let status_label = gtk::Label::new(Some("Ready"));
     status_label.set_widget_name("notm-status-bar");
@@ -735,23 +766,36 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
 
     let widgets = Widgets {
         window: window.clone(),
+        left_pane: left.clone(),
+        message_pane: right.clone(),
         saved_box,
         saved_name_entry,
         saved_query_entry,
         custom_tag_entry,
         search_entry,
+        search_button: search_button.clone(),
         search_generation,
         hidden_tag_searches,
         thread_list,
         thread_result_label,
         load_more_button,
         thread_scrolled: scrolled_threads,
+        compose_button: compose_button.clone(),
+        debug_button: debug_button.clone(),
+        palette_button: palette_button.clone(),
+        settings_button: settings_button.clone(),
+        archive_button: archive_button.clone(),
         read_toggle_button: read_button.clone(),
         flag_toggle_button: flag_button.clone(),
+        trash_button: trash_button.clone(),
+        spam_button: spam_button.clone(),
+        tag_menu_button: tag_menu_button.clone(),
         undo_tag_button: undo_button.clone(),
         message_stack,
         message_view,
+        message_scrolled: scrolled_message.clone(),
         html_view,
+        html_scrolled: scrolled_html.clone(),
         response_menu_button,
         message_menu_button,
         message_menu_box,
@@ -790,9 +834,13 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         compose_bcc,
         compose_subject,
         compose_body,
+        compose_scrolled: scrolled_compose_body.clone(),
         compose_attachments,
+        add_attachment_button: add_attachment_button.clone(),
+        save_draft_button: save_draft_button.clone(),
         clear_draft_button: clear_draft_button.clone(),
         delete_local_draft_button: delete_local_draft_button.clone(),
+        send_button: send_button.clone(),
         address_suggestions_popover,
         address_suggestions_list,
         draft_list,
@@ -866,6 +914,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     connect_recipient_autocomplete(&widgets.compose_to, &widgets, &state);
     connect_address_suggestion_list(&widgets, &state);
     connect_search_debounce(&options, &widgets, &state);
+    connect_input_mode_focus(&widgets, &state);
     install_shortcuts(&options, &widgets, &state, &undo_state);
     connect_auto_load_more(&options, &widgets, &state);
 
@@ -1641,6 +1690,276 @@ fn connect_search_debounce(options: &LaunchOptions, widgets: &Widgets, state: &S
     });
 }
 
+fn set_input_mode(widgets: &Widgets, state: &SharedState, mode: InputMode, status: &str) {
+    state.borrow_mut().input_mode = mode;
+    update_button_binding_labels(widgets, state);
+    widgets.status_label.set_text(status);
+}
+
+fn enter_normal_mode(widgets: &Widgets, state: &SharedState) {
+    set_input_mode(widgets, state, InputMode::Normal, "Normal mode");
+    focus_active_pane(widgets, state);
+}
+
+fn enter_insert_mode_for_search(widgets: &Widgets, state: &SharedState) {
+    state.borrow_mut().active_pane = ActivePane::Threads;
+    set_input_mode(
+        widgets,
+        state,
+        InputMode::Insert,
+        "Insert mode: search (Esc for normal)",
+    );
+    widgets.search_entry.grab_focus();
+}
+
+fn enter_insert_mode_for_active_pane(widgets: &Widgets, state: &SharedState) {
+    set_input_mode(
+        widgets,
+        state,
+        InputMode::Insert,
+        "Insert mode (Esc for normal)",
+    );
+    match state.borrow().active_pane {
+        ActivePane::Sidebar => widgets.saved_query_entry.grab_focus(),
+        ActivePane::Threads => widgets.search_entry.grab_focus(),
+        ActivePane::Message if compose_view_is_visible(widgets) => widgets.compose_to.grab_focus(),
+        ActivePane::Message => widgets.message_view.grab_focus(),
+    };
+}
+
+fn focus_active_pane(widgets: &Widgets, state: &SharedState) {
+    match state.borrow().active_pane {
+        ActivePane::Sidebar => {
+            widgets.left_pane.grab_focus();
+        }
+        ActivePane::Threads => {
+            widgets.thread_list.grab_focus();
+        }
+        ActivePane::Message => {
+            if compose_view_is_visible(widgets) {
+                widgets.message_pane.grab_focus();
+            } else if html_view_is_visible(widgets) {
+                widgets.html_view.grab_focus();
+            } else {
+                widgets.message_view.grab_focus();
+            }
+        }
+    }
+}
+
+fn set_active_pane(widgets: &Widgets, state: &SharedState, pane: ActivePane) {
+    state.borrow_mut().active_pane = pane;
+    if state.borrow().input_mode == InputMode::Normal {
+        focus_active_pane(widgets, state);
+    }
+    let name = match pane {
+        ActivePane::Sidebar => "sidebar",
+        ActivePane::Threads => "thread list",
+        ActivePane::Message => "message view",
+    };
+    widgets
+        .status_label
+        .set_text(&format!("Active pane: {name}"));
+    update_debug(widgets, state);
+}
+
+fn move_active_pane(widgets: &Widgets, state: &SharedState, delta: isize) {
+    let current = match state.borrow().active_pane {
+        ActivePane::Sidebar => 0_i32,
+        ActivePane::Threads => 1,
+        ActivePane::Message => 2,
+    };
+    let next = (current + delta as i32).clamp(0, 2);
+    let pane = match next {
+        0 => ActivePane::Sidebar,
+        1 => ActivePane::Threads,
+        _ => ActivePane::Message,
+    };
+    set_active_pane(widgets, state, pane);
+}
+
+fn scroll_adjustment(adjustment: &gtk::Adjustment, delta: f64) {
+    let lower = adjustment.lower();
+    let upper = (adjustment.upper() - adjustment.page_size()).max(lower);
+    adjustment.set_value((adjustment.value() + delta).clamp(lower, upper));
+}
+
+fn scroll_window_lines(scrolled: &gtk::ScrolledWindow, lines: f64) {
+    scroll_adjustment(&scrolled.vadjustment(), lines * 40.0);
+}
+
+fn scroll_window_pages(scrolled: &gtk::ScrolledWindow, pages: f64) {
+    let adjustment = scrolled.vadjustment();
+    scroll_adjustment(&adjustment, adjustment.page_size() * pages);
+}
+
+fn scroll_window_to_edge(scrolled: &gtk::ScrolledWindow, bottom: bool) {
+    let adjustment = scrolled.vadjustment();
+    if bottom {
+        scroll_adjustment(&adjustment, f64::INFINITY);
+    } else {
+        scroll_adjustment(&adjustment, f64::NEG_INFINITY);
+    }
+}
+
+fn active_message_scrolled(widgets: &Widgets) -> gtk::ScrolledWindow {
+    if compose_view_is_visible(widgets) {
+        widgets.compose_scrolled.clone()
+    } else if html_view_is_visible(widgets) {
+        widgets.html_scrolled.clone()
+    } else {
+        widgets.message_scrolled.clone()
+    }
+}
+
+fn vim_scroll_lines(widgets: &Widgets, state: &SharedState, lines: f64) {
+    match state.borrow().active_pane {
+        ActivePane::Threads => scroll_window_lines(&widgets.thread_scrolled, lines),
+        ActivePane::Sidebar => scroll_window_lines(&widgets.thread_scrolled, lines),
+        ActivePane::Message => scroll_window_lines(&active_message_scrolled(widgets), lines),
+    }
+}
+
+fn vim_scroll_pages(widgets: &Widgets, state: &SharedState, pages: f64) {
+    match state.borrow().active_pane {
+        ActivePane::Threads => scroll_window_pages(&widgets.thread_scrolled, pages),
+        ActivePane::Sidebar => scroll_window_pages(&widgets.thread_scrolled, pages),
+        ActivePane::Message => scroll_window_pages(&active_message_scrolled(widgets), pages),
+    }
+}
+
+fn vim_scroll_to_edge(widgets: &Widgets, state: &SharedState, bottom: bool) {
+    match state.borrow().active_pane {
+        ActivePane::Threads => scroll_window_to_edge(&widgets.thread_scrolled, bottom),
+        ActivePane::Sidebar => scroll_window_to_edge(&widgets.thread_scrolled, bottom),
+        ActivePane::Message => scroll_window_to_edge(&active_message_scrolled(widgets), bottom),
+    }
+}
+
+fn select_thread_edge(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    bottom: bool,
+) {
+    let len = state.borrow().thread_list_items.len();
+    if len == 0 {
+        return;
+    }
+    let index = if bottom { len - 1 } else { 0 };
+    if let Some(row) = widgets.thread_list.row_at_index(index as i32) {
+        widgets.thread_list.select_row(Some(&row));
+        select_thread_by_index(options, widgets, state, index, false);
+    }
+}
+
+fn select_thread_page(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    pages: isize,
+) {
+    let page = state.borrow().thread_page_size.clamp(5, 25) as isize;
+    select_relative_thread(options, widgets, state, page * pages);
+}
+
+fn button_label(base: &str, binding: &str, state: &SharedState) -> String {
+    if state.borrow().input_mode == InputMode::Normal && !binding.is_empty() {
+        format!("{base} ({binding})")
+    } else {
+        base.to_string()
+    }
+}
+
+fn strip_binding_suffix(label: &str) -> String {
+    if label.ends_with(')')
+        && let Some(index) = label.rfind(" (")
+    {
+        return label[..index].to_string();
+    }
+    label.to_string()
+}
+
+fn set_button_label(widget: &gtk::Button, base: &str, binding: &str, state: &SharedState) {
+    widget.set_label(&button_label(base, binding, state));
+}
+
+fn set_menu_button_label(widget: &gtk::MenuButton, base: &str, binding: &str, state: &SharedState) {
+    widget.set_label(&button_label(base, binding, state));
+}
+
+fn update_button_binding_labels(widgets: &Widgets, state: &SharedState) {
+    set_button_label(&widgets.compose_button, "Compose", "c", state);
+    set_button_label(&widgets.debug_button, "Debug", "d", state);
+    set_button_label(&widgets.palette_button, "Commands", "Ctrl+K", state);
+    set_button_label(&widgets.settings_button, "Settings", ",", state);
+    set_button_label(&widgets.search_button, "Search", "/", state);
+    set_button_label(&widgets.load_more_button, "Load more", "G", state);
+    set_button_label(&widgets.archive_button, "Archive", "a", state);
+    let read_base = strip_binding_suffix(&widgets.read_toggle_button.label().unwrap_or_default());
+    set_button_label(&widgets.read_toggle_button, &read_base, "u", state);
+    let flag_base = strip_binding_suffix(&widgets.flag_toggle_button.label().unwrap_or_default());
+    set_button_label(&widgets.flag_toggle_button, &flag_base, "f", state);
+    set_button_label(&widgets.trash_button, "Trash", "t", state);
+    set_button_label(&widgets.spam_button, "Spam", "s", state);
+    set_menu_button_label(&widgets.tag_menu_button, "Tag…", "T", state);
+    set_button_label(&widgets.undo_tag_button, "Undo tag", "z", state);
+    set_menu_button_label(&widgets.response_menu_button, "Respond", "r/R/F", state);
+    set_menu_button_label(&widgets.view_menu_button, "View", "v", state);
+    set_button_label(
+        &widgets.collapse_quotes_button,
+        "Collapse quotes",
+        "q",
+        state,
+    );
+    set_menu_button_label(&widgets.copy_menu_button, "Copy", "y/Y", state);
+    let image_base = strip_binding_suffix(&widgets.image_policy_button.label().unwrap_or_default());
+    set_button_label(&widgets.image_policy_button, &image_base, "I", state);
+    set_button_label(
+        &widgets.add_attachment_button,
+        "Add attachment…",
+        "A",
+        state,
+    );
+    set_button_label(&widgets.save_draft_button, "Save draft", "S", state);
+    let clear_base = strip_binding_suffix(&widgets.clear_draft_button.label().unwrap_or_default());
+    set_button_label(&widgets.clear_draft_button, &clear_base, "x", state);
+    set_button_label(
+        &widgets.delete_local_draft_button,
+        "Delete local draft",
+        "D",
+        state,
+    );
+    set_button_label(&widgets.send_button, "Send", "Ctrl+Enter", state);
+}
+
+fn connect_input_mode_focus(widgets: &Widgets, state: &SharedState) {
+    connect_insert_focus(&widgets.saved_name_entry, widgets, state);
+    connect_insert_focus(&widgets.saved_query_entry, widgets, state);
+    connect_insert_focus(&widgets.custom_tag_entry, widgets, state);
+    connect_insert_focus(&widgets.search_entry, widgets, state);
+    connect_insert_focus(&widgets.compose_from, widgets, state);
+    connect_insert_focus(&widgets.compose_to, widgets, state);
+    connect_insert_focus(&widgets.compose_cc, widgets, state);
+    connect_insert_focus(&widgets.compose_bcc, widgets, state);
+    connect_insert_focus(&widgets.compose_subject, widgets, state);
+    connect_insert_focus(&widgets.compose_body, widgets, state);
+}
+
+fn connect_insert_focus<W>(widget: &W, widgets: &Widgets, state: &SharedState)
+where
+    W: IsA<gtk::Widget> + Clone + 'static,
+{
+    let focus = gtk::EventControllerFocus::new();
+    let w = widgets.clone();
+    let st = state.clone();
+    focus.connect_enter(move |_| {
+        st.borrow_mut().input_mode = InputMode::Insert;
+        update_button_binding_labels(&w, &st);
+    });
+    widget.add_controller(focus);
+}
+
 fn install_shortcuts(
     options: &LaunchOptions,
     widgets: &Widgets,
@@ -1666,17 +1985,40 @@ fn install_shortcuts(
             send_compose(&opts, &w, &st);
             return gtk::glib::Propagation::Stop;
         }
-        if focused_is_text(&w) {
+        if st.borrow().input_mode == InputMode::Insert {
             if key == gtk::gdk::Key::Escape {
-                w.thread_list.grab_focus();
-                w.status_label.set_text("Normal mode");
+                enter_normal_mode(&w, &st);
                 return gtk::glib::Propagation::Stop;
             }
             return gtk::glib::Propagation::Proceed;
         }
+        if ctrl && (key == gtk::gdk::Key::h || key == gtk::gdk::Key::H) {
+            move_active_pane(&w, &st, -1);
+            return gtk::glib::Propagation::Stop;
+        }
+        if ctrl && (key == gtk::gdk::Key::l || key == gtk::gdk::Key::L) {
+            move_active_pane(&w, &st, 1);
+            return gtk::glib::Propagation::Stop;
+        }
+        if ctrl && (key == gtk::gdk::Key::d || key == gtk::gdk::Key::D) {
+            if st.borrow().active_pane == ActivePane::Threads {
+                select_thread_page(&opts, &w, &st, 1);
+            }
+            vim_scroll_pages(&w, &st, 0.5);
+            return gtk::glib::Propagation::Stop;
+        }
+        if ctrl && (key == gtk::gdk::Key::u || key == gtk::gdk::Key::U) {
+            if st.borrow().active_pane == ActivePane::Threads {
+                select_thread_page(&opts, &w, &st, -1);
+            }
+            vim_scroll_pages(&w, &st, -0.5);
+            return gtk::glib::Propagation::Stop;
+        }
         if key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter {
-            let idx = selected_thread_index(&w).unwrap_or(0);
-            open_thread_by_index(&opts, &w, &st, idx);
+            if st.borrow().active_pane == ActivePane::Threads {
+                let idx = selected_thread_index(&w).unwrap_or(0);
+                open_thread_by_index(&opts, &w, &st, idx);
+            }
             return gtk::glib::Propagation::Stop;
         }
         gtk::glib::Propagation::Proceed
@@ -1694,25 +2036,40 @@ fn install_shortcuts(
         if ctrl {
             return gtk::glib::Propagation::Proceed;
         }
-        if focused_is_text(&w) {
+        if st.borrow().input_mode == InputMode::Insert {
             return gtk::glib::Propagation::Proceed;
         }
         if *pending_go.borrow() {
             *pending_go.borrow_mut() = false;
-            let handled = if key == gtk::gdk::Key::i {
+            let handled = if key == gtk::gdk::Key::g {
+                if st.borrow().active_pane == ActivePane::Threads {
+                    select_thread_edge(&opts, &w, &st, false);
+                }
+                vim_scroll_to_edge(&w, &st, false);
+                true
+            } else if key == gtk::gdk::Key::i {
                 open_saved_search_name(&opts, &w, &st, "Inbox");
+                set_active_pane(&w, &st, ActivePane::Threads);
                 true
             } else if key == gtk::gdk::Key::u {
                 open_saved_search_name(&opts, &w, &st, "Unread");
+                set_active_pane(&w, &st, ActivePane::Threads);
                 true
             } else if key == gtk::gdk::Key::f {
                 open_saved_search_name(&opts, &w, &st, "Flagged");
+                set_active_pane(&w, &st, ActivePane::Threads);
                 true
             } else if key == gtk::gdk::Key::s {
                 open_saved_search_name(&opts, &w, &st, "Sent");
+                set_active_pane(&w, &st, ActivePane::Threads);
+                true
+            } else if key == gtk::gdk::Key::d {
+                open_saved_search_name(&opts, &w, &st, "Drafts");
+                set_active_pane(&w, &st, ActivePane::Threads);
                 true
             } else if key == gtk::gdk::Key::a {
                 open_saved_search_name(&opts, &w, &st, "All");
+                set_active_pane(&w, &st, ActivePane::Threads);
                 true
             } else {
                 false
@@ -1723,25 +2080,40 @@ fn install_shortcuts(
                 gtk::glib::Propagation::Proceed
             };
         }
-        let handled = if key == gtk::gdk::Key::slash || key == gtk::gdk::Key::i {
-            w.search_entry.grab_focus();
-            w.status_label
-                .set_text("Input mode: search (Esc for normal)");
+        let handled = if key == gtk::gdk::Key::slash {
+            enter_insert_mode_for_search(&w, &st);
+            true
+        } else if key == gtk::gdk::Key::i {
+            enter_insert_mode_for_active_pane(&w, &st);
             true
         } else if key == gtk::gdk::Key::g {
             *pending_go.borrow_mut() = true;
             w.status_label
-                .set_text("Go: i inbox, u unread, f flagged, s sent, a all");
+                .set_text("Go: g top, i inbox, u unread, f flagged, s sent, d drafts, a all");
             true
         } else if key == gtk::gdk::Key::j || key == gtk::gdk::Key::Down {
-            select_relative_thread(&opts, &w, &st, 1);
+            if st.borrow().active_pane == ActivePane::Threads {
+                select_relative_thread(&opts, &w, &st, 1);
+            }
+            vim_scroll_lines(&w, &st, 1.0);
             true
         } else if key == gtk::gdk::Key::k || key == gtk::gdk::Key::Up {
-            select_relative_thread(&opts, &w, &st, -1);
+            if st.borrow().active_pane == ActivePane::Threads {
+                select_relative_thread(&opts, &w, &st, -1);
+            }
+            vim_scroll_lines(&w, &st, -1.0);
+            true
+        } else if key == gtk::gdk::Key::G {
+            if st.borrow().active_pane == ActivePane::Threads {
+                select_thread_edge(&opts, &w, &st, true);
+            }
+            vim_scroll_to_edge(&w, &st, true);
             true
         } else if key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter {
-            let idx = selected_thread_index(&w).unwrap_or(0);
-            open_thread_by_index(&opts, &w, &st, idx);
+            if st.borrow().active_pane == ActivePane::Threads {
+                let idx = selected_thread_index(&w).unwrap_or(0);
+                open_thread_by_index(&opts, &w, &st, idx);
+            }
             true
         } else if key == gtk::gdk::Key::a {
             tag_selected(
@@ -1771,8 +2143,76 @@ fn install_shortcuts(
         } else if key == gtk::gdk::Key::c {
             open_compose(&w, &st);
             true
+        } else if key == gtk::gdk::Key::t {
+            tag_selected(
+                &opts,
+                &w,
+                &st,
+                &undo,
+                TagMutation {
+                    add: vec!["trash".to_string()],
+                    remove: vec!["inbox".to_string(), "spam".to_string()],
+                    sync_maildir_flags: opts.sync_maildir_flags_after_tag_change,
+                },
+            );
+            true
+        } else if key == gtk::gdk::Key::s {
+            tag_selected(
+                &opts,
+                &w,
+                &st,
+                &undo,
+                TagMutation {
+                    add: vec!["spam".to_string()],
+                    remove: vec!["inbox".to_string(), "trash".to_string()],
+                    sync_maildir_flags: opts.sync_maildir_flags_after_tag_change,
+                },
+            );
+            true
+        } else if key == gtk::gdk::Key::z {
+            undo_last_tag(&opts, &w, &st, &undo);
+            true
         } else if key == gtk::gdk::Key::F {
             forward_selected(&opts, &w, &st);
+            true
+        } else if key == gtk::gdk::Key::v {
+            toggle_text_visual_view(&opts, &w, &st);
+            true
+        } else if key == gtk::gdk::Key::q {
+            toggle_quote_collapse(&opts, &w, &st);
+            true
+        } else if key == gtk::gdk::Key::y {
+            copy_selected_message_id(&w, &st);
+            true
+        } else if key == gtk::gdk::Key::Y {
+            copy_selected_thread_id(&w, &st);
+            true
+        } else if key == gtk::gdk::Key::I {
+            activate_image_policy_button(&opts, &w, &st);
+            true
+        } else if key == gtk::gdk::Key::S && compose_view_is_visible(&w) {
+            match save_current_draft(&opts, &w, &st) {
+                Ok(_) => w.status_label.set_text("Draft saved"),
+                Err(err) => w
+                    .status_label
+                    .set_text(&format!("Draft save failed: {err}")),
+            }
+            refresh_draft_list(&w);
+            true
+        } else if key == gtk::gdk::Key::x && compose_view_is_visible(&w) {
+            clear_draft_widgets(&w, &st);
+            let _ = clear_draft_file(&w.draft_path);
+            w.status_label.set_text("Composer closed");
+            true
+        } else if key == gtk::gdk::Key::D && compose_view_is_visible(&w) {
+            delete_active_draft_from_ui(&opts, &w, &st);
+            true
+        } else if key == gtk::gdk::Key::d {
+            let visible = w.debug_view.is_visible();
+            w.debug_view.set_visible(!visible);
+            true
+        } else if key == gtk::gdk::Key::comma {
+            show_settings(&w, &opts);
             true
         } else if key == gtk::gdk::Key::question {
             show_shortcuts_overlay(&w);
@@ -1813,17 +2253,6 @@ fn connect_auto_load_more(options: &LaunchOptions, widgets: &Widgets, state: &Sh
         last_auto_offset.set(offset);
         load_more_threads(&opts, &w, &st);
     });
-}
-
-fn focused_is_text(widgets: &Widgets) -> bool {
-    gtk::prelude::GtkWindowExt::focus(&widgets.window)
-        .map(|focus| {
-            focus.is::<gtk::Entry>()
-                || focus.is::<gtk::TextView>()
-                || focus.ancestor(gtk::Entry::static_type()).is_some()
-                || focus.ancestor(gtk::TextView::static_type()).is_some()
-        })
-        .unwrap_or(false)
 }
 
 fn selected_thread_index(widgets: &Widgets) -> Option<usize> {
@@ -2093,6 +2522,7 @@ fn update_draft_action_buttons(widgets: &Widgets, state: &SharedState) {
         widgets.clear_draft_button.set_label("Discard draft");
         widgets.delete_local_draft_button.set_visible(false);
     }
+    update_button_binding_labels(widgets, state);
 }
 
 fn fields_has_content(fields: &ComposeFields) -> bool {
@@ -2970,6 +3400,7 @@ fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, sta
     if !has_html {
         widgets.image_policy_button.set_label("Load images once");
         widgets.image_policy_button.set_sensitive(false);
+        update_button_binding_labels(widgets, state);
         return;
     }
 
@@ -2993,6 +3424,7 @@ fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, sta
         widgets.image_policy_button.set_label("Load images once");
         widgets.image_policy_button.set_sensitive(true);
     }
+    update_button_binding_labels(widgets, state);
 }
 
 fn html_view_is_visible(widgets: &Widgets) -> bool {
@@ -3236,9 +3668,16 @@ fn open_selected_draft_message(widgets: &Widgets, state: &SharedState) -> anyhow
         }),
     );
     show_compose_view(widgets);
-    widgets.compose_body.grab_focus();
-    state.borrow_mut().last_operation =
-        Some(format!("opened draft {} for editing", message.message_id));
+    {
+        let mut state = state.borrow_mut();
+        state.active_pane = ActivePane::Message;
+        state.last_operation = Some(format!("opened draft {} for editing", message.message_id));
+    }
+    if state.borrow().input_mode == InputMode::Insert {
+        widgets.compose_to.grab_focus();
+    } else {
+        focus_active_pane(widgets, state);
+    }
     Ok(())
 }
 
@@ -4360,6 +4799,11 @@ fn select_thread_by_index(
         {
             let mut state = state.borrow_mut();
             state.selected_thread = Some(thread.clone());
+            state.active_pane = if open {
+                ActivePane::Message
+            } else {
+                ActivePane::Threads
+            };
             if !open {
                 state.selected_message = None;
                 state.messages.clear();
@@ -4396,6 +4840,7 @@ fn open_thread_by_index(
             s.selected_thread = Some(thread.clone());
             s.selected_message = messages.last().cloned();
             s.messages = messages;
+            s.active_pane = ActivePane::Message;
             s.last_operation = Some(format!("opened thread {}", thread.thread_id));
             s.last_error = None;
         }
@@ -4683,12 +5128,17 @@ fn run_manual_sync(options: &LaunchOptions, widgets: &Widgets, state: &SharedSta
 fn open_compose(widgets: &Widgets, state: &SharedState) {
     show_compose_view(widgets);
     set_active_draft(widgets, state, None);
-    widgets.compose_subject.grab_focus();
     {
         let mut state = state.borrow_mut();
+        state.active_pane = ActivePane::Message;
         state.compose_fields.in_reply_to = None;
         state.compose_fields.references.clear();
         state.last_operation = Some("opened composer".to_string());
+    }
+    if state.borrow().input_mode == InputMode::Insert {
+        widgets.compose_to.grab_focus();
+    } else {
+        focus_active_pane(widgets, state);
     }
     update_debug(widgets, state);
 }
@@ -4827,7 +5277,16 @@ fn fill_composer(widgets: &Widgets, state: &SharedState, message: ComposedMessag
                 .set_text(&format!("Attachment cache failed: {err}"));
         }
     }
-    state.borrow_mut().compose_fields = fields;
+    {
+        let mut state = state.borrow_mut();
+        state.compose_fields = fields;
+        state.active_pane = ActivePane::Message;
+    }
+    if state.borrow().input_mode == InputMode::Insert {
+        widgets.compose_to.grab_focus();
+    } else {
+        focus_active_pane(widgets, state);
+    }
 }
 
 fn cache_composer_attachments(attachments: &[AttachmentInput]) -> anyhow::Result<Vec<String>> {
