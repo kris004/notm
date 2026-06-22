@@ -272,7 +272,8 @@ struct SearchResponse {
 static SEARCH_CACHE: OnceLock<Mutex<BTreeMap<String, SearchData>>> = OnceLock::new();
 static THREAD_DETAIL_CACHE: OnceLock<Mutex<BTreeMap<String, ThreadUiDetails>>> = OnceLock::new();
 
-const SIDEBAR_MIN_WIDTH: i32 = 180;
+const SIDEBAR_MIN_WIDTH: i32 = 112;
+const SIDEBAR_INITIAL_WIDTH: i32 = 136;
 const THREAD_LIST_MIN_WIDTH: i32 = 320;
 const COMPOSE_BODY_MIN_HEIGHT: i32 = 160;
 const COMPOSE_BODY_NATURAL_HEIGHT: i32 = 260;
@@ -357,14 +358,19 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     let saved_editor_title = gtk::Label::new(Some("Custom saved search"));
     saved_editor_title.set_xalign(0.0);
     saved_editor_title.add_css_class("dim-label");
+    saved_editor_title.set_wrap(true);
     left.append(&saved_editor_title);
     let saved_name_entry = entry_with_placeholder("Name");
     saved_name_entry.set_widget_name("notm-saved-search-name");
+    saved_name_entry.set_width_chars(10);
+    saved_name_entry.set_max_width_chars(10);
     let saved_query_entry = entry_with_placeholder("Query");
     saved_query_entry.set_widget_name("notm-saved-search-query");
+    saved_query_entry.set_width_chars(10);
+    saved_query_entry.set_max_width_chars(10);
     left.append(&saved_name_entry);
     left.append(&saved_query_entry);
-    let saved_editor_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    let saved_editor_buttons = gtk::Box::new(gtk::Orientation::Vertical, 4);
     let save_search_button = gtk::Button::with_label("Save");
     save_search_button.set_widget_name("notm-save-search-button");
     let delete_search_button = gtk::Button::with_label("Delete");
@@ -749,7 +755,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     outer_paned.set_wide_handle(true);
     outer_paned.set_start_child(Some(&left));
     outer_paned.set_end_child(Some(&content_paned));
-    outer_paned.set_position(SIDEBAR_MIN_WIDTH);
+    outer_paned.set_position(SIDEBAR_INITIAL_WIDTH);
     outer_paned.set_hexpand(true);
     outer_paned.set_vexpand(true);
     root.append(&outer_paned);
@@ -1983,6 +1989,38 @@ fn select_thread_edge(
         return;
     }
     let index = if bottom { len - 1 } else { 0 };
+    select_thread_index_clamped(options, widgets, state, index);
+}
+
+fn select_thread_absolute(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    one_based: usize,
+) {
+    let target = one_based.saturating_sub(1);
+    let len = state.borrow().thread_list_items.len();
+    if len == 0 {
+        return;
+    }
+    if target >= len && state.borrow().can_load_more_threads {
+        load_until_thread_index(options, widgets, state, target);
+        return;
+    }
+    select_thread_index_clamped(options, widgets, state, target);
+}
+
+fn select_thread_index_clamped(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    index: usize,
+) {
+    let len = state.borrow().thread_list_items.len();
+    if len == 0 {
+        return;
+    }
+    let index = index.min(len - 1);
     if let Some(row) = widgets.thread_list.row_at_index(index as i32) {
         let already_selected = selected_thread_index(widgets) == Some(index);
         widgets.thread_list.select_row(Some(&row));
@@ -1993,24 +2031,56 @@ fn select_thread_edge(
     }
 }
 
-fn select_thread_absolute(
+fn load_until_thread_index(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
-    one_based: usize,
+    target_index: usize,
 ) {
+    let target_number = target_index + 1;
+    set_thread_loading_indicator(widgets, &format!("Loading messages up to {target_number}…"));
+    loop {
+        let (query, offset, can_load_more) = {
+            let state = state.borrow();
+            (
+                state.current_query.clone(),
+                state.thread_list_items.len(),
+                state.can_load_more_threads,
+            )
+        };
+        if offset > target_index || !can_load_more {
+            break;
+        }
+        match execute_search_page(options, &query, offset) {
+            Ok(data) => {
+                set_thread_loading_indicator(
+                    widgets,
+                    &format!("Loading messages up to {target_number}… loaded {}", offset),
+                );
+                append_search_data(options, widgets, state, data);
+            }
+            Err(err) => {
+                apply_search_error(widgets, state, err);
+                return;
+            }
+        }
+    }
     let len = state.borrow().thread_list_items.len();
     if len == 0 {
+        update_thread_result_label(widgets, state);
         return;
     }
-    let index = one_based.saturating_sub(1).min(len - 1);
-    if let Some(row) = widgets.thread_list.row_at_index(index as i32) {
-        let already_selected = selected_thread_index(widgets) == Some(index);
-        widgets.thread_list.select_row(Some(&row));
-        focus_thread_row(&row);
-        if already_selected {
-            select_thread_by_index(options, widgets, state, index, false);
-        }
+    select_thread_index_clamped(options, widgets, state, target_index);
+    update_thread_result_label(widgets, state);
+}
+
+fn set_thread_loading_indicator(widgets: &Widgets, message: &str) {
+    widgets.status_label.set_text(message);
+    widgets.load_more_button.set_label("Loading…");
+    widgets.load_more_button.set_sensitive(false);
+    let context = gtk::glib::MainContext::default();
+    while context.pending() {
+        context.iteration(false);
     }
 }
 
@@ -2497,6 +2567,7 @@ fn connect_auto_load_more(options: &LaunchOptions, widgets: &Widgets, state: &Sh
     let w = widgets.clone();
     let st = state.clone();
     let last_auto_offset = Rc::new(Cell::new(usize::MAX));
+    let auto_load_scheduled = Rc::new(Cell::new(false));
     adjustment.connect_value_changed(move |adjustment| {
         let upper = adjustment.upper();
         let page = adjustment.page_size();
@@ -2512,9 +2583,35 @@ fn connect_auto_load_more(options: &LaunchOptions, widgets: &Widgets, state: &Sh
         if !can_load_more || last_auto_offset.get() == offset {
             return;
         }
+        if auto_load_scheduled.get() {
+            return;
+        }
         last_auto_offset.set(offset);
-        load_more_threads(&opts, &w, &st);
+        auto_load_scheduled.set(true);
+        widgets_set_pending_load_more(&w, &st);
+        let opts = opts.clone();
+        let w = w.clone();
+        let st = st.clone();
+        let scheduled = auto_load_scheduled.clone();
+        gtk::glib::timeout_add_local_once(Duration::from_millis(120), move || {
+            scheduled.set(false);
+            load_more_threads(&opts, &w, &st);
+        });
     });
+}
+
+fn widgets_set_pending_load_more(widgets: &Widgets, state: &SharedState) {
+    let status = selected_thread_index(widgets)
+        .map(|index| {
+            format!(
+                "{}; loading more…",
+                message_position_status(state, index, "Selected")
+            )
+        })
+        .unwrap_or_else(|| "Bottom reached; loading more messages…".to_string());
+    widgets.status_label.set_text(&status);
+    widgets.load_more_button.set_label("Loading…");
+    widgets.load_more_button.set_sensitive(false);
 }
 
 fn selected_thread_index(widgets: &Widgets) -> Option<usize> {
@@ -4777,6 +4874,7 @@ fn load_more_threads(options: &LaunchOptions, widgets: &Widgets, state: &SharedS
             .set_text("All currently counted threads are already loaded");
         return;
     }
+    set_thread_loading_indicator(widgets, "Loading more messages…");
     match execute_search_page(options, &query, offset) {
         Ok(data) => append_search_data(options, widgets, state, data),
         Err(err) => apply_search_error(widgets, state, err),
@@ -4864,13 +4962,20 @@ fn append_search_data(
         ));
     }
     populate_thread_list(options, widgets, state);
-    restore_thread_selection(widgets, state, selected_thread_id, selected_index);
+    let restored_index =
+        restore_thread_selection(widgets, state, selected_thread_id, selected_index);
     update_tag_searches(options, widgets, state);
-    widgets.status_label.set_text(&format!(
-        "Loaded {} of {} thread(s)",
-        state.borrow().thread_loaded_count,
-        state.borrow().thread_total_count
-    ));
+    if let Some(index) = restored_index {
+        widgets
+            .status_label
+            .set_text(&message_position_status(state, index, "Selected"));
+    } else {
+        widgets.status_label.set_text(&format!(
+            "Loaded {} of {} thread(s)",
+            state.borrow().thread_loaded_count,
+            state.borrow().thread_total_count
+        ));
+    }
     update_thread_result_label(widgets, state);
     update_debug(widgets, state);
 }
@@ -4880,7 +4985,7 @@ fn restore_thread_selection(
     state: &SharedState,
     selected_thread_id: Option<String>,
     selected_index: Option<usize>,
-) {
+) -> Option<usize> {
     let threads = state.borrow().thread_list_items.clone();
     let index = selected_thread_id
         .and_then(|thread_id| {
@@ -4895,18 +5000,21 @@ fn restore_thread_selection(
     {
         widgets.thread_list.select_row(Some(&row));
         focus_thread_row(&row);
+        return Some(index);
     }
+    None
 }
 
 fn update_thread_result_label(widgets: &Widgets, state: &SharedState) {
-    let state = state.borrow();
+    let state_ref = state.borrow();
     widgets.thread_result_label.set_text(&format!(
         "Loaded {} of {} thread(s) · page size {}",
-        state.thread_loaded_count, state.thread_total_count, state.thread_page_size
+        state_ref.thread_loaded_count, state_ref.thread_total_count, state_ref.thread_page_size
     ));
-    widgets
-        .load_more_button
-        .set_sensitive(state.can_load_more_threads);
+    let can_load_more = state_ref.can_load_more_threads;
+    drop(state_ref);
+    set_button_label(&widgets.load_more_button, "Load more", "G", state);
+    widgets.load_more_button.set_sensitive(can_load_more);
 }
 
 fn search_cache_key(
@@ -5086,6 +5194,61 @@ fn body_preview(body: &str) -> String {
     preview
 }
 
+fn format_count(value: usize) -> String {
+    let digits = value.to_string();
+    let mut out = String::new();
+    for (index, ch) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+fn truncate_status_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut out = value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    out.push('…');
+    out
+}
+
+fn message_position_status(state: &SharedState, index: usize, verb: &str) -> String {
+    let state = state.borrow();
+    let loaded = state.thread_list_items.len();
+    let total = (state.thread_total_count as usize).max(loaded);
+    let number = index.saturating_add(1).min(total.max(1));
+    let position = if total > loaded {
+        format!(
+            "{} of {} ({} loaded)",
+            format_count(number),
+            format_count(total),
+            format_count(loaded)
+        )
+    } else {
+        format!(
+            "{} of {}",
+            format_count(number),
+            format_count(total.max(loaded))
+        )
+    };
+    let subject = state
+        .thread_list_items
+        .get(index)
+        .map(|thread| truncate_status_text(&thread.subject, 72))
+        .unwrap_or_default();
+    if subject.is_empty() {
+        format!("{verb} message {position}")
+    } else {
+        format!("{verb} message {position} · {subject}")
+    }
+}
+
 fn select_thread_by_index(
     options: &LaunchOptions,
     widgets: &Widgets,
@@ -5124,7 +5287,11 @@ fn select_thread_by_index(
                     Ok(()) => {
                         state.borrow_mut().active_pane = ActivePane::Threads;
                         focus_active_pane(widgets, state);
-                        widgets.status_label.set_text("Previewed draft");
+                        widgets.status_label.set_text(&message_position_status(
+                            state,
+                            index,
+                            "Selected draft",
+                        ));
                     }
                     Err(err) => {
                         state.borrow_mut().last_error = Some(err.to_string());
@@ -5140,7 +5307,7 @@ fn select_thread_by_index(
                 focus_active_pane(widgets, state);
                 widgets
                     .status_label
-                    .set_text(&format!("Selected {}", thread.thread_id));
+                    .set_text(&message_position_status(state, index, "Selected"));
             }
         }
         Err(err) => {
@@ -5188,7 +5355,11 @@ fn open_thread_by_index(
             update_message_menu(options, widgets, state);
             if selected_message_is_draft(options, state) {
                 match open_selected_draft_message(widgets, state) {
-                    Ok(()) => widgets.status_label.set_text("Opened draft for editing"),
+                    Ok(()) => widgets.status_label.set_text(&message_position_status(
+                        state,
+                        index,
+                        "Opened draft",
+                    )),
                     Err(err) => {
                         state.borrow_mut().last_error = Some(err.to_string());
                         widgets
@@ -5201,7 +5372,7 @@ fn open_thread_by_index(
                 show_selected_message_text_view(options, widgets, state);
                 widgets
                     .status_label
-                    .set_text(&format!("Opened thread {}", thread.thread_id));
+                    .set_text(&message_position_status(state, index, "Opened"));
             }
         }
         Err(err) => {
