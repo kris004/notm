@@ -33,7 +33,7 @@ use webkit6::{
 
 use crate::{
     automation::{self, AutomationConfig, AutomationRequest},
-    model::{ComposeFields, ThreadUiDetails, UiState},
+    model::{ActiveDraft, ComposeFields, ThreadUiDetails, UiState},
     screenshot, shortcuts,
 };
 
@@ -203,6 +203,7 @@ struct Widgets {
     compose_subject: gtk::Entry,
     compose_body: gtk::TextView,
     compose_attachments: gtk::Label,
+    delete_local_draft_button: gtk::Button,
     address_suggestions_popover: gtk::Popover,
     address_suggestions_list: gtk::ListBox,
     draft_list: gtk::ListBox,
@@ -670,12 +671,17 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     let save_draft_button = gtk::Button::with_label("Save draft");
     save_draft_button.set_widget_name("notm-save-draft-button");
     let clear_draft_button = gtk::Button::with_label("Discard draft");
+    let delete_local_draft_button = gtk::Button::with_label("Delete local draft");
+    delete_local_draft_button.set_widget_name("notm-delete-local-draft-button");
+    delete_local_draft_button.add_css_class("destructive-action");
+    delete_local_draft_button.set_visible(false);
     let send_button = gtk::Button::with_label("Send");
     send_button.set_widget_name("notm-send-button");
     for b in [
         &add_attachment_button,
         &save_draft_button,
         &clear_draft_button,
+        &delete_local_draft_button,
         &send_button,
     ] {
         composer_actions.insert(b, -1);
@@ -778,6 +784,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         compose_subject,
         compose_body,
         compose_attachments,
+        delete_local_draft_button: delete_local_draft_button.clone(),
         address_suggestions_popover,
         address_suggestions_list,
         draft_list,
@@ -845,6 +852,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         &add_attachment_button,
         &save_draft_button,
         &clear_draft_button,
+        &delete_local_draft_button,
     );
     connect_message_actions(&options, &widgets, &state);
     connect_recipient_autocomplete(&widgets.compose_to, &widgets, &state);
@@ -1354,6 +1362,7 @@ fn connect_compose_helpers(
     add_attachment_button: &gtk::Button,
     save_draft_button: &gtk::Button,
     clear_draft_button: &gtk::Button,
+    delete_local_draft_button: &gtk::Button,
 ) {
     for entry in [
         widgets.compose_from.clone(),
@@ -1409,6 +1418,13 @@ fn connect_compose_helpers(
                 .status_label
                 .set_text(&format!("Draft clear failed: {err}")),
         }
+    });
+
+    let w = widgets.clone();
+    let st = state.clone();
+    let opts = options.clone();
+    delete_local_draft_button.connect_clicked(move |_| {
+        delete_active_draft_from_ui(&opts, &w, &st);
     });
 
     let w = widgets.clone();
@@ -2096,6 +2112,7 @@ struct DraftSaveReport {
     local_path: Option<PathBuf>,
     maildir_path: Option<PathBuf>,
     indexed_message_id: Option<String>,
+    replaced_path: Option<PathBuf>,
 }
 
 fn save_current_draft(
@@ -2105,6 +2122,7 @@ fn save_current_draft(
 ) -> anyhow::Result<DraftSaveReport> {
     let fields = compose_fields(widgets, state);
     anyhow::ensure!(fields_has_content(&fields), "draft has no content");
+    let previous_draft = state.borrow().active_draft.clone();
     let persisted = if options.save_drafts_to_maildir {
         let message = composed_message_from_fields(&fields)?;
         persist_draft_message(options, &message)?
@@ -2116,11 +2134,90 @@ fn save_current_draft(
     } else {
         None
     };
+    let active_draft = persisted
+        .as_ref()
+        .map(|persisted| ActiveDraft {
+            path: persisted.path.clone(),
+            message_id: persisted.indexed_message_id.clone(),
+            indexed: persisted.indexed_message_id.is_some(),
+        })
+        .or_else(|| {
+            local_path.as_ref().map(|path| ActiveDraft {
+                path: path.clone(),
+                message_id: None,
+                indexed: false,
+            })
+        });
+    set_active_draft(widgets, state, active_draft);
+    let replaced_path = if let Some(previous) = previous_draft
+        && Some(&previous.path)
+            != persisted
+                .as_ref()
+                .map(|persisted| &persisted.path)
+                .or(local_path.as_ref())
+    {
+        delete_draft_source(options, &previous)?;
+        Some(previous.path)
+    } else {
+        None
+    };
     Ok(DraftSaveReport {
         local_path,
         maildir_path: persisted.as_ref().map(|persisted| persisted.path.clone()),
         indexed_message_id: persisted.and_then(|persisted| persisted.indexed_message_id),
+        replaced_path,
     })
+}
+
+fn set_active_draft(widgets: &Widgets, state: &SharedState, active_draft: Option<ActiveDraft>) {
+    widgets
+        .delete_local_draft_button
+        .set_visible(active_draft.is_some());
+    state.borrow_mut().active_draft = active_draft;
+}
+
+fn delete_draft_source(options: &LaunchOptions, draft: &ActiveDraft) -> anyhow::Result<()> {
+    if draft.indexed {
+        let db = Database::open(&open_config(options), DatabaseMode::ReadWrite)?;
+        db.remove_message_file(&draft.path)?;
+    }
+    if draft.path.exists() {
+        std::fs::remove_file(&draft.path)?;
+    }
+    Ok(())
+}
+
+fn delete_active_draft_from_ui(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    let Some(draft) = state.borrow().active_draft.clone() else {
+        widgets
+            .status_label
+            .set_text("No saved local draft to delete");
+        return;
+    };
+    match delete_draft_source(options, &draft) {
+        Ok(()) => {
+            clear_draft_widgets(widgets, state);
+            let _ = clear_draft_file(&widgets.draft_path);
+            let current = state.borrow().current_query.clone();
+            run_search(options, widgets, state, &current);
+            widgets
+                .status_label
+                .set_text(&format!("Deleted local draft {}", draft.path.display()));
+            {
+                let mut state = state.borrow_mut();
+                state.last_error = None;
+                state.last_operation =
+                    Some(format!("deleted local draft {}", draft.path.display()));
+            }
+        }
+        Err(err) => {
+            state.borrow_mut().last_error = Some(err.to_string());
+            widgets
+                .status_label
+                .set_text(&format!("Delete local draft failed: {err}"));
+            update_debug(widgets, state);
+        }
+    }
 }
 
 fn list_named_drafts(dir: &Path) -> Vec<(PathBuf, ComposeFields)> {
@@ -2199,8 +2296,17 @@ fn selected_named_draft(widgets: &Widgets) -> anyhow::Result<(PathBuf, ComposeFi
 }
 
 fn load_selected_named_draft(widgets: &Widgets, state: &SharedState) -> anyhow::Result<()> {
-    let (_, fields) = selected_named_draft(widgets)?;
+    let (path, fields) = selected_named_draft(widgets)?;
     apply_compose_fields(widgets, state, fields);
+    set_active_draft(
+        widgets,
+        state,
+        Some(ActiveDraft {
+            path,
+            message_id: None,
+            indexed: false,
+        }),
+    );
     show_compose_view(widgets);
     Ok(())
 }
@@ -2242,6 +2348,7 @@ fn clear_draft_widgets(widgets: &Widgets, state: &SharedState) {
         ..ComposeFields::default()
     };
     apply_compose_fields(widgets, state, fields);
+    set_active_draft(widgets, state, None);
     widgets.address_suggestions_popover.popdown();
     widgets.message_stack.set_visible_child_name("text");
     refresh_thread_attachment_list(widgets, state);
@@ -3046,6 +3153,106 @@ fn selected_message_filename(state: &SharedState) -> anyhow::Result<String> {
         .as_ref()
         .and_then(|message| message.filenames.first().cloned())
         .ok_or_else(|| anyhow::anyhow!("selected message has no file"))
+}
+
+fn selected_message_is_draft(options: &LaunchOptions, state: &SharedState) -> bool {
+    state
+        .borrow()
+        .selected_message
+        .as_ref()
+        .is_some_and(|message| is_draft_message(options, message))
+}
+
+fn is_draft_message(options: &LaunchOptions, message: &notm_notmuch::MessageSummary) -> bool {
+    let draft_tags = if options.draft_tags.is_empty() {
+        vec!["draft".to_string()]
+    } else {
+        options.draft_tags.clone()
+    };
+    draft_tags
+        .iter()
+        .any(|draft_tag| message.tags.iter().any(|tag| tag == draft_tag))
+}
+
+fn open_selected_draft_message(widgets: &Widgets, state: &SharedState) -> anyhow::Result<()> {
+    let message = state
+        .borrow()
+        .selected_message
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("no selected draft message"))?;
+    let filename = message
+        .filenames
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("selected draft has no file"))?;
+    let fields = draft_fields_from_message_file(filename)?;
+    apply_compose_fields(widgets, state, fields);
+    set_active_draft(
+        widgets,
+        state,
+        Some(ActiveDraft {
+            path: PathBuf::from(filename),
+            message_id: Some(message.message_id.clone()),
+            indexed: true,
+        }),
+    );
+    show_compose_view(widgets);
+    widgets.compose_body.grab_focus();
+    state.borrow_mut().last_operation =
+        Some(format!("opened draft {} for editing", message.message_id));
+    Ok(())
+}
+
+fn draft_fields_from_message_file(path: impl AsRef<Path>) -> anyhow::Result<ComposeFields> {
+    let path = path.as_ref();
+    let parsed = parse_file(path)?;
+    let attachment_inputs = extract_attachments_from_file(path)?
+        .into_iter()
+        .map(|attachment| AttachmentInput {
+            filename: attachment.filename,
+            content_type: attachment.content_type,
+            bytes: attachment.bytes,
+            source_path: None,
+        })
+        .collect::<Vec<_>>();
+    let attachments = cache_composer_attachments(&attachment_inputs)?;
+    let body = if parsed.text_body.trim().is_empty() {
+        parsed.safe_body
+    } else {
+        parsed.text_body
+    };
+    Ok(ComposeFields {
+        from: parsed.from,
+        to: parsed.to,
+        cc: parsed.cc,
+        bcc: header_value(&parsed.headers, "Bcc"),
+        subject: parsed.subject,
+        body,
+        attachments,
+        in_reply_to: nonempty_string(parsed.in_reply_to),
+        references: references_from_header(&parsed.references),
+    })
+}
+
+fn header_value(headers: &BTreeMap<String, String>, name: &str) -> String {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default()
+}
+
+fn nonempty_string(value: String) -> Option<String> {
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn references_from_header(value: &str) -> Vec<String> {
+    value
+        .split_whitespace()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn show_text_message_view(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -4158,10 +4365,23 @@ fn open_thread_by_index(
         Ok(()) => {
             refresh_thread_attachment_list(widgets, state);
             update_message_menu(options, widgets, state);
-            show_selected_message_text_view(options, widgets, state);
-            widgets
-                .status_label
-                .set_text(&format!("Opened thread {}", thread.thread_id));
+            if selected_message_is_draft(options, state) {
+                match open_selected_draft_message(widgets, state) {
+                    Ok(()) => widgets.status_label.set_text("Opened draft for editing"),
+                    Err(err) => {
+                        state.borrow_mut().last_error = Some(err.to_string());
+                        widgets
+                            .status_label
+                            .set_text(&format!("Open draft failed: {err}"));
+                    }
+                }
+            } else {
+                set_active_draft(widgets, state, None);
+                show_selected_message_text_view(options, widgets, state);
+                widgets
+                    .status_label
+                    .set_text(&format!("Opened thread {}", thread.thread_id));
+            }
         }
         Err(err) => {
             state.borrow_mut().last_error = Some(err.to_string());
@@ -4305,7 +4525,20 @@ fn select_message_by_index(
         widgets.attachment_list.select_row(Some(&row));
     }
     update_message_menu(options, widgets, state);
-    show_selected_message_text_view(options, widgets, state);
+    if selected_message_is_draft(options, state) {
+        match open_selected_draft_message(widgets, state) {
+            Ok(()) => widgets.status_label.set_text("Opened draft for editing"),
+            Err(err) => {
+                state.borrow_mut().last_error = Some(err.to_string());
+                widgets
+                    .status_label
+                    .set_text(&format!("Open draft failed: {err}"));
+            }
+        }
+    } else {
+        set_active_draft(widgets, state, None);
+        show_selected_message_text_view(options, widgets, state);
+    }
 }
 
 fn undo_last_tag(
@@ -4409,6 +4642,7 @@ fn run_manual_sync(options: &LaunchOptions, widgets: &Widgets, state: &SharedSta
 
 fn open_compose(widgets: &Widgets, state: &SharedState) {
     show_compose_view(widgets);
+    set_active_draft(widgets, state, None);
     widgets.compose_subject.grab_focus();
     {
         let mut state = state.borrow_mut();
@@ -4531,6 +4765,7 @@ fn forward_as_attachment_selected(options: &LaunchOptions, widgets: &Widgets, st
 
 fn fill_composer(widgets: &Widgets, state: &SharedState, message: ComposedMessage) {
     show_compose_view(widgets);
+    set_active_draft(widgets, state, None);
     widgets.compose_from.set_text(&message.from);
     widgets.compose_to.set_text(&message.to.join(", "));
     widgets.compose_cc.set_text(&message.cc.join(", "));
@@ -4648,6 +4883,14 @@ fn send_compose(options: &LaunchOptions, widgets: &Widgets, state: &SharedState)
                 .map(|r| r.accepted)
                 .unwrap_or(false)
             {
+                if let Some(draft) = state.borrow().active_draft.clone()
+                    && let Err(err) = delete_draft_source(options, &draft)
+                {
+                    state.borrow_mut().last_error = Some(err.to_string());
+                    widgets
+                        .status_label
+                        .set_text(&format!("Send accepted; draft delete failed: {err}"));
+                }
                 let _ = clear_draft_file(&widgets.draft_path);
                 clear_draft_widgets(widgets, state);
             }
@@ -5279,6 +5522,10 @@ fn handle_automation_request(
             Ok(()) => json!({"ok": true}),
             Err(err) => json!({"ok": false, "error": err.to_string()}),
         },
+        "delete_active_draft" | "delete_local_draft" => {
+            delete_active_draft_from_ui(options, widgets, state);
+            json!({"ok": state.borrow().last_error.is_none(), "compose_fields": state.borrow().compose_fields, "active_draft": state.borrow().active_draft, "last_error": state.borrow().last_error})
+        }
         "load_draft" => {
             restore_draft_if_present(widgets, state);
             json!({"ok": true, "compose_fields": state.borrow().compose_fields})
@@ -6163,6 +6410,32 @@ mod tests {
         );
         assert!(rendered.contains("In-Reply-To: <original@example.test>\r\n"));
         assert!(rendered.contains("References: <older@example.test> <original@example.test>\r\n"));
+    }
+
+    #[test]
+    fn draft_fields_load_from_saved_rfc5322_message() {
+        let path = std::env::temp_dir().join(format!("notm-draft-{}.eml", Uuid::new_v4()));
+        let raw = "From: Me <me@example.test>\r\nTo: You <you@example.test>\r\nCc: Other <other@example.test>\r\nBcc: Hidden <hidden@example.test>\r\nSubject: Draft subject\r\nMessage-ID: <draft@example.test>\r\nIn-Reply-To: <parent@example.test>\r\nReferences: <root@example.test> <parent@example.test>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nDraft body.";
+        std::fs::write(&path, raw).expect("write draft");
+
+        let fields = draft_fields_from_message_file(&path).expect("draft fields");
+
+        assert_eq!(fields.from, "Me <me@example.test>");
+        assert_eq!(fields.to, "You <you@example.test>");
+        assert_eq!(fields.cc, "Other <other@example.test>");
+        assert_eq!(fields.bcc, "Hidden <hidden@example.test>");
+        assert_eq!(fields.subject, "Draft subject");
+        assert_eq!(fields.body, "Draft body.");
+        assert_eq!(fields.in_reply_to.as_deref(), Some("<parent@example.test>"));
+        assert_eq!(
+            fields.references,
+            vec![
+                "<root@example.test>".to_string(),
+                "<parent@example.test>".to_string()
+            ]
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -278,6 +278,13 @@ impl Database {
         Ok(id)
     }
 
+    pub fn remove_message_file(&self, path: &Path) -> Result<()> {
+        let path = path_to_cstring(path)?;
+        let status =
+            unsafe { ffi::notmuch_database_remove_message(self.ptr.as_ptr(), path.as_ptr()) };
+        check_index(status, self.status_string())
+    }
+
     pub fn apply_tags_to_query(
         &self,
         query: &str,

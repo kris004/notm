@@ -21,6 +21,7 @@ pub struct UiState {
     pub address_suggestions: Vec<String>,
     pub trusted_image_senders: Vec<String>,
     pub compose_fields: ComposeFields,
+    pub active_draft: Option<ActiveDraft>,
     pub last_send_report: Option<SendReport>,
     pub last_error: Option<String>,
     pub last_operation: Option<String>,
@@ -49,6 +50,7 @@ impl Default for UiState {
             address_suggestions: Vec::new(),
             trusted_image_senders: Vec::new(),
             compose_fields: ComposeFields::default(),
+            active_draft: None,
             last_send_report: None,
             last_error: None,
             last_operation: None,
@@ -83,4 +85,11 @@ pub struct ComposeFields {
     pub in_reply_to: Option<String>,
     #[serde(default)]
     pub references: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveDraft {
+    pub path: PathBuf,
+    pub message_id: Option<String>,
+    pub indexed: bool,
 }

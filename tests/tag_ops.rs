@@ -1,4 +1,5 @@
 use notm_notmuch::{QueryOptions, SortOrder, TagMutation};
+use std::path::Path;
 
 #[test]
 fn applies_and_undoes_tag_operations_without_cli() -> anyhow::Result<()> {
@@ -58,5 +59,30 @@ fn applies_path_style_tags() -> anyhow::Result<()> {
         &options,
     )?;
     assert_eq!(count, 1);
+    Ok(())
+}
+
+#[test]
+fn removes_indexed_message_file_from_database() -> anyhow::Result<()> {
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let options = QueryOptions {
+        limit: 10,
+        offset: 0,
+        sort: SortOrder::NewestFirst,
+        excluded_tags: vec![],
+    };
+    let db = fixture.open_readwrite()?;
+    let messages = db.search_messages("subject:\"Draft like message\"", &options)?;
+    let filename = messages
+        .first()
+        .and_then(|message| message.filenames.first())
+        .expect("fixture draft filename")
+        .clone();
+
+    db.remove_message_file(Path::new(&filename))?;
+    let count = db.count_messages("subject:\"Draft like message\"", &options)?;
+
+    assert_eq!(count, 0);
+    assert!(Path::new(&filename).exists());
     Ok(())
 }

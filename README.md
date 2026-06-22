@@ -63,9 +63,10 @@ CARGO_HOME=$PWD/.cargo-home cargo run -p notm-app -- live-self-send
 - Automation disabled by default and token-gated when enabled.
 - Remote images disabled by default; Visual HTML uses one image-policy button that starts as `Load images once` and changes to `Trust sender images` after one-shot loading. Trusted senders are stored in `[ui].trusted_image_senders`.
 - Sending uses an explicit external transport abstraction and fake transport contract tests.
-- Trash/spam/archive are tag operations only; message files are not deleted.
+- Trash/spam/archive are tag operations only; ordinary message files are not deleted.
+- Saved local drafts can be explicitly deleted with `Delete local draft`; this removes the local draft file and its notmuch index entry, not a Gmail server message.
 - Sent Maildir saving/indexing is disabled unless explicitly configured.
-- Explicit draft saves write/index a normal Maildir message tagged `draft` by default; compose autosave remains a local crash-recovery file.
+- Explicit draft saves write/index a normal local Maildir message tagged `draft` by default; compose autosave remains a local crash-recovery file.
 
 ## Current status
 
@@ -80,7 +81,7 @@ This repository builds and runs a native GTK4 Notmuch client. Implemented daily-
 - external send transport with stdin/file/template/auto modes and lieer helper auto `-t`,
 - fake send contract tests,
 - optional sent Maildir save/indexing only when configured,
-- local JSON compose crash recovery and Maildir draft save/indexing under `tag:draft`,
+- local JSON compose crash recovery, local Maildir draft save/indexing under `tag:draft`, draft reopening in the composer, and explicit local draft deletion,
 - address suggestions from Notmuch headers,
 - keyboard shortcuts, shortcuts overlay, command palette, settings, debug panel,
 - local Unix-socket automation, paged result loading with Load more and scroll-bottom auto-load, manual sync action disabled by default, and screenshot capture,
