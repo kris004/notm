@@ -285,7 +285,6 @@ static SEARCH_CACHE: OnceLock<Mutex<BTreeMap<String, SearchData>>> = OnceLock::n
 static THREAD_DETAIL_CACHE: OnceLock<Mutex<BTreeMap<String, ThreadUiDetails>>> = OnceLock::new();
 
 const SIDEBAR_MIN_WIDTH: i32 = 136;
-const SIDEBAR_INITIAL_WIDTH: i32 = 136;
 const THREAD_LIST_MIN_WIDTH: i32 = 320;
 const COMPOSE_BODY_MIN_HEIGHT: i32 = 160;
 const COMPOSE_BODY_NATURAL_HEIGHT: i32 = 260;
@@ -779,8 +778,10 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     outer_paned.set_wide_handle(true);
     outer_paned.set_start_child(Some(&left));
     outer_paned.set_end_child(Some(&content_paned));
+    outer_paned.set_resize_start_child(false);
+    outer_paned.set_resize_end_child(true);
     outer_paned.set_shrink_start_child(false);
-    outer_paned.set_position(SIDEBAR_INITIAL_WIDTH);
+    outer_paned.set_position(SIDEBAR_MIN_WIDTH);
     outer_paned.set_hexpand(true);
     outer_paned.set_vexpand(true);
     root.append(&outer_paned);
