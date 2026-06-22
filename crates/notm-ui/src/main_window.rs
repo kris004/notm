@@ -2345,6 +2345,9 @@ fn vim_scroll_lines(widgets: &Widgets, state: &SharedState, lines: f64) {
     match state.borrow().active_pane {
         ActivePane::Threads => {}
         ActivePane::Sidebar => scroll_window_lines(&widgets.thread_scrolled, lines),
+        ActivePane::Message if html_view_is_visible(widgets) => {
+            scroll_html_view_lines(widgets, lines)
+        }
         ActivePane::Message => scroll_window_lines(&active_message_scrolled(widgets), lines),
     }
 }
@@ -2353,6 +2356,9 @@ fn vim_scroll_pages(widgets: &Widgets, state: &SharedState, pages: f64) {
     match state.borrow().active_pane {
         ActivePane::Threads => {}
         ActivePane::Sidebar => scroll_window_pages(&widgets.thread_scrolled, pages),
+        ActivePane::Message if html_view_is_visible(widgets) => {
+            scroll_html_view_pages(widgets, pages)
+        }
         ActivePane::Message => scroll_window_pages(&active_message_scrolled(widgets), pages),
     }
 }
@@ -2361,8 +2367,46 @@ fn vim_scroll_to_edge(widgets: &Widgets, state: &SharedState, bottom: bool) {
     match state.borrow().active_pane {
         ActivePane::Threads => {}
         ActivePane::Sidebar => scroll_window_to_edge(&widgets.thread_scrolled, bottom),
+        ActivePane::Message if html_view_is_visible(widgets) => {
+            scroll_html_view_to_edge(widgets, bottom)
+        }
         ActivePane::Message => scroll_window_to_edge(&active_message_scrolled(widgets), bottom),
     }
+}
+
+fn scroll_html_view_lines(widgets: &Widgets, lines: f64) {
+    scroll_html_view_by_pixels(widgets, lines * 40.0);
+}
+
+fn scroll_html_view_pages(widgets: &Widgets, pages: f64) {
+    let script = format!(
+        "window.scrollBy(0, Math.round(window.innerHeight * {}));",
+        pages
+    );
+    evaluate_html_scroll_script(widgets, &script);
+}
+
+fn scroll_html_view_to_edge(widgets: &Widgets, bottom: bool) {
+    let y = if bottom {
+        "document.scrollingElement ? document.scrollingElement.scrollHeight : document.body.scrollHeight"
+    } else {
+        "0"
+    };
+    evaluate_html_scroll_script(widgets, &format!("window.scrollTo(0, {y});"));
+}
+
+fn scroll_html_view_by_pixels(widgets: &Widgets, pixels: f64) {
+    evaluate_html_scroll_script(widgets, &format!("window.scrollBy(0, {});", pixels.round()));
+}
+
+fn evaluate_html_scroll_script(widgets: &Widgets, script: &str) {
+    widgets.html_view.evaluate_javascript(
+        script,
+        None,
+        None,
+        None::<&gtk::gio::Cancellable>,
+        |_| {},
+    );
 }
 
 fn select_thread_edge(
