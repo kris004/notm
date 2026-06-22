@@ -284,7 +284,7 @@ struct SearchResponse {
 static SEARCH_CACHE: OnceLock<Mutex<BTreeMap<String, SearchData>>> = OnceLock::new();
 static THREAD_DETAIL_CACHE: OnceLock<Mutex<BTreeMap<String, ThreadUiDetails>>> = OnceLock::new();
 
-const SIDEBAR_MIN_WIDTH: i32 = 112;
+const SIDEBAR_MIN_WIDTH: i32 = 136;
 const SIDEBAR_INITIAL_WIDTH: i32 = 136;
 const THREAD_LIST_MIN_WIDTH: i32 = 320;
 const COMPOSE_BODY_MIN_HEIGHT: i32 = 160;
@@ -779,6 +779,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     outer_paned.set_wide_handle(true);
     outer_paned.set_start_child(Some(&left));
     outer_paned.set_end_child(Some(&content_paned));
+    outer_paned.set_shrink_start_child(false);
     outer_paned.set_position(SIDEBAR_INITIAL_WIDTH);
     outer_paned.set_hexpand(true);
     outer_paned.set_vexpand(true);
@@ -1047,7 +1048,7 @@ fn refresh_saved_searches(
     }
     let custom_searches = saved_store.borrow().clone();
     for saved in custom_searches {
-        append_custom_saved_search_row(options, widgets, state, saved_store, saved);
+        append_saved_search_button(options, widgets, state, &widgets.saved_box, saved);
     }
     update_saved_search_button_labels(widgets, state);
     update_tag_searches(options, widgets, state);
@@ -1071,47 +1072,6 @@ fn append_saved_search_button(
     });
     container.append(&btn);
     btn
-}
-
-fn append_custom_saved_search_row(
-    options: &LaunchOptions,
-    widgets: &Widgets,
-    state: &SharedState,
-    saved_store: &SavedSearchStore,
-    saved: SavedSearch,
-) {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    row.set_widget_name(&format!(
-        "notm-saved-search-row-{}",
-        widget_token(&saved.name)
-    ));
-    let search_button = append_saved_search_button(options, widgets, state, &row, saved.clone());
-    search_button.set_hexpand(true);
-
-    let delete_button = gtk::Button::with_label("×");
-    delete_button.set_widget_name(&format!(
-        "notm-delete-saved-search-{}",
-        widget_token(&saved.name)
-    ));
-    delete_button.add_css_class("destructive-action");
-    delete_button.set_tooltip_text(Some(&format!("Delete saved search {}", saved.name)));
-    let opts = options.clone();
-    let w = widgets.clone();
-    let st = state.clone();
-    let store = saved_store.clone();
-    let name = saved.name.clone();
-    delete_button.connect_clicked(move |_| {
-        match delete_custom_saved_search_by_name(&opts, &w, &st, &store, &name) {
-            Ok(()) => w
-                .status_label
-                .set_text(&format!("Deleted saved search {name}")),
-            Err(err) => w
-                .status_label
-                .set_text(&format!("Delete saved search failed: {err}")),
-        }
-    });
-    row.append(&delete_button);
-    widgets.saved_box.append(&row);
 }
 
 fn activate_saved_search(
@@ -1366,6 +1326,12 @@ fn connect_saved_search_editor(
         let store = saved_store.clone();
         entry.connect_changed(move |_| {
             update_saved_search_editor_actions(&w, &st, &store);
+            let w = w.clone();
+            let st = st.clone();
+            let store = store.clone();
+            gtk::glib::idle_add_local_once(move || {
+                update_saved_search_editor_actions(&w, &st, &store);
+            });
         });
     }
     update_saved_search_editor_actions(widgets, state, saved_store);
@@ -1383,17 +1349,17 @@ fn update_saved_search_editor_actions(
         .iter()
         .any(|saved| saved.name.eq_ignore_ascii_case(&name));
     let baseline = selected_saved_search_baseline(state, saved_store);
-    let unchanged = baseline
+    let changed = baseline
         .as_ref()
-        .is_some_and(|(base_name, base_query, _)| name == *base_name && query == *base_query);
-    let delete_visible = unchanged
+        .is_none_or(|(base_name, base_query, _)| name != *base_name || query != *base_query);
+    let delete_visible = !changed
         && baseline.as_ref().is_some_and(|(_, _, kind)| {
             matches!(
                 kind,
                 SavedSearchBaselineKind::Custom | SavedSearchBaselineKind::Tag
             )
         });
-    let save_visible = has_values && !delete_visible && !built_in_name;
+    let save_visible = has_values && changed && !built_in_name;
 
     widgets.save_search_button.set_visible(save_visible);
     widgets.delete_search_button.set_visible(delete_visible);
@@ -1486,35 +1452,6 @@ fn delete_custom_search_from_entries(
     refresh_saved_searches(options, widgets, state, saved_store);
     widgets.saved_name_entry.set_text("");
     widgets.saved_query_entry.set_text("");
-    update_saved_search_editor_actions(widgets, state, saved_store);
-    Ok(())
-}
-
-fn delete_custom_saved_search_by_name(
-    options: &LaunchOptions,
-    widgets: &Widgets,
-    state: &SharedState,
-    saved_store: &SavedSearchStore,
-    name: &str,
-) -> anyhow::Result<()> {
-    {
-        let mut searches = saved_store.borrow_mut();
-        let before = searches.len();
-        searches.retain(|saved| !saved.name.eq_ignore_ascii_case(name));
-        anyhow::ensure!(searches.len() != before, "custom saved search not found");
-        persist_custom_saved_searches(options, &searches)?;
-    }
-    let was_selected = state
-        .borrow()
-        .visible_saved_search
-        .as_deref()
-        .is_some_and(|selected| selected.eq_ignore_ascii_case(name));
-    if was_selected {
-        state.borrow_mut().visible_saved_search = None;
-        widgets.saved_name_entry.set_text("");
-        widgets.saved_query_entry.set_text("");
-    }
-    refresh_saved_searches(options, widgets, state, saved_store);
     update_saved_search_editor_actions(widgets, state, saved_store);
     Ok(())
 }
