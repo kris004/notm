@@ -289,6 +289,7 @@ const SIDEBAR_INITIAL_WIDTH: i32 = 136;
 const THREAD_LIST_MIN_WIDTH: i32 = 320;
 const COMPOSE_BODY_MIN_HEIGHT: i32 = 160;
 const COMPOSE_BODY_NATURAL_HEIGHT: i32 = 260;
+const KEYBOARD_CURSOR_CLASS: &str = "notm-keyboard-cursor";
 
 fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     install_css();
@@ -675,7 +676,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         .build();
     let compose_body = SourceView::builder()
         .buffer(&compose_body_buffer)
-        .highlight_current_line(true)
+        .highlight_current_line(false)
         .hexpand(true)
         .monospace(true)
         .vexpand(true)
@@ -1007,12 +1008,13 @@ fn saved_search_binding(name: &str) -> Option<&'static str> {
 }
 
 fn update_saved_search_button_labels(widgets: &Widgets, state: &SharedState) {
-    let mut child = widgets.saved_box.first_child();
-    while let Some(widget) = child {
-        child = widget.next_sibling();
-        let Ok(button) = widget.downcast::<gtk::Button>() else {
-            continue;
-        };
+    update_saved_search_button_labels_in_widget(&widgets.saved_box.clone().upcast(), state);
+}
+
+fn update_saved_search_button_labels_in_widget(widget: &gtk::Widget, state: &SharedState) {
+    if let Ok(button) = widget.clone().downcast::<gtk::Button>()
+        && button.widget_name().starts_with("notm-saved-search-")
+    {
         let name = button
             .tooltip_text()
             .map(|text| text.to_string())
@@ -1023,6 +1025,11 @@ fn update_saved_search_button_labels(widgets: &Widgets, state: &SharedState) {
             saved_search_binding(&name).unwrap_or_default(),
             state,
         );
+    }
+    let mut child = widget.first_child();
+    while let Some(child_widget) = child {
+        child = child_widget.next_sibling();
+        update_saved_search_button_labels_in_widget(&child_widget, state);
     }
 }
 
@@ -1035,22 +1042,76 @@ fn refresh_saved_searches(
     while let Some(child) = widgets.saved_box.first_child() {
         widgets.saved_box.remove(&child);
     }
-    let mut searches = built_in_saved_searches();
-    searches.extend(saved_store.borrow().iter().cloned());
-    for saved in searches {
-        let btn = gtk::Button::with_label(&saved.name);
-        btn.set_widget_name(&format!("notm-saved-search-{}", widget_token(&saved.name)));
-        btn.set_tooltip_text(Some(&saved.name));
-        let st = state.clone();
-        let w = widgets.clone();
-        let opts = options.clone();
-        btn.connect_clicked(move |_| {
-            activate_saved_search(&opts, &w, &st, &saved.name, &saved.query);
-        });
-        widgets.saved_box.append(&btn);
+    for saved in built_in_saved_searches() {
+        append_saved_search_button(options, widgets, state, &widgets.saved_box, saved);
+    }
+    let custom_searches = saved_store.borrow().clone();
+    for saved in custom_searches {
+        append_custom_saved_search_row(options, widgets, state, saved_store, saved);
     }
     update_saved_search_button_labels(widgets, state);
     update_tag_searches(options, widgets, state);
+}
+
+fn append_saved_search_button(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    container: &impl IsA<gtk::Box>,
+    saved: SavedSearch,
+) -> gtk::Button {
+    let btn = gtk::Button::with_label(&saved.name);
+    btn.set_widget_name(&format!("notm-saved-search-{}", widget_token(&saved.name)));
+    btn.set_tooltip_text(Some(&saved.name));
+    let st = state.clone();
+    let w = widgets.clone();
+    let opts = options.clone();
+    btn.connect_clicked(move |_| {
+        activate_saved_search(&opts, &w, &st, &saved.name, &saved.query);
+    });
+    container.append(&btn);
+    btn
+}
+
+fn append_custom_saved_search_row(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    saved_store: &SavedSearchStore,
+    saved: SavedSearch,
+) {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    row.set_widget_name(&format!(
+        "notm-saved-search-row-{}",
+        widget_token(&saved.name)
+    ));
+    let search_button = append_saved_search_button(options, widgets, state, &row, saved.clone());
+    search_button.set_hexpand(true);
+
+    let delete_button = gtk::Button::with_label("×");
+    delete_button.set_widget_name(&format!(
+        "notm-delete-saved-search-{}",
+        widget_token(&saved.name)
+    ));
+    delete_button.add_css_class("destructive-action");
+    delete_button.set_tooltip_text(Some(&format!("Delete saved search {}", saved.name)));
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let store = saved_store.clone();
+    let name = saved.name.clone();
+    delete_button.connect_clicked(move |_| {
+        match delete_custom_saved_search_by_name(&opts, &w, &st, &store, &name) {
+            Ok(()) => w
+                .status_label
+                .set_text(&format!("Deleted saved search {name}")),
+            Err(err) => w
+                .status_label
+                .set_text(&format!("Delete saved search failed: {err}")),
+        }
+    });
+    row.append(&delete_button);
+    widgets.saved_box.append(&row);
 }
 
 fn activate_saved_search(
@@ -1425,6 +1486,35 @@ fn delete_custom_search_from_entries(
     refresh_saved_searches(options, widgets, state, saved_store);
     widgets.saved_name_entry.set_text("");
     widgets.saved_query_entry.set_text("");
+    update_saved_search_editor_actions(widgets, state, saved_store);
+    Ok(())
+}
+
+fn delete_custom_saved_search_by_name(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    saved_store: &SavedSearchStore,
+    name: &str,
+) -> anyhow::Result<()> {
+    {
+        let mut searches = saved_store.borrow_mut();
+        let before = searches.len();
+        searches.retain(|saved| !saved.name.eq_ignore_ascii_case(name));
+        anyhow::ensure!(searches.len() != before, "custom saved search not found");
+        persist_custom_saved_searches(options, &searches)?;
+    }
+    let was_selected = state
+        .borrow()
+        .visible_saved_search
+        .as_deref()
+        .is_some_and(|selected| selected.eq_ignore_ascii_case(name));
+    if was_selected {
+        state.borrow_mut().visible_saved_search = None;
+        widgets.saved_name_entry.set_text("");
+        widgets.saved_query_entry.set_text("");
+    }
+    refresh_saved_searches(options, widgets, state, saved_store);
     update_saved_search_editor_actions(widgets, state, saved_store);
     Ok(())
 }
@@ -2047,7 +2137,7 @@ fn focus_active_pane(widgets: &Widgets, state: &SharedState) {
     update_active_pane_visuals(widgets, state);
     match state.borrow().active_pane {
         ActivePane::Sidebar => {
-            widgets.left_pane.grab_focus();
+            focus_sidebar_default(widgets);
         }
         ActivePane::Threads => {
             widgets.thread_list.grab_focus();
@@ -2116,16 +2206,14 @@ where
 }
 
 fn composer_has_focus(widgets: &Widgets) -> bool {
-    widgets.compose_from.has_focus()
-        || widgets.compose_to.has_focus()
-        || widgets.compose_cc.has_focus()
-        || widgets.compose_bcc.has_focus()
-        || widgets.compose_subject.has_focus()
-        || widgets.compose_body.has_focus()
+    composer_focus_targets(widgets)
+        .iter()
+        .any(widget_contains_focus)
 }
 
 fn focus_first_composer_field(widgets: &Widgets) {
-    widgets.compose_to.grab_focus();
+    let targets = composer_focus_targets(widgets);
+    focus_widget_at(&targets, 0);
 }
 
 fn focus_composer_insert_target(widgets: &Widgets) {
@@ -2136,10 +2224,22 @@ fn focus_composer_insert_target(widgets: &Widgets) {
 }
 
 fn focus_sidebar_insert_target(widgets: &Widgets) {
-    if widgets.saved_name_entry.has_focus() || widgets.saved_query_entry.has_focus() {
+    if widget_contains_focus(widgets.saved_name_entry.upcast_ref())
+        || widget_contains_focus(widgets.saved_query_entry.upcast_ref())
+    {
         return;
     }
     widgets.saved_query_entry.grab_focus();
+}
+
+fn focus_sidebar_default(widgets: &Widgets) {
+    let mut targets = Vec::new();
+    collect_sidebar_focus_targets(&widgets.left_pane.clone().upcast(), &mut targets);
+    if let Some(index) = targets.iter().position(widget_contains_focus) {
+        mark_keyboard_cursor(&targets, index);
+    } else {
+        focus_widget_at(&targets, 0);
+    }
 }
 
 fn move_sidebar_focus(widgets: &Widgets, delta: isize) {
@@ -2151,7 +2251,7 @@ fn move_sidebar_focus(widgets: &Widgets, delta: isize) {
 fn activate_focused_sidebar_widget(widgets: &Widgets, state: &SharedState) {
     let mut targets = Vec::new();
     collect_sidebar_focus_targets(&widgets.left_pane.clone().upcast(), &mut targets);
-    let Some(focused) = targets.into_iter().find(|widget| widget.has_focus()) else {
+    let Some(focused) = targets.into_iter().find(widget_contains_focus) else {
         move_sidebar_focus(widgets, 1);
         return;
     };
@@ -2212,7 +2312,7 @@ fn focus_relative_widget(targets: &[gtk::Widget], delta: isize) {
     }
     let current = targets
         .iter()
-        .position(|widget| widget.has_focus())
+        .position(widget_contains_focus)
         .unwrap_or_else(|| {
             if delta.is_negative() {
                 targets.len()
@@ -2227,7 +2327,39 @@ fn focus_relative_widget(targets: &[gtk::Widget], delta: isize) {
             .saturating_add_signed(delta)
             .min(targets.len().saturating_sub(1))
     };
-    targets[next].grab_focus();
+    focus_widget_at(targets, next);
+}
+
+fn focus_widget_at(targets: &[gtk::Widget], index: usize) {
+    if targets.is_empty() {
+        return;
+    }
+    let index = index.min(targets.len().saturating_sub(1));
+    mark_keyboard_cursor(targets, index);
+    targets[index].grab_focus();
+}
+
+fn mark_keyboard_cursor(targets: &[gtk::Widget], index: usize) {
+    for target in targets {
+        target.remove_css_class(KEYBOARD_CURSOR_CLASS);
+    }
+    if let Some(target) = targets.get(index) {
+        target.add_css_class(KEYBOARD_CURSOR_CLASS);
+    }
+}
+
+fn widget_contains_focus(widget: &gtk::Widget) -> bool {
+    if widget.has_focus() || widget.is_focus() || widget.has_visible_focus() {
+        return true;
+    }
+    let mut child = widget.focus_child();
+    while let Some(child_widget) = child {
+        if widget_contains_focus(&child_widget) {
+            return true;
+        }
+        child = child_widget.focus_child();
+    }
+    false
 }
 
 fn scroll_adjustment(adjustment: &gtk::Adjustment, delta: f64) {

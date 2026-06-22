@@ -15,12 +15,20 @@ pub fn css() -> &'static str {
         border-color: alpha(@theme_selected_bg_color, .55);
         background-color: alpha(@theme_selected_bg_color, .055);
     }
+    .notm-active-pane .notm-keyboard-cursor {
+        box-shadow: inset 0 0 0 2px alpha(@theme_selected_bg_color, .85);
+        background-color: alpha(@theme_selected_bg_color, .12);
+    }
     #notm-thread-list row.unread label { font-weight: 700; }
     #notm-compose-body,
     #notm-compose-body text,
     #notm-compose-body gutter {
         background-color: @theme_bg_color;
         color: @theme_fg_color;
+    }
+    #notm-compose-body text selection {
+        background-color: @theme_selected_bg_color;
+        color: @theme_selected_fg_color;
     }
     #notm-message-header {
         padding: 8px;
