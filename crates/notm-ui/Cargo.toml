@@ -14,6 +14,7 @@ parking_lot.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sourceview5 = { version = "0.11", features = ["v5_4"] }
 toml.workspace = true
 tokio.workspace = true
 tracing.workspace = true

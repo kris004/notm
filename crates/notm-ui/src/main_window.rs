@@ -25,6 +25,7 @@ use notm_mail::{
 use notm_notmuch::{Database, DatabaseMode, OpenConfig, QueryOptions, SortOrder, TagMutation};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sourceview5::{Buffer as SourceBuffer, View as SourceView, VimIMContext};
 use uuid::Uuid;
 use webkit6::{
     NavigationPolicyDecision, PolicyDecisionType,
@@ -214,7 +215,7 @@ struct Widgets {
     compose_cc: gtk::Entry,
     compose_bcc: gtk::Entry,
     compose_subject: gtk::Entry,
-    compose_body: gtk::TextView,
+    compose_body: SourceView,
     compose_scrolled: gtk::ScrolledWindow,
     compose_attachments: gtk::Label,
     add_attachment_button: gtk::Button,
@@ -655,11 +656,20 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     let compose_cc = entry_with_placeholder("Cc");
     let compose_bcc = entry_with_placeholder("Bcc");
     let compose_subject = entry_with_placeholder("Subject");
-    let compose_body = gtk::TextView::new();
+    let compose_body_buffer = SourceBuffer::builder()
+        .highlight_matching_brackets(true)
+        .highlight_syntax(false)
+        .build();
+    let compose_body = SourceView::builder()
+        .buffer(&compose_body_buffer)
+        .highlight_current_line(true)
+        .hexpand(true)
+        .monospace(true)
+        .vexpand(true)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .build();
     compose_body.set_widget_name("notm-compose-body");
-    compose_body.set_hexpand(true);
-    compose_body.set_wrap_mode(gtk::WrapMode::WordChar);
-    compose_body.set_vexpand(true);
+    let compose_vim_context = attach_compose_vim_context(&compose_body);
     let scrolled_compose_body = gtk::ScrolledWindow::builder()
         .hexpand(true)
         .vexpand(true)
@@ -916,6 +926,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         &clear_draft_button,
         &delete_local_draft_button,
     );
+    connect_compose_vim_context(&options, &widgets, &state, &compose_vim_context);
     connect_message_actions(&options, &widgets, &state);
     connect_recipient_autocomplete(&widgets.compose_to, &widgets, &state);
     connect_address_suggestion_list(&widgets, &state);
@@ -1543,6 +1554,76 @@ fn widget_token(value: &str) -> String {
         .collect::<String>()
         .trim_matches('-')
         .to_string()
+}
+
+fn attach_compose_vim_context(compose_body: &SourceView) -> VimIMContext {
+    let vim_context = VimIMContext::new();
+    let key_controller = gtk::EventControllerKey::new();
+    key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    key_controller.set_im_context(Some(&vim_context));
+    compose_body.add_controller(key_controller);
+    vim_context.set_client_widget(Some(compose_body));
+    vim_context
+}
+
+fn connect_compose_vim_context(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    vim_context: &VimIMContext,
+) {
+    let status = widgets.status_label.clone();
+    let compose_body = widgets.compose_body.clone();
+    vim_context.connect_command_bar_text_notify(move |context| {
+        update_compose_vim_status(&compose_body, &status, context);
+    });
+
+    let status = widgets.status_label.clone();
+    let compose_body = widgets.compose_body.clone();
+    vim_context.connect_command_text_notify(move |context| {
+        update_compose_vim_status(&compose_body, &status, context);
+    });
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    vim_context.connect_write(move |_, _, path| match save_current_draft(&opts, &w, &st) {
+        Ok(report) => {
+            refresh_draft_list(&w);
+            let destination = report
+                .maildir_path
+                .as_ref()
+                .or(report.local_path.as_ref())
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "draft store".to_string());
+            let suffix = path
+                .map(|requested| format!("; ignored Vim file path {requested}"))
+                .unwrap_or_default();
+            w.status_label
+                .set_text(&format!("Vim :w saved draft to {destination}{suffix}"));
+        }
+        Err(err) => w.status_label.set_text(&format!("Vim :w failed: {err}")),
+    });
+}
+
+fn update_compose_vim_status(
+    compose_body: &SourceView,
+    status_label: &gtk::Label,
+    vim_context: &VimIMContext,
+) {
+    if !compose_body.has_focus() {
+        return;
+    }
+    let command_bar = vim_context.command_bar_text();
+    let command_text = vim_context.command_text();
+    let text = if !command_bar.is_empty() {
+        command_bar.to_string()
+    } else if !command_text.is_empty() {
+        format!("Vim {command_text}")
+    } else {
+        "Vim composer".to_string()
+    };
+    status_label.set_text(&text);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2264,6 +2345,9 @@ fn install_shortcuts(
         }
         if st.borrow().input_mode == InputMode::Insert {
             if key == gtk::gdk::Key::Escape {
+                if w.compose_body.has_focus() {
+                    return gtk::glib::Propagation::Proceed;
+                }
                 enter_normal_mode(&w, &st);
                 return gtk::glib::Propagation::Stop;
             }
