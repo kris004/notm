@@ -71,7 +71,7 @@ pub struct ThreadUiDetails {
     pub preview: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ComposeFields {
     pub from: String,
     pub to: String,
@@ -92,4 +92,5 @@ pub struct ActiveDraft {
     pub path: PathBuf,
     pub message_id: Option<String>,
     pub indexed: bool,
+    pub saved_fields: ComposeFields,
 }

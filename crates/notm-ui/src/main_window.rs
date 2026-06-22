@@ -203,6 +203,7 @@ struct Widgets {
     compose_subject: gtk::Entry,
     compose_body: gtk::TextView,
     compose_attachments: gtk::Label,
+    clear_draft_button: gtk::Button,
     delete_local_draft_button: gtk::Button,
     address_suggestions_popover: gtk::Popover,
     address_suggestions_list: gtk::ListBox,
@@ -666,7 +667,9 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     compose_attachments.set_xalign(0.0);
     compose_attachments.set_wrap(true);
     compose_attachments.add_css_class("dim-label");
-    let composer_actions = button_flow(4);
+    let composer_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    composer_actions.set_hexpand(true);
+    let composer_left_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let add_attachment_button = gtk::Button::with_label("Add attachment…");
     let save_draft_button = gtk::Button::with_label("Save draft");
     save_draft_button.set_widget_name("notm-save-draft-button");
@@ -681,11 +684,15 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         &add_attachment_button,
         &save_draft_button,
         &clear_draft_button,
-        &delete_local_draft_button,
         &send_button,
     ] {
-        composer_actions.insert(b, -1);
+        composer_left_actions.append(b);
     }
+    let composer_action_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    composer_action_spacer.set_hexpand(true);
+    composer_actions.append(&composer_left_actions);
+    composer_actions.append(&composer_action_spacer);
+    composer_actions.append(&delete_local_draft_button);
     for w in [
         &compose_from,
         &compose_to,
@@ -784,6 +791,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         compose_subject,
         compose_body,
         compose_attachments,
+        clear_draft_button: clear_draft_button.clone(),
         delete_local_draft_button: delete_local_draft_button.clone(),
         address_suggestions_popover,
         address_suggestions_list,
@@ -1411,9 +1419,20 @@ fn connect_compose_helpers(
     let w = widgets.clone();
     let st = state.clone();
     clear_draft_button.connect_clicked(move |_| {
+        let active_draft = st.borrow().active_draft.clone();
+        let has_unsaved_changes = active_draft
+            .as_ref()
+            .is_some_and(|draft| compose_fields(&w, &st) != draft.saved_fields);
         clear_draft_widgets(&w, &st);
         match clear_draft_file(&w.draft_path) {
-            Ok(()) => w.status_label.set_text("Draft cleared"),
+            Ok(()) => {
+                let status = match (active_draft.is_some(), has_unsaved_changes) {
+                    (true, true) => "Draft changes discarded",
+                    (true, false) => "Draft closed",
+                    (false, _) => "Draft discarded",
+                };
+                w.status_label.set_text(status);
+            }
             Err(err) => w
                 .status_label
                 .set_text(&format!("Draft clear failed: {err}")),
@@ -2057,6 +2076,23 @@ fn autosave_draft_from_widgets(widgets: &Widgets, state: &SharedState) {
     if fields_has_content(&fields) {
         let _ = save_draft_fields(&widgets.draft_path, &fields);
     }
+    update_draft_action_buttons(widgets, state);
+}
+
+fn update_draft_action_buttons(widgets: &Widgets, state: &SharedState) {
+    let active_draft = state.borrow().active_draft.clone();
+    if let Some(active_draft) = active_draft {
+        let current_fields = compose_fields(widgets, state);
+        if current_fields == active_draft.saved_fields {
+            widgets.clear_draft_button.set_label("Close draft");
+        } else {
+            widgets.clear_draft_button.set_label("Discard changes");
+        }
+        widgets.delete_local_draft_button.set_visible(true);
+    } else {
+        widgets.clear_draft_button.set_label("Discard draft");
+        widgets.delete_local_draft_button.set_visible(false);
+    }
 }
 
 fn fields_has_content(fields: &ComposeFields) -> bool {
@@ -2140,12 +2176,14 @@ fn save_current_draft(
             path: persisted.path.clone(),
             message_id: persisted.indexed_message_id.clone(),
             indexed: persisted.indexed_message_id.is_some(),
+            saved_fields: fields.clone(),
         })
         .or_else(|| {
             local_path.as_ref().map(|path| ActiveDraft {
                 path: path.clone(),
                 message_id: None,
                 indexed: false,
+                saved_fields: fields.clone(),
             })
         });
     set_active_draft(widgets, state, active_draft);
@@ -2170,10 +2208,8 @@ fn save_current_draft(
 }
 
 fn set_active_draft(widgets: &Widgets, state: &SharedState, active_draft: Option<ActiveDraft>) {
-    widgets
-        .delete_local_draft_button
-        .set_visible(active_draft.is_some());
     state.borrow_mut().active_draft = active_draft;
+    update_draft_action_buttons(widgets, state);
 }
 
 fn delete_draft_source(options: &LaunchOptions, draft: &ActiveDraft) -> anyhow::Result<()> {
@@ -2297,7 +2333,7 @@ fn selected_named_draft(widgets: &Widgets) -> anyhow::Result<(PathBuf, ComposeFi
 
 fn load_selected_named_draft(widgets: &Widgets, state: &SharedState) -> anyhow::Result<()> {
     let (path, fields) = selected_named_draft(widgets)?;
-    apply_compose_fields(widgets, state, fields);
+    apply_compose_fields(widgets, state, fields.clone());
     set_active_draft(
         widgets,
         state,
@@ -2305,6 +2341,7 @@ fn load_selected_named_draft(widgets: &Widgets, state: &SharedState) -> anyhow::
             path,
             message_id: None,
             indexed: false,
+            saved_fields: fields,
         }),
     );
     show_compose_view(widgets);
@@ -2363,6 +2400,7 @@ fn apply_compose_fields(widgets: &Widgets, state: &SharedState, fields: ComposeF
     widgets.compose_body.buffer().set_text(&fields.body);
     update_attachment_label(widgets, &fields.attachments);
     state.borrow_mut().compose_fields = fields;
+    update_draft_action_buttons(widgets, state);
 }
 
 fn add_attachment_path(widgets: &Widgets, state: &SharedState, path: PathBuf) {
@@ -2378,6 +2416,7 @@ fn add_attachment_path(widgets: &Widgets, state: &SharedState, path: PathBuf) {
     update_attachment_label(widgets, &fields.attachments);
     state.borrow_mut().compose_fields = fields.clone();
     let _ = save_draft_fields(&widgets.draft_path, &fields);
+    update_draft_action_buttons(widgets, state);
     widgets.status_label.set_text("Attachment added to draft");
 }
 
@@ -3185,7 +3224,7 @@ fn open_selected_draft_message(widgets: &Widgets, state: &SharedState) -> anyhow
         .first()
         .ok_or_else(|| anyhow::anyhow!("selected draft has no file"))?;
     let fields = draft_fields_from_message_file(filename)?;
-    apply_compose_fields(widgets, state, fields);
+    apply_compose_fields(widgets, state, fields.clone());
     set_active_draft(
         widgets,
         state,
@@ -3193,6 +3232,7 @@ fn open_selected_draft_message(widgets: &Widgets, state: &SharedState) -> anyhow
             path: PathBuf::from(filename),
             message_id: Some(message.message_id.clone()),
             indexed: true,
+            saved_fields: fields,
         }),
     );
     show_compose_view(widgets);
