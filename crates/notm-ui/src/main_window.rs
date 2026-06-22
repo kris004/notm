@@ -929,7 +929,11 @@ fn update_tag_searches(options: &LaunchOptions, widgets: &Widgets, state: &Share
     let hidden = widgets.hidden_tag_searches.borrow();
     let mut direct = Vec::new();
     let mut grouped = BTreeMap::<String, Vec<String>>::new();
-    for tag in tags.into_iter().filter(|tag| !hidden.contains(tag)) {
+    for tag in tags
+        .into_iter()
+        .filter(|tag| !hidden.contains(tag))
+        .filter(|tag| !is_duplicate_tag_search(options, tag))
+    {
         if let Some((root, _)) = tag.split_once('/') {
             grouped.entry(root.to_string()).or_default().push(tag);
         } else {
@@ -997,6 +1001,17 @@ fn append_tag_search_button_to_box(
 
 fn tag_query(tag: &str) -> String {
     format!("tag:\"{}\"", tag.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn is_duplicate_tag_search(options: &LaunchOptions, tag: &str) -> bool {
+    if ["inbox", "unread", "flagged", "sent", "draft", "trash"].contains(&tag) {
+        return true;
+    }
+    options
+        .custom_saved_searches
+        .iter()
+        .filter_map(|saved| parse_single_tag_query(&saved.query))
+        .any(|saved_tag| saved_tag == tag)
 }
 
 fn connect_saved_search_editor(
