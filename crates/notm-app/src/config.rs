@@ -141,23 +141,23 @@ pub struct SendConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DraftsConfig {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub save_maildir: bool,
     #[serde(default)]
     pub maildir: Option<PathBuf>,
     #[serde(default = "default_draft_tags")]
     pub tags: Vec<String>,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub index_after_save: bool,
 }
 
 impl Default for DraftsConfig {
     fn default() -> Self {
         Self {
-            save_maildir: false,
+            save_maildir: true,
             maildir: None,
             tags: vec!["draft".to_string()],
-            index_after_save: false,
+            index_after_save: true,
         }
     }
 }

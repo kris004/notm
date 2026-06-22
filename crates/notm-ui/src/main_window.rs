@@ -108,10 +108,10 @@ impl Default for LaunchOptions {
             sent_maildir: None,
             sent_tags: vec!["sent".to_string()],
             index_sent_after_send: false,
-            save_drafts_to_maildir: false,
+            save_drafts_to_maildir: true,
             draft_maildir: None,
             draft_tags: vec!["draft".to_string()],
-            index_draft_after_save: false,
+            index_draft_after_save: true,
             sync_enabled: false,
             manual_sync_label: "Sync".to_string(),
             notmuch_database_update_enabled: false,
@@ -161,6 +161,7 @@ struct Widgets {
     message_stack: gtk::Stack,
     message_view: gtk::TextView,
     html_view: webkit6::WebView,
+    response_menu_button: gtk::MenuButton,
     message_menu_button: gtk::MenuButton,
     message_menu_box: gtk::Box,
     view_menu_button: gtk::MenuButton,
@@ -184,6 +185,7 @@ struct Widgets {
     attachment_scrolled: gtk::ScrolledWindow,
     attachment_list: gtk::ListBox,
     attachment_items: Rc<RefCell<Vec<ThreadAttachmentItem>>>,
+    tag_list_label: gtk::Label,
     draft_path: PathBuf,
     debug_view: gtk::TextView,
     status_label: gtk::Label,
@@ -285,20 +287,11 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
 
     let compose_button = gtk::Button::with_label("Compose");
     compose_button.set_widget_name("notm-compose-button");
-    let reply_button = gtk::Button::with_label("Reply");
-    let reply_all_button = gtk::Button::with_label("Reply all");
-    let forward_button = gtk::Button::with_label("Forward");
-    let forward_attachment_button = gtk::Button::with_label("Forward attached");
-    forward_attachment_button.set_widget_name("notm-forward-attachment-button");
     let debug_button = gtk::Button::with_label("Debug");
     let palette_button = gtk::Button::with_label("Commands");
     let settings_button = gtk::Button::with_label("Settings");
     for b in [
         &compose_button,
-        &reply_button,
-        &reply_all_button,
-        &forward_button,
-        &forward_attachment_button,
         &debug_button,
         &palette_button,
         &settings_button,
@@ -346,11 +339,11 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     tag_title.set_xalign(0.0);
     tag_title.add_css_class("heading");
     left.append(&tag_title);
-    let tags_label = gtk::Label::new(Some("Open a database to load tags."));
-    tags_label.set_wrap(true);
-    tags_label.set_xalign(0.0);
-    tags_label.set_widget_name("notm-tag-list");
-    left.append(&tags_label);
+    let tag_list_label = gtk::Label::new(Some("No tags loaded yet."));
+    tag_list_label.set_wrap(true);
+    tag_list_label.set_xalign(0.0);
+    tag_list_label.set_widget_name("notm-tag-list");
+    left.append(&tag_list_label);
     let manual_sync_button = if options.sync_enabled && options.show_manual_sync_button {
         let sync_button = gtk::Button::with_label(&options.manual_sync_label);
         sync_button.set_widget_name("notm-manual-sync-button");
@@ -451,6 +444,24 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
 
     let message_actions = button_flow(4);
     message_actions.set_widget_name("notm-message-actions");
+    let (response_menu_button, response_menu_box) =
+        menu_button_with_box("Respond", "notm-response-menu-button");
+    let reply_button = gtk::Button::with_label("Reply");
+    reply_button.set_widget_name("notm-reply-button");
+    let reply_all_button = gtk::Button::with_label("Reply all");
+    reply_all_button.set_widget_name("notm-reply-all-button");
+    let forward_button = gtk::Button::with_label("Forward");
+    forward_button.set_widget_name("notm-forward-button");
+    let forward_attachment_button = gtk::Button::with_label("Forward attached");
+    forward_attachment_button.set_widget_name("notm-forward-attachment-button");
+    for b in [
+        &reply_button,
+        &reply_all_button,
+        &forward_button,
+        &forward_attachment_button,
+    ] {
+        response_menu_box.append(b);
+    }
     let (message_menu_button, message_menu_box) =
         menu_button_with_box("Message", "notm-message-menu-button");
     let (view_menu_button, view_menu_box) = menu_button_with_box("View", "notm-view-menu-button");
@@ -497,6 +508,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     ] {
         copy_menu_box.append(b);
     }
+    message_actions.insert(&response_menu_button, -1);
     message_actions.insert(&message_menu_button, -1);
     message_actions.insert(&view_menu_button, -1);
     message_actions.insert(&collapse_quotes_button, -1);
@@ -594,10 +606,14 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     address_suggestions_list.set_selection_mode(gtk::SelectionMode::Single);
     address_suggestions_list.add_css_class("boxed-list");
     address_suggestions_list.set_size_request(360, -1);
+    address_suggestions_list.set_focusable(false);
     let address_suggestions_popover = gtk::Popover::new();
     address_suggestions_popover.set_widget_name("notm-address-suggestions");
     address_suggestions_popover.set_has_arrow(false);
-    address_suggestions_popover.set_autohide(true);
+    // Address suggestions are informational while the recipient entry keeps
+    // keyboard focus.  The default modal/autohide popover grabs keyboard input,
+    // which makes typing stop as soon as suggestions appear.
+    address_suggestions_popover.set_autohide(false);
     address_suggestions_popover.set_child(Some(&address_suggestions_list));
     address_suggestions_popover.set_parent(&compose_to);
     let compose_attachments = gtk::Label::new(Some("No attachments"));
@@ -607,10 +623,17 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     compose_attachments.add_css_class("dim-label");
     let composer_actions = button_flow(4);
     let add_attachment_button = gtk::Button::with_label("Add attachment…");
+    let save_draft_button = gtk::Button::with_label("Save draft");
+    save_draft_button.set_widget_name("notm-save-draft-button");
     let clear_draft_button = gtk::Button::with_label("Discard draft");
     let send_button = gtk::Button::with_label("Send");
     send_button.set_widget_name("notm-send-button");
-    for b in [&add_attachment_button, &clear_draft_button, &send_button] {
+    for b in [
+        &add_attachment_button,
+        &save_draft_button,
+        &clear_draft_button,
+        &send_button,
+    ] {
         composer_actions.insert(b, -1);
     }
     for w in [
@@ -668,6 +691,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         message_stack,
         message_view,
         html_view,
+        response_menu_button,
         message_menu_button,
         message_menu_box,
         view_menu_button,
@@ -691,6 +715,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         attachment_scrolled: scrolled_attachments,
         attachment_list,
         attachment_items: Rc::new(RefCell::new(Vec::new())),
+        tag_list_label,
         draft_path: options
             .draft_path
             .clone()
@@ -771,6 +796,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         &widgets,
         &state,
         &add_attachment_button,
+        &save_draft_button,
         &clear_draft_button,
     );
     connect_message_actions(&options, &widgets, &state);
@@ -1082,10 +1108,11 @@ fn widget_token(value: &str) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn connect_compose_helpers(
-    _options: &LaunchOptions,
+    options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
     add_attachment_button: &gtk::Button,
+    save_draft_button: &gtk::Button,
     clear_draft_button: &gtk::Button,
 ) {
     for entry in [
@@ -1105,6 +1132,32 @@ fn connect_compose_helpers(
         .compose_body
         .buffer()
         .connect_changed(move |_| autosave_draft_from_widgets(&w, &st));
+
+    let w = widgets.clone();
+    let st = state.clone();
+    let opts = options.clone();
+    save_draft_button.connect_clicked(move |_| {
+        match save_current_draft(&opts, &w, &st) {
+            Ok(report) => {
+                let destination = report
+                    .maildir_path
+                    .as_ref()
+                    .or(report.local_path.as_ref())
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "draft store".to_string());
+                w.status_label
+                    .set_text(&format!("Draft saved to {destination}"));
+                if report.indexed_message_id.is_some() {
+                    let current = st.borrow().current_query.clone();
+                    run_search(&opts, &w, &st, &current);
+                }
+            }
+            Err(err) => w
+                .status_label
+                .set_text(&format!("Draft save failed: {err}")),
+        }
+        refresh_draft_list(&w);
+    });
 
     let w = widgets.clone();
     let st = state.clone();
@@ -1720,6 +1773,7 @@ fn populate_address_suggestions_list(widgets: &Widgets, suggestions: &[String]) 
             "notm-address-suggestion-{}",
             widget_token(suggestion)
         ));
+        row.set_focusable(false);
         let label = gtk::Label::new(Some(suggestion));
         label.set_xalign(0.0);
         label.set_margin_start(6);
@@ -1799,7 +1853,7 @@ fn save_named_draft_fields(dir: &Path, fields: &ComposeFields) -> anyhow::Result
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DraftSaveReport {
-    local_path: PathBuf,
+    local_path: Option<PathBuf>,
     maildir_path: Option<PathBuf>,
     indexed_message_id: Option<String>,
 }
@@ -1810,10 +1864,15 @@ fn save_current_draft(
     state: &SharedState,
 ) -> anyhow::Result<DraftSaveReport> {
     let fields = compose_fields(widgets, state);
-    let local_path = save_named_draft_fields(&widgets.drafts_dir, &fields)?;
+    anyhow::ensure!(fields_has_content(&fields), "draft has no content");
     let persisted = if options.save_drafts_to_maildir {
         let message = composed_message_from_fields(&fields)?;
         persist_draft_message(options, &message)?
+    } else {
+        None
+    };
+    let local_path = if persisted.is_none() {
+        Some(save_named_draft_fields(&widgets.drafts_dir, &fields)?)
     } else {
         None
     };
@@ -2414,6 +2473,7 @@ fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, sta
     let has_html = selected_message_has_html(state);
     let has_message = state.borrow().selected_message.is_some();
     let has_thread = state.borrow().selected_thread.is_some();
+    widgets.response_menu_button.set_sensitive(has_message);
     widgets
         .html_policy_row
         .set_visible(html_visible && has_html);
@@ -3516,6 +3576,7 @@ fn apply_search_data(
         ));
     }
     populate_thread_list(options, widgets, state);
+    update_tag_list(widgets, state);
     refresh_thread_attachment_list(widgets, state);
     update_message_menu(options, widgets, state);
     widgets.status_label.set_text(&format!(
@@ -3556,6 +3617,7 @@ fn append_search_data(
         ));
     }
     populate_thread_list(options, widgets, state);
+    update_tag_list(widgets, state);
     widgets.status_label.set_text(&format!(
         "Loaded {} of {} thread(s)",
         state.borrow().thread_loaded_count,
@@ -3574,6 +3636,15 @@ fn update_thread_result_label(widgets: &Widgets, state: &SharedState) {
     widgets
         .load_more_button
         .set_sensitive(state.can_load_more_threads);
+}
+
+fn update_tag_list(widgets: &Widgets, state: &SharedState) {
+    let tags = state.borrow().visible_tags.clone();
+    if tags.is_empty() {
+        widgets.tag_list_label.set_text("No tags found.");
+    } else {
+        widgets.tag_list_label.set_text(&tags.join("\n"));
+    }
 }
 
 fn search_cache_key(
@@ -4364,6 +4435,7 @@ fn persist_draft_message(
                 .as_ref()
                 .map(|path| path.join("Drafts"))
         })
+        .or_else(|| default_database_maildir(options, "Drafts").ok())
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "drafts.save_maildir=true but no draft maildir or database path is configured"
@@ -4379,6 +4451,11 @@ fn persist_draft_message(
         path,
         indexed_message_id,
     }))
+}
+
+fn default_database_maildir(options: &LaunchOptions, name: &str) -> anyhow::Result<PathBuf> {
+    let db = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
+    Ok(PathBuf::from(db.path()).join(name))
 }
 
 fn save_rfc5322_to_maildir(
@@ -4860,9 +4937,15 @@ fn handle_automation_request(
         "save_draft" => match save_current_draft(options, widgets, state) {
             Ok(report) => {
                 refresh_draft_list(widgets);
+                let destination = report
+                    .maildir_path
+                    .as_ref()
+                    .or(report.local_path.as_ref())
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "draft store".to_string());
                 widgets
                     .status_label
-                    .set_text(&format!("Draft saved to {}", report.local_path.display()));
+                    .set_text(&format!("Draft saved to {destination}"));
                 json!({"ok": true, "report": report})
             }
             Err(err) => json!({"ok": false, "error": err.to_string()}),

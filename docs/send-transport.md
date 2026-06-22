@@ -27,7 +27,9 @@ index_sent_after_send = true
 
 If enabled, `notm` writes the exact RFC5322 message to a Maildir and, only when `index_sent_after_send=true`, indexes that one file through libnotmuch and applies the configured tags. It does not run `notmuch new` or any sync command.
 
-Optional draft Maildir persistence is also explicit:
+Explicit draft saves are Maildir-backed by default. They write a normal message
+under `<database>/Drafts`, index that file, and apply `tag:draft`; set
+`save_maildir = false` to fall back to local JSON draft files.
 
 ```toml
 [drafts]
