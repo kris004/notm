@@ -152,10 +152,13 @@ pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
 struct Widgets {
     window: gtk::ApplicationWindow,
     left_pane: gtk::Box,
+    thread_pane: gtk::Box,
     message_pane: gtk::Box,
     saved_box: gtk::Box,
     saved_name_entry: gtk::Entry,
     saved_query_entry: gtk::Entry,
+    save_search_button: gtk::Button,
+    delete_search_button: gtk::Button,
     custom_tag_entry: gtk::Entry,
     search_entry: gtk::Entry,
     search_button: gtk::Button,
@@ -216,6 +219,7 @@ struct Widgets {
     compose_bcc: gtk::Entry,
     compose_subject: gtk::Entry,
     compose_body: SourceView,
+    compose_vim_context: VimIMContext,
     compose_scrolled: gtk::ScrolledWindow,
     compose_attachments: gtk::Label,
     add_attachment_button: gtk::Button,
@@ -240,6 +244,13 @@ enum MessageViewKind {
     Html,
     Headers,
     Raw,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SavedSearchBaselineKind {
+    BuiltIn,
+    Custom,
+    Tag,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,6 +408,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     };
 
     let middle = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    middle.set_widget_name("notm-thread-pane");
     middle.set_margin_start(8);
     middle.set_margin_end(8);
     middle.set_margin_top(8);
@@ -497,6 +509,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     middle.append(&thread_result_row);
 
     let right = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    right.set_widget_name("notm-message-pane");
     right.set_margin_start(8);
     right.set_margin_end(8);
     right.set_margin_top(8);
@@ -783,10 +796,13 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     let widgets = Widgets {
         window: window.clone(),
         left_pane: left.clone(),
+        thread_pane: middle.clone(),
         message_pane: right.clone(),
         saved_box,
         saved_name_entry,
         saved_query_entry,
+        save_search_button: save_search_button.clone(),
+        delete_search_button: delete_search_button.clone(),
         custom_tag_entry,
         search_entry,
         search_button: search_button.clone(),
@@ -850,6 +866,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         compose_bcc,
         compose_subject,
         compose_body,
+        compose_vim_context: compose_vim_context.clone(),
         compose_scrolled: scrolled_compose_body.clone(),
         compose_attachments,
         add_attachment_button: add_attachment_button.clone(),
@@ -865,6 +882,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
             .clone()
             .unwrap_or_else(default_drafts_dir),
     };
+    update_active_pane_visuals(&widgets, &state);
     update_message_action_buttons(&options, &widgets, &state);
     if let Some(id) = identity(&options) {
         widgets.compose_from.set_text(&id.formatted());
@@ -1277,6 +1295,72 @@ fn connect_saved_search_editor(
                 .set_text(&format!("Delete search failed: {err}")),
         }
     });
+
+    for entry in [
+        widgets.saved_name_entry.clone(),
+        widgets.saved_query_entry.clone(),
+    ] {
+        let w = widgets.clone();
+        let st = state.clone();
+        let store = saved_store.clone();
+        entry.connect_changed(move |_| {
+            update_saved_search_editor_actions(&w, &st, &store);
+        });
+    }
+    update_saved_search_editor_actions(widgets, state, saved_store);
+}
+
+fn update_saved_search_editor_actions(
+    widgets: &Widgets,
+    state: &SharedState,
+    saved_store: &SavedSearchStore,
+) {
+    let name = widgets.saved_name_entry.text().trim().to_string();
+    let query = widgets.saved_query_entry.text().trim().to_string();
+    let has_values = !name.is_empty() && !query.is_empty();
+    let built_in_name = built_in_saved_searches()
+        .iter()
+        .any(|saved| saved.name.eq_ignore_ascii_case(&name));
+    let baseline = selected_saved_search_baseline(state, saved_store);
+    let unchanged = baseline
+        .as_ref()
+        .is_some_and(|(base_name, base_query, _)| name == *base_name && query == *base_query);
+    let delete_visible = unchanged
+        && baseline.as_ref().is_some_and(|(_, _, kind)| {
+            matches!(
+                kind,
+                SavedSearchBaselineKind::Custom | SavedSearchBaselineKind::Tag
+            )
+        });
+    let save_visible = has_values && !delete_visible && !built_in_name;
+
+    widgets.save_search_button.set_visible(save_visible);
+    widgets.delete_search_button.set_visible(delete_visible);
+}
+
+fn selected_saved_search_baseline(
+    state: &SharedState,
+    saved_store: &SavedSearchStore,
+) -> Option<(String, String, SavedSearchBaselineKind)> {
+    let selected = state.borrow().visible_saved_search.clone()?;
+    if let Some(saved) = built_in_saved_searches()
+        .into_iter()
+        .find(|saved| saved.name == selected)
+    {
+        return Some((saved.name, saved.query, SavedSearchBaselineKind::BuiltIn));
+    }
+    if let Some(saved) = saved_store
+        .borrow()
+        .iter()
+        .find(|saved| saved.name.eq_ignore_ascii_case(&selected))
+        .cloned()
+    {
+        return Some((saved.name, saved.query, SavedSearchBaselineKind::Custom));
+    }
+    let tags = state.borrow().visible_tags.clone();
+    tags.into_iter()
+        .find(|tag| tag == &selected || tag_query(tag) == selected)
+        .map(|tag| (tag.clone(), tag_query(&tag), SavedSearchBaselineKind::Tag))
 }
 
 fn save_custom_search_from_entries(
@@ -1315,6 +1399,7 @@ fn save_custom_search_from_entries(
     refresh_saved_searches(options, widgets, state, saved_store);
     widgets.search_entry.set_text(&query);
     state.borrow_mut().visible_saved_search = Some(name);
+    update_saved_search_editor_actions(widgets, state, saved_store);
     run_search(options, widgets, state, &query);
     Ok(())
 }
@@ -1340,6 +1425,7 @@ fn delete_custom_search_from_entries(
     refresh_saved_searches(options, widgets, state, saved_store);
     widgets.saved_name_entry.set_text("");
     widgets.saved_query_entry.set_text("");
+    update_saved_search_editor_actions(widgets, state, saved_store);
     Ok(())
 }
 
@@ -1604,6 +1690,10 @@ fn connect_compose_vim_context(
         }
         Err(err) => w.status_label.set_text(&format!("Vim :w failed: {err}")),
     });
+}
+
+fn compose_vim_ready_for_app_escape(vim_context: &VimIMContext) -> bool {
+    vim_context.command_bar_text().is_empty() && vim_context.command_text().is_empty()
 }
 
 fn update_compose_vim_status(
@@ -1908,12 +1998,16 @@ fn connect_search_debounce(options: &LaunchOptions, widgets: &Widgets, state: &S
 fn set_input_mode(widgets: &Widgets, state: &SharedState, mode: InputMode, status: &str) {
     state.borrow_mut().input_mode = mode;
     update_button_binding_labels(widgets, state);
+    update_active_pane_visuals(widgets, state);
     widgets.status_label.set_text(status);
 }
 
 fn enter_normal_mode(widgets: &Widgets, state: &SharedState) {
+    let keep_composer_focus = compose_view_is_visible(widgets) && composer_has_focus(widgets);
     set_input_mode(widgets, state, InputMode::Normal, "Normal mode");
-    focus_active_pane(widgets, state);
+    if !keep_composer_focus {
+        focus_active_pane(widgets, state);
+    }
 }
 
 fn enter_insert_mode_for_search(widgets: &Widgets, state: &SharedState) {
@@ -1936,14 +2030,21 @@ fn enter_insert_mode_for_active_pane(widgets: &Widgets, state: &SharedState) {
     );
     let active_pane = state.borrow().active_pane;
     match active_pane {
-        ActivePane::Sidebar => widgets.saved_query_entry.grab_focus(),
-        ActivePane::Threads => widgets.search_entry.grab_focus(),
-        ActivePane::Message if compose_view_is_visible(widgets) => widgets.compose_to.grab_focus(),
-        ActivePane::Message => widgets.message_view.grab_focus(),
+        ActivePane::Sidebar => focus_sidebar_insert_target(widgets),
+        ActivePane::Threads => {
+            widgets.search_entry.grab_focus();
+        }
+        ActivePane::Message if compose_view_is_visible(widgets) => {
+            focus_composer_insert_target(widgets)
+        }
+        ActivePane::Message => {
+            widgets.message_view.grab_focus();
+        }
     };
 }
 
 fn focus_active_pane(widgets: &Widgets, state: &SharedState) {
+    update_active_pane_visuals(widgets, state);
     match state.borrow().active_pane {
         ActivePane::Sidebar => {
             widgets.left_pane.grab_focus();
@@ -1953,7 +2054,7 @@ fn focus_active_pane(widgets: &Widgets, state: &SharedState) {
         }
         ActivePane::Message => {
             if compose_view_is_visible(widgets) {
-                widgets.message_pane.grab_focus();
+                focus_first_composer_field(widgets);
             } else if html_view_is_visible(widgets) {
                 widgets.html_view.grab_focus();
             } else {
@@ -1971,11 +2072,13 @@ fn set_active_pane(widgets: &Widgets, state: &SharedState, pane: ActivePane) {
     let name = match pane {
         ActivePane::Sidebar => "sidebar",
         ActivePane::Threads => "thread list",
+        ActivePane::Message if compose_view_is_visible(widgets) => "composer",
         ActivePane::Message => "message view",
     };
     widgets
         .status_label
         .set_text(&format!("Active pane: {name}"));
+    update_active_pane_visuals(widgets, state);
     update_debug(widgets, state);
 }
 
@@ -1992,6 +2095,139 @@ fn move_active_pane(widgets: &Widgets, state: &SharedState, delta: isize) {
         _ => ActivePane::Message,
     };
     set_active_pane(widgets, state, pane);
+}
+
+fn update_active_pane_visuals(widgets: &Widgets, state: &SharedState) {
+    let active = state.borrow().active_pane;
+    set_active_pane_class(&widgets.left_pane, active == ActivePane::Sidebar);
+    set_active_pane_class(&widgets.thread_pane, active == ActivePane::Threads);
+    set_active_pane_class(&widgets.message_pane, active == ActivePane::Message);
+}
+
+fn set_active_pane_class<W>(widget: &W, active: bool)
+where
+    W: IsA<gtk::Widget>,
+{
+    if active {
+        widget.add_css_class("notm-active-pane");
+    } else {
+        widget.remove_css_class("notm-active-pane");
+    }
+}
+
+fn composer_has_focus(widgets: &Widgets) -> bool {
+    widgets.compose_from.has_focus()
+        || widgets.compose_to.has_focus()
+        || widgets.compose_cc.has_focus()
+        || widgets.compose_bcc.has_focus()
+        || widgets.compose_subject.has_focus()
+        || widgets.compose_body.has_focus()
+}
+
+fn focus_first_composer_field(widgets: &Widgets) {
+    widgets.compose_to.grab_focus();
+}
+
+fn focus_composer_insert_target(widgets: &Widgets) {
+    if composer_has_focus(widgets) {
+        return;
+    }
+    focus_first_composer_field(widgets);
+}
+
+fn focus_sidebar_insert_target(widgets: &Widgets) {
+    if widgets.saved_name_entry.has_focus() || widgets.saved_query_entry.has_focus() {
+        return;
+    }
+    widgets.saved_query_entry.grab_focus();
+}
+
+fn move_sidebar_focus(widgets: &Widgets, delta: isize) {
+    let mut targets = Vec::new();
+    collect_sidebar_focus_targets(&widgets.left_pane.clone().upcast(), &mut targets);
+    focus_relative_widget(&targets, delta);
+}
+
+fn activate_focused_sidebar_widget(widgets: &Widgets, state: &SharedState) {
+    let mut targets = Vec::new();
+    collect_sidebar_focus_targets(&widgets.left_pane.clone().upcast(), &mut targets);
+    let Some(focused) = targets.into_iter().find(|widget| widget.has_focus()) else {
+        move_sidebar_focus(widgets, 1);
+        return;
+    };
+    if let Ok(button) = focused.clone().downcast::<gtk::Button>() {
+        button.emit_clicked();
+    } else if let Ok(menu_button) = focused.clone().downcast::<gtk::MenuButton>() {
+        menu_button.popup();
+    } else if focused.downcast::<gtk::Entry>().is_ok() {
+        enter_insert_mode_for_active_pane(widgets, state);
+    }
+}
+
+fn collect_sidebar_focus_targets(widget: &gtk::Widget, targets: &mut Vec<gtk::Widget>) {
+    if !widget.is_visible() || !widget.is_sensitive() {
+        return;
+    }
+    if widget.clone().downcast::<gtk::Button>().is_ok()
+        || widget.clone().downcast::<gtk::MenuButton>().is_ok()
+        || widget.clone().downcast::<gtk::Entry>().is_ok()
+    {
+        targets.push(widget.clone());
+    }
+    if let Ok(menu_button) = widget.clone().downcast::<gtk::MenuButton>()
+        && let Some(popover) = menu_button.popover()
+        && let Some(child) = popover.child()
+    {
+        collect_sidebar_focus_targets(&child, targets);
+    }
+    let mut child = widget.first_child();
+    while let Some(child_widget) = child {
+        child = child_widget.next_sibling();
+        collect_sidebar_focus_targets(&child_widget, targets);
+    }
+}
+
+fn move_composer_focus(widgets: &Widgets, delta: isize) {
+    let targets = composer_focus_targets(widgets);
+    focus_relative_widget(&targets, delta);
+}
+
+fn composer_focus_targets(widgets: &Widgets) -> Vec<gtk::Widget> {
+    [
+        widgets.compose_from.clone().upcast::<gtk::Widget>(),
+        widgets.compose_to.clone().upcast::<gtk::Widget>(),
+        widgets.compose_cc.clone().upcast::<gtk::Widget>(),
+        widgets.compose_bcc.clone().upcast::<gtk::Widget>(),
+        widgets.compose_subject.clone().upcast::<gtk::Widget>(),
+        widgets.compose_body.clone().upcast::<gtk::Widget>(),
+    ]
+    .into_iter()
+    .filter(|widget| widget.is_visible() && widget.is_sensitive())
+    .collect()
+}
+
+fn focus_relative_widget(targets: &[gtk::Widget], delta: isize) {
+    if targets.is_empty() {
+        return;
+    }
+    let current = targets
+        .iter()
+        .position(|widget| widget.has_focus())
+        .unwrap_or_else(|| {
+            if delta.is_negative() {
+                targets.len()
+            } else {
+                usize::MAX
+            }
+        });
+    let next = if current == usize::MAX {
+        0
+    } else {
+        current
+            .saturating_add_signed(delta)
+            .min(targets.len().saturating_sub(1))
+    };
+    targets[next].grab_focus();
 }
 
 fn scroll_adjustment(adjustment: &gtk::Adjustment, delta: f64) {
@@ -2288,19 +2524,39 @@ fn update_button_binding_labels(widgets: &Widgets, state: &SharedState) {
 }
 
 fn connect_input_mode_focus(widgets: &Widgets, state: &SharedState) {
-    connect_insert_focus(&widgets.saved_name_entry, widgets, state);
-    connect_insert_focus(&widgets.saved_query_entry, widgets, state);
-    connect_insert_focus(&widgets.custom_tag_entry, widgets, state);
-    connect_insert_focus(&widgets.search_entry, widgets, state);
-    connect_insert_focus(&widgets.compose_from, widgets, state);
-    connect_insert_focus(&widgets.compose_to, widgets, state);
-    connect_insert_focus(&widgets.compose_cc, widgets, state);
-    connect_insert_focus(&widgets.compose_bcc, widgets, state);
-    connect_insert_focus(&widgets.compose_subject, widgets, state);
-    connect_insert_focus(&widgets.compose_body, widgets, state);
+    connect_text_focus(
+        &widgets.saved_name_entry,
+        widgets,
+        state,
+        ActivePane::Sidebar,
+    );
+    connect_text_focus(
+        &widgets.saved_query_entry,
+        widgets,
+        state,
+        ActivePane::Sidebar,
+    );
+    connect_text_focus(
+        &widgets.custom_tag_entry,
+        widgets,
+        state,
+        ActivePane::Threads,
+    );
+    connect_text_focus(&widgets.search_entry, widgets, state, ActivePane::Threads);
+    connect_text_focus(&widgets.compose_from, widgets, state, ActivePane::Message);
+    connect_text_focus(&widgets.compose_to, widgets, state, ActivePane::Message);
+    connect_text_focus(&widgets.compose_cc, widgets, state, ActivePane::Message);
+    connect_text_focus(&widgets.compose_bcc, widgets, state, ActivePane::Message);
+    connect_text_focus(
+        &widgets.compose_subject,
+        widgets,
+        state,
+        ActivePane::Message,
+    );
+    connect_compose_body_focus(&widgets.compose_body, widgets, state);
 }
 
-fn connect_insert_focus<W>(widget: &W, widgets: &Widgets, state: &SharedState)
+fn connect_text_focus<W>(widget: &W, widgets: &Widgets, state: &SharedState, pane: ActivePane)
 where
     W: IsA<gtk::Widget> + Clone + 'static,
 {
@@ -2311,9 +2567,32 @@ where
         let Ok(mut state) = st.try_borrow_mut() else {
             return;
         };
+        state.active_pane = pane;
+        drop(state);
+        update_button_binding_labels(&w, &st);
+        update_active_pane_visuals(&w, &st);
+    });
+    widget.add_controller(focus);
+}
+
+fn connect_compose_body_focus<W>(widget: &W, widgets: &Widgets, state: &SharedState)
+where
+    W: IsA<gtk::Widget> + Clone + 'static,
+{
+    let focus = gtk::EventControllerFocus::new();
+    let w = widgets.clone();
+    let st = state.clone();
+    focus.connect_enter(move |_| {
+        let Ok(mut state) = st.try_borrow_mut() else {
+            return;
+        };
+        state.active_pane = ActivePane::Message;
         state.input_mode = InputMode::Insert;
         drop(state);
         update_button_binding_labels(&w, &st);
+        update_active_pane_visuals(&w, &st);
+        w.status_label
+            .set_text("Vim composer: Esc leaves insert/visual, Esc again exits to notm");
     });
     widget.add_controller(focus);
 }
@@ -2346,6 +2625,10 @@ fn install_shortcuts(
         if st.borrow().input_mode == InputMode::Insert {
             if key == gtk::gdk::Key::Escape {
                 if w.compose_body.has_focus() {
+                    if ctrl || compose_vim_ready_for_app_escape(&w.compose_vim_context) {
+                        enter_normal_mode(&w, &st);
+                        return gtk::glib::Propagation::Stop;
+                    }
                     return gtk::glib::Propagation::Proceed;
                 }
                 enter_normal_mode(&w, &st);
@@ -2364,6 +2647,10 @@ fn install_shortcuts(
         if ctrl && (key == gtk::gdk::Key::d || key == gtk::gdk::Key::D) {
             if st.borrow().active_pane == ActivePane::Threads {
                 select_thread_page(&opts, &w, &st, 1);
+            } else if st.borrow().active_pane == ActivePane::Sidebar {
+                move_sidebar_focus(&w, 5);
+            } else if compose_view_is_visible(&w) {
+                move_composer_focus(&w, 5);
             } else {
                 vim_scroll_pages(&w, &st, 0.5);
             }
@@ -2372,15 +2659,26 @@ fn install_shortcuts(
         if ctrl && (key == gtk::gdk::Key::u || key == gtk::gdk::Key::U) {
             if st.borrow().active_pane == ActivePane::Threads {
                 select_thread_page(&opts, &w, &st, -1);
+            } else if st.borrow().active_pane == ActivePane::Sidebar {
+                move_sidebar_focus(&w, -5);
+            } else if compose_view_is_visible(&w) {
+                move_composer_focus(&w, -5);
             } else {
                 vim_scroll_pages(&w, &st, -0.5);
             }
             return gtk::glib::Propagation::Stop;
         }
         if key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter {
-            if st.borrow().active_pane == ActivePane::Threads {
-                let idx = selected_thread_index(&w).unwrap_or(0);
-                open_thread_by_index(&opts, &w, &st, idx);
+            match st.borrow().active_pane {
+                ActivePane::Threads => {
+                    let idx = selected_thread_index(&w).unwrap_or(0);
+                    open_thread_by_index(&opts, &w, &st, idx);
+                }
+                ActivePane::Sidebar => activate_focused_sidebar_widget(&w, &st),
+                ActivePane::Message if compose_view_is_visible(&w) => {
+                    enter_insert_mode_for_active_pane(&w, &st);
+                }
+                ActivePane::Message => {}
             }
             return gtk::glib::Propagation::Stop;
         }
@@ -2480,6 +2778,10 @@ fn install_shortcuts(
         } else if key == gtk::gdk::Key::j || key == gtk::gdk::Key::Down {
             if st.borrow().active_pane == ActivePane::Threads {
                 select_relative_thread(&opts, &w, &st, count as isize);
+            } else if st.borrow().active_pane == ActivePane::Sidebar {
+                move_sidebar_focus(&w, count as isize);
+            } else if compose_view_is_visible(&w) {
+                move_composer_focus(&w, count as isize);
             } else {
                 vim_scroll_lines(&w, &st, count as f64);
             }
@@ -2488,6 +2790,10 @@ fn install_shortcuts(
         } else if key == gtk::gdk::Key::k || key == gtk::gdk::Key::Up {
             if st.borrow().active_pane == ActivePane::Threads {
                 select_relative_thread(&opts, &w, &st, -(count as isize));
+            } else if st.borrow().active_pane == ActivePane::Sidebar {
+                move_sidebar_focus(&w, -(count as isize));
+            } else if compose_view_is_visible(&w) {
+                move_composer_focus(&w, -(count as isize));
             } else {
                 vim_scroll_lines(&w, &st, -(count as f64));
             }
@@ -3275,9 +3581,21 @@ fn apply_compose_fields(widgets: &Widgets, state: &SharedState, fields: ComposeF
     widgets.compose_bcc.set_text(&fields.bcc);
     widgets.compose_subject.set_text(&fields.subject);
     widgets.compose_body.buffer().set_text(&fields.body);
+    move_compose_cursor_to_start(widgets);
     update_attachment_label(widgets, &fields.attachments);
     state.borrow_mut().compose_fields = fields;
     update_draft_action_buttons(widgets, state);
+}
+
+fn move_compose_cursor_to_start(widgets: &Widgets) {
+    let buffer = widgets.compose_body.buffer();
+    let start = buffer.start_iter();
+    buffer.place_cursor(&start);
+    let compose_body = widgets.compose_body.clone();
+    gtk::glib::timeout_add_local_once(Duration::from_millis(0), move || {
+        let mut start = compose_body.buffer().start_iter();
+        compose_body.scroll_to_iter(&mut start, 0.0, true, 0.0, 0.0);
+    });
 }
 
 fn add_attachment_path(widgets: &Widgets, state: &SharedState, path: PathBuf) {
@@ -3648,6 +3966,7 @@ fn show_selected_message_text_view(
                 .set_text(&format!("Text view failed: {err}"));
         }
     }
+    update_active_pane_visuals(widgets, state);
     update_debug(widgets, state);
 }
 
@@ -5719,6 +6038,7 @@ fn run_manual_sync(options: &LaunchOptions, widgets: &Widgets, state: &SharedSta
 fn open_compose(widgets: &Widgets, state: &SharedState) {
     show_compose_view(widgets);
     set_active_draft(widgets, state, None);
+    move_compose_cursor_to_start(widgets);
     {
         let mut state = state.borrow_mut();
         state.active_pane = ActivePane::Message;
@@ -5853,6 +6173,7 @@ fn fill_composer(widgets: &Widgets, state: &SharedState, message: ComposedMessag
     widgets.compose_bcc.set_text(&message.bcc.join(", "));
     widgets.compose_subject.set_text(&message.subject);
     widgets.compose_body.buffer().set_text(&message.body);
+    move_compose_cursor_to_start(widgets);
     let mut fields = compose_fields(widgets, state);
     fields.in_reply_to = message.in_reply_to;
     fields.references = message.references;
@@ -6517,7 +6838,10 @@ fn handle_automation_request(
                 "compose_set_cc" => widgets.compose_cc.set_text(value),
                 "compose_set_bcc" => widgets.compose_bcc.set_text(value),
                 "compose_set_subject" => widgets.compose_subject.set_text(value),
-                "compose_set_body" => widgets.compose_body.buffer().set_text(value),
+                "compose_set_body" => {
+                    widgets.compose_body.buffer().set_text(value);
+                    move_compose_cursor_to_start(widgets);
+                }
                 _ => {}
             }
             state.borrow_mut().compose_fields = compose_fields(widgets, state);
