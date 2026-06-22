@@ -107,6 +107,7 @@ fn launch_options(cfg: &config::AppConfig, app_config_path: Option<PathBuf>) -> 
         start_maximized: cfg.ui.start_maximized,
         remote_images: cfg.ui.remote_images,
         trusted_image_senders: cfg.ui.trusted_image_senders.clone(),
+        hidden_tag_searches: cfg.ui.hidden_tag_searches.clone(),
         sync_maildir_flags_after_tag_change: cfg.notmuch.sync_maildir_flags_after_tag_change,
         draft_path: None,
         drafts_dir: None,

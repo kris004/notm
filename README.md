@@ -72,6 +72,7 @@ CARGO_HOME=$PWD/.cargo-home cargo run -p notm-app -- live-self-send
 This repository builds and runs a native GTK4 Notmuch client. Implemented daily-driver flows include:
 
 - global Notmuch search and saved searches,
+- tag-derived searches, including grouped `Parent/Child` tag menus and hidden-tag persistence,
 - thread rows with unread/flagged/attachment/encrypted/signed indicators and body previews,
 - thread/message view with safe text and visual sanitized WebKitGTK HTML toggle, one-shot/trusted-sender remote image controls, HTML-to-text fallback, full headers, raw source, filenames, tags, MIME tree, selectable attachment list, and quote collapse,
 - tag operations and undo through libnotmuch,

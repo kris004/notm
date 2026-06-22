@@ -81,6 +81,7 @@ pub struct LaunchOptions {
     pub start_maximized: bool,
     pub remote_images: bool,
     pub trusted_image_senders: Vec<String>,
+    pub hidden_tag_searches: Vec<String>,
     pub sync_maildir_flags_after_tag_change: bool,
     pub draft_path: Option<PathBuf>,
     pub drafts_dir: Option<PathBuf>,
@@ -127,6 +128,7 @@ impl Default for LaunchOptions {
             start_maximized: false,
             remote_images: false,
             trusted_image_senders: Vec::new(),
+            hidden_tag_searches: Vec::new(),
             sync_maildir_flags_after_tag_change: true,
             draft_path: None,
             drafts_dir: None,
@@ -154,10 +156,13 @@ struct Widgets {
     custom_tag_entry: gtk::Entry,
     search_entry: gtk::Entry,
     search_generation: Rc<Cell<u64>>,
+    hidden_tag_searches: HiddenTagSearchStore,
     thread_list: gtk::ListBox,
     thread_result_label: gtk::Label,
     load_more_button: gtk::Button,
     thread_scrolled: gtk::ScrolledWindow,
+    read_toggle_button: gtk::Button,
+    flag_toggle_button: gtk::Button,
     message_stack: gtk::Stack,
     message_view: gtk::TextView,
     html_view: webkit6::WebView,
@@ -172,6 +177,7 @@ struct Widgets {
     image_policy_button: gtk::Button,
     html_policy_row: gtk::Box,
     html_policy_label: gtk::Label,
+    message_header_label: gtk::Label,
     collapse_quotes_button: gtk::Button,
     copy_menu_button: gtk::MenuButton,
     copy_message_id_button: gtk::Button,
@@ -185,7 +191,7 @@ struct Widgets {
     attachment_scrolled: gtk::ScrolledWindow,
     attachment_list: gtk::ListBox,
     attachment_items: Rc<RefCell<Vec<ThreadAttachmentItem>>>,
-    tag_list_label: gtk::Label,
+    tag_search_box: gtk::Box,
     draft_path: PathBuf,
     debug_view: gtk::TextView,
     status_label: gtk::Label,
@@ -205,6 +211,15 @@ struct Widgets {
 type SharedState = Rc<RefCell<UiState>>;
 type UndoState = Rc<RefCell<Option<(String, TagMutation)>>>;
 type SavedSearchStore = Rc<RefCell<Vec<SavedSearch>>>;
+type HiddenTagSearchStore = Rc<RefCell<BTreeSet<String>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageViewKind {
+    Text,
+    Html,
+    Headers,
+    Raw,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ThreadAttachmentItem {
@@ -265,6 +280,9 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     let state = Rc::new(RefCell::new(initial_state));
     let undo_state: UndoState = Rc::new(RefCell::new(None));
     let search_generation = Rc::new(Cell::new(0_u64));
+    let hidden_tag_searches: HiddenTagSearchStore = Rc::new(RefCell::new(
+        options.hidden_tag_searches.iter().cloned().collect(),
+    ));
     let quote_collapse = Rc::new(Cell::new(false));
 
     let window = gtk::ApplicationWindow::builder()
@@ -339,11 +357,9 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     tag_title.set_xalign(0.0);
     tag_title.add_css_class("heading");
     left.append(&tag_title);
-    let tag_list_label = gtk::Label::new(Some("No tags loaded yet."));
-    tag_list_label.set_wrap(true);
-    tag_list_label.set_xalign(0.0);
-    tag_list_label.set_widget_name("notm-tag-list");
-    left.append(&tag_list_label);
+    let tag_search_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    tag_search_box.set_widget_name("notm-tag-searches");
+    left.append(&tag_search_box);
     let manual_sync_button = if options.sync_enabled && options.show_manual_sync_button {
         let sync_button = gtk::Button::with_label(&options.manual_sync_label);
         sync_button.set_widget_name("notm-manual-sync-button");
@@ -382,13 +398,16 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
 
     let action_row = button_flow(4);
     let archive_button = gtk::Button::with_label("Archive");
-    let read_button = gtk::Button::with_label("Read");
-    let unread_button = gtk::Button::with_label("Unread");
+    let read_button = gtk::Button::with_label("Mark read");
+    read_button.set_widget_name("notm-read-toggle-button");
     let flag_button = gtk::Button::with_label("Flag");
-    let unflag_button = gtk::Button::with_label("Unflag");
+    flag_button.set_widget_name("notm-flag-toggle-button");
     let trash_button = gtk::Button::with_label("Trash");
     let spam_button = gtk::Button::with_label("Spam");
     let undo_button = gtk::Button::with_label("Undo tag");
+    undo_button.set_tooltip_text(Some(
+        "Undo only reverses the most recent tag operation from this session.",
+    ));
     let custom_tag_entry = entry_with_placeholder("tag");
     custom_tag_entry.set_widget_name("notm-custom-tag-entry");
     custom_tag_entry.set_width_chars(12);
@@ -399,9 +418,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     for b in [
         &archive_button,
         &read_button,
-        &unread_button,
         &flag_button,
-        &unflag_button,
         &trash_button,
         &spam_button,
         &undo_button,
@@ -546,6 +563,14 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     html_policy_row.append(&image_policy_button);
     right.append(&html_policy_row);
 
+    let message_header_label = gtk::Label::new(None);
+    message_header_label.set_widget_name("notm-message-header");
+    message_header_label.set_xalign(0.0);
+    message_header_label.set_wrap(true);
+    message_header_label.set_selectable(true);
+    message_header_label.set_visible(false);
+    right.append(&message_header_label);
+
     let message_view = gtk::TextView::new();
     message_view.set_widget_name("notm-message-view");
     message_view.set_editable(false);
@@ -684,10 +709,13 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         custom_tag_entry,
         search_entry,
         search_generation,
+        hidden_tag_searches,
         thread_list,
         thread_result_label,
         load_more_button,
         thread_scrolled: scrolled_threads,
+        read_toggle_button: read_button.clone(),
+        flag_toggle_button: flag_button.clone(),
         message_stack,
         message_view,
         html_view,
@@ -702,6 +730,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         image_policy_button,
         html_policy_row,
         html_policy_label,
+        message_header_label,
         collapse_quotes_button,
         copy_menu_button,
         copy_message_id_button,
@@ -715,7 +744,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         attachment_scrolled: scrolled_attachments,
         attachment_list,
         attachment_items: Rc::new(RefCell::new(Vec::new())),
-        tag_list_label,
+        tag_search_box,
         draft_path: options
             .draft_path
             .clone()
@@ -775,9 +804,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         &search_button,
         &archive_button,
         &read_button,
-        &unread_button,
         &flag_button,
-        &unflag_button,
         &trash_button,
         &spam_button,
         &undo_button,
@@ -865,14 +892,111 @@ fn refresh_saved_searches(
         let w = widgets.clone();
         let opts = options.clone();
         btn.connect_clicked(move |_| {
-            st.borrow_mut().visible_saved_search = Some(saved.name.clone());
-            w.saved_name_entry.set_text(&saved.name);
-            w.saved_query_entry.set_text(&saved.query);
-            w.search_entry.set_text(&saved.query);
-            run_search(&opts, &w, &st, &saved.query);
+            activate_saved_search(&opts, &w, &st, &saved.name, &saved.query);
         });
         widgets.saved_box.append(&btn);
     }
+    update_tag_searches(options, widgets, state);
+}
+
+fn activate_saved_search(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    name: &str,
+    query: &str,
+) {
+    state.borrow_mut().visible_saved_search = Some(name.to_string());
+    widgets.saved_name_entry.set_text(name);
+    widgets.saved_query_entry.set_text(query);
+    widgets.search_entry.set_text(query);
+    run_search(options, widgets, state, query);
+}
+
+fn update_tag_searches(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    while let Some(child) = widgets.tag_search_box.first_child() {
+        widgets.tag_search_box.remove(&child);
+    }
+    let tags = state.borrow().visible_tags.clone();
+    if tags.is_empty() {
+        let label = gtk::Label::new(Some("Run a search to load tags."));
+        label.set_xalign(0.0);
+        label.add_css_class("dim-label");
+        widgets.tag_search_box.append(&label);
+        return;
+    }
+
+    let hidden = widgets.hidden_tag_searches.borrow();
+    let mut direct = Vec::new();
+    let mut grouped = BTreeMap::<String, Vec<String>>::new();
+    for tag in tags.into_iter().filter(|tag| !hidden.contains(tag)) {
+        if let Some((root, _)) = tag.split_once('/') {
+            grouped.entry(root.to_string()).or_default().push(tag);
+        } else {
+            direct.push(tag);
+        }
+    }
+    drop(hidden);
+
+    if direct.is_empty() && grouped.is_empty() {
+        let label = gtk::Label::new(Some("All tag searches hidden."));
+        label.set_xalign(0.0);
+        label.add_css_class("dim-label");
+        widgets.tag_search_box.append(&label);
+        return;
+    }
+
+    direct.sort_by_key(|tag| tag.to_lowercase());
+    for tag in direct {
+        append_tag_search_button(options, widgets, state, &tag, &tag);
+    }
+
+    for (root, mut tags) in grouped {
+        tags.sort_by_key(|tag| tag.to_lowercase());
+        let (button, menu) =
+            menu_button_with_box(&root, &format!("notm-tag-group-{}", widget_token(&root)));
+        for tag in tags {
+            let label = tag
+                .strip_prefix(&format!("{root}/"))
+                .unwrap_or(&tag)
+                .to_string();
+            append_tag_search_button_to_box(options, widgets, state, &menu, &label, &tag);
+        }
+        widgets.tag_search_box.append(&button);
+    }
+}
+
+fn append_tag_search_button(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    label: &str,
+    tag: &str,
+) {
+    append_tag_search_button_to_box(options, widgets, state, &widgets.tag_search_box, label, tag);
+}
+
+fn append_tag_search_button_to_box(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    container: &gtk::Box,
+    label: &str,
+    tag: &str,
+) {
+    let button = gtk::Button::with_label(label);
+    button.set_widget_name(&format!("notm-tag-search-{}", widget_token(tag)));
+    let tag = tag.to_string();
+    let query = tag_query(&tag);
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    button.connect_clicked(move |_| activate_saved_search(&opts, &w, &st, &tag, &query));
+    container.append(&button);
+}
+
+fn tag_query(tag: &str) -> String {
+    format!("tag:\"{}\"", tag.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn connect_saved_search_editor(
@@ -962,13 +1086,60 @@ fn delete_custom_search_from_entries(
         let mut searches = saved_store.borrow_mut();
         let before = searches.len();
         searches.retain(|saved| !saved.name.eq_ignore_ascii_case(&name));
-        anyhow::ensure!(searches.len() != before, "custom search not found");
-        persist_custom_saved_searches(options, &searches)?;
+        if searches.len() != before {
+            persist_custom_saved_searches(options, &searches)?;
+        } else {
+            hide_tag_search_from_entries(options, widgets, state)?;
+        }
     }
     refresh_saved_searches(options, widgets, state, saved_store);
     widgets.saved_name_entry.set_text("");
     widgets.saved_query_entry.set_text("");
     Ok(())
+}
+
+fn hide_tag_search_from_entries(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) -> anyhow::Result<()> {
+    let name = widgets.saved_name_entry.text().trim().to_string();
+    let query = widgets.saved_query_entry.text().trim().to_string();
+    let visible_tags = state.borrow().visible_tags.clone();
+    let tag = visible_tags
+        .iter()
+        .find(|tag| tag.eq_ignore_ascii_case(&name))
+        .cloned()
+        .or_else(|| parse_single_tag_query(&query))
+        .filter(|tag| visible_tags.iter().any(|visible| visible == tag))
+        .ok_or_else(|| anyhow::anyhow!("custom search not found"))?;
+    {
+        let mut hidden = widgets.hidden_tag_searches.borrow_mut();
+        hidden.insert(tag);
+        persist_hidden_tag_searches(options, &hidden)?;
+    }
+    Ok(())
+}
+
+fn parse_single_tag_query(query: &str) -> Option<String> {
+    let value = query.trim().strip_prefix("tag:")?.trim();
+    if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+        let inner = &value[1..value.len() - 1];
+        let mut out = String::new();
+        let mut chars = inner.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                out.push(chars.next().unwrap_or(ch));
+            } else {
+                out.push(ch);
+            }
+        }
+        Some(out)
+    } else if !value.is_empty() && !value.contains(char::is_whitespace) {
+        Some(value.to_string())
+    } else {
+        None
+    }
 }
 
 fn persist_custom_saved_searches(
@@ -999,6 +1170,40 @@ fn persist_custom_saved_searches(
     ui.insert(
         "custom_saved_searches".to_string(),
         toml::Value::try_from(searches)?,
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, toml::to_string_pretty(&value)?)?;
+    Ok(())
+}
+
+fn persist_hidden_tag_searches(
+    options: &LaunchOptions,
+    hidden_tags: &BTreeSet<String>,
+) -> anyhow::Result<()> {
+    let Some(path) = &options.app_config_path else {
+        return Ok(());
+    };
+    let mut value = if path.exists() {
+        std::fs::read_to_string(path)?
+            .parse::<toml::Value>()
+            .unwrap_or_else(|_| toml::Value::Table(Default::default()))
+    } else {
+        toml::Value::Table(Default::default())
+    };
+    if !value.is_table() {
+        value = toml::Value::Table(Default::default());
+    }
+    let root = value.as_table_mut().expect("value is table");
+    let hidden = hidden_tags
+        .iter()
+        .cloned()
+        .map(toml::Value::String)
+        .collect::<Vec<_>>();
+    table_entry(root, "ui").insert(
+        "hidden_tag_searches".to_string(),
+        toml::Value::Array(hidden),
     );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -2367,6 +2572,7 @@ fn show_selected_message_text_view(
     match render_selected_message_text(widgets, state) {
         Ok(rendered) => {
             show_text_message_view(options, widgets, state);
+            set_active_message_view(widgets, MessageViewKind::Text);
             widgets.message_view.set_monospace(false);
             widgets.message_view.buffer().set_text(&rendered);
             let index = selected_message_index(state)
@@ -2393,21 +2599,7 @@ fn render_selected_message_text(widgets: &Widgets, state: &SharedState) -> anyho
         .selected_message
         .clone()
         .ok_or_else(|| anyhow::anyhow!("no selected message"))?;
-    let index = selected_message_index(state)
-        .map(|index| index + 1)
-        .unwrap_or(1);
-    let total = state.borrow().messages.len().max(1);
-    let mut rendered = format!(
-        "Message {index} of {total}\nFrom: {}\nTo: {}\nCc: {}\nSubject: {}\nDate: {}\nTags: {}\nMessage-ID: {}\nFilenames: {}\n\n",
-        message.from,
-        message.to,
-        message.cc,
-        message.subject,
-        message.date,
-        message.tags.join(" "),
-        message.message_id,
-        message.filenames.join(", ")
-    );
+    let mut rendered = String::new();
     if let Some(path) = message.filenames.first() {
         match parse_file(path) {
             Ok(parsed) => {
@@ -2448,6 +2640,55 @@ fn selected_message_index(state: &SharedState) -> Option<usize> {
         .position(|message| &message.message_id == selected_id)
 }
 
+fn update_message_header(widgets: &Widgets, state: &SharedState) {
+    let Some(message) = state.borrow().selected_message.clone() else {
+        widgets.message_header_label.set_visible(false);
+        widgets.message_header_label.set_text("");
+        return;
+    };
+    let index = selected_message_index(state)
+        .map(|index| index + 1)
+        .unwrap_or(1);
+    let total = state.borrow().messages.len().max(1);
+    widgets.message_header_label.set_text(&format!(
+        "Message {index} of {total}\nFrom: {}\nTo: {}\nCc: {}\nSubject: {}\nDate: {}\nTags: {}\nMessage-ID: {}\nFilenames: {}",
+        message.from,
+        message.to,
+        message.cc,
+        message.subject,
+        format_message_date(message.date),
+        message.tags.join(" "),
+        message.message_id,
+        message.filenames.join(", ")
+    ));
+    widgets.message_header_label.set_visible(true);
+}
+
+fn format_message_date(timestamp: i64) -> String {
+    chrono::DateTime::<Utc>::from_timestamp(timestamp, 0)
+        .map(|date| date.to_rfc2822())
+        .unwrap_or_else(|| timestamp.to_string())
+}
+
+fn set_active_message_view(widgets: &Widgets, active: MessageViewKind) {
+    for button in [
+        &widgets.view_text_button,
+        &widgets.view_html_button,
+        &widgets.view_headers_button,
+        &widgets.view_raw_button,
+    ] {
+        button.remove_css_class("suggested-action");
+    }
+    match active {
+        MessageViewKind::Text => widgets.view_text_button.add_css_class("suggested-action"),
+        MessageViewKind::Html => widgets.view_html_button.add_css_class("suggested-action"),
+        MessageViewKind::Headers => widgets
+            .view_headers_button
+            .add_css_class("suggested-action"),
+        MessageViewKind::Raw => widgets.view_raw_button.add_css_class("suggested-action"),
+    }
+}
+
 fn toggle_text_visual_view(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     if html_view_is_visible(widgets) {
         show_rendered_selected_thread(options, widgets, state);
@@ -2471,9 +2712,39 @@ fn activate_image_policy_button(options: &LaunchOptions, widgets: &Widgets, stat
 fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     let html_visible = html_view_is_visible(widgets);
     let has_html = selected_message_has_html(state);
-    let has_message = state.borrow().selected_message.is_some();
-    let has_thread = state.borrow().selected_thread.is_some();
+    let (has_message, selected_thread, message_count) = {
+        let state = state.borrow();
+        (
+            state.selected_message.is_some(),
+            state.selected_thread.clone(),
+            state.messages.len(),
+        )
+    };
+    let has_thread = selected_thread.is_some();
+    let multiple_messages = message_count > 1;
+    if !has_message {
+        widgets.message_header_label.set_visible(false);
+    }
+    widgets.message_menu_button.set_visible(multiple_messages);
+    widgets
+        .collapse_quotes_button
+        .set_visible(multiple_messages);
     widgets.response_menu_button.set_sensitive(has_message);
+    widgets.read_toggle_button.set_sensitive(has_thread);
+    widgets.flag_toggle_button.set_sensitive(has_thread);
+    if let Some(thread) = selected_thread {
+        widgets.read_toggle_button.set_label(if thread.has_unread {
+            "Mark read"
+        } else {
+            "Mark unread"
+        });
+        widgets
+            .flag_toggle_button
+            .set_label(if thread.is_flagged { "Unflag" } else { "Flag" });
+    } else {
+        widgets.read_toggle_button.set_label("Mark read");
+        widgets.flag_toggle_button.set_label("Flag");
+    }
     widgets
         .html_policy_row
         .set_visible(html_visible && has_html);
@@ -2636,6 +2907,7 @@ fn show_raw_source(options: &LaunchOptions, widgets: &Widgets, state: &SharedSta
     match result {
         Ok(raw) => {
             show_text_message_view(options, widgets, state);
+            set_active_message_view(widgets, MessageViewKind::Raw);
             widgets.message_view.set_monospace(true);
             widgets.message_view.buffer().set_text(&raw);
             widgets.status_label.set_text("Raw message source shown");
@@ -2660,6 +2932,7 @@ fn show_full_headers(options: &LaunchOptions, widgets: &Widgets, state: &SharedS
     match result {
         Ok(headers) => {
             show_text_message_view(options, widgets, state);
+            set_active_message_view(widgets, MessageViewKind::Headers);
             widgets.message_view.set_monospace(true);
             widgets.message_view.buffer().set_text(&headers);
             widgets.status_label.set_text("Full message headers shown");
@@ -2742,6 +3015,7 @@ fn selected_message_filename(state: &SharedState) -> anyhow::Result<String> {
 
 fn show_text_message_view(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     widgets.message_stack.set_visible_child_name("text");
+    update_message_header(widgets, state);
     refresh_thread_attachment_list(widgets, state);
     update_message_action_buttons(options, widgets, state);
 }
@@ -2749,6 +3023,7 @@ fn show_text_message_view(options: &LaunchOptions, widgets: &Widgets, state: &Sh
 fn show_compose_view(widgets: &Widgets) {
     widgets.address_suggestions_popover.popdown();
     widgets.html_policy_row.set_visible(false);
+    widgets.message_header_label.set_visible(false);
     widgets.attachment_title.set_visible(false);
     widgets.attachment_scrolled.set_visible(false);
     widgets.message_stack.set_visible_child_name("compose");
@@ -2852,6 +3127,8 @@ fn show_visual_html_with_image_policy(
             set_html_image_loading(&widgets.html_view, allow_remote_images);
             widgets.html_view.load_html(&document, Some("about:blank"));
             widgets.message_stack.set_visible_child_name("html");
+            update_message_header(widgets, state);
+            set_active_message_view(widgets, MessageViewKind::Html);
             widgets.status_label.set_text(&html_status_text(
                 image_policy,
                 allow_remote_images,
@@ -3257,9 +3534,7 @@ fn connect_actions(
     search_button: &gtk::Button,
     archive_button: &gtk::Button,
     read_button: &gtk::Button,
-    unread_button: &gtk::Button,
     flag_button: &gtk::Button,
-    unflag_button: &gtk::Button,
     trash_button: &gtk::Button,
     spam_button: &gtk::Button,
     undo_button: &gtk::Button,
@@ -3320,42 +3595,18 @@ fn connect_actions(
         &[],
         &["inbox"],
     );
-    connect_tag_button(
-        read_button,
-        options,
-        widgets,
-        state,
-        undo_state,
-        &[],
-        &["unread"],
-    );
-    connect_tag_button(
-        unread_button,
-        options,
-        widgets,
-        state,
-        undo_state,
-        &["unread"],
-        &[],
-    );
-    connect_tag_button(
-        flag_button,
-        options,
-        widgets,
-        state,
-        undo_state,
-        &["flagged"],
-        &[],
-    );
-    connect_tag_button(
-        unflag_button,
-        options,
-        widgets,
-        state,
-        undo_state,
-        &[],
-        &["flagged"],
-    );
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let undo = undo_state.clone();
+    read_button.connect_clicked(move |_| toggle_unread_selected(&opts, &w, &st, &undo));
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let undo = undo_state.clone();
+    flag_button.connect_clicked(move |_| toggle_flagged_selected(&opts, &w, &st, &undo));
+
     connect_tag_button(
         trash_button,
         options,
@@ -3576,7 +3827,7 @@ fn apply_search_data(
         ));
     }
     populate_thread_list(options, widgets, state);
-    update_tag_list(widgets, state);
+    update_tag_searches(options, widgets, state);
     refresh_thread_attachment_list(widgets, state);
     update_message_menu(options, widgets, state);
     widgets.status_label.set_text(&format!(
@@ -3617,7 +3868,7 @@ fn append_search_data(
         ));
     }
     populate_thread_list(options, widgets, state);
-    update_tag_list(widgets, state);
+    update_tag_searches(options, widgets, state);
     widgets.status_label.set_text(&format!(
         "Loaded {} of {} thread(s)",
         state.borrow().thread_loaded_count,
@@ -3636,15 +3887,6 @@ fn update_thread_result_label(widgets: &Widgets, state: &SharedState) {
     widgets
         .load_more_button
         .set_sensitive(state.can_load_more_threads);
-}
-
-fn update_tag_list(widgets: &Widgets, state: &SharedState) {
-    let tags = state.borrow().visible_tags.clone();
-    if tags.is_empty() {
-        widgets.tag_list_label.set_text("No tags found.");
-    } else {
-        widgets.tag_list_label.set_text(&tags.join("\n"));
-    }
 }
 
 fn search_cache_key(
@@ -3929,9 +4171,11 @@ fn tag_selected(
     })();
     match result {
         Ok(()) => {
-            widgets.status_label.set_text("Tag operation complete");
             let current = state.borrow().current_query.clone();
             run_search(options, widgets, state, &current);
+            widgets
+                .status_label
+                .set_text("Tag operation complete; Undo tag reverses this change");
         }
         Err(err) => {
             state.borrow_mut().last_error = Some(err.to_string());
@@ -4028,6 +4272,7 @@ fn undo_last_tag(
         Ok(()) => {
             let current = state.borrow().current_query.clone();
             run_search(options, widgets, state, &current);
+            widgets.status_label.set_text("Undid last tag operation");
         }
         Err(err) => {
             state.borrow_mut().last_error = Some(err.to_string());

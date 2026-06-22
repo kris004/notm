@@ -84,6 +84,8 @@ pub struct UiConfig {
     pub confirm_destructive_tag_actions: bool,
     #[serde(default)]
     pub custom_saved_searches: Vec<SavedSearchConfig>,
+    #[serde(default)]
+    pub hidden_tag_searches: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -105,6 +107,7 @@ impl Default for UiConfig {
             show_debug_panel: false,
             confirm_destructive_tag_actions: true,
             custom_saved_searches: Vec::new(),
+            hidden_tag_searches: Vec::new(),
         }
     }
 }
