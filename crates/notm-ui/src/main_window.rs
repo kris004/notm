@@ -477,8 +477,9 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     right.set_hexpand(true);
     right.set_vexpand(true);
 
-    let message_actions = button_flow(4);
+    let message_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     message_actions.set_widget_name("notm-message-actions");
+    message_actions.set_halign(gtk::Align::Start);
     let (response_menu_button, response_menu_box) =
         menu_button_with_box("Respond", "notm-response-menu-button");
     let reply_button = gtk::Button::with_label("Reply");
@@ -543,11 +544,11 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     ] {
         copy_menu_box.append(b);
     }
-    message_actions.insert(&response_menu_button, -1);
-    message_actions.insert(&message_menu_button, -1);
-    message_actions.insert(&view_menu_button, -1);
-    message_actions.insert(&collapse_quotes_button, -1);
-    message_actions.insert(&copy_menu_button, -1);
+    message_actions.append(&response_menu_button);
+    message_actions.append(&message_menu_button);
+    message_actions.append(&view_menu_button);
+    message_actions.append(&collapse_quotes_button);
+    message_actions.append(&copy_menu_button);
     right.append(&message_actions);
 
     let attachment_title = gtk::Label::new(Some("Attachments in thread"));
