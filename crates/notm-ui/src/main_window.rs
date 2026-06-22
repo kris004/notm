@@ -1857,16 +1857,18 @@ fn connect_message_actions(options: &LaunchOptions, widgets: &Widgets, state: &S
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
-    widgets
-        .view_text_button
-        .connect_clicked(move |_| show_rendered_selected_thread(&opts, &w, &st));
+    widgets.view_text_button.connect_clicked(move |_| {
+        st.borrow_mut().prefer_html_view = false;
+        show_rendered_selected_thread(&opts, &w, &st);
+    });
 
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
-    widgets
-        .view_html_button
-        .connect_clicked(move |_| show_visual_html_selected_message(&opts, &w, &st));
+    widgets.view_html_button.connect_clicked(move |_| {
+        st.borrow_mut().prefer_html_view = true;
+        show_visual_html_selected_message(&opts, &w, &st);
+    });
 
     let opts = options.clone();
     let w = widgets.clone();
@@ -2375,38 +2377,15 @@ fn vim_scroll_to_edge(widgets: &Widgets, state: &SharedState, bottom: bool) {
 }
 
 fn scroll_html_view_lines(widgets: &Widgets, lines: f64) {
-    scroll_html_view_by_pixels(widgets, lines * 40.0);
+    scroll_window_lines(&widgets.html_scrolled, lines);
 }
 
 fn scroll_html_view_pages(widgets: &Widgets, pages: f64) {
-    let script = format!(
-        "window.scrollBy(0, Math.round(window.innerHeight * {}));",
-        pages
-    );
-    evaluate_html_scroll_script(widgets, &script);
+    scroll_window_pages(&widgets.html_scrolled, pages);
 }
 
 fn scroll_html_view_to_edge(widgets: &Widgets, bottom: bool) {
-    let y = if bottom {
-        "document.scrollingElement ? document.scrollingElement.scrollHeight : document.body.scrollHeight"
-    } else {
-        "0"
-    };
-    evaluate_html_scroll_script(widgets, &format!("window.scrollTo(0, {y});"));
-}
-
-fn scroll_html_view_by_pixels(widgets: &Widgets, pixels: f64) {
-    evaluate_html_scroll_script(widgets, &format!("window.scrollBy(0, {});", pixels.round()));
-}
-
-fn evaluate_html_scroll_script(widgets: &Widgets, script: &str) {
-    widgets.html_view.evaluate_javascript(
-        script,
-        None,
-        None,
-        None::<&gtk::gio::Cancellable>,
-        |_| {},
-    );
+    scroll_window_to_edge(&widgets.html_scrolled, bottom);
 }
 
 fn select_thread_edge(
@@ -2607,7 +2586,11 @@ fn update_button_binding_labels(widgets: &Widgets, state: &SharedState) {
     set_menu_button_label(&widgets.tag_menu_button, "Tag…", "T", state);
     set_button_label(&widgets.undo_tag_button, "Undo tag", "z", state);
     set_menu_button_label(&widgets.response_menu_button, "Respond", "r/R/F", state);
-    set_menu_button_label(&widgets.view_menu_button, "View", "v", state);
+    set_menu_button_label(&widgets.view_menu_button, "View", "v/H/O", state);
+    set_button_label(&widgets.view_text_button, "Text", "v", state);
+    set_button_label(&widgets.view_html_button, "Visual HTML", "v", state);
+    set_button_label(&widgets.view_headers_button, "Full headers", "H", state);
+    set_button_label(&widgets.view_raw_button, "Raw source", "O", state);
     set_button_label(
         &widgets.collapse_quotes_button,
         "Collapse quotes",
@@ -2635,6 +2618,12 @@ fn update_button_binding_labels(widgets: &Widgets, state: &SharedState) {
     set_button_label(&widgets.send_button, "Send", "Ctrl+Enter", state);
     update_saved_search_button_labels(widgets, state);
     update_tag_search_button_labels(widgets, state);
+}
+
+fn clear_go_prompt_status(widgets: &Widgets) {
+    if widgets.status_label.text().starts_with("Go:") {
+        widgets.status_label.set_text("Normal mode");
+    }
 }
 
 fn connect_input_mode_focus(widgets: &Widgets, state: &SharedState) {
@@ -2861,8 +2850,10 @@ fn install_shortcuts(
                 false
             };
             return if handled {
+                clear_go_prompt_status(&w);
                 gtk::glib::Propagation::Stop
             } else {
+                clear_go_prompt_status(&w);
                 gtk::glib::Propagation::Proceed
             };
         }
@@ -3003,6 +2994,14 @@ fn install_shortcuts(
         } else if key == gtk::gdk::Key::v {
             clear_numeric_prefix(&numeric_prefix);
             toggle_text_visual_view(&opts, &w, &st);
+            true
+        } else if key == gtk::gdk::Key::H {
+            clear_numeric_prefix(&numeric_prefix);
+            show_full_headers(&opts, &w, &st);
+            true
+        } else if key == gtk::gdk::Key::O {
+            clear_numeric_prefix(&numeric_prefix);
+            show_raw_source(&opts, &w, &st);
             true
         } else if key == gtk::gdk::Key::q {
             clear_numeric_prefix(&numeric_prefix);
@@ -4054,6 +4053,18 @@ fn show_rendered_selected_thread(options: &LaunchOptions, widgets: &Widgets, sta
     }
 }
 
+fn show_preferred_selected_message_view(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) {
+    if state.borrow().prefer_html_view && selected_message_has_html(state) {
+        show_visual_html_selected_message(options, widgets, state);
+    } else {
+        show_selected_message_text_view(options, widgets, state);
+    }
+}
+
 fn show_selected_message_text_view(
     options: &LaunchOptions,
     widgets: &Widgets,
@@ -4182,8 +4193,10 @@ fn set_active_message_view(widgets: &Widgets, active: MessageViewKind) {
 
 fn toggle_text_visual_view(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     if html_view_is_visible(widgets) {
+        state.borrow_mut().prefer_html_view = false;
         show_rendered_selected_thread(options, widgets, state);
     } else {
+        state.borrow_mut().prefer_html_view = true;
         show_visual_html_selected_message(options, widgets, state);
     }
 }
@@ -5571,51 +5584,62 @@ fn populate_thread_list(options: &LaunchOptions, widgets: &Widgets, state: &Shar
     for (idx, thread) in threads.iter().enumerate() {
         let row = gtk::ListBoxRow::new();
         row.set_widget_name(&format!("notm-thread-row-{idx}"));
-        if thread.has_unread {
-            row.add_css_class("unread");
-        }
-        let box_ = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        box_.set_margin_start(6);
-        box_.set_margin_end(6);
-        box_.set_margin_top(6);
-        box_.set_margin_bottom(6);
         let detail = details.get(&thread.thread_id).cloned().unwrap_or_default();
-        let title = gtk::Label::new(Some(&format!(
-            "{}{}{}{}{}{}",
-            if thread.has_unread { "● " } else { "" },
-            if thread.is_flagged { "★ " } else { "" },
-            if detail.has_attachment { "📎 " } else { "" },
-            if detail.has_encrypted { "🔒 " } else { "" },
-            if detail.has_signed { "✍ " } else { "" },
-            thread.subject
-        )));
-        title.set_widget_name(&format!("notm-thread-title-{idx}"));
-        title.set_xalign(0.0);
-        title.set_wrap(true);
-        let meta = gtk::Label::new(Some(&format!(
-            "{}  ·  {}/{}  ·  {}",
-            thread.authors,
-            thread.matched_messages,
-            thread.total_messages,
-            thread.tags.join(" ")
-        )));
-        meta.set_widget_name(&format!("notm-thread-meta-{idx}"));
-        meta.set_xalign(0.0);
-        meta.add_css_class("dim-label");
-        meta.set_wrap(true);
-        box_.append(&title);
-        box_.append(&meta);
-        if !detail.preview.is_empty() {
-            let preview = gtk::Label::new(Some(&detail.preview));
-            preview.set_widget_name(&format!("notm-thread-preview-{idx}"));
-            preview.set_xalign(0.0);
-            preview.add_css_class("dim-label");
-            preview.set_wrap(true);
-            box_.append(&preview);
-        }
-        row.set_child(Some(&box_));
+        set_thread_row_content(&row, idx, thread, &detail);
         widgets.thread_list.append(&row);
     }
+}
+
+fn set_thread_row_content(
+    row: &gtk::ListBoxRow,
+    idx: usize,
+    thread: &notm_notmuch::ThreadSummary,
+    detail: &ThreadUiDetails,
+) {
+    if thread.has_unread {
+        row.add_css_class("unread");
+    } else {
+        row.remove_css_class("unread");
+    }
+    let box_ = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    box_.set_margin_start(6);
+    box_.set_margin_end(6);
+    box_.set_margin_top(6);
+    box_.set_margin_bottom(6);
+    let title = gtk::Label::new(Some(&format!(
+        "{}{}{}{}{}{}",
+        if thread.has_unread { "● " } else { "" },
+        if thread.is_flagged { "★ " } else { "" },
+        if detail.has_attachment { "📎 " } else { "" },
+        if detail.has_encrypted { "🔒 " } else { "" },
+        if detail.has_signed { "✍ " } else { "" },
+        thread.subject
+    )));
+    title.set_widget_name(&format!("notm-thread-title-{idx}"));
+    title.set_xalign(0.0);
+    title.set_wrap(true);
+    let meta = gtk::Label::new(Some(&format!(
+        "{}  ·  {}/{}  ·  {}",
+        thread.authors,
+        thread.matched_messages,
+        thread.total_messages,
+        thread.tags.join(" ")
+    )));
+    meta.set_widget_name(&format!("notm-thread-meta-{idx}"));
+    meta.set_xalign(0.0);
+    meta.add_css_class("dim-label");
+    meta.set_wrap(true);
+    box_.append(&title);
+    box_.append(&meta);
+    if !detail.preview.is_empty() {
+        let preview = gtk::Label::new(Some(&detail.preview));
+        preview.set_widget_name(&format!("notm-thread-preview-{idx}"));
+        preview.set_xalign(0.0);
+        preview.add_css_class("dim-label");
+        preview.set_wrap(true);
+        box_.append(&preview);
+    }
+    row.set_child(Some(&box_));
 }
 
 fn visible_thread_details(
@@ -5819,7 +5843,7 @@ fn select_thread_by_index(
                 }
             } else {
                 set_active_draft(widgets, state, None);
-                show_selected_message_text_view(options, widgets, state);
+                show_preferred_selected_message_view(options, widgets, state);
                 state.borrow_mut().active_pane = ActivePane::Threads;
                 focus_active_pane(widgets, state);
                 widgets
@@ -5886,7 +5910,7 @@ fn open_thread_by_index(
                 }
             } else {
                 set_active_draft(widgets, state, None);
-                show_selected_message_text_view(options, widgets, state);
+                show_preferred_selected_message_view(options, widgets, state);
                 widgets
                     .status_label
                     .set_text(&message_position_status(state, index, "Opened"));
@@ -5939,8 +5963,9 @@ fn tag_selected(
     })();
     match result {
         Ok(changed_messages) => {
-            let current = state.borrow().current_query.clone();
-            run_search(options, widgets, state, &current);
+            apply_local_tag_mutation(widgets, state, &mutation);
+            update_message_header(widgets, state);
+            update_message_action_buttons(options, widgets, state);
             let undo_available = changed_messages > 0;
             set_undo_tag_available(widgets, undo_available);
             if undo_available {
@@ -5961,6 +5986,64 @@ fn tag_selected(
             update_debug(widgets, state);
         }
     }
+}
+
+fn apply_local_tag_mutation(widgets: &Widgets, state: &SharedState, mutation: &TagMutation) {
+    let selected_thread_id = state
+        .borrow()
+        .selected_thread
+        .as_ref()
+        .map(|thread| thread.thread_id.clone());
+    let row_update = {
+        let mut state = state.borrow_mut();
+        let mut updated_thread_index = None;
+        for (index, thread) in state.thread_list_items.iter_mut().enumerate() {
+            if selected_thread_id.as_ref() == Some(&thread.thread_id) {
+                apply_tag_mutation_to_thread(thread, mutation);
+                updated_thread_index.get_or_insert(index);
+            }
+        }
+        if let Some(thread) = &mut state.selected_thread {
+            apply_tag_mutation_to_thread(thread, mutation);
+        }
+        for message in &mut state.messages {
+            apply_tag_mutation_to_tags(&mut message.tags, mutation);
+        }
+        if let Some(message) = &mut state.selected_message {
+            apply_tag_mutation_to_tags(&mut message.tags, mutation);
+        }
+        updated_thread_index.and_then(|index| {
+            let thread = state.thread_list_items.get(index)?.clone();
+            let detail = state
+                .thread_details
+                .get(&thread.thread_id)
+                .cloned()
+                .unwrap_or_default();
+            Some((index, thread, detail))
+        })
+    };
+    if let Some((index, thread, detail)) = row_update
+        && let Some(row) = widgets.thread_list.row_at_index(index as i32)
+    {
+        set_thread_row_content(&row, index, &thread, &detail);
+    }
+}
+
+fn apply_tag_mutation_to_thread(thread: &mut notm_notmuch::ThreadSummary, mutation: &TagMutation) {
+    apply_tag_mutation_to_tags(&mut thread.tags, mutation);
+    thread.has_unread = thread.tags.iter().any(|tag| tag == "unread");
+    thread.is_flagged = thread.tags.iter().any(|tag| tag == "flagged");
+}
+
+fn apply_tag_mutation_to_tags(tags: &mut Vec<String>, mutation: &TagMutation) {
+    let mut tag_set = tags.iter().cloned().collect::<BTreeSet<_>>();
+    for tag in &mutation.remove {
+        tag_set.remove(tag);
+    }
+    for tag in &mutation.add {
+        tag_set.insert(tag.clone());
+    }
+    *tags = tag_set.into_iter().collect();
 }
 
 fn set_undo_tag_available(widgets: &Widgets, available: bool) {
@@ -6046,7 +6129,7 @@ fn select_message_by_index(
         }
     } else {
         set_active_draft(widgets, state, None);
-        show_selected_message_text_view(options, widgets, state);
+        show_preferred_selected_message_view(options, widgets, state);
     }
 }
 
@@ -6071,8 +6154,19 @@ fn undo_last_tag(
         Ok(()) => {
             undo_state.borrow_mut().take();
             set_undo_tag_available(widgets, false);
-            let current = state.borrow().current_query.clone();
-            run_search(options, widgets, state, &current);
+            let selected_query_matches = state
+                .borrow()
+                .selected_thread
+                .as_ref()
+                .is_some_and(|thread| query == format!("thread:{}", thread.thread_id));
+            if selected_query_matches {
+                apply_local_tag_mutation(widgets, state, &mutation);
+                update_message_header(widgets, state);
+                update_message_action_buttons(options, widgets, state);
+            } else {
+                let current = state.borrow().current_query.clone();
+                run_search(options, widgets, state, &current);
+            }
             widgets.status_label.set_text("Undid last tag operation");
         }
         Err(err) => {
@@ -7101,6 +7195,7 @@ fn handle_automation_request(
             json!({"ok": state.borrow().last_error.is_none(), "last_error": state.borrow().last_error})
         }
         "show_rendered_thread" | "show_text_thread" | "text_view" => {
+            state.borrow_mut().prefer_html_view = false;
             show_rendered_selected_thread(options, widgets, state);
             json!({"ok": true, "state": &*state.borrow()})
         }
@@ -7113,6 +7208,7 @@ fn handle_automation_request(
             })
         }
         "show_visual_html" | "show_html_visual" | "visual_html" => {
+            state.borrow_mut().prefer_html_view = true;
             show_visual_html_selected_message(options, widgets, state);
             json!({
                 "ok": state.borrow().last_error.is_none(),
@@ -7432,6 +7528,7 @@ fn run_named_command(
             json!({"ok": state.borrow().last_error.is_none(), "last_error": state.borrow().last_error})
         }
         "text" | "rendered" | "show_rendered_thread" | "show_text_thread" => {
+            state.borrow_mut().prefer_html_view = false;
             show_rendered_selected_thread(options, widgets, state);
             json!({"ok": true, "state": &*state.borrow()})
         }
@@ -7444,6 +7541,7 @@ fn run_named_command(
             })
         }
         "visual_html" | "show_visual_html" | "show_html_visual" => {
+            state.borrow_mut().prefer_html_view = true;
             show_visual_html_selected_message(options, widgets, state);
             json!({
                 "ok": state.borrow().last_error.is_none(),

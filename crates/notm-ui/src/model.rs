@@ -32,6 +32,7 @@ pub struct UiState {
     pub automation_enabled: bool,
     pub screenshot_path: Option<PathBuf>,
     pub quote_collapse_enabled: bool,
+    pub prefer_html_view: bool,
 }
 
 impl Default for UiState {
@@ -63,6 +64,7 @@ impl Default for UiState {
             automation_enabled: false,
             screenshot_path: None,
             quote_collapse_enabled: false,
+            prefer_html_view: false,
         }
     }
 }
