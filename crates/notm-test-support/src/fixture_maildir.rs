@@ -149,6 +149,7 @@ fn fixture_messages() -> Vec<FixtureMessage> {
             None,
         ),
         html_msg(),
+        long_html_msg(),
         attachment_msg(),
         msg(
             "multi-recipient",
@@ -242,6 +243,19 @@ fn html_msg() -> FixtureMessage {
     FixtureMessage {
         raw: "From: html@example.test\r\nTo: fixture@example.test\r\nSubject: HTML message\r\nDate: Thu, 18 Jun 2026 20:00:00 -0600\r\nMessage-ID: <html-message@fixture.test>\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><h1>Hello</h1><script>alert(1)</script><p>Safe <b>HTML</b>.</p><img src=\"https://example.test/pixel\"></body></html>".to_string(),
         tags: vec!["inbox", "unread"],
+    }
+}
+
+fn long_html_msg() -> FixtureMessage {
+    let body = (1..=80)
+        .map(|n| format!("<p>Scrollable HTML fixture row {n}</p>"))
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    FixtureMessage {
+        raw: format!(
+            "From: long-html@example.test\r\nTo: fixture@example.test\r\nSubject: Long HTML message\r\nDate: Thu, 18 Jun 2026 20:00:30 -0600\r\nMessage-ID: <long-html-message@fixture.test>\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><h1>Long HTML</h1>{body}</body></html>"
+        ),
+        tags: vec!["inbox"],
     }
 }
 

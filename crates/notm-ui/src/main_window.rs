@@ -6,7 +6,7 @@ use std::{
     rc::Rc,
     sync::{Mutex, OnceLock, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
@@ -178,6 +178,8 @@ struct Widgets {
     trash_button: gtk::Button,
     spam_button: gtk::Button,
     tag_menu_button: gtk::MenuButton,
+    add_custom_tag_button: gtk::Button,
+    remove_custom_tag_button: gtk::Button,
     undo_tag_button: gtk::Button,
     message_stack: gtk::Stack,
     message_view: gtk::TextView,
@@ -469,6 +471,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     add_tag_button.set_widget_name("notm-add-custom-tag-button");
     let remove_tag_button = gtk::Button::with_label("Remove tag");
     remove_tag_button.set_widget_name("notm-remove-custom-tag-button");
+    remove_tag_button.set_visible(false);
     tag_button_row.append(&add_tag_button);
     tag_button_row.append(&remove_tag_button);
     tag_menu_box.append(&custom_tag_entry);
@@ -825,6 +828,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         trash_button: trash_button.clone(),
         spam_button: spam_button.clone(),
         tag_menu_button: tag_menu_button.clone(),
+        add_custom_tag_button: add_tag_button.clone(),
+        remove_custom_tag_button: remove_tag_button.clone(),
         undo_tag_button: undo_button.clone(),
         message_stack,
         message_view,
@@ -1623,8 +1628,24 @@ fn connect_custom_tag_editor(
     let w = widgets.clone();
     let st = state.clone();
     let undo = undo_state.clone();
+    widgets
+        .custom_tag_entry
+        .connect_activate(move |_| apply_custom_tag_from_entry(&opts, &w, &st, &undo, true));
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let undo = undo_state.clone();
     remove_tag_button
         .connect_clicked(move |_| apply_custom_tag_from_entry(&opts, &w, &st, &undo, false));
+
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets
+        .custom_tag_entry
+        .connect_changed(move |_| update_custom_tag_controls(&w, &st));
+
+    update_custom_tag_controls(widgets, state);
 }
 
 fn apply_custom_tag_from_entry(
@@ -1653,6 +1674,31 @@ fn apply_custom_tag_from_entry(
         }
     };
     tag_selected(options, widgets, state, undo_state, mutation);
+    update_custom_tag_controls(widgets, state);
+}
+
+fn update_custom_tag_controls(widgets: &Widgets, state: &SharedState) {
+    let tag = widgets.custom_tag_entry.text().trim().to_string();
+    let can_remove = !tag.is_empty()
+        && state
+            .borrow()
+            .selected_thread
+            .as_ref()
+            .is_some_and(|thread| thread.tags.iter().any(|existing| existing == &tag));
+    widgets.add_custom_tag_button.set_visible(true);
+    widgets.remove_custom_tag_button.set_visible(can_remove);
+}
+
+fn open_custom_tag_editor(widgets: &Widgets, state: &SharedState) {
+    update_custom_tag_controls(widgets, state);
+    widgets.tag_menu_button.popup();
+    set_input_mode(
+        widgets,
+        state,
+        InputMode::Insert,
+        "Insert mode: tag (Esc for normal)",
+    );
+    widgets.custom_tag_entry.grab_focus();
 }
 
 fn widget_token(value: &str) -> String {
@@ -2377,15 +2423,112 @@ fn vim_scroll_to_edge(widgets: &Widgets, state: &SharedState, bottom: bool) {
 }
 
 fn scroll_html_view_lines(widgets: &Widgets, lines: f64) {
-    scroll_window_lines(&widgets.html_scrolled, lines);
+    evaluate_html_scroll_script(
+        widgets,
+        &format!(
+            "const e = document.scrollingElement || document.documentElement || document.body; \
+             e.scrollBy(0, {}); \
+             JSON.stringify({{y:e.scrollTop,h:e.scrollHeight,c:e.clientHeight}});",
+            (lines * 40.0).round()
+        ),
+    );
 }
 
 fn scroll_html_view_pages(widgets: &Widgets, pages: f64) {
-    scroll_window_pages(&widgets.html_scrolled, pages);
+    evaluate_html_scroll_script(
+        widgets,
+        &format!(
+            "const e = document.scrollingElement || document.documentElement || document.body; \
+             e.scrollBy(0, Math.round(window.innerHeight * {})); \
+             JSON.stringify({{y:e.scrollTop,h:e.scrollHeight,c:e.clientHeight}});",
+            pages
+        ),
+    );
 }
 
 fn scroll_html_view_to_edge(widgets: &Widgets, bottom: bool) {
-    scroll_window_to_edge(&widgets.html_scrolled, bottom);
+    let target = if bottom { "e.scrollHeight" } else { "0" };
+    evaluate_html_scroll_script(
+        widgets,
+        &format!(
+            "const e = document.scrollingElement || document.documentElement || document.body; \
+             e.scrollTo(0, {target}); \
+             JSON.stringify({{y:e.scrollTop,h:e.scrollHeight,c:e.clientHeight}});"
+        ),
+    );
+}
+
+fn evaluate_html_scroll_script(widgets: &Widgets, script: &str) {
+    let status = widgets.status_label.clone();
+    widgets.html_view.evaluate_javascript(
+        script,
+        Some("notm-scroll"),
+        Some("notm://scroll"),
+        None::<&gtk::gio::Cancellable>,
+        move |result| {
+            if let Err(err) = result {
+                status.set_text(&format!("HTML scroll failed: {err}"));
+            }
+        },
+    );
+}
+
+fn evaluate_html_javascript_json_sync(
+    widgets: &Widgets,
+    script: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let slot: Rc<RefCell<Option<anyhow::Result<serde_json::Value>>>> = Rc::new(RefCell::new(None));
+    let slot_for_callback = slot.clone();
+    widgets.html_view.evaluate_javascript(
+        script,
+        Some("notm-automation"),
+        Some("notm://automation"),
+        None::<&gtk::gio::Cancellable>,
+        move |result| {
+            let parsed = match result {
+                Ok(value) => serde_json::from_str::<serde_json::Value>(&value.to_str())
+                    .map_err(anyhow::Error::from),
+                Err(err) => Err(anyhow::anyhow!(err.to_string())),
+            };
+            *slot_for_callback.borrow_mut() = Some(parsed);
+        },
+    );
+    let context = gtk::glib::MainContext::default();
+    let started = Instant::now();
+    while slot.borrow().is_none() && started.elapsed() < Duration::from_secs(2) {
+        while context.pending() {
+            context.iteration(false);
+        }
+        if slot.borrow().is_none() {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    slot.borrow_mut()
+        .take()
+        .unwrap_or_else(|| Err(anyhow::anyhow!("HTML JavaScript evaluation timed out")))
+}
+
+fn spin_main_context_for(duration: Duration) {
+    let context = gtk::glib::MainContext::default();
+    let started = Instant::now();
+    while started.elapsed() < duration {
+        while context.pending() {
+            context.iteration(false);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn html_scroll_state(widgets: &Widgets) -> serde_json::Value {
+    match evaluate_html_javascript_json_sync(
+        widgets,
+        "const e = document.scrollingElement || document.documentElement || document.body; \
+         JSON.stringify({y:e.scrollTop,h:e.scrollHeight,c:e.clientHeight, \
+         canScroll:e.scrollHeight > e.clientHeight});",
+    ) {
+        Ok(value) => json!({"ok": true, "scroll": value}),
+        Err(err) => json!({"ok": false, "error": err.to_string()}),
+    }
 }
 
 fn select_thread_edge(
@@ -2942,6 +3085,10 @@ fn install_shortcuts(
         } else if key == gtk::gdk::Key::f {
             clear_numeric_prefix(&numeric_prefix);
             toggle_flagged_selected(&opts, &w, &st, &undo);
+            true
+        } else if key == gtk::gdk::Key::T {
+            clear_numeric_prefix(&numeric_prefix);
+            open_custom_tag_editor(&w, &st);
             true
         } else if key == gtk::gdk::Key::r {
             clear_numeric_prefix(&numeric_prefix);
@@ -4286,7 +4433,7 @@ fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, sta
             "remote images blocked"
         };
         widgets.html_policy_label.set_text(&format!(
-            "Sanitized HTML view: JavaScript disabled; {image_policy}; link navigation blocked in-app."
+            "Sanitized HTML view: message JavaScript disabled; {image_policy}; link navigation blocked in-app."
         ));
     }
 
@@ -4645,7 +4792,7 @@ fn show_compose_view(widgets: &Widgets) {
 
 fn configure_html_webview(view: &webkit6::WebView, allow_remote_images: bool) {
     if let Some(settings) = WebViewExt::settings(view) {
-        settings.set_enable_javascript(false);
+        settings.set_enable_javascript(true);
         settings.set_enable_javascript_markup(false);
         settings.set_enable_developer_extras(false);
         settings.set_allow_file_access_from_file_urls(false);
@@ -5863,6 +6010,7 @@ fn select_thread_by_index(
     if let Some(row) = widgets.thread_list.row_at_index(index as i32) {
         focus_thread_row(&row);
     }
+    update_custom_tag_controls(widgets, state);
     update_message_action_buttons(options, widgets, state);
     update_debug(widgets, state);
 }
@@ -5923,6 +6071,7 @@ fn open_thread_by_index(
                 .set_text(&format!("Open thread failed: {err}"));
         }
     }
+    update_custom_tag_controls(widgets, state);
     update_debug(widgets, state);
 }
 
@@ -5965,6 +6114,7 @@ fn tag_selected(
         Ok(changed_messages) => {
             apply_local_tag_mutation(widgets, state, &mutation);
             update_message_header(widgets, state);
+            update_custom_tag_controls(widgets, state);
             update_message_action_buttons(options, widgets, state);
             let undo_available = changed_messages > 0;
             set_undo_tag_available(widgets, undo_available);
@@ -6162,6 +6312,7 @@ fn undo_last_tag(
             if selected_query_matches {
                 apply_local_tag_mutation(widgets, state, &mutation);
                 update_message_header(widgets, state);
+                update_custom_tag_controls(widgets, state);
                 update_message_action_buttons(options, widgets, state);
             } else {
                 let current = state.borrow().current_query.clone();
@@ -7215,6 +7366,17 @@ fn handle_automation_request(
                 "html_view": html_view_state(options, widgets, state),
                 "last_error": state.borrow().last_error,
             })
+        }
+        "html_scroll_state" => html_scroll_state(widgets),
+        "scroll_html_view_lines" => {
+            let lines = req
+                .args
+                .get("lines")
+                .and_then(|value| value.as_f64())
+                .unwrap_or(1.0);
+            scroll_html_view_lines(widgets, lines);
+            spin_main_context_for(Duration::from_millis(150));
+            html_scroll_state(widgets)
         }
         "image_policy" => {
             activate_image_policy_button(options, widgets, state);
