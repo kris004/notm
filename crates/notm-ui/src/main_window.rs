@@ -749,7 +749,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     outer_paned.set_wide_handle(true);
     outer_paned.set_start_child(Some(&left));
     outer_paned.set_end_child(Some(&content_paned));
-    outer_paned.set_position(SIDEBAR_MIN_WIDTH + 20);
+    outer_paned.set_position(SIDEBAR_MIN_WIDTH);
     outer_paned.set_hexpand(true);
     outer_paned.set_vexpand(true);
     root.append(&outer_paned);
@@ -1847,7 +1847,8 @@ fn enter_insert_mode_for_active_pane(widgets: &Widgets, state: &SharedState) {
         InputMode::Insert,
         "Insert mode (Esc for normal)",
     );
-    match state.borrow().active_pane {
+    let active_pane = state.borrow().active_pane;
+    match active_pane {
         ActivePane::Sidebar => widgets.saved_query_entry.grab_focus(),
         ActivePane::Threads => widgets.search_entry.grab_focus(),
         ActivePane::Message if compose_view_is_visible(widgets) => widgets.compose_to.grab_focus(),
@@ -2156,7 +2157,11 @@ where
     let w = widgets.clone();
     let st = state.clone();
     focus.connect_enter(move |_| {
-        st.borrow_mut().input_mode = InputMode::Insert;
+        let Ok(mut state) = st.try_borrow_mut() else {
+            return;
+        };
+        state.input_mode = InputMode::Insert;
+        drop(state);
         update_button_binding_labels(&w, &st);
     });
     widget.add_controller(focus);
@@ -2230,6 +2235,7 @@ fn install_shortcuts(
     widgets.window.add_controller(capture_controller);
 
     let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
@@ -2248,14 +2254,12 @@ fn install_shortcuts(
             *pending_go.borrow_mut() = false;
             let count = take_numeric_prefix(&numeric_prefix);
             let handled = if key == gtk::gdk::Key::g {
-                if st.borrow().active_pane == ActivePane::Threads {
-                    if let Some(count) = count {
-                        select_thread_absolute(&opts, &w, &st, count);
-                    } else {
-                        select_thread_edge(&opts, &w, &st, false);
-                    }
-                } else if count.is_none() {
+                if let Some(count) = count {
+                    select_thread_absolute(&opts, &w, &st, count);
+                } else if st.borrow().active_pane == ActivePane::Message {
                     vim_scroll_to_edge(&w, &st, false);
+                } else {
+                    select_thread_edge(&opts, &w, &st, false);
                 }
                 true
             } else if key_to_digit(key).is_some()
@@ -2336,14 +2340,12 @@ fn install_shortcuts(
             clear_numeric_prefix(&numeric_prefix);
             true
         } else if key == gtk::gdk::Key::G {
-            if st.borrow().active_pane == ActivePane::Threads {
-                if numeric_prefix.borrow().is_empty() {
-                    select_thread_edge(&opts, &w, &st, true);
-                } else {
-                    select_thread_absolute(&opts, &w, &st, count);
-                }
-            } else {
+            if !numeric_prefix.borrow().is_empty() {
+                select_thread_absolute(&opts, &w, &st, count);
+            } else if st.borrow().active_pane == ActivePane::Message {
                 vim_scroll_to_edge(&w, &st, true);
+            } else {
+                select_thread_edge(&opts, &w, &st, true);
             }
             clear_numeric_prefix(&numeric_prefix);
             true
@@ -4823,6 +4825,9 @@ fn apply_search_data(
         if data.cached { " (cached)" } else { "" }
     ));
     update_thread_result_label(widgets, state);
+    if state.borrow().input_mode == InputMode::Normal {
+        focus_active_pane(widgets, state);
+    }
     update_debug(widgets, state);
 }
 
@@ -4832,6 +4837,12 @@ fn append_search_data(
     state: &SharedState,
     data: SearchData,
 ) {
+    let selected_thread_id = state
+        .borrow()
+        .selected_thread
+        .as_ref()
+        .map(|thread| thread.thread_id.clone());
+    let selected_index = selected_thread_index(widgets);
     {
         let mut s = state.borrow_mut();
         s.current_query = data.query.clone();
@@ -4853,6 +4864,7 @@ fn append_search_data(
         ));
     }
     populate_thread_list(options, widgets, state);
+    restore_thread_selection(widgets, state, selected_thread_id, selected_index);
     update_tag_searches(options, widgets, state);
     widgets.status_label.set_text(&format!(
         "Loaded {} of {} thread(s)",
@@ -4861,6 +4873,29 @@ fn append_search_data(
     ));
     update_thread_result_label(widgets, state);
     update_debug(widgets, state);
+}
+
+fn restore_thread_selection(
+    widgets: &Widgets,
+    state: &SharedState,
+    selected_thread_id: Option<String>,
+    selected_index: Option<usize>,
+) {
+    let threads = state.borrow().thread_list_items.clone();
+    let index = selected_thread_id
+        .and_then(|thread_id| {
+            threads
+                .iter()
+                .position(|thread| thread.thread_id == thread_id)
+        })
+        .or(selected_index)
+        .filter(|index| *index < threads.len());
+    if let Some(index) = index
+        && let Some(row) = widgets.thread_list.row_at_index(index as i32)
+    {
+        widgets.thread_list.select_row(Some(&row));
+        focus_thread_row(&row);
+    }
 }
 
 fn update_thread_result_label(widgets: &Widgets, state: &SharedState) {
