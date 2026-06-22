@@ -749,7 +749,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     outer_paned.set_wide_handle(true);
     outer_paned.set_start_child(Some(&left));
     outer_paned.set_end_child(Some(&content_paned));
-    outer_paned.set_position(260);
+    outer_paned.set_position(SIDEBAR_MIN_WIDTH + 20);
     outer_paned.set_hexpand(true);
     outer_paned.set_vexpand(true);
     root.append(&outer_paned);
@@ -959,6 +959,38 @@ fn built_in_saved_searches() -> Vec<SavedSearch> {
     ]
 }
 
+fn saved_search_binding(name: &str) -> Option<&'static str> {
+    match name {
+        "Inbox" => Some("g i"),
+        "Unread" => Some("g u"),
+        "Flagged" => Some("g f"),
+        "Sent" => Some("g s"),
+        "Drafts" => Some("g d"),
+        "All" => Some("g a"),
+        _ => None,
+    }
+}
+
+fn update_saved_search_button_labels(widgets: &Widgets, state: &SharedState) {
+    let mut child = widgets.saved_box.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        let Ok(button) = widget.downcast::<gtk::Button>() else {
+            continue;
+        };
+        let name = button
+            .tooltip_text()
+            .map(|text| text.to_string())
+            .unwrap_or_else(|| strip_binding_suffix(&button.label().unwrap_or_default()));
+        set_button_label(
+            &button,
+            &name,
+            saved_search_binding(&name).unwrap_or_default(),
+            state,
+        );
+    }
+}
+
 fn refresh_saved_searches(
     options: &LaunchOptions,
     widgets: &Widgets,
@@ -973,6 +1005,7 @@ fn refresh_saved_searches(
     for saved in searches {
         let btn = gtk::Button::with_label(&saved.name);
         btn.set_widget_name(&format!("notm-saved-search-{}", widget_token(&saved.name)));
+        btn.set_tooltip_text(Some(&saved.name));
         let st = state.clone();
         let w = widgets.clone();
         let opts = options.clone();
@@ -981,6 +1014,7 @@ fn refresh_saved_searches(
         });
         widgets.saved_box.append(&btn);
     }
+    update_saved_search_button_labels(widgets, state);
     update_tag_searches(options, widgets, state);
 }
 
@@ -1053,6 +1087,7 @@ fn update_tag_searches(options: &LaunchOptions, widgets: &Widgets, state: &Share
         }
         widgets.tag_search_box.append(&button);
     }
+    update_tag_search_button_labels(widgets, state);
 }
 
 fn append_tag_search_button(
@@ -1075,6 +1110,7 @@ fn append_tag_search_button_to_box(
 ) {
     let button = gtk::Button::with_label(label);
     button.set_widget_name(&format!("notm-tag-search-{}", widget_token(tag)));
+    button.set_tooltip_text(Some(tag));
     let tag = tag.to_string();
     let query = tag_query(&tag);
     let opts = options.clone();
@@ -1086,6 +1122,98 @@ fn append_tag_search_button_to_box(
 
 fn tag_query(tag: &str) -> String {
     format!("tag:\"{}\"", tag.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn tag_button_base_label(tag: &str) -> String {
+    tag.rsplit_once('/')
+        .map(|(_, leaf)| leaf.to_string())
+        .unwrap_or_else(|| tag.to_string())
+}
+
+fn collect_visible_tag_button_targets(widgets: &Widgets) -> Vec<String> {
+    let mut targets = Vec::new();
+    collect_tag_button_targets_from_widget(&widgets.tag_search_box.clone().upcast(), &mut targets);
+    targets
+}
+
+fn collect_tag_button_targets_from_widget(widget: &gtk::Widget, targets: &mut Vec<String>) {
+    if let Ok(button) = widget.clone().downcast::<gtk::Button>()
+        && let Some(tag) = button.tooltip_text()
+    {
+        targets.push(tag.to_string());
+    }
+    if let Ok(menu_button) = widget.clone().downcast::<gtk::MenuButton>()
+        && let Some(popover) = menu_button.popover()
+        && let Some(child) = popover.child()
+    {
+        collect_tag_button_targets_from_widget(&child, targets);
+    }
+    let mut child = widget.first_child();
+    while let Some(child_widget) = child {
+        child = child_widget.next_sibling();
+        collect_tag_button_targets_from_widget(&child_widget, targets);
+    }
+}
+
+fn update_tag_search_button_labels(widgets: &Widgets, state: &SharedState) {
+    let targets = collect_visible_tag_button_targets(widgets);
+    update_tag_search_button_labels_in_widget(
+        &widgets.tag_search_box.clone().upcast(),
+        &targets,
+        state,
+    );
+}
+
+fn update_tag_search_button_labels_in_widget(
+    widget: &gtk::Widget,
+    targets: &[String],
+    state: &SharedState,
+) {
+    if let Ok(button) = widget.clone().downcast::<gtk::Button>()
+        && let Some(tag) = button.tooltip_text()
+    {
+        let tag = tag.to_string();
+        let base = tag_button_base_label(&tag);
+        let binding = targets
+            .iter()
+            .position(|target| target == &tag)
+            .filter(|index| *index < 9)
+            .map(|index| format!("g {}", index + 1))
+            .unwrap_or_default();
+        set_button_label(&button, &base, &binding, state);
+    }
+    if let Ok(menu_button) = widget.clone().downcast::<gtk::MenuButton>()
+        && let Some(popover) = menu_button.popover()
+        && let Some(child) = popover.child()
+    {
+        update_tag_search_button_labels_in_widget(&child, targets, state);
+    }
+    let mut child = widget.first_child();
+    while let Some(child_widget) = child {
+        child = child_widget.next_sibling();
+        update_tag_search_button_labels_in_widget(&child_widget, targets, state);
+    }
+}
+
+fn open_visible_tag_by_key(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    key: gtk::gdk::Key,
+) -> bool {
+    let Some(digit) = key_to_digit(key) else {
+        return false;
+    };
+    if !(1..=9).contains(&digit) {
+        return false;
+    }
+    let targets = collect_visible_tag_button_targets(widgets);
+    let Some(tag) = targets.get(digit as usize - 1).cloned() else {
+        return false;
+    };
+    activate_saved_search(options, widgets, state, &tag, &tag_query(&tag));
+    set_active_pane(widgets, state, ActivePane::Threads);
+    true
 }
 
 fn is_duplicate_tag_search(options: &LaunchOptions, tag: &str) -> bool {
@@ -1781,7 +1909,14 @@ fn move_active_pane(widgets: &Widgets, state: &SharedState, delta: isize) {
 fn scroll_adjustment(adjustment: &gtk::Adjustment, delta: f64) {
     let lower = adjustment.lower();
     let upper = (adjustment.upper() - adjustment.page_size()).max(lower);
-    adjustment.set_value((adjustment.value() + delta).clamp(lower, upper));
+    let value = if delta.is_infinite() && delta.is_sign_positive() {
+        upper
+    } else if delta.is_infinite() && delta.is_sign_negative() {
+        lower
+    } else {
+        (adjustment.value() + delta).clamp(lower, upper)
+    };
+    adjustment.set_value(value);
 }
 
 fn scroll_window_lines(scrolled: &gtk::ScrolledWindow, lines: f64) {
@@ -1814,7 +1949,7 @@ fn active_message_scrolled(widgets: &Widgets) -> gtk::ScrolledWindow {
 
 fn vim_scroll_lines(widgets: &Widgets, state: &SharedState, lines: f64) {
     match state.borrow().active_pane {
-        ActivePane::Threads => scroll_window_lines(&widgets.thread_scrolled, lines),
+        ActivePane::Threads => {}
         ActivePane::Sidebar => scroll_window_lines(&widgets.thread_scrolled, lines),
         ActivePane::Message => scroll_window_lines(&active_message_scrolled(widgets), lines),
     }
@@ -1822,7 +1957,7 @@ fn vim_scroll_lines(widgets: &Widgets, state: &SharedState, lines: f64) {
 
 fn vim_scroll_pages(widgets: &Widgets, state: &SharedState, pages: f64) {
     match state.borrow().active_pane {
-        ActivePane::Threads => scroll_window_pages(&widgets.thread_scrolled, pages),
+        ActivePane::Threads => {}
         ActivePane::Sidebar => scroll_window_pages(&widgets.thread_scrolled, pages),
         ActivePane::Message => scroll_window_pages(&active_message_scrolled(widgets), pages),
     }
@@ -1830,7 +1965,7 @@ fn vim_scroll_pages(widgets: &Widgets, state: &SharedState, pages: f64) {
 
 fn vim_scroll_to_edge(widgets: &Widgets, state: &SharedState, bottom: bool) {
     match state.borrow().active_pane {
-        ActivePane::Threads => scroll_window_to_edge(&widgets.thread_scrolled, bottom),
+        ActivePane::Threads => {}
         ActivePane::Sidebar => scroll_window_to_edge(&widgets.thread_scrolled, bottom),
         ActivePane::Message => scroll_window_to_edge(&active_message_scrolled(widgets), bottom),
     }
@@ -1848,9 +1983,46 @@ fn select_thread_edge(
     }
     let index = if bottom { len - 1 } else { 0 };
     if let Some(row) = widgets.thread_list.row_at_index(index as i32) {
+        let already_selected = selected_thread_index(widgets) == Some(index);
         widgets.thread_list.select_row(Some(&row));
-        select_thread_by_index(options, widgets, state, index, false);
+        focus_thread_row(&row);
+        if already_selected {
+            select_thread_by_index(options, widgets, state, index, false);
+        }
     }
+}
+
+fn select_thread_absolute(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    one_based: usize,
+) {
+    let len = state.borrow().thread_list_items.len();
+    if len == 0 {
+        return;
+    }
+    let index = one_based.saturating_sub(1).min(len - 1);
+    if let Some(row) = widgets.thread_list.row_at_index(index as i32) {
+        let already_selected = selected_thread_index(widgets) == Some(index);
+        widgets.thread_list.select_row(Some(&row));
+        focus_thread_row(&row);
+        if already_selected {
+            select_thread_by_index(options, widgets, state, index, false);
+        }
+    }
+}
+
+fn visible_thread_row_count(widgets: &Widgets) -> isize {
+    let row_height = widgets
+        .thread_list
+        .selected_row()
+        .or_else(|| widgets.thread_list.row_at_index(0))
+        .map(|row| row.height().max(1) as f64)
+        .unwrap_or(64.0);
+    (widgets.thread_scrolled.vadjustment().page_size() / row_height)
+        .floor()
+        .max(1.0) as isize
 }
 
 fn select_thread_page(
@@ -1859,8 +2031,36 @@ fn select_thread_page(
     state: &SharedState,
     pages: isize,
 ) {
-    let page = state.borrow().thread_page_size.clamp(5, 25) as isize;
+    let page = (visible_thread_row_count(widgets) / 2).max(1);
     select_relative_thread(options, widgets, state, page * pages);
+}
+
+fn focus_thread_row(row: &gtk::ListBoxRow) {
+    row.grab_focus();
+}
+
+fn key_to_digit(key: gtk::gdk::Key) -> Option<u8> {
+    key.to_unicode()
+        .and_then(|ch| ch.to_digit(10))
+        .map(|digit| digit as u8)
+}
+
+fn numeric_prefix_value(prefix: &Rc<RefCell<String>>) -> Option<usize> {
+    let prefix = prefix.borrow();
+    if prefix.is_empty() {
+        return None;
+    }
+    prefix.parse::<usize>().ok().filter(|value| *value > 0)
+}
+
+fn take_numeric_prefix(prefix: &Rc<RefCell<String>>) -> Option<usize> {
+    let value = numeric_prefix_value(prefix);
+    prefix.borrow_mut().clear();
+    value
+}
+
+fn clear_numeric_prefix(prefix: &Rc<RefCell<String>>) {
+    prefix.borrow_mut().clear();
 }
 
 fn button_label(base: &str, binding: &str, state: &SharedState) -> String {
@@ -1931,6 +2131,8 @@ fn update_button_binding_labels(widgets: &Widgets, state: &SharedState) {
         state,
     );
     set_button_label(&widgets.send_button, "Send", "Ctrl+Enter", state);
+    update_saved_search_button_labels(widgets, state);
+    update_tag_search_button_labels(widgets, state);
 }
 
 fn connect_input_mode_focus(widgets: &Widgets, state: &SharedState) {
@@ -2003,15 +2205,17 @@ fn install_shortcuts(
         if ctrl && (key == gtk::gdk::Key::d || key == gtk::gdk::Key::D) {
             if st.borrow().active_pane == ActivePane::Threads {
                 select_thread_page(&opts, &w, &st, 1);
+            } else {
+                vim_scroll_pages(&w, &st, 0.5);
             }
-            vim_scroll_pages(&w, &st, 0.5);
             return gtk::glib::Propagation::Stop;
         }
         if ctrl && (key == gtk::gdk::Key::u || key == gtk::gdk::Key::U) {
             if st.borrow().active_pane == ActivePane::Threads {
                 select_thread_page(&opts, &w, &st, -1);
+            } else {
+                vim_scroll_pages(&w, &st, -0.5);
             }
-            vim_scroll_pages(&w, &st, -0.5);
             return gtk::glib::Propagation::Stop;
         }
         if key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter {
@@ -2031,6 +2235,7 @@ fn install_shortcuts(
     let st = state.clone();
     let undo = undo_state.clone();
     let pending_go = Rc::new(RefCell::new(false));
+    let numeric_prefix = Rc::new(RefCell::new(String::new()));
     controller.connect_key_pressed(move |_, key, _, mods| {
         let ctrl = mods.contains(gtk::gdk::ModifierType::CONTROL_MASK);
         if ctrl {
@@ -2041,11 +2246,22 @@ fn install_shortcuts(
         }
         if *pending_go.borrow() {
             *pending_go.borrow_mut() = false;
+            let count = take_numeric_prefix(&numeric_prefix);
             let handled = if key == gtk::gdk::Key::g {
                 if st.borrow().active_pane == ActivePane::Threads {
-                    select_thread_edge(&opts, &w, &st, false);
+                    if let Some(count) = count {
+                        select_thread_absolute(&opts, &w, &st, count);
+                    } else {
+                        select_thread_edge(&opts, &w, &st, false);
+                    }
+                } else if count.is_none() {
+                    vim_scroll_to_edge(&w, &st, false);
                 }
-                vim_scroll_to_edge(&w, &st, false);
+                true
+            } else if key_to_digit(key).is_some()
+                && count.is_none()
+                && open_visible_tag_by_key(&opts, &w, &st, key)
+            {
                 true
             } else if key == gtk::gdk::Key::i {
                 open_saved_search_name(&opts, &w, &st, "Inbox");
@@ -2080,42 +2296,66 @@ fn install_shortcuts(
                 gtk::glib::Propagation::Proceed
             };
         }
+        if let Some(digit) = key_to_digit(key)
+            && (digit != 0 || !numeric_prefix.borrow().is_empty())
+        {
+            numeric_prefix.borrow_mut().push(char::from(b'0' + digit));
+            w.status_label
+                .set_text(&format!("count: {}", numeric_prefix.borrow()));
+            return gtk::glib::Propagation::Stop;
+        }
+        let count = numeric_prefix_value(&numeric_prefix).unwrap_or(1);
         let handled = if key == gtk::gdk::Key::slash {
+            clear_numeric_prefix(&numeric_prefix);
             enter_insert_mode_for_search(&w, &st);
             true
         } else if key == gtk::gdk::Key::i {
+            clear_numeric_prefix(&numeric_prefix);
             enter_insert_mode_for_active_pane(&w, &st);
             true
         } else if key == gtk::gdk::Key::g {
             *pending_go.borrow_mut() = true;
-            w.status_label
-                .set_text("Go: g top, i inbox, u unread, f flagged, s sent, d drafts, a all");
+            w.status_label.set_text(
+                "Go: g top/count, 1-9 tags, i inbox, u unread, f flagged, s sent, d drafts, a all",
+            );
             true
         } else if key == gtk::gdk::Key::j || key == gtk::gdk::Key::Down {
             if st.borrow().active_pane == ActivePane::Threads {
-                select_relative_thread(&opts, &w, &st, 1);
+                select_relative_thread(&opts, &w, &st, count as isize);
+            } else {
+                vim_scroll_lines(&w, &st, count as f64);
             }
-            vim_scroll_lines(&w, &st, 1.0);
+            clear_numeric_prefix(&numeric_prefix);
             true
         } else if key == gtk::gdk::Key::k || key == gtk::gdk::Key::Up {
             if st.borrow().active_pane == ActivePane::Threads {
-                select_relative_thread(&opts, &w, &st, -1);
+                select_relative_thread(&opts, &w, &st, -(count as isize));
+            } else {
+                vim_scroll_lines(&w, &st, -(count as f64));
             }
-            vim_scroll_lines(&w, &st, -1.0);
+            clear_numeric_prefix(&numeric_prefix);
             true
         } else if key == gtk::gdk::Key::G {
             if st.borrow().active_pane == ActivePane::Threads {
-                select_thread_edge(&opts, &w, &st, true);
+                if numeric_prefix.borrow().is_empty() {
+                    select_thread_edge(&opts, &w, &st, true);
+                } else {
+                    select_thread_absolute(&opts, &w, &st, count);
+                }
+            } else {
+                vim_scroll_to_edge(&w, &st, true);
             }
-            vim_scroll_to_edge(&w, &st, true);
+            clear_numeric_prefix(&numeric_prefix);
             true
         } else if key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter {
+            clear_numeric_prefix(&numeric_prefix);
             if st.borrow().active_pane == ActivePane::Threads {
                 let idx = selected_thread_index(&w).unwrap_or(0);
                 open_thread_by_index(&opts, &w, &st, idx);
             }
             true
         } else if key == gtk::gdk::Key::a {
+            clear_numeric_prefix(&numeric_prefix);
             tag_selected(
                 &opts,
                 &w,
@@ -2129,21 +2369,27 @@ fn install_shortcuts(
             );
             true
         } else if key == gtk::gdk::Key::u {
+            clear_numeric_prefix(&numeric_prefix);
             toggle_unread_selected(&opts, &w, &st, &undo);
             true
         } else if key == gtk::gdk::Key::f {
+            clear_numeric_prefix(&numeric_prefix);
             toggle_flagged_selected(&opts, &w, &st, &undo);
             true
         } else if key == gtk::gdk::Key::r {
+            clear_numeric_prefix(&numeric_prefix);
             reply_selected(&opts, &w, &st, ReplyKind::Sender);
             true
         } else if key == gtk::gdk::Key::R {
+            clear_numeric_prefix(&numeric_prefix);
             reply_selected(&opts, &w, &st, ReplyKind::All);
             true
         } else if key == gtk::gdk::Key::c {
+            clear_numeric_prefix(&numeric_prefix);
             open_compose(&w, &st);
             true
         } else if key == gtk::gdk::Key::t {
+            clear_numeric_prefix(&numeric_prefix);
             tag_selected(
                 &opts,
                 &w,
@@ -2157,6 +2403,7 @@ fn install_shortcuts(
             );
             true
         } else if key == gtk::gdk::Key::s {
+            clear_numeric_prefix(&numeric_prefix);
             tag_selected(
                 &opts,
                 &w,
@@ -2170,27 +2417,35 @@ fn install_shortcuts(
             );
             true
         } else if key == gtk::gdk::Key::z {
+            clear_numeric_prefix(&numeric_prefix);
             undo_last_tag(&opts, &w, &st, &undo);
             true
         } else if key == gtk::gdk::Key::F {
+            clear_numeric_prefix(&numeric_prefix);
             forward_selected(&opts, &w, &st);
             true
         } else if key == gtk::gdk::Key::v {
+            clear_numeric_prefix(&numeric_prefix);
             toggle_text_visual_view(&opts, &w, &st);
             true
         } else if key == gtk::gdk::Key::q {
+            clear_numeric_prefix(&numeric_prefix);
             toggle_quote_collapse(&opts, &w, &st);
             true
         } else if key == gtk::gdk::Key::y {
+            clear_numeric_prefix(&numeric_prefix);
             copy_selected_message_id(&w, &st);
             true
         } else if key == gtk::gdk::Key::Y {
+            clear_numeric_prefix(&numeric_prefix);
             copy_selected_thread_id(&w, &st);
             true
         } else if key == gtk::gdk::Key::I {
+            clear_numeric_prefix(&numeric_prefix);
             activate_image_policy_button(&opts, &w, &st);
             true
         } else if key == gtk::gdk::Key::S && compose_view_is_visible(&w) {
+            clear_numeric_prefix(&numeric_prefix);
             match save_current_draft(&opts, &w, &st) {
                 Ok(_) => w.status_label.set_text("Draft saved"),
                 Err(err) => w
@@ -2200,21 +2455,26 @@ fn install_shortcuts(
             refresh_draft_list(&w);
             true
         } else if key == gtk::gdk::Key::x && compose_view_is_visible(&w) {
+            clear_numeric_prefix(&numeric_prefix);
             clear_draft_widgets(&w, &st);
             let _ = clear_draft_file(&w.draft_path);
             w.status_label.set_text("Composer closed");
             true
         } else if key == gtk::gdk::Key::D && compose_view_is_visible(&w) {
+            clear_numeric_prefix(&numeric_prefix);
             delete_active_draft_from_ui(&opts, &w, &st);
             true
         } else if key == gtk::gdk::Key::d {
+            clear_numeric_prefix(&numeric_prefix);
             let visible = w.debug_view.is_visible();
             w.debug_view.set_visible(!visible);
             true
         } else if key == gtk::gdk::Key::comma {
+            clear_numeric_prefix(&numeric_prefix);
             show_settings(&w, &opts);
             true
         } else if key == gtk::gdk::Key::question {
+            clear_numeric_prefix(&numeric_prefix);
             show_shortcuts_overlay(&w);
             true
         } else {
@@ -2298,8 +2558,12 @@ fn select_relative_thread(
     let current = selected_thread_index(widgets).unwrap_or(0) as isize;
     let next = (current + delta).clamp(0, len.saturating_sub(1) as isize) as i32;
     if let Some(row) = widgets.thread_list.row_at_index(next) {
+        let already_selected = selected_thread_index(widgets) == Some(next as usize);
         widgets.thread_list.select_row(Some(&row));
-        select_thread_by_index(options, widgets, state, next as usize, false);
+        focus_thread_row(&row);
+        if already_selected {
+            select_thread_by_index(options, widgets, state, next as usize, false);
+        }
     }
 }
 
@@ -4794,30 +5058,67 @@ fn select_thread_by_index(
     index: usize,
     open: bool,
 ) {
-    let thread = state.borrow().thread_list_items.get(index).cloned();
-    if let Some(thread) = thread {
+    let Some(thread) = state.borrow().thread_list_items.get(index).cloned() else {
+        return;
+    };
+    if open {
+        open_thread_by_index(options, widgets, state, index);
+        return;
+    }
+
+    let result = (|| -> anyhow::Result<()> {
+        let db = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
+        let messages = db.thread_messages(&thread.thread_id)?;
         {
             let mut state = state.borrow_mut();
             state.selected_thread = Some(thread.clone());
-            state.active_pane = if open {
-                ActivePane::Message
-            } else {
-                ActivePane::Threads
-            };
-            if !open {
-                state.selected_message = None;
-                state.messages.clear();
-            }
+            state.selected_message = messages.last().cloned();
+            state.messages = messages;
+            state.active_pane = ActivePane::Threads;
+            state.last_operation = Some(format!("previewed thread {}", thread.thread_id));
+            state.last_error = None;
         }
-        widgets
-            .status_label
-            .set_text(&format!("Selected {}", thread.thread_id));
-        if open {
-            open_thread_by_index(options, widgets, state, index);
-        } else {
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
             refresh_thread_attachment_list(widgets, state);
             update_message_menu(options, widgets, state);
+            if selected_message_is_draft(options, state) {
+                match open_selected_draft_message(widgets, state) {
+                    Ok(()) => {
+                        state.borrow_mut().active_pane = ActivePane::Threads;
+                        focus_active_pane(widgets, state);
+                        widgets.status_label.set_text("Previewed draft");
+                    }
+                    Err(err) => {
+                        state.borrow_mut().last_error = Some(err.to_string());
+                        widgets
+                            .status_label
+                            .set_text(&format!("Preview draft failed: {err}"));
+                    }
+                }
+            } else {
+                set_active_draft(widgets, state, None);
+                show_selected_message_text_view(options, widgets, state);
+                state.borrow_mut().active_pane = ActivePane::Threads;
+                focus_active_pane(widgets, state);
+                widgets
+                    .status_label
+                    .set_text(&format!("Selected {}", thread.thread_id));
+            }
         }
+        Err(err) => {
+            state.borrow_mut().last_error = Some(err.to_string());
+            widgets
+                .status_label
+                .set_text(&format!("Preview thread failed: {err}"));
+            update_debug(widgets, state);
+            return;
+        }
+    }
+    if let Some(row) = widgets.thread_list.row_at_index(index as i32) {
+        focus_thread_row(&row);
     }
     update_message_action_buttons(options, widgets, state);
     update_debug(widgets, state);

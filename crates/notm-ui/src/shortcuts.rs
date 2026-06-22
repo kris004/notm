@@ -3,9 +3,17 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("i", "Insert mode: focus nearest input for the active pane"),
     ("/", "Insert mode in search"),
     ("Ctrl+h/l", "Move active pane left/right"),
-    ("j/k", "Move down/up or scroll the active pane"),
-    ("gg/G", "Top/bottom of the active pane"),
-    ("Ctrl+d/u", "Half page down/up"),
+    (
+        "j/k",
+        "Move selected thread down/up, or scroll the active pane",
+    ),
+    ("<count>j/k", "Move selected thread by count"),
+    ("gg/G", "Top/bottom of the thread list or active pane"),
+    ("<count>gg/G", "Go to thread number"),
+    (
+        "Ctrl+d/u",
+        "Half page down/up through threads or active pane",
+    ),
     ("Enter", "Open selected thread from the thread pane"),
     ("a", "Archive"),
     ("u", "Toggle unread"),
@@ -25,6 +33,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("x", "Discard draft/changes in compose"),
     ("D", "Delete opened local draft in compose"),
     ("g i/u/f/s/d/a", "Inbox/Unread/Flagged/Sent/Drafts/All"),
+    ("g 1-9", "Open the numbered found-tag search"),
     (
         "Message menu",
         "Choose which message in the thread is selected",
