@@ -34,3 +34,29 @@ fn applies_and_undoes_tag_operations_without_cli() -> anyhow::Result<()> {
     assert_eq!(restored, 1);
     Ok(())
 }
+
+#[test]
+fn applies_path_style_tags() -> anyhow::Result<()> {
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let options = QueryOptions {
+        limit: 10,
+        offset: 0,
+        sort: SortOrder::NewestFirst,
+        excluded_tags: vec![],
+    };
+    let db = fixture.open_readwrite()?;
+    db.apply_tags_to_query(
+        "subject:\"Unread inbox message\"",
+        &TagMutation {
+            add: vec!["tests/notm".into()],
+            remove: vec![],
+            sync_maildir_flags: true,
+        },
+    )?;
+    let count = db.count_messages(
+        "subject:\"Unread inbox message\" and tag:\"tests/notm\"",
+        &options,
+    )?;
+    assert_eq!(count, 1);
+    Ok(())
+}

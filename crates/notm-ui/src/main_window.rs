@@ -163,6 +163,7 @@ struct Widgets {
     thread_scrolled: gtk::ScrolledWindow,
     read_toggle_button: gtk::Button,
     flag_toggle_button: gtk::Button,
+    undo_tag_button: gtk::Button,
     message_stack: gtk::Stack,
     message_view: gtk::TextView,
     html_view: webkit6::WebView,
@@ -396,6 +397,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     helper.add_css_class("dim-label");
     middle.append(&helper);
 
+    let action_outer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    action_outer.set_hexpand(true);
     let action_row = button_flow(4);
     let archive_button = gtk::Button::with_label("Archive");
     let read_button = gtk::Button::with_label("Mark read");
@@ -405,30 +408,45 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     let trash_button = gtk::Button::with_label("Trash");
     let spam_button = gtk::Button::with_label("Spam");
     let undo_button = gtk::Button::with_label("Undo tag");
+    undo_button.set_widget_name("notm-undo-tag-button");
+    undo_button.add_css_class("suggested-action");
+    undo_button.set_halign(gtk::Align::End);
+    undo_button.set_visible(false);
     undo_button.set_tooltip_text(Some(
         "Undo only reverses the most recent tag operation from this session.",
     ));
+    let (tag_menu_button, tag_menu_box) =
+        menu_button_with_box("Tag…", "notm-custom-tag-menu-button");
+    tag_menu_box.set_spacing(6);
+    tag_menu_box.set_margin_start(6);
+    tag_menu_box.set_margin_end(6);
+    tag_menu_box.set_margin_top(6);
+    tag_menu_box.set_margin_bottom(6);
     let custom_tag_entry = entry_with_placeholder("tag");
     custom_tag_entry.set_widget_name("notm-custom-tag-entry");
-    custom_tag_entry.set_width_chars(12);
-    let add_tag_button = gtk::Button::with_label("+tag");
+    custom_tag_entry.set_width_chars(18);
+    let tag_button_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let add_tag_button = gtk::Button::with_label("Add tag");
     add_tag_button.set_widget_name("notm-add-custom-tag-button");
-    let remove_tag_button = gtk::Button::with_label("-tag");
+    let remove_tag_button = gtk::Button::with_label("Remove tag");
     remove_tag_button.set_widget_name("notm-remove-custom-tag-button");
+    tag_button_row.append(&add_tag_button);
+    tag_button_row.append(&remove_tag_button);
+    tag_menu_box.append(&custom_tag_entry);
+    tag_menu_box.append(&tag_button_row);
     for b in [
         &archive_button,
         &read_button,
         &flag_button,
         &trash_button,
         &spam_button,
-        &undo_button,
     ] {
         action_row.insert(b, -1);
     }
-    action_row.insert(&custom_tag_entry, -1);
-    action_row.insert(&add_tag_button, -1);
-    action_row.insert(&remove_tag_button, -1);
-    middle.append(&action_row);
+    action_row.insert(&tag_menu_button, -1);
+    action_outer.append(&action_row);
+    action_outer.append(&undo_button);
+    middle.append(&action_outer);
 
     let thread_list = gtk::ListBox::new();
     thread_list.set_widget_name("notm-thread-list");
@@ -716,6 +734,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         thread_scrolled: scrolled_threads,
         read_toggle_button: read_button.clone(),
         flag_toggle_button: flag_button.clone(),
+        undo_tag_button: undo_button.clone(),
         message_stack,
         message_view,
         html_view,
@@ -4167,30 +4186,42 @@ fn tag_selected(
         return;
     };
     let query = format!("thread:{}", thread.thread_id);
-    let result = (|| -> anyhow::Result<()> {
+    let result = (|| -> anyhow::Result<usize> {
         let db = Database::open(&open_config(options), DatabaseMode::ReadWrite)?;
         let report = db.apply_tags_to_query(&query, &mutation)?;
-        *undo_state.borrow_mut() = Some((
-            query.clone(),
-            TagMutation {
-                add: mutation.remove.clone(),
-                remove: mutation.add.clone(),
-                sync_maildir_flags: mutation.sync_maildir_flags,
-            },
-        ));
+        if report.changed_messages == 0 {
+            undo_state.borrow_mut().take();
+        } else {
+            *undo_state.borrow_mut() = Some((
+                query.clone(),
+                TagMutation {
+                    add: mutation.remove.clone(),
+                    remove: mutation.add.clone(),
+                    sync_maildir_flags: mutation.sync_maildir_flags,
+                },
+            ));
+        }
         state.borrow_mut().last_operation = Some(format!(
             "tagged {} message(s): +{:?} -{:?}",
             report.changed_messages, report.added, report.removed
         ));
-        Ok(())
+        Ok(report.changed_messages)
     })();
     match result {
-        Ok(()) => {
+        Ok(changed_messages) => {
             let current = state.borrow().current_query.clone();
             run_search(options, widgets, state, &current);
-            widgets
-                .status_label
-                .set_text("Tag operation complete; Undo tag reverses this change");
+            let undo_available = changed_messages > 0;
+            set_undo_tag_available(widgets, undo_available);
+            if undo_available {
+                widgets
+                    .status_label
+                    .set_text("Tag operation complete; Undo tag reverses this change");
+            } else {
+                widgets
+                    .status_label
+                    .set_text("Tag operation made no changes");
+            }
         }
         Err(err) => {
             state.borrow_mut().last_error = Some(err.to_string());
@@ -4199,6 +4230,15 @@ fn tag_selected(
                 .set_text(&format!("Tag operation failed: {err}"));
             update_debug(widgets, state);
         }
+    }
+}
+
+fn set_undo_tag_available(widgets: &Widgets, available: bool) {
+    widgets.undo_tag_button.set_visible(available);
+    if available {
+        widgets.undo_tag_button.add_css_class("suggested-action");
+    } else {
+        widgets.undo_tag_button.remove_css_class("suggested-action");
     }
 }
 
@@ -4273,7 +4313,8 @@ fn undo_last_tag(
     state: &SharedState,
     undo_state: &UndoState,
 ) {
-    let Some((query, mutation)) = undo_state.borrow_mut().take() else {
+    let Some((query, mutation)) = undo_state.borrow().clone() else {
+        set_undo_tag_available(widgets, false);
         widgets.status_label.set_text("No tag operation to undo");
         return;
     };
@@ -4285,11 +4326,14 @@ fn undo_last_tag(
     })();
     match result {
         Ok(()) => {
+            undo_state.borrow_mut().take();
+            set_undo_tag_available(widgets, false);
             let current = state.borrow().current_query.clone();
             run_search(options, widgets, state, &current);
             widgets.status_label.set_text("Undid last tag operation");
         }
         Err(err) => {
+            set_undo_tag_available(widgets, true);
             state.borrow_mut().last_error = Some(err.to_string());
             widgets
                 .status_label
