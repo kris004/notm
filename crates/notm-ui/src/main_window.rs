@@ -363,7 +363,7 @@ static THREAD_DETAIL_CACHE: OnceLock<Mutex<BTreeMap<String, ThreadUiDetails>>> =
 
 const SIDEBAR_MIN_WIDTH: i32 = 136;
 const THREAD_LIST_MIN_WIDTH: i32 = 320;
-const COMPOSE_BODY_MIN_HEIGHT: i32 = 160;
+const COMPOSE_BODY_MIN_HEIGHT: i32 = 96;
 const COMPOSE_BODY_NATURAL_HEIGHT: i32 = 260;
 const KEYBOARD_CURSOR_CLASS: &str = "notm-keyboard-cursor";
 
@@ -543,8 +543,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     helper.add_css_class("dim-label");
     controls_box.append(&helper);
 
-    let action_outer = gtk::Grid::new();
-    action_outer.set_column_spacing(6);
+    let action_outer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     action_outer.set_hexpand(true);
     action_outer.set_halign(gtk::Align::Fill);
     action_outer.set_valign(gtk::Align::Start);
@@ -634,11 +633,19 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         action_row.insert(b, -1);
     }
     action_row.insert(&tag_menu_button, -1);
+    let undo_row = button_flow(4);
+    undo_row.set_widget_name("notm-undo-tag-row");
+    undo_row.set_hexpand(false);
+    undo_row.set_halign(gtk::Align::End);
+    undo_row.set_valign(gtk::Align::Start);
+    undo_row.set_min_children_per_line(1);
+    undo_row.set_max_children_per_line(1);
     undo_button.set_hexpand(false);
-    undo_button.set_halign(gtk::Align::End);
-    undo_button.set_valign(gtk::Align::Start);
-    action_outer.attach(&action_row, 0, 0, 1, 1);
-    action_outer.attach(&undo_button, 1, 0, 1, 1);
+    undo_button.set_halign(gtk::Align::Fill);
+    undo_button.set_valign(gtk::Align::Fill);
+    undo_row.insert(&undo_button, -1);
+    action_outer.append(&action_row);
+    action_outer.append(&undo_row);
     controls_box.append(&action_outer);
 
     let thread_list = gtk::ListBox::new();
@@ -811,6 +818,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     message_stack.set_widget_name("notm-message-stack");
     message_stack.set_hexpand(true);
     message_stack.set_vexpand(true);
+    message_stack.set_hhomogeneous(false);
+    message_stack.set_vhomogeneous(false);
     message_stack.add_named(&scrolled_message, Some("text"));
     message_stack.add_named(&scrolled_html, Some("html"));
     message_stack.set_visible_child_name("text");
