@@ -2,7 +2,9 @@ pub fn css() -> &'static str {
     r#"
     .notm-tag { padding: 2px 6px; border-radius: 10px; background: alpha(currentColor, .10); }
     #notm-left-sidebar button,
-    #notm-left-sidebar entry {
+    #notm-left-sidebar entry,
+    #notm-left-sidebar-content button,
+    #notm-left-sidebar-content entry {
         min-width: 96px;
     }
     #notm-left-sidebar,

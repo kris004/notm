@@ -163,7 +163,7 @@ pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
 #[derive(Clone)]
 struct Widgets {
     window: gtk::ApplicationWindow,
-    left_pane: gtk::Box,
+    left_pane: gtk::ScrolledWindow,
     thread_pane: gtk::Box,
     message_pane: gtk::Box,
     saved_box: gtk::Box,
@@ -325,6 +325,7 @@ struct ThreadAttachmentItem {
 struct SearchData {
     query: String,
     threads: Vec<notm_notmuch::ThreadSummary>,
+    details: BTreeMap<String, ThreadUiDetails>,
     count: u32,
     offset: usize,
     limit: usize,
@@ -337,6 +338,10 @@ struct SearchData {
 struct SearchResponse {
     generation: u64,
     result: anyhow::Result<SearchData>,
+}
+
+struct AddressSuggestionsResponse {
+    result: anyhow::Result<Vec<String>>,
 }
 
 struct ThreadPageResponse {
@@ -427,13 +432,23 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     root.append(&toolbar);
 
     let left = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    left.set_widget_name("notm-left-sidebar");
+    left.set_widget_name("notm-left-sidebar-content");
     left.set_size_request(SIDEBAR_MIN_WIDTH, -1);
     left.set_focusable(true);
-    left.set_margin_start(8);
-    left.set_margin_end(8);
-    left.set_margin_top(8);
-    left.set_margin_bottom(8);
+
+    let sidebar_scrolled = gtk::ScrolledWindow::new();
+    sidebar_scrolled.set_widget_name("notm-left-sidebar");
+    sidebar_scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    sidebar_scrolled.set_size_request(SIDEBAR_MIN_WIDTH, -1);
+    sidebar_scrolled.set_min_content_width(SIDEBAR_MIN_WIDTH);
+    sidebar_scrolled.set_hexpand(false);
+    sidebar_scrolled.set_vexpand(true);
+    sidebar_scrolled.set_focusable(true);
+    sidebar_scrolled.set_margin_start(8);
+    sidebar_scrolled.set_margin_end(8);
+    sidebar_scrolled.set_margin_top(8);
+    sidebar_scrolled.set_margin_bottom(8);
+    sidebar_scrolled.set_child(Some(&left));
 
     let sidebar_title = gtk::Label::new(Some("Saved searches"));
     sidebar_title.add_css_class("heading");
@@ -491,6 +506,11 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     middle.set_size_request(THREAD_LIST_MIN_WIDTH, -1);
     middle.set_focusable(true);
 
+    let controls_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    controls_box.set_hexpand(true);
+    controls_box.set_halign(gtk::Align::Fill);
+    middle.append(&controls_box);
+
     let search_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let search_entry = gtk::Entry::new();
     search_entry.set_widget_name("notm-search-entry");
@@ -511,18 +531,23 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     search_button.set_widget_name("notm-search-button");
     search_row.append(&search_entry);
     search_row.append(&search_button);
-    middle.append(&search_row);
-    middle.append(&search_suggestions_list);
+    controls_box.append(&search_row);
+    controls_box.append(&search_suggestions_list);
     let helper = gtk::Label::new(Some(
         "Syntax: tag:inbox, from:alice, subject:report, thread:<id>, *",
     ));
     helper.set_xalign(0.0);
     helper.add_css_class("dim-label");
-    middle.append(&helper);
+    controls_box.append(&helper);
 
-    let action_outer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let action_outer = gtk::Grid::new();
+    action_outer.set_column_spacing(6);
     action_outer.set_hexpand(true);
+    action_outer.set_halign(gtk::Align::Fill);
+    action_outer.set_valign(gtk::Align::Start);
     let action_row = button_flow(4);
+    action_row.set_halign(gtk::Align::Fill);
+    action_row.set_hexpand(true);
     let archive_button = gtk::Button::with_label("Archive");
     let read_button = gtk::Button::with_label("Mark read");
     read_button.set_widget_name("notm-read-toggle-button");
@@ -534,6 +559,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     undo_button.set_widget_name("notm-undo-tag-button");
     undo_button.add_css_class("suggested-action");
     undo_button.set_halign(gtk::Align::End);
+    undo_button.set_valign(gtk::Align::Start);
+    undo_button.set_vexpand(false);
     undo_button.set_visible(false);
     undo_button.set_tooltip_text(Some("Undo recent tag operations."));
     undo_menu_box.set_spacing(6);
@@ -603,9 +630,12 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         action_row.insert(b, -1);
     }
     action_row.insert(&tag_menu_button, -1);
-    action_outer.append(&action_row);
-    action_outer.append(&undo_button);
-    middle.append(&action_outer);
+    undo_button.set_hexpand(false);
+    undo_button.set_halign(gtk::Align::End);
+    undo_button.set_valign(gtk::Align::Start);
+    action_outer.attach(&action_row, 0, 0, 1, 1);
+    action_outer.attach(&undo_button, 1, 0, 1, 1);
+    controls_box.append(&action_outer);
 
     let thread_list = gtk::ListBox::new();
     thread_list.set_widget_name("notm-thread-list");
@@ -888,7 +918,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
 
     let outer_paned = gtk::Paned::new(gtk::Orientation::Horizontal);
     outer_paned.set_wide_handle(true);
-    outer_paned.set_start_child(Some(&left));
+    outer_paned.set_start_child(Some(&sidebar_scrolled));
     outer_paned.set_end_child(Some(&content_paned));
     outer_paned.set_resize_start_child(false);
     outer_paned.set_resize_end_child(true);
@@ -910,7 +940,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
 
     let widgets = Widgets {
         window: window.clone(),
-        left_pane: left.clone(),
+        left_pane: sidebar_scrolled.clone(),
         thread_pane: middle.clone(),
         message_pane: right.clone(),
         saved_box,
@@ -1100,9 +1130,30 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     restore_draft_if_present(&widgets, &state);
     refresh_draft_list(&widgets);
     window.present();
-    run_search(&options, &widgets, &state, &options.default_query);
-    refresh_address_suggestions(&options, &widgets, &state);
-    run_startup_sync(&options, &widgets, &state);
+    widgets
+        .status_label
+        .set_text("Starting notm; loading mail…");
+    widgets
+        .thread_result_label
+        .set_text("Loading initial search…");
+    {
+        let opts = options.clone();
+        let w = widgets.clone();
+        let st = state.clone();
+        let query = options.default_query.clone();
+        gtk::glib::timeout_add_local_once(Duration::from_millis(0), move || {
+            run_search_async(&opts, &w, &st, &query);
+            refresh_address_suggestions_async(&opts, &w, &st);
+        });
+    }
+    {
+        let opts = options.clone();
+        let w = widgets.clone();
+        let st = state.clone();
+        gtk::glib::timeout_add_local_once(Duration::from_millis(250), move || {
+            run_startup_sync(&opts, &w, &st);
+        });
+    }
     update_debug(&widgets, &state);
 }
 
@@ -5013,39 +5064,72 @@ fn toggle_flagged_selected(
     tag_selected(options, widgets, state, undo_state, mutation);
 }
 
-fn refresh_address_suggestions(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
-    let result = (|| -> anyhow::Result<Vec<String>> {
-        let db = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
-        let opts = QueryOptions {
-            limit: 500,
-            offset: 0,
-            sort: SortOrder::NewestFirst,
-            excluded_tags: options.excluded_tags.clone(),
-        };
-        let messages = db.search_messages("*", &opts)?;
-        let mut addrs = Vec::new();
-        for msg in messages {
-            addrs.extend(parse_address_list(&msg.from));
-            addrs.extend(parse_address_list(&msg.to));
-            addrs.extend(parse_address_list(&msg.cc));
+fn refresh_address_suggestions_async(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) {
+    let (tx, rx) = mpsc::channel::<AddressSuggestionsResponse>();
+    let opts = options.clone();
+    thread::spawn(move || {
+        let result = collect_address_suggestions(&opts);
+        let _ = tx.send(AddressSuggestionsResponse { result });
+    });
+
+    let w = widgets.clone();
+    let st = state.clone();
+    gtk::glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(response) => {
+            apply_address_suggestions_result(&w, &st, response.result);
+            gtk::glib::ControlFlow::Break
         }
-        let mut own = options
-            .other_email
-            .iter()
-            .map(|s| s.to_lowercase())
-            .collect::<BTreeSet<_>>();
-        if let Some(email) = &options.primary_email {
-            own.insert(email.to_lowercase());
+        Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            st.borrow_mut().last_error = Some("address cache cancelled".to_string());
+            update_debug(&w, &st);
+            gtk::glib::ControlFlow::Break
         }
-        let mut out = dedupe_addresses(addrs)
-            .into_iter()
-            .filter(|addr| !own.contains(&addr.email.to_lowercase()))
-            .map(|addr| format_address(&addr))
-            .collect::<Vec<_>>();
-        out.sort_by_key(|s| s.to_lowercase());
-        out.truncate(200);
-        Ok(out)
-    })();
+    });
+}
+
+fn collect_address_suggestions(options: &LaunchOptions) -> anyhow::Result<Vec<String>> {
+    let db = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
+    let opts = QueryOptions {
+        limit: 500,
+        offset: 0,
+        sort: SortOrder::NewestFirst,
+        excluded_tags: options.excluded_tags.clone(),
+    };
+    let messages = db.search_messages("*", &opts)?;
+    let mut addrs = Vec::new();
+    for msg in messages {
+        addrs.extend(parse_address_list(&msg.from));
+        addrs.extend(parse_address_list(&msg.to));
+        addrs.extend(parse_address_list(&msg.cc));
+    }
+    let mut own = options
+        .other_email
+        .iter()
+        .map(|s| s.to_lowercase())
+        .collect::<BTreeSet<_>>();
+    if let Some(email) = &options.primary_email {
+        own.insert(email.to_lowercase());
+    }
+    let mut out = dedupe_addresses(addrs)
+        .into_iter()
+        .filter(|addr| !own.contains(&addr.email.to_lowercase()))
+        .map(|addr| format_address(&addr))
+        .collect::<Vec<_>>();
+    out.sort_by_key(|s| s.to_lowercase());
+    out.truncate(200);
+    Ok(out)
+}
+
+fn apply_address_suggestions_result(
+    widgets: &Widgets,
+    state: &SharedState,
+    result: anyhow::Result<Vec<String>>,
+) {
     match result {
         Ok(suggestions) => {
             state.borrow_mut().address_suggestions = suggestions;
@@ -7361,6 +7445,49 @@ fn run_search(options: &LaunchOptions, widgets: &Widgets, state: &SharedState, q
     }
 }
 
+fn run_search_async(options: &LaunchOptions, widgets: &Widgets, state: &SharedState, query: &str) {
+    let generation = widgets.search_generation.get().saturating_add(1);
+    widgets.search_generation.set(generation);
+    widgets
+        .status_label
+        .set_text(&format!("Loading search `{query}`…"));
+    widgets.thread_result_label.set_text("Loading search…");
+    widgets.load_more_button.set_sensitive(false);
+
+    let (tx, rx) = mpsc::channel::<SearchResponse>();
+    let opts = options.clone();
+    let query = query.to_string();
+    thread::spawn(move || {
+        let result = execute_search_page(&opts, &query, 0);
+        let _ = tx.send(SearchResponse { generation, result });
+    });
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    gtk::glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(response) => {
+            if response.generation == w.search_generation.get() {
+                match response.result {
+                    Ok(data) => apply_search_data(&opts, &w, &st, data),
+                    Err(err) => apply_search_error(&w, &st, err),
+                }
+            } else {
+                st.borrow_mut().last_operation = Some(format!(
+                    "discarded stale search generation {}",
+                    response.generation
+                ));
+            }
+            gtk::glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            apply_search_error(&w, &st, anyhow::anyhow!("search cancelled"));
+            gtk::glib::ControlFlow::Break
+        }
+    });
+}
+
 fn execute_search(options: &LaunchOptions, query: &str) -> anyhow::Result<SearchData> {
     execute_search_page(options, query, 0)
 }
@@ -7395,9 +7522,11 @@ fn execute_search_page(
     let count = db
         .count_threads(query, &opts)
         .unwrap_or(threads.len() as u32);
+    let details = thread_details_for_threads(&db, &db_path, &revision, &threads);
     let data = SearchData {
         query: query.to_string(),
         threads,
+        details,
         count,
         offset,
         limit: options.page_size,
@@ -7469,17 +7598,21 @@ fn apply_search_data(
     state: &SharedState,
     data: SearchData,
 ) {
+    let query = data.query.clone();
+    let count = data.count;
+    let offset = data.offset;
+    let cached = data.cached;
     {
         let mut s = state.borrow_mut();
-        s.current_query = data.query.clone();
-        s.thread_window_offset = data.offset;
+        s.current_query = query.clone();
+        s.thread_window_offset = offset;
         s.thread_list_items = data.threads;
-        s.thread_total_count = data.count;
+        s.thread_total_count = count;
         s.thread_loaded_count = s.thread_list_items.len();
         s.thread_page_size = data.limit;
         s.can_load_more_threads =
-            s.thread_window_offset + s.thread_list_items.len() < data.count as usize;
-        s.thread_details.clear();
+            s.thread_window_offset + s.thread_list_items.len() < count as usize;
+        s.thread_details = data.details;
         s.selected_thread = None;
         s.selected_message = None;
         s.messages.clear();
@@ -7493,11 +7626,11 @@ fn apply_search_data(
         s.last_error = None;
         s.last_operation = Some(format!(
             "search `{}` loaded {} of {} thread(s) from offset {}{}",
-            data.query,
+            query,
             s.thread_list_items.len(),
-            data.count,
-            data.offset,
-            if data.cached { " from cache" } else { "" }
+            count,
+            offset,
+            if cached { " from cache" } else { "" }
         ));
     }
     populate_thread_list(options, widgets, state);
@@ -7507,8 +7640,8 @@ fn apply_search_data(
     widgets.status_label.set_text(&format!(
         "{} for {}{}",
         thread_window_status(state),
-        data.query,
-        if data.cached { " (cached)" } else { "" }
+        query,
+        if cached { " (cached)" } else { "" }
     ));
     update_thread_result_label(widgets, state);
     if state.borrow().input_mode == InputMode::Normal {
@@ -7523,6 +7656,10 @@ fn append_search_data(
     state: &SharedState,
     data: SearchData,
 ) {
+    let query = data.query.clone();
+    let count = data.count;
+    let offset = data.offset;
+    let cached = data.cached;
     let selected_thread_id = state
         .borrow()
         .selected_thread
@@ -7531,30 +7668,32 @@ fn append_search_data(
     let selected_index = selected_thread_index(widgets);
     {
         let mut s = state.borrow_mut();
-        s.current_query = data.query.clone();
+        s.current_query = query.clone();
         if data.offset != s.thread_window_offset + s.thread_list_items.len() {
             s.thread_window_offset = data.offset;
             s.thread_list_items.clear();
+            s.thread_details.clear();
         }
         s.thread_list_items.extend(data.threads);
-        s.thread_total_count = data.count;
+        s.thread_details.extend(data.details);
+        s.thread_total_count = count;
         s.thread_loaded_count = s.thread_list_items.len();
         s.thread_page_size = data.limit;
         s.can_load_more_threads =
-            s.thread_window_offset + s.thread_list_items.len() < data.count as usize;
+            s.thread_window_offset + s.thread_list_items.len() < count as usize;
         s.visible_tags = data.tags;
         s.database_path = Some(data.database_path);
         s.database_revision = Some(data.revision);
         s.last_error = None;
         s.last_operation = Some(format!(
             "loaded page at offset {}: {}{}",
-            data.offset,
+            offset,
             thread_window_status_from_parts(
                 s.thread_window_offset,
                 s.thread_list_items.len(),
-                data.count as usize,
+                count as usize,
             ),
-            if data.cached { " from cache" } else { "" }
+            if cached { " from cache" } else { "" }
         ));
     }
     populate_thread_list(options, widgets, state);
@@ -7675,16 +7814,18 @@ fn apply_search_error(widgets: &Widgets, state: &SharedState, err: anyhow::Error
     update_debug(widgets, state);
 }
 
-fn populate_thread_list(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+fn populate_thread_list(_options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     while let Some(child) = widgets.thread_list.first_child() {
         widgets.thread_list.remove(&child);
     }
-    let (threads, window_offset) = {
+    let (threads, window_offset, details) = {
         let state = state.borrow();
-        (state.thread_list_items.clone(), state.thread_window_offset)
+        (
+            state.thread_list_items.clone(),
+            state.thread_window_offset,
+            state.thread_details.clone(),
+        )
     };
-    let details = visible_thread_details(options, state, &threads);
-    state.borrow_mut().thread_details = details.clone();
     for (idx, thread) in threads.iter().enumerate() {
         let row = gtk::ListBoxRow::new();
         row.set_widget_name(&format!("notm-thread-row-{idx}"));
@@ -7886,16 +8027,23 @@ fn collect_thread_ids_for_range(
     start: usize,
     end: usize,
 ) -> anyhow::Result<BTreeSet<String>> {
+    let db = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
     let page_size = options.page_size.max(1);
     let mut offset = (start / page_size) * page_size;
     let mut ids = BTreeSet::new();
     while offset <= end {
-        let data = execute_search_page(options, query, offset)?;
-        if data.threads.is_empty() {
+        let opts = QueryOptions {
+            limit: page_size,
+            offset,
+            sort: SortOrder::NewestFirst,
+            excluded_tags: options.excluded_tags.clone(),
+        };
+        let threads = db.search_threads(query, &opts)?;
+        if threads.is_empty() {
             break;
         }
-        for (index, thread) in data.threads.iter().enumerate() {
-            let absolute_index = data.offset + index;
+        for (index, thread) in threads.iter().enumerate() {
+            let absolute_index = offset + index;
             if (start..=end).contains(&absolute_index) {
                 ids.insert(thread.thread_id.clone());
             }
@@ -7974,25 +8122,15 @@ fn set_thread_row_content(
     row.set_child(Some(&box_));
 }
 
-fn visible_thread_details(
-    options: &LaunchOptions,
-    state: &SharedState,
+fn thread_details_for_threads(
+    db: &Database,
+    database_path: &str,
+    revision: &notm_notmuch::Revision,
     threads: &[notm_notmuch::ThreadSummary],
 ) -> BTreeMap<String, ThreadUiDetails> {
-    let (database_path, revision) = {
-        let state = state.borrow();
-        (state.database_path.clone(), state.database_revision.clone())
-    };
     let mut out = BTreeMap::new();
-    let Ok(db) = Database::open(&open_config(options), DatabaseMode::ReadOnly) else {
-        return out;
-    };
     for thread in threads {
-        let cache_key = thread_detail_cache_key(
-            database_path.as_deref().unwrap_or(""),
-            revision.as_ref(),
-            &thread.thread_id,
-        );
+        let cache_key = thread_detail_cache_key(database_path, Some(revision), &thread.thread_id);
         if let Some(detail) = THREAD_DETAIL_CACHE
             .get_or_init(Default::default)
             .lock()
