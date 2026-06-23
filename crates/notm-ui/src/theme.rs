@@ -34,6 +34,7 @@ pub fn css() -> &'static str {
     #notm-compose-body gutter {
         background-color: @theme_bg_color;
         color: @theme_fg_color;
+        caret-color: @theme_fg_color;
     }
     #notm-compose-body text selection {
         background-color: @theme_selected_bg_color;

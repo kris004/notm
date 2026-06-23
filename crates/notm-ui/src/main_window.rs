@@ -4120,6 +4120,10 @@ fn install_shortcuts(
             send_compose(&opts, &w, &st);
             return gtk::glib::Propagation::Stop;
         }
+        if key == gtk::gdk::Key::Escape && st.borrow().visual_select_mode {
+            clear_visual_selection(&w, &st);
+            return gtk::glib::Propagation::Stop;
+        }
         if st.borrow().input_mode == InputMode::Insert {
             if key == gtk::gdk::Key::Tab && complete_focused_recipient(&w, &st) {
                 autosave_draft_from_widgets(&w, &st);
@@ -4141,10 +4145,6 @@ fn install_shortcuts(
                 return gtk::glib::Propagation::Stop;
             }
             return gtk::glib::Propagation::Proceed;
-        }
-        if key == gtk::gdk::Key::Escape && st.borrow().visual_select_mode {
-            clear_visual_selection(&w, &st);
-            return gtk::glib::Propagation::Stop;
         }
         if ctrl && (key == gtk::gdk::Key::h || key == gtk::gdk::Key::H) {
             move_active_pane(&w, &st, -1);
@@ -4243,7 +4243,11 @@ fn install_shortcuts(
             w.copy_menu_button.popdown();
             w.tag_menu_button.popdown();
             w.undo_tag_button.popdown();
-            w.status_label.set_text("Normal mode");
+            if st.borrow().visual_select_mode {
+                clear_visual_selection(&w, &st);
+            } else {
+                w.status_label.set_text("Normal mode");
+            }
             return gtk::glib::Propagation::Stop;
         }
         if *pending_custom_search.borrow() {
@@ -4584,7 +4588,7 @@ fn install_shortcuts(
         } else if key == gtk::gdk::Key::v {
             clear_numeric_prefix(&numeric_prefix);
             if st.borrow().active_pane == ActivePane::Threads {
-                enter_visual_select_mode(&w, &st);
+                toggle_visual_select_mode(&w, &st);
                 true
             } else {
                 false
@@ -6273,7 +6277,7 @@ fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, sta
             "remote images blocked"
         };
         widgets.html_policy_label.set_text(&format!(
-            "Sanitized HTML view: message JavaScript disabled; {image_policy}; link navigation blocked in-app."
+            "Sanitized HTML view: message JavaScript disabled; {image_policy}; links open externally."
         ));
     }
 
@@ -6664,14 +6668,33 @@ fn connect_html_navigation_policy(view: &webkit6::WebView, status_label: &gtk::L
                 && uri != "about:blank"
             {
                 decision.ignore();
-                status.set_text(&format!(
-                    "Blocked HTML navigation; copy/open manually after checking target: {uri}"
-                ));
+                open_html_link_externally(uri, &status);
                 return true;
             }
         }
         false
     });
+}
+
+fn open_html_link_externally(uri: &str, status_label: &gtk::Label) {
+    if !html_link_scheme_is_external_safe(uri) {
+        status_label.set_text(&format!("Blocked unsupported HTML link target: {uri}"));
+        return;
+    }
+    match gtk::gio::AppInfo::launch_default_for_uri(uri, None::<&gtk::gio::AppLaunchContext>) {
+        Ok(()) => status_label.set_text(&format!("Opened link externally: {uri}")),
+        Err(err) => status_label.set_text(&format!("Open link failed: {err}; target: {uri}")),
+    }
+}
+
+fn html_link_scheme_is_external_safe(uri: &str) -> bool {
+    let Some((scheme, _)) = uri.split_once(':') else {
+        return false;
+    };
+    matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "http" | "https" | "mailto"
+    )
 }
 
 fn navigation_decision_uri(decision: &webkit6::PolicyDecision) -> Option<String> {
@@ -7672,6 +7695,14 @@ fn populate_thread_list(options: &LaunchOptions, widgets: &Widgets, state: &Shar
     update_visual_selection_rows(widgets, state);
 }
 
+fn toggle_visual_select_mode(widgets: &Widgets, state: &SharedState) {
+    if state.borrow().visual_select_mode {
+        clear_visual_selection(widgets, state);
+    } else {
+        enter_visual_select_mode(widgets, state);
+    }
+}
+
 fn enter_visual_select_mode(widgets: &Widgets, state: &SharedState) {
     let Some(index) = selected_thread_index(widgets) else {
         widgets
@@ -7696,8 +7727,12 @@ fn clear_visual_selection(widgets: &Widgets, state: &SharedState) {
         state.visual_select_anchor = None;
         state.visual_selected_threads.clear();
         state.visual_selection_pending_range = None;
+        state.input_mode = InputMode::Normal;
+        state.active_pane = ActivePane::Threads;
     }
     update_visual_selection_rows(widgets, state);
+    update_button_binding_labels(widgets, state);
+    update_active_pane_visuals(widgets, state);
     widgets.status_label.set_text("Normal mode");
 }
 
@@ -10980,7 +11015,7 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
             ("visual_html_preferred", "Visual HTML first when available"),
         ],
         &options.html_mode,
-        "Visual HTML is sanitized. Message scripts and in-app link navigation stay blocked.",
+        "Visual HTML is sanitized. Message scripts stay blocked; http/https/mailto links open externally.",
     );
     let start_maximized = settings_check_row(
         &form,
