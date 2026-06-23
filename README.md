@@ -32,7 +32,7 @@ install -Dm644 packaging/notm.desktop ~/.local/share/applications/notm.desktop
 update-desktop-database ~/.local/share/applications
 ```
 
-The installed desktop entry launches `Exec=/home/user/.local/bin/notm launch`.
+The installed desktop entry launches `Exec=notm launch`; install the binary somewhere on your desktop session's `PATH` or adjust the desktop entry locally.
 
 ## Runtime/build dependencies
 
@@ -78,7 +78,7 @@ This repository builds and runs a native GTK4 Notmuch client. Implemented daily-
 - thread/message view with safe text and visual sanitized WebKitGTK HTML toggle, one-shot/trusted-sender remote image controls, HTML-to-text fallback, full headers, raw source, filenames, tags, MIME tree, selectable attachment list, and quote collapse,
 - tag operations and undo through libnotmuch,
 - compose, reply, reply-all, inline forward, and forward-as-`message/rfc822` attachment,
-- external send transport with stdin/file/template/auto modes and lieer helper auto `-t`,
+- external send transport with stdin/file/template/auto modes and optional configured-helper auto behavior,
 - fake send contract tests,
 - optional sent Maildir save/indexing only when configured,
 - local JSON compose crash recovery, local Maildir draft save/indexing under `tag:draft`, draft reopening in the composer, and explicit local draft deletion,
@@ -86,7 +86,7 @@ This repository builds and runs a native GTK4 Notmuch client. Implemented daily-
 - keyboard shortcuts, shortcuts overlay, command palette, settings, debug panel,
 - local Unix-socket automation, paged result loading with Load more and scroll-bottom auto-load, manual sync action disabled by default, and screenshot capture,
 - fixture Notmuch database creation/indexing through libnotmuch,
-- live read-only smoke against the real Notmuch database,
-- bounded live send validation emails with consistent subjects.
+- explicitly gated live read-only smoke for a configured Notmuch database,
+- explicitly gated live send validation for configured send transports.
 
-Known limitations: visual styling is direct gtk4-rs rather than libadwaita-polished; visual HTML rendering uses sanitized WebKitGTK with JavaScript/navigation blocked and remote images disabled by default unless explicitly loaded/trusted; recipient chips are list/Tab suggestions rather than fully polished chips; large-mailbox performance has paging/debounce/cache and scroll-bottom loading but not virtualized rows.
+Known limitations: visual styling is direct gtk4-rs rather than libadwaita-polished; visual HTML rendering uses sanitized WebKitGTK with JavaScript blocked, links opened externally, and remote images disabled by default unless explicitly loaded/trusted; recipient chips are list/Tab suggestions rather than fully polished chips; large-mailbox performance has paging/debounce/cache and scroll-bottom loading but not virtualized rows.

@@ -278,11 +278,6 @@ pub fn load(path_override: Option<PathBuf>) -> anyhow::Result<AppConfig> {
             config.identity.other_email = identity.other_email;
         }
     }
-    if config.send.command.is_none()
-        && let Some(candidate) = find_in_path("aerc-gmail-send")
-    {
-        config.send.command = Some(candidate);
-    }
     Ok(config)
 }
 
@@ -293,13 +288,6 @@ pub fn transport_mode(value: &str) -> notm_mail::TransportMode {
         "command_template" => notm_mail::TransportMode::CommandTemplate,
         _ => notm_mail::TransportMode::Auto,
     }
-}
-
-fn find_in_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
 }
 
 fn default_true() -> bool {

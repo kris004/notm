@@ -3,4 +3,10 @@
 /artifacts/*
 !/artifacts/logs/
 !/artifacts/logs/.gitkeep
+/PROGRESS.md
+/TEST_REPORT.md
+*.local.toml
+*.local.json
+.env
+.env.*
 *.tmp

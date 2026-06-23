@@ -11067,7 +11067,7 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
         &form,
         "Command",
         &option_path_text(&options.send_command),
-        "External send helper path, for example aerc-gmail-send.",
+        "External send helper path, for example msmtp or a gmi wrapper.",
         SettingsPathKind::File,
     );
     let send_args = settings_entry_row(

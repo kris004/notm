@@ -103,7 +103,7 @@ impl SendTransport for ExternalCommandTransport {
             }
         }
         if let Ok(text) = std::fs::read_to_string(&self.command)
-            && (text.contains("gmi send") || text.contains("aerc-gmail-send"))
+            && text.contains("gmi send")
         {
             details.push("script looks like the configured Gmail/lieer send helper; auto mode uses stdin-RFC5322 and appends -t when no explicit recipient/template args are configured".to_string());
             if let Some(repo) = extract_gmailieer_repo(&text) {
@@ -192,7 +192,7 @@ impl ExternalCommandTransport {
 
     fn looks_like_lieer_send_helper(&self) -> bool {
         std::fs::read_to_string(&self.command)
-            .map(|text| text.contains("gmi send") || text.contains("aerc-gmail-send"))
+            .map(|text| text.contains("gmi send"))
             .unwrap_or(false)
     }
 

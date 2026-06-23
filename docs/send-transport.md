@@ -13,7 +13,7 @@ The live UI refuses to fall back to the fake capture transport when no
 `send.command` is configured. Fake capture is only enabled for fixture/test
 launches so a real compose window cannot report success for an unsent message.
 
-For detected lieer helpers like `aerc-gmail-send`, auto mode uses stdin-RFC5322 and appends `-t` when no explicit recipient/template args are configured, because `gmi send` requires `-t` to trust RFC5322 recipients from headers.
+For configured helper scripts whose contents invoke `gmi send`, auto mode uses stdin-RFC5322 and appends `-t` when no explicit recipient/template args are configured, because `gmi send` requires `-t` to trust RFC5322 recipients from headers.
 
 Optional post-send persistence is explicit:
 
