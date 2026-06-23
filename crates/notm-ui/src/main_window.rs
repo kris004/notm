@@ -55,9 +55,13 @@ pub struct LaunchOptions {
     pub identity_name: Option<String>,
     pub primary_email: Option<String>,
     pub other_email: Vec<String>,
+    pub send_enabled: bool,
     pub send_command: Option<PathBuf>,
     pub send_args: Vec<String>,
     pub send_mode: TransportMode,
+    pub send_working_dir: Option<PathBuf>,
+    pub send_env: BTreeMap<String, String>,
+    pub send_timeout_seconds: u64,
     pub fake_send_capture_dir: Option<PathBuf>,
     pub save_sent: bool,
     pub sent_maildir: Option<PathBuf>,
@@ -70,10 +74,11 @@ pub struct LaunchOptions {
     pub sync_enabled: bool,
     pub manual_sync_label: String,
     pub notmuch_database_update_enabled: bool,
+    pub notmuch_database_update_on_startup: bool,
     pub notmuch_database_update_command: String,
     pub external_receive_enabled: bool,
+    pub external_receive_on_startup: bool,
     pub external_receive_command: String,
-    pub show_manual_sync_button: bool,
     pub screenshot_dir: PathBuf,
     pub automation_enabled: bool,
     pub automation_socket: Option<PathBuf>,
@@ -81,6 +86,7 @@ pub struct LaunchOptions {
     pub show_debug_panel: bool,
     pub start_maximized: bool,
     pub remote_images: bool,
+    pub html_mode: String,
     pub trusted_image_senders: Vec<String>,
     pub hidden_tag_searches: Vec<String>,
     pub sync_maildir_flags_after_tag_change: bool,
@@ -102,9 +108,13 @@ impl Default for LaunchOptions {
             identity_name: None,
             primary_email: None,
             other_email: Vec::new(),
+            send_enabled: true,
             send_command: None,
             send_args: Vec::new(),
             send_mode: TransportMode::Auto,
+            send_working_dir: None,
+            send_env: BTreeMap::new(),
+            send_timeout_seconds: 120,
             fake_send_capture_dir: None,
             save_sent: false,
             sent_maildir: None,
@@ -117,10 +127,11 @@ impl Default for LaunchOptions {
             sync_enabled: false,
             manual_sync_label: "Sync".to_string(),
             notmuch_database_update_enabled: false,
+            notmuch_database_update_on_startup: false,
             notmuch_database_update_command: String::new(),
             external_receive_enabled: false,
+            external_receive_on_startup: false,
             external_receive_command: String::new(),
-            show_manual_sync_button: false,
             screenshot_dir: PathBuf::from("artifacts/screenshots"),
             automation_enabled: false,
             automation_socket: None,
@@ -128,6 +139,7 @@ impl Default for LaunchOptions {
             show_debug_panel: false,
             start_maximized: false,
             remote_images: false,
+            html_mode: "sanitize_then_render_text_fallback".to_string(),
             trusted_image_senders: Vec::new(),
             hidden_tag_searches: Vec::new(),
             sync_maildir_flags_after_tag_change: true,
@@ -158,11 +170,12 @@ struct Widgets {
     saved_name_entry: gtk::Entry,
     saved_query_entry: gtk::Entry,
     save_search_button: gtk::Button,
-    delete_search_button: gtk::Button,
     custom_tag_entry: gtk::Entry,
     search_entry: gtk::Entry,
     search_button: gtk::Button,
     search_generation: Rc<Cell<u64>>,
+    search_suggestions_list: gtk::ListBox,
+    search_completion: Rc<RefCell<Option<SearchCompletionSession>>>,
     hidden_tag_searches: HiddenTagSearchStore,
     thread_list: gtk::ListBox,
     thread_result_label: gtk::Label,
@@ -172,24 +185,37 @@ struct Widgets {
     debug_button: gtk::Button,
     palette_button: gtk::Button,
     settings_button: gtk::Button,
+    help_button: gtk::Button,
     archive_button: gtk::Button,
     read_toggle_button: gtk::Button,
     flag_toggle_button: gtk::Button,
     trash_button: gtk::Button,
     spam_button: gtk::Button,
+    tag_command_entry: gtk::Entry,
+    tag_command_apply_button: gtk::Button,
     tag_menu_button: gtk::MenuButton,
+    tag_menu_box: gtk::Box,
     add_custom_tag_button: gtk::Button,
     remove_custom_tag_button: gtk::Button,
-    undo_tag_button: gtk::Button,
+    undo_tag_button: gtk::MenuButton,
+    undo_menu_box: gtk::Box,
+    undo_last_tag_button: gtk::Button,
+    undo_list_tag_button: gtk::Button,
     message_stack: gtk::Stack,
     message_view: gtk::TextView,
     message_scrolled: gtk::ScrolledWindow,
     html_view: webkit6::WebView,
     html_scrolled: gtk::ScrolledWindow,
     response_menu_button: gtk::MenuButton,
+    reply_button: gtk::Button,
+    reply_all_button: gtk::Button,
+    forward_button: gtk::Button,
+    forward_attachment_button: gtk::Button,
+    response_menu_box: gtk::Box,
     message_menu_button: gtk::MenuButton,
     message_menu_box: gtk::Box,
     view_menu_button: gtk::MenuButton,
+    view_menu_box: gtk::Box,
     view_text_button: gtk::Button,
     view_html_button: gtk::Button,
     view_headers_button: gtk::Button,
@@ -200,6 +226,7 @@ struct Widgets {
     message_header_label: gtk::Label,
     collapse_quotes_button: gtk::Button,
     copy_menu_button: gtk::MenuButton,
+    copy_menu_box: gtk::Box,
     copy_message_id_button: gtk::Button,
     copy_thread_id_button: gtk::Button,
     copy_from_email_button: gtk::Button,
@@ -229,16 +256,52 @@ struct Widgets {
     clear_draft_button: gtk::Button,
     delete_local_draft_button: gtk::Button,
     send_button: gtk::Button,
-    address_suggestions_popover: gtk::Popover,
     address_suggestions_list: gtk::ListBox,
+    active_address_entry: Rc<RefCell<Option<gtk::Entry>>>,
+    active_address_field: Rc<Cell<Option<RecipientField>>>,
+    address_completion: Rc<RefCell<Option<AddressCompletionSession>>>,
     draft_list: gtk::ListBox,
     drafts_dir: PathBuf,
 }
 
 type SharedState = Rc<RefCell<UiState>>;
-type UndoState = Rc<RefCell<Option<(String, TagMutation)>>>;
+type UndoState = Rc<RefCell<Vec<UndoTagAction>>>;
 type SavedSearchStore = Rc<RefCell<Vec<SavedSearch>>>;
 type HiddenTagSearchStore = Rc<RefCell<BTreeSet<String>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecipientField {
+    To,
+    Cc,
+    Bcc,
+}
+
+#[derive(Debug, Clone)]
+struct AddressCompletionSession {
+    field: RecipientField,
+    base: String,
+    suggestions: Vec<String>,
+    next_index: usize,
+    generated_text: Option<String>,
+    suppress_next_change: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SearchCompletionSession {
+    base: String,
+    cursor_position: i32,
+    suggestions: Vec<String>,
+    next_index: usize,
+    generated_text: Option<String>,
+    suppress_next_change: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UndoTagAction {
+    query: String,
+    mutation: TagMutation,
+    label: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MessageViewKind {
@@ -246,13 +309,6 @@ enum MessageViewKind {
     Html,
     Headers,
     Raw,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SavedSearchBaselineKind {
-    BuiltIn,
-    Custom,
-    Tag,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,6 +359,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
             .database_path
             .as_ref()
             .map(|p| p.display().to_string()),
+        prefer_html_view: options.html_mode == "visual_html_preferred",
         trusted_image_senders: normalize_sender_list(&options.trusted_image_senders),
         compose_fields: ComposeFields {
             from: identity(&options)
@@ -313,7 +370,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         ..UiState::default()
     };
     let state = Rc::new(RefCell::new(initial_state));
-    let undo_state: UndoState = Rc::new(RefCell::new(None));
+    let undo_state: UndoState = Rc::new(RefCell::new(load_undo_tag_actions()));
     let search_generation = Rc::new(Cell::new(0_u64));
     let hidden_tag_searches: HiddenTagSearchStore = Rc::new(RefCell::new(
         options.hidden_tag_searches.iter().cloned().collect(),
@@ -343,11 +400,13 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     let debug_button = gtk::Button::with_label("Debug");
     let palette_button = gtk::Button::with_label("Commands");
     let settings_button = gtk::Button::with_label("Settings");
+    let help_button = gtk::Button::with_label("Help");
     for b in [
         &compose_button,
         &debug_button,
         &palette_button,
         &settings_button,
+        &help_button,
     ] {
         toolbar.insert(b, -1);
     }
@@ -369,11 +428,13 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     let saved_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     saved_box.set_widget_name("notm-saved-searches");
     left.append(&saved_box);
+    let (custom_search_button, custom_search_box) =
+        menu_button_with_box("Add custom search", "notm-custom-search-menu-button");
     let saved_editor_title = gtk::Label::new(Some("Custom saved search"));
     saved_editor_title.set_xalign(0.0);
     saved_editor_title.add_css_class("dim-label");
     saved_editor_title.set_wrap(true);
-    left.append(&saved_editor_title);
+    custom_search_box.append(&saved_editor_title);
     let saved_name_entry = entry_with_placeholder("Name");
     saved_name_entry.set_widget_name("notm-saved-search-name");
     saved_name_entry.set_width_chars(10);
@@ -382,16 +443,13 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     saved_query_entry.set_widget_name("notm-saved-search-query");
     saved_query_entry.set_width_chars(10);
     saved_query_entry.set_max_width_chars(10);
-    left.append(&saved_name_entry);
-    left.append(&saved_query_entry);
+    custom_search_box.append(&saved_name_entry);
+    custom_search_box.append(&saved_query_entry);
     let saved_editor_buttons = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    let save_search_button = gtk::Button::with_label("Save");
+    let save_search_button = gtk::Button::with_label("Save search");
     save_search_button.set_widget_name("notm-save-search-button");
-    let delete_search_button = gtk::Button::with_label("Delete");
-    delete_search_button.set_widget_name("notm-delete-search-button");
     saved_editor_buttons.append(&save_search_button);
-    saved_editor_buttons.append(&delete_search_button);
-    left.append(&saved_editor_buttons);
+    custom_search_box.append(&saved_editor_buttons);
 
     let tag_title = gtk::Label::new(Some("Tags"));
     tag_title.set_xalign(0.0);
@@ -400,7 +458,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     let tag_search_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     tag_search_box.set_widget_name("notm-tag-searches");
     left.append(&tag_search_box);
-    let manual_sync_button = if options.sync_enabled && options.show_manual_sync_button {
+    left.append(&custom_search_button);
+    let manual_sync_button = if options.sync_enabled {
         let sync_button = gtk::Button::with_label(&options.manual_sync_label);
         sync_button.set_widget_name("notm-manual-sync-button");
         left.append(&sync_button);
@@ -426,11 +485,20 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     search_entry.set_placeholder_text(Some(
         "Notmuch query, e.g. tag:inbox and not tag:trash and not tag:spam",
     ));
+    let search_suggestions_list = gtk::ListBox::new();
+    search_suggestions_list.set_widget_name("notm-search-suggestions-list");
+    search_suggestions_list.set_selection_mode(gtk::SelectionMode::Single);
+    search_suggestions_list.add_css_class("boxed-list");
+    search_suggestions_list.set_hexpand(true);
+    search_suggestions_list.set_focusable(false);
+    search_suggestions_list.set_visible(false);
+    let search_completion = Rc::new(RefCell::new(None::<SearchCompletionSession>));
     let search_button = gtk::Button::with_label("Search");
     search_button.set_widget_name("notm-search-button");
     search_row.append(&search_entry);
     search_row.append(&search_button);
     middle.append(&search_row);
+    middle.append(&search_suggestions_list);
     let helper = gtk::Label::new(Some(
         "Syntax: tag:inbox, from:alice, subject:report, thread:<id>, *",
     ));
@@ -448,14 +516,23 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     flag_button.set_widget_name("notm-flag-toggle-button");
     let trash_button = gtk::Button::with_label("Trash");
     let spam_button = gtk::Button::with_label("Spam");
-    let undo_button = gtk::Button::with_label("Undo tag");
+    let (undo_button, undo_menu_box) = menu_button_with_box("Undo", "notm-undo-tag-menu-button");
     undo_button.set_widget_name("notm-undo-tag-button");
     undo_button.add_css_class("suggested-action");
     undo_button.set_halign(gtk::Align::End);
     undo_button.set_visible(false);
-    undo_button.set_tooltip_text(Some(
-        "Undo only reverses the most recent tag operation from this session.",
-    ));
+    undo_button.set_tooltip_text(Some("Undo recent tag operations."));
+    undo_menu_box.set_spacing(6);
+    undo_menu_box.set_margin_start(6);
+    undo_menu_box.set_margin_end(6);
+    undo_menu_box.set_margin_top(6);
+    undo_menu_box.set_margin_bottom(6);
+    let undo_last_button = gtk::Button::with_label("Undo last");
+    undo_last_button.set_widget_name("notm-undo-last-tag-button");
+    let undo_list_button = gtk::Button::with_label("Undo multiple");
+    undo_list_button.set_widget_name("notm-undo-list-tag-button");
+    undo_menu_box.append(&undo_last_button);
+    undo_menu_box.append(&undo_list_button);
     let (tag_menu_button, tag_menu_box) =
         menu_button_with_box("Tag…", "notm-custom-tag-menu-button");
     tag_menu_box.set_spacing(6);
@@ -463,19 +540,45 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     tag_menu_box.set_margin_end(6);
     tag_menu_box.set_margin_top(6);
     tag_menu_box.set_margin_bottom(6);
+    let single_tag_label = gtk::Label::new(Some("Single tag"));
+    single_tag_label.set_xalign(0.0);
+    single_tag_label.add_css_class("dim-label");
+    tag_menu_box.append(&single_tag_label);
     let custom_tag_entry = entry_with_placeholder("tag");
     custom_tag_entry.set_widget_name("notm-custom-tag-entry");
     custom_tag_entry.set_width_chars(18);
+    custom_tag_entry.set_hexpand(true);
     let tag_button_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    tag_button_row.set_hexpand(true);
+    tag_button_row.set_homogeneous(true);
     let add_tag_button = gtk::Button::with_label("Add tag");
     add_tag_button.set_widget_name("notm-add-custom-tag-button");
+    add_tag_button.set_hexpand(true);
+    add_tag_button.set_halign(gtk::Align::Fill);
     let remove_tag_button = gtk::Button::with_label("Remove tag");
     remove_tag_button.set_widget_name("notm-remove-custom-tag-button");
+    remove_tag_button.set_hexpand(true);
+    remove_tag_button.set_halign(gtk::Align::Fill);
     remove_tag_button.set_visible(false);
     tag_button_row.append(&add_tag_button);
     tag_button_row.append(&remove_tag_button);
     tag_menu_box.append(&custom_tag_entry);
     tag_menu_box.append(&tag_button_row);
+    let multi_tag_label = gtk::Label::new(Some("Multiple tag changes"));
+    multi_tag_label.set_xalign(0.0);
+    multi_tag_label.add_css_class("dim-label");
+    tag_menu_box.append(&multi_tag_label);
+    let tag_command_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    tag_command_row.set_widget_name("notm-tag-command-row");
+    tag_command_row.set_hexpand(true);
+    let tag_command_entry = entry_with_placeholder("-inbox +books +flagged");
+    tag_command_entry.set_widget_name("notm-tag-command-entry");
+    tag_command_entry.set_hexpand(true);
+    let tag_command_apply_button = gtk::Button::with_label("Apply");
+    tag_command_apply_button.set_widget_name("notm-run-tag-command-button");
+    tag_command_row.append(&tag_command_entry);
+    tag_command_row.append(&tag_command_apply_button);
+    tag_menu_box.append(&tag_command_row);
     for b in [
         &archive_button,
         &read_button,
@@ -702,17 +805,12 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     address_suggestions_list.set_widget_name("notm-address-suggestions-list");
     address_suggestions_list.set_selection_mode(gtk::SelectionMode::Single);
     address_suggestions_list.add_css_class("boxed-list");
-    address_suggestions_list.set_size_request(360, -1);
+    address_suggestions_list.set_hexpand(true);
     address_suggestions_list.set_focusable(false);
-    let address_suggestions_popover = gtk::Popover::new();
-    address_suggestions_popover.set_widget_name("notm-address-suggestions");
-    address_suggestions_popover.set_has_arrow(false);
-    // Address suggestions are informational while the recipient entry keeps
-    // keyboard focus.  The default modal/autohide popover grabs keyboard input,
-    // which makes typing stop as soon as suggestions appear.
-    address_suggestions_popover.set_autohide(false);
-    address_suggestions_popover.set_child(Some(&address_suggestions_list));
-    address_suggestions_popover.set_parent(&compose_to);
+    address_suggestions_list.set_visible(false);
+    let active_address_entry = Rc::new(RefCell::new(None::<gtk::Entry>));
+    let active_address_field = Rc::new(Cell::new(None::<RecipientField>));
+    let address_completion = Rc::new(RefCell::new(None::<AddressCompletionSession>));
     let compose_attachments = gtk::Label::new(Some("No attachments"));
     compose_attachments.set_widget_name("notm-compose-attachments");
     compose_attachments.set_xalign(0.0);
@@ -744,15 +842,12 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     composer_actions.append(&composer_left_actions);
     composer_actions.append(&composer_action_spacer);
     composer_actions.append(&delete_local_draft_button);
-    for w in [
-        &compose_from,
-        &compose_to,
-        &compose_cc,
-        &compose_bcc,
-        &compose_subject,
-    ] {
-        composer_box.append(w);
-    }
+    composer_box.append(&compose_from);
+    composer_box.append(&compose_to);
+    composer_box.append(&address_suggestions_list);
+    composer_box.append(&compose_cc);
+    composer_box.append(&compose_bcc);
+    composer_box.append(&compose_subject);
     composer_box.append(&scrolled_compose_body);
     composer_box.append(&compose_attachments);
     let draft_list = gtk::ListBox::new();
@@ -808,11 +903,12 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         saved_name_entry,
         saved_query_entry,
         save_search_button: save_search_button.clone(),
-        delete_search_button: delete_search_button.clone(),
         custom_tag_entry,
         search_entry,
         search_button: search_button.clone(),
         search_generation,
+        search_suggestions_list,
+        search_completion,
         hidden_tag_searches,
         thread_list,
         thread_result_label,
@@ -822,24 +918,37 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         debug_button: debug_button.clone(),
         palette_button: palette_button.clone(),
         settings_button: settings_button.clone(),
+        help_button: help_button.clone(),
         archive_button: archive_button.clone(),
         read_toggle_button: read_button.clone(),
         flag_toggle_button: flag_button.clone(),
         trash_button: trash_button.clone(),
         spam_button: spam_button.clone(),
+        tag_command_entry: tag_command_entry.clone(),
+        tag_command_apply_button: tag_command_apply_button.clone(),
         tag_menu_button: tag_menu_button.clone(),
+        tag_menu_box: tag_menu_box.clone(),
         add_custom_tag_button: add_tag_button.clone(),
         remove_custom_tag_button: remove_tag_button.clone(),
         undo_tag_button: undo_button.clone(),
+        undo_menu_box: undo_menu_box.clone(),
+        undo_last_tag_button: undo_last_button.clone(),
+        undo_list_tag_button: undo_list_button.clone(),
         message_stack,
         message_view,
         message_scrolled: scrolled_message.clone(),
         html_view,
         html_scrolled: scrolled_html.clone(),
         response_menu_button,
+        reply_button: reply_button.clone(),
+        reply_all_button: reply_all_button.clone(),
+        forward_button: forward_button.clone(),
+        forward_attachment_button: forward_attachment_button.clone(),
+        response_menu_box: response_menu_box.clone(),
         message_menu_button,
         message_menu_box,
         view_menu_button,
+        view_menu_box: view_menu_box.clone(),
         view_text_button,
         view_html_button,
         view_headers_button,
@@ -850,6 +959,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         message_header_label,
         collapse_quotes_button,
         copy_menu_button,
+        copy_menu_box: copy_menu_box.clone(),
         copy_message_id_button,
         copy_thread_id_button,
         copy_from_email_button,
@@ -882,8 +992,10 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         clear_draft_button: clear_draft_button.clone(),
         delete_local_draft_button: delete_local_draft_button.clone(),
         send_button: send_button.clone(),
-        address_suggestions_popover,
         address_suggestions_list,
+        active_address_entry,
+        active_address_field,
+        address_completion,
         draft_list,
         drafts_dir: options
             .drafts_dir
@@ -892,6 +1004,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     };
     update_active_pane_visuals(&widgets, &state);
     update_message_action_buttons(&options, &widgets, &state);
+    set_undo_tag_available(&widgets, !undo_state.borrow().is_empty());
     if let Some(id) = identity(&options) {
         widgets.compose_from.set_text(&id.formatted());
     }
@@ -904,7 +1017,6 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         &state,
         &saved_search_store,
         &save_search_button,
-        &delete_search_button,
     );
     connect_custom_tag_editor(
         &options,
@@ -914,6 +1026,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         &add_tag_button,
         &remove_tag_button,
     );
+    connect_notmuch_tag_command_editor(&options, &widgets, &state, &undo_state);
     if let Some(sync_button) = manual_sync_button {
         let opts = options.clone();
         let w = widgets.clone();
@@ -932,7 +1045,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         &flag_button,
         &trash_button,
         &spam_button,
-        &undo_button,
+        &undo_last_button,
+        &undo_list_button,
         &compose_button,
         &reply_button,
         &reply_all_button,
@@ -941,6 +1055,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         &debug_button,
         &palette_button,
         &settings_button,
+        &help_button,
         &send_button,
     );
     connect_compose_helpers(
@@ -955,10 +1070,13 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     connect_compose_vim_context(&options, &widgets, &state, &compose_vim_context);
     connect_message_actions(&options, &widgets, &state);
     connect_recipient_autocomplete(&widgets.compose_to, &widgets, &state);
+    connect_recipient_autocomplete(&widgets.compose_cc, &widgets, &state);
+    connect_recipient_autocomplete(&widgets.compose_bcc, &widgets, &state);
     connect_address_suggestion_list(&widgets, &state);
     connect_search_debounce(&options, &widgets, &state);
+    connect_search_autocomplete(&widgets, &state);
     connect_input_mode_focus(&widgets, &state);
-    install_shortcuts(&options, &widgets, &state, &undo_state);
+    install_shortcuts(&options, &widgets, &state, &undo_state, &saved_search_store);
     connect_auto_load_more(&options, &widgets, &state);
 
     if options.automation_enabled {
@@ -970,6 +1088,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     window.present();
     run_search(&options, &widgets, &state, &options.default_query);
     refresh_address_suggestions(&options, &widgets, &state);
+    run_startup_sync(&options, &widgets, &state);
     update_debug(&widgets, &state);
 }
 
@@ -996,6 +1115,10 @@ fn built_in_saved_searches() -> Vec<SavedSearch> {
             query: "tag:draft".to_string(),
         },
         SavedSearch {
+            name: "Trash".to_string(),
+            query: "tag:trash".to_string(),
+        },
+        SavedSearch {
             name: "All".to_string(),
             query: "*".to_string(),
         },
@@ -1009,16 +1132,26 @@ fn saved_search_binding(name: &str) -> Option<&'static str> {
         "Flagged" => Some("g f"),
         "Sent" => Some("g s"),
         "Drafts" => Some("g d"),
+        "Trash" => Some("g t"),
         "All" => Some("g a"),
         _ => None,
     }
 }
 
 fn update_saved_search_button_labels(widgets: &Widgets, state: &SharedState) {
-    update_saved_search_button_labels_in_widget(&widgets.saved_box.clone().upcast(), state);
+    let mut custom_index = 0_usize;
+    update_saved_search_button_labels_in_widget(
+        &widgets.saved_box.clone().upcast(),
+        state,
+        &mut custom_index,
+    );
 }
 
-fn update_saved_search_button_labels_in_widget(widget: &gtk::Widget, state: &SharedState) {
+fn update_saved_search_button_labels_in_widget(
+    widget: &gtk::Widget,
+    state: &SharedState,
+    custom_index: &mut usize,
+) {
     if let Ok(button) = widget.clone().downcast::<gtk::Button>()
         && button.widget_name().starts_with("notm-saved-search-")
     {
@@ -1032,11 +1165,37 @@ fn update_saved_search_button_labels_in_widget(widget: &gtk::Widget, state: &Sha
             saved_search_binding(&name).unwrap_or_default(),
             state,
         );
+        if state.borrow().visible_saved_search.as_deref() == Some(name.as_str()) {
+            button.add_css_class("suggested-action");
+        } else {
+            button.remove_css_class("suggested-action");
+        }
+    } else if let Ok(button) = widget.clone().downcast::<gtk::Button>()
+        && button
+            .widget_name()
+            .starts_with("notm-custom-saved-search-")
+    {
+        *custom_index += 1;
+        let name = button
+            .tooltip_text()
+            .map(|text| text.to_string())
+            .unwrap_or_else(|| strip_binding_suffix(&button.label().unwrap_or_default()));
+        let binding = if *custom_index <= 9 {
+            format!("g c {}", *custom_index)
+        } else {
+            String::new()
+        };
+        set_button_label(&button, &name, &binding, state);
+        if state.borrow().visible_saved_search.as_deref() == Some(name.as_str()) {
+            button.add_css_class("suggested-action");
+        } else {
+            button.remove_css_class("suggested-action");
+        }
     }
     let mut child = widget.first_child();
     while let Some(child_widget) = child {
         child = child_widget.next_sibling();
-        update_saved_search_button_labels_in_widget(&child_widget, state);
+        update_saved_search_button_labels_in_widget(&child_widget, state, custom_index);
     }
 }
 
@@ -1049,12 +1208,44 @@ fn refresh_saved_searches(
     while let Some(child) = widgets.saved_box.first_child() {
         widgets.saved_box.remove(&child);
     }
+    let default_title = gtk::Label::new(Some("Default"));
+    default_title.set_xalign(0.0);
+    default_title.add_css_class("dim-label");
+    widgets.saved_box.append(&default_title);
     for saved in built_in_saved_searches() {
-        append_saved_search_button(options, widgets, state, &widgets.saved_box, saved);
+        append_saved_search_button(
+            options,
+            widgets,
+            state,
+            saved_store,
+            &widgets.saved_box,
+            saved,
+            false,
+        );
     }
     let custom_searches = saved_store.borrow().clone();
-    for saved in custom_searches {
-        append_saved_search_button(options, widgets, state, &widgets.saved_box, saved);
+    let custom_title = gtk::Label::new(Some("Custom"));
+    custom_title.set_xalign(0.0);
+    custom_title.add_css_class("dim-label");
+    custom_title.set_margin_top(6);
+    widgets.saved_box.append(&custom_title);
+    if custom_searches.is_empty() {
+        let label = gtk::Label::new(Some("No custom searches."));
+        label.set_xalign(0.0);
+        label.add_css_class("dim-label");
+        widgets.saved_box.append(&label);
+    } else {
+        for saved in custom_searches {
+            append_saved_search_button(
+                options,
+                widgets,
+                state,
+                saved_store,
+                &widgets.saved_box,
+                saved,
+                true,
+            );
+        }
     }
     update_saved_search_button_labels(widgets, state);
     update_tag_searches(options, widgets, state);
@@ -1064,18 +1255,36 @@ fn append_saved_search_button(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
+    saved_store: &SavedSearchStore,
     container: &impl IsA<gtk::Box>,
     saved: SavedSearch,
+    custom: bool,
 ) -> gtk::Button {
     let btn = gtk::Button::with_label(&saved.name);
-    btn.set_widget_name(&format!("notm-saved-search-{}", widget_token(&saved.name)));
+    let prefix = if custom {
+        "notm-custom-saved-search"
+    } else {
+        "notm-saved-search"
+    };
+    btn.set_widget_name(&format!("{prefix}-{}", widget_token(&saved.name)));
     btn.set_tooltip_text(Some(&saved.name));
+    let saved_name = saved.name.clone();
     let st = state.clone();
     let w = widgets.clone();
     let opts = options.clone();
     btn.connect_clicked(move |_| {
         activate_saved_search(&opts, &w, &st, &saved.name, &saved.query);
     });
+    if custom {
+        connect_custom_saved_search_context_menu(
+            options,
+            widgets,
+            state,
+            saved_store,
+            &btn,
+            &saved_name,
+        );
+    }
     container.append(&btn);
     btn
 }
@@ -1092,6 +1301,52 @@ fn activate_saved_search(
     widgets.saved_query_entry.set_text(query);
     widgets.search_entry.set_text(query);
     run_search(options, widgets, state, query);
+}
+
+fn connect_custom_saved_search_context_menu(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    saved_store: &SavedSearchStore,
+    button: &gtk::Button,
+    name: &str,
+) {
+    let click = gtk::GestureClick::new();
+    click.set_button(3);
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let store = saved_store.clone();
+    let name = name.to_string();
+    let parent = button.clone();
+    click.connect_pressed(move |_, _, x, y| {
+        let popover = gtk::Popover::new();
+        popover.set_has_arrow(true);
+        popover.set_parent(&parent);
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let delete = gtk::Button::with_label("Delete custom search");
+        delete.add_css_class("destructive-action");
+        menu.append(&delete);
+        popover.set_child(Some(&menu));
+        let opts = opts.clone();
+        let w = w.clone();
+        let st = st.clone();
+        let store = store.clone();
+        let name = name.clone();
+        let popover_for_delete = popover.clone();
+        delete.connect_clicked(move |_| {
+            match delete_custom_search_by_name(&opts, &w, &st, &store, &name) {
+                Ok(()) => w.status_label.set_text("Deleted custom search"),
+                Err(err) => w
+                    .status_label
+                    .set_text(&format!("Delete search failed: {err}")),
+            }
+            popover_for_delete.popdown();
+        });
+        popover.popup();
+    });
+    button.add_controller(click);
 }
 
 fn update_tag_searches(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -1140,6 +1395,7 @@ fn update_tag_searches(options: &LaunchOptions, widgets: &Widgets, state: &Share
         tags.sort_by_key(|tag| tag.to_lowercase());
         let (button, menu) =
             menu_button_with_box(&root, &format!("notm-tag-group-{}", widget_token(&root)));
+        button.set_tooltip_text(Some(&root));
         for tag in tags {
             let label = tag
                 .strip_prefix(&format!("{root}/"))
@@ -1194,27 +1450,33 @@ fn tag_button_base_label(tag: &str) -> String {
 
 fn collect_visible_tag_button_targets(widgets: &Widgets) -> Vec<String> {
     let mut targets = Vec::new();
-    collect_tag_button_targets_from_widget(&widgets.tag_search_box.clone().upcast(), &mut targets);
+    let mut child = widgets.tag_search_box.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if let Ok(button) = widget.clone().downcast::<gtk::Button>()
+            && let Some(tag) = button.tooltip_text()
+        {
+            targets.push(tag.to_string());
+        } else if let Ok(menu_button) = widget.clone().downcast::<gtk::MenuButton>()
+            && let Some(root) = menu_button.tooltip_text()
+        {
+            targets.push(root.to_string());
+        }
+    }
     targets
 }
 
-fn collect_tag_button_targets_from_widget(widget: &gtk::Widget, targets: &mut Vec<String>) {
-    if let Ok(button) = widget.clone().downcast::<gtk::Button>()
-        && let Some(tag) = button.tooltip_text()
-    {
-        targets.push(tag.to_string());
+fn top_level_tag_menu_button_by_root(widgets: &Widgets, root: &str) -> Option<gtk::MenuButton> {
+    let mut child = widgets.tag_search_box.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if let Ok(menu_button) = widget.downcast::<gtk::MenuButton>()
+            && menu_button.tooltip_text().as_deref() == Some(root)
+        {
+            return Some(menu_button);
+        }
     }
-    if let Ok(menu_button) = widget.clone().downcast::<gtk::MenuButton>()
-        && let Some(popover) = menu_button.popover()
-        && let Some(child) = popover.child()
-    {
-        collect_tag_button_targets_from_widget(&child, targets);
-    }
-    let mut child = widget.first_child();
-    while let Some(child_widget) = child {
-        child = child_widget.next_sibling();
-        collect_tag_button_targets_from_widget(&child_widget, targets);
-    }
+    None
 }
 
 fn update_tag_search_button_labels(widgets: &Widgets, state: &SharedState) {
@@ -1231,6 +1493,7 @@ fn update_tag_search_button_labels_in_widget(
     targets: &[String],
     state: &SharedState,
 ) {
+    let active_tag = active_tag_search(state);
     if let Ok(button) = widget.clone().downcast::<gtk::Button>()
         && let Some(tag) = button.tooltip_text()
     {
@@ -1243,11 +1506,34 @@ fn update_tag_search_button_labels_in_widget(
             .map(|index| format!("g {}", index + 1))
             .unwrap_or_default();
         set_button_label(&button, &base, &binding, state);
+        if active_tag.as_deref() == Some(tag.as_str()) {
+            button.add_css_class("suggested-action");
+        } else {
+            button.remove_css_class("suggested-action");
+        }
     }
     if let Ok(menu_button) = widget.clone().downcast::<gtk::MenuButton>()
         && let Some(popover) = menu_button.popover()
         && let Some(child) = popover.child()
     {
+        if let Some(root) = menu_button.tooltip_text() {
+            let root = root.to_string();
+            let binding = targets
+                .iter()
+                .position(|target| target == &root)
+                .filter(|index| *index < 9)
+                .map(|index| format!("g {}", index + 1))
+                .unwrap_or_default();
+            set_menu_button_label(&menu_button, &root, &binding, state);
+            let selected_in_group = active_tag
+                .as_deref()
+                .is_some_and(|tag| tag.starts_with(&format!("{root}/")));
+            if selected_in_group {
+                menu_button.add_css_class("suggested-action");
+            } else {
+                menu_button.remove_css_class("suggested-action");
+            }
+        }
         update_tag_search_button_labels_in_widget(&child, targets, state);
     }
     let mut child = widget.first_child();
@@ -1255,6 +1541,21 @@ fn update_tag_search_button_labels_in_widget(
         child = child_widget.next_sibling();
         update_tag_search_button_labels_in_widget(&child_widget, targets, state);
     }
+}
+
+fn active_tag_search(state: &SharedState) -> Option<String> {
+    let state = state.borrow();
+    state
+        .visible_saved_search
+        .as_deref()
+        .and_then(|selected| {
+            state
+                .visible_tags
+                .iter()
+                .find(|tag| *tag == selected)
+                .cloned()
+        })
+        .or_else(|| parse_single_tag_query(&state.current_query))
 }
 
 fn open_visible_tag_by_key(
@@ -1273,9 +1574,56 @@ fn open_visible_tag_by_key(
     let Some(tag) = targets.get(digit as usize - 1).cloned() else {
         return false;
     };
-    activate_saved_search(options, widgets, state, &tag, &tag_query(&tag));
+    if let Some(menu_button) = top_level_tag_menu_button_by_root(widgets, &tag) {
+        menu_button.popup();
+        widgets
+            .status_label
+            .set_text("Tag group opened; use arrows/Enter or click a subtag");
+    } else {
+        activate_saved_search(options, widgets, state, &tag, &tag_query(&tag));
+        set_active_pane(widgets, state, ActivePane::Threads);
+    }
+    true
+}
+
+fn open_custom_saved_search_by_key(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    saved_store: &SavedSearchStore,
+    key: gtk::gdk::Key,
+) -> bool {
+    let Some(digit) = key_to_digit(key) else {
+        return false;
+    };
+    if !(1..=9).contains(&digit) {
+        return false;
+    }
+    let custom_searches = saved_store.borrow();
+    let Some(saved) = custom_searches.get(digit as usize - 1) else {
+        widgets
+            .status_label
+            .set_text("No custom search for that number");
+        return true;
+    };
+    activate_saved_search(options, widgets, state, &saved.name, &saved.query);
     set_active_pane(widgets, state, ActivePane::Threads);
     true
+}
+
+fn custom_saved_search_prompt(saved_store: &SavedSearchStore) -> String {
+    let searches = saved_store.borrow();
+    if searches.is_empty() {
+        return "No custom saved searches".to_string();
+    }
+    let bindings = searches
+        .iter()
+        .take(9)
+        .enumerate()
+        .map(|(index, saved)| format!("{} {}", index + 1, saved.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Custom search: {bindings}")
 }
 
 fn is_duplicate_tag_search(options: &LaunchOptions, tag: &str) -> bool {
@@ -1295,7 +1643,6 @@ fn connect_saved_search_editor(
     state: &SharedState,
     saved_store: &SavedSearchStore,
     save_search_button: &gtk::Button,
-    delete_search_button: &gtk::Button,
 ) {
     let opts = options.clone();
     let w = widgets.clone();
@@ -1307,19 +1654,6 @@ fn connect_saved_search_editor(
             Err(err) => w
                 .status_label
                 .set_text(&format!("Save search failed: {err}")),
-        }
-    });
-
-    let opts = options.clone();
-    let w = widgets.clone();
-    let st = state.clone();
-    let store = saved_store.clone();
-    delete_search_button.connect_clicked(move |_| {
-        match delete_custom_search_from_entries(&opts, &w, &st, &store) {
-            Ok(()) => w.status_label.set_text("Deleted custom search"),
-            Err(err) => w
-                .status_label
-                .set_text(&format!("Delete search failed: {err}")),
         }
     });
 
@@ -1357,30 +1691,22 @@ fn update_saved_search_editor_actions(
     let baseline = selected_saved_search_baseline(state, saved_store);
     let changed = baseline
         .as_ref()
-        .is_none_or(|(base_name, base_query, _)| name != *base_name || query != *base_query);
-    let delete_visible = !changed
-        && baseline.as_ref().is_some_and(|(_, _, kind)| {
-            matches!(
-                kind,
-                SavedSearchBaselineKind::Custom | SavedSearchBaselineKind::Tag
-            )
-        });
+        .is_none_or(|(base_name, base_query)| name != *base_name || query != *base_query);
     let save_visible = has_values && changed && !built_in_name;
 
     widgets.save_search_button.set_visible(save_visible);
-    widgets.delete_search_button.set_visible(delete_visible);
 }
 
 fn selected_saved_search_baseline(
     state: &SharedState,
     saved_store: &SavedSearchStore,
-) -> Option<(String, String, SavedSearchBaselineKind)> {
+) -> Option<(String, String)> {
     let selected = state.borrow().visible_saved_search.clone()?;
     if let Some(saved) = built_in_saved_searches()
         .into_iter()
         .find(|saved| saved.name == selected)
     {
-        return Some((saved.name, saved.query, SavedSearchBaselineKind::BuiltIn));
+        return Some((saved.name, saved.query));
     }
     if let Some(saved) = saved_store
         .borrow()
@@ -1388,12 +1714,12 @@ fn selected_saved_search_baseline(
         .find(|saved| saved.name.eq_ignore_ascii_case(&selected))
         .cloned()
     {
-        return Some((saved.name, saved.query, SavedSearchBaselineKind::Custom));
+        return Some((saved.name, saved.query));
     }
     let tags = state.borrow().visible_tags.clone();
     tags.into_iter()
         .find(|tag| tag == &selected || tag_query(tag) == selected)
-        .map(|tag| (tag.clone(), tag_query(&tag), SavedSearchBaselineKind::Tag))
+        .map(|tag| (tag.clone(), tag_query(&tag)))
 }
 
 fn save_custom_search_from_entries(
@@ -1458,6 +1784,38 @@ fn delete_custom_search_from_entries(
     refresh_saved_searches(options, widgets, state, saved_store);
     widgets.saved_name_entry.set_text("");
     widgets.saved_query_entry.set_text("");
+    update_saved_search_editor_actions(widgets, state, saved_store);
+    Ok(())
+}
+
+fn delete_custom_search_by_name(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    saved_store: &SavedSearchStore,
+    name: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(!name.trim().is_empty(), "saved search name is empty");
+    {
+        let mut searches = saved_store.borrow_mut();
+        let before = searches.len();
+        searches.retain(|saved| !saved.name.eq_ignore_ascii_case(name));
+        anyhow::ensure!(searches.len() != before, "custom search not found");
+        persist_custom_saved_searches(options, &searches)?;
+    }
+    if state.borrow().visible_saved_search.as_deref() == Some(name) {
+        state.borrow_mut().visible_saved_search = None;
+    }
+    if widgets
+        .saved_name_entry
+        .text()
+        .trim()
+        .eq_ignore_ascii_case(name)
+    {
+        widgets.saved_name_entry.set_text("");
+        widgets.saved_query_entry.set_text("");
+    }
+    refresh_saved_searches(options, widgets, state, saved_store);
     update_saved_search_editor_actions(widgets, state, saved_store);
     Ok(())
 }
@@ -1621,23 +1979,31 @@ fn connect_custom_tag_editor(
     let w = widgets.clone();
     let st = state.clone();
     let undo = undo_state.clone();
-    add_tag_button
-        .connect_clicked(move |_| apply_custom_tag_from_entry(&opts, &w, &st, &undo, true));
+    add_tag_button.connect_clicked(move |_| {
+        if apply_custom_tag_from_entry(&opts, &w, &st, &undo, true) {
+            prepare_custom_tag_entry_for_next(&w, &st);
+        }
+    });
 
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
     let undo = undo_state.clone();
-    widgets
-        .custom_tag_entry
-        .connect_activate(move |_| apply_custom_tag_from_entry(&opts, &w, &st, &undo, true));
+    widgets.custom_tag_entry.connect_activate(move |_| {
+        if apply_custom_tag_from_entry_auto(&opts, &w, &st, &undo) {
+            prepare_custom_tag_entry_for_next(&w, &st);
+        }
+    });
 
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
     let undo = undo_state.clone();
-    remove_tag_button
-        .connect_clicked(move |_| apply_custom_tag_from_entry(&opts, &w, &st, &undo, false));
+    remove_tag_button.connect_clicked(move |_| {
+        if apply_custom_tag_from_entry(&opts, &w, &st, &undo, false) {
+            prepare_custom_tag_entry_for_next(&w, &st);
+        }
+    });
 
     let w = widgets.clone();
     let st = state.clone();
@@ -1645,7 +2011,40 @@ fn connect_custom_tag_editor(
         .custom_tag_entry
         .connect_changed(move |_| update_custom_tag_controls(&w, &st));
 
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let w = widgets.clone();
+    let st = state.clone();
+    controller.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            close_custom_tag_editor(&w, &st);
+            return gtk::glib::Propagation::Stop;
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    widgets.custom_tag_entry.add_controller(controller);
+
+    if let Some(popover) = widgets.tag_menu_button.popover() {
+        let w = widgets.clone();
+        let st = state.clone();
+        popover.connect_closed(move |_| {
+            if tag_editor_insert_mode_active(&w, &st) {
+                enter_normal_mode(&w, &st);
+            }
+        });
+    }
+
     update_custom_tag_controls(widgets, state);
+}
+
+fn apply_custom_tag_from_entry_auto(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    undo_state: &UndoState,
+) -> bool {
+    let add = !custom_tag_can_remove(widgets, state);
+    apply_custom_tag_from_entry(options, widgets, state, undo_state, add)
 }
 
 fn apply_custom_tag_from_entry(
@@ -1654,11 +2053,11 @@ fn apply_custom_tag_from_entry(
     state: &SharedState,
     undo_state: &UndoState,
     add: bool,
-) {
+) -> bool {
     let tag = widgets.custom_tag_entry.text().trim().to_string();
     if tag.is_empty() {
         widgets.status_label.set_text("Tag name is empty");
-        return;
+        return false;
     }
     let mutation = if add {
         TagMutation {
@@ -1673,20 +2072,175 @@ fn apply_custom_tag_from_entry(
             sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
         }
     };
-    tag_selected(options, widgets, state, undo_state, mutation);
+    let applied = tag_selected(options, widgets, state, undo_state, mutation);
     update_custom_tag_controls(widgets, state);
+    applied
+}
+
+fn apply_notmuch_tag_command_text(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    undo_state: &UndoState,
+    command: &str,
+) -> bool {
+    let command = command.trim();
+    if command.is_empty() {
+        widgets
+            .status_label
+            .set_text("Tag command is empty; use e.g. -inbox +books");
+        return false;
+    }
+    match parse_notmuch_tag_command(command) {
+        Ok((add, remove)) => {
+            let applied = tag_selected(
+                options,
+                widgets,
+                state,
+                undo_state,
+                TagMutation {
+                    add,
+                    remove,
+                    sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+                },
+            );
+            update_custom_tag_controls(widgets, state);
+            applied
+        }
+        Err(err) => {
+            widgets
+                .status_label
+                .set_text(&format!("Tag command failed: {err}"));
+            false
+        }
+    }
+}
+
+fn parse_notmuch_tag_command(command: &str) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let mut tokens = command.split_whitespace().peekable();
+    if tokens.peek().is_some_and(|token| *token == "notmuch") {
+        tokens.next();
+    }
+    if tokens.peek().is_some_and(|token| *token == "tag") {
+        tokens.next();
+    }
+
+    let mut add = BTreeSet::new();
+    let mut remove = BTreeSet::new();
+    for token in tokens {
+        if token == "--" {
+            anyhow::bail!("query terms are not supported here; selected messages are the target");
+        }
+        let Some(op) = token.chars().next() else {
+            continue;
+        };
+        if op != '+' && op != '-' {
+            anyhow::bail!("expected +tag or -tag token, got `{token}`");
+        }
+        let tag = unquote_tag_command_token(&token[1..]);
+        if tag.is_empty() {
+            anyhow::bail!("empty tag in `{token}`");
+        }
+        if op == '+' {
+            add.insert(tag);
+        } else {
+            remove.insert(tag);
+        }
+    }
+    if add.is_empty() && remove.is_empty() {
+        anyhow::bail!("command needs at least one +tag or -tag");
+    }
+    Ok((add.into_iter().collect(), remove.into_iter().collect()))
+}
+
+fn unquote_tag_command_token(token: &str) -> String {
+    let token = token.trim();
+    if token.len() >= 2
+        && ((token.starts_with('"') && token.ends_with('"'))
+            || (token.starts_with('\'') && token.ends_with('\'')))
+    {
+        token[1..token.len() - 1].to_string()
+    } else {
+        token.to_string()
+    }
+}
+
+fn connect_notmuch_tag_command_editor(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    undo_state: &UndoState,
+) {
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let undo = undo_state.clone();
+    widgets.tag_command_apply_button.connect_clicked(move |_| {
+        if apply_notmuch_tag_command_text(&opts, &w, &st, &undo, &w.tag_command_entry.text()) {
+            close_notmuch_tag_command_editor(&w, &st);
+        }
+    });
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let undo = undo_state.clone();
+    widgets.tag_command_entry.connect_activate(move |entry| {
+        if apply_notmuch_tag_command_text(&opts, &w, &st, &undo, &entry.text()) {
+            close_notmuch_tag_command_editor(&w, &st);
+        } else {
+            entry.select_region(0, -1);
+        }
+    });
+
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let w = widgets.clone();
+    let st = state.clone();
+    controller.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            close_notmuch_tag_command_editor(&w, &st);
+            return gtk::glib::Propagation::Stop;
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    widgets.tag_command_entry.add_controller(controller);
+}
+
+fn open_notmuch_tag_command_editor(widgets: &Widgets, state: &SharedState) {
+    widgets.tag_menu_button.popup();
+    set_input_mode(
+        widgets,
+        state,
+        InputMode::Insert,
+        "Insert mode: tag command (Esc for normal)",
+    );
+    widgets.tag_command_entry.grab_focus();
+    widgets.tag_command_entry.select_region(0, -1);
+}
+
+fn close_notmuch_tag_command_editor(widgets: &Widgets, state: &SharedState) {
+    if let Some(popover) = widgets.tag_menu_button.popover() {
+        popover.popdown();
+    }
+    enter_normal_mode(widgets, state);
 }
 
 fn update_custom_tag_controls(widgets: &Widgets, state: &SharedState) {
-    let tag = widgets.custom_tag_entry.text().trim().to_string();
-    let can_remove = !tag.is_empty()
-        && state
-            .borrow()
-            .selected_thread
-            .as_ref()
-            .is_some_and(|thread| thread.tags.iter().any(|existing| existing == &tag));
-    widgets.add_custom_tag_button.set_visible(true);
+    let has_tag = !widgets.custom_tag_entry.text().trim().is_empty();
+    let can_remove = custom_tag_can_remove(widgets, state);
+    widgets.add_custom_tag_button.set_visible(!can_remove);
     widgets.remove_custom_tag_button.set_visible(can_remove);
+    widgets.add_custom_tag_button.set_sensitive(has_tag);
+    widgets.remove_custom_tag_button.set_sensitive(has_tag);
+}
+
+fn custom_tag_can_remove(widgets: &Widgets, state: &SharedState) -> bool {
+    let tag = widgets.custom_tag_entry.text().trim().to_string();
+    !tag.is_empty()
+        && tag_targets_any(state, |thread| {
+            thread.tags.iter().any(|existing| existing == &tag)
+        })
 }
 
 fn open_custom_tag_editor(widgets: &Widgets, state: &SharedState) {
@@ -1699,6 +2253,114 @@ fn open_custom_tag_editor(widgets: &Widgets, state: &SharedState) {
         "Insert mode: tag (Esc for normal)",
     );
     widgets.custom_tag_entry.grab_focus();
+    widgets.custom_tag_entry.select_region(0, -1);
+}
+
+fn prepare_custom_tag_entry_for_next(widgets: &Widgets, state: &SharedState) {
+    update_custom_tag_controls(widgets, state);
+    widgets.tag_menu_button.popup();
+    set_input_mode(
+        widgets,
+        state,
+        InputMode::Insert,
+        "Tag applied; type another tag or Esc for normal",
+    );
+    widgets.custom_tag_entry.grab_focus();
+    widgets.custom_tag_entry.select_region(0, -1);
+}
+
+fn tag_target_thread_ids(state: &SharedState) -> BTreeSet<String> {
+    let state = state.borrow();
+    if state.visual_select_mode && !state.visual_selected_threads.is_empty() {
+        state.visual_selected_threads.clone()
+    } else {
+        state
+            .selected_thread
+            .iter()
+            .map(|thread| thread.thread_id.clone())
+            .collect()
+    }
+}
+
+fn tag_target_threads(state: &SharedState) -> Vec<notm_notmuch::ThreadSummary> {
+    let state = state.borrow();
+    let target_ids = if state.visual_select_mode && !state.visual_selected_threads.is_empty() {
+        state.visual_selected_threads.clone()
+    } else {
+        state
+            .selected_thread
+            .iter()
+            .map(|thread| thread.thread_id.clone())
+            .collect()
+    };
+    if target_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut threads = Vec::new();
+    for thread in &state.thread_list_items {
+        if target_ids.contains(&thread.thread_id) && seen.insert(thread.thread_id.clone()) {
+            threads.push(thread.clone());
+        }
+    }
+    if let Some(thread) = &state.selected_thread
+        && target_ids.contains(&thread.thread_id)
+        && seen.insert(thread.thread_id.clone())
+    {
+        threads.push(thread.clone());
+    }
+    threads
+}
+
+fn tag_targets_any<F>(state: &SharedState, mut predicate: F) -> bool
+where
+    F: FnMut(&notm_notmuch::ThreadSummary) -> bool,
+{
+    tag_target_threads(state)
+        .iter()
+        .any(|thread| predicate(thread))
+}
+
+fn tag_query_for_thread_ids(thread_ids: &BTreeSet<String>) -> String {
+    thread_ids
+        .iter()
+        .map(|thread_id| format!("thread:{thread_id}"))
+        .collect::<Vec<_>>()
+        .join(" or ")
+}
+
+fn thread_ids_from_tag_query(query: &str) -> BTreeSet<String> {
+    query
+        .split_whitespace()
+        .filter_map(|token| token.strip_prefix("thread:"))
+        .map(|thread_id| thread_id.trim_matches(['(', ')']))
+        .filter(|thread_id| !thread_id.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn tag_target_status_label(count: usize) -> String {
+    match count {
+        0 => "no threads".to_string(),
+        1 => "1 thread".to_string(),
+        count => format!("{} threads", format_count(count)),
+    }
+}
+
+fn close_custom_tag_editor(widgets: &Widgets, state: &SharedState) {
+    if let Some(popover) = widgets.tag_menu_button.popover() {
+        popover.popdown();
+    }
+    if tag_editor_insert_mode_active(widgets, state) {
+        enter_normal_mode(widgets, state);
+    }
+}
+
+fn tag_editor_insert_mode_active(widgets: &Widgets, state: &SharedState) -> bool {
+    state.borrow().input_mode == InputMode::Insert
+        && (widgets.status_label.text().starts_with("Insert mode: tag")
+            || widgets.status_label.text().starts_with("Tag applied;"))
 }
 
 fn widget_token(value: &str) -> String {
@@ -1904,16 +2566,20 @@ fn connect_message_actions(options: &LaunchOptions, widgets: &Widgets, state: &S
     let w = widgets.clone();
     let st = state.clone();
     widgets.view_text_button.connect_clicked(move |_| {
+        let scroll = current_message_scroll_fraction(&w);
         st.borrow_mut().prefer_html_view = false;
         show_rendered_selected_thread(&opts, &w, &st);
+        restore_message_scroll_fraction(&w, scroll);
     });
 
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
     widgets.view_html_button.connect_clicked(move |_| {
+        let scroll = current_message_scroll_fraction(&w);
         st.borrow_mut().prefer_html_view = true;
         show_visual_html_selected_message(&opts, &w, &st);
+        restore_message_scroll_fraction(&w, scroll);
     });
 
     let opts = options.clone();
@@ -1984,21 +2650,55 @@ fn connect_message_actions(options: &LaunchOptions, widgets: &Widgets, state: &S
 fn connect_recipient_autocomplete(entry: &gtk::Entry, widgets: &Widgets, state: &SharedState) {
     let w = widgets.clone();
     let st = state.clone();
+    let entry_for_change = entry.clone();
     entry.connect_changed(move |entry| {
-        update_address_suggestions_label(&w, &st, &entry.text());
+        let text = entry.text().to_string();
+        let field = recipient_field_for_entry(&w, &entry_for_change);
+        {
+            let mut completion = w.address_completion.borrow_mut();
+            if let Some(session) = completion.as_mut()
+                && Some(session.field) == field
+                && session.suppress_next_change
+            {
+                if session.generated_text.as_deref() == Some(text.as_str()) {
+                    session.suppress_next_change = false;
+                    autosave_draft_from_widgets(&w, &st);
+                    return;
+                }
+                if text.is_empty() && session.generated_text.is_some() {
+                    return;
+                }
+            }
+        }
+        if address_completion_current_matches(&w, field, &text) {
+            autosave_draft_from_widgets(&w, &st);
+            return;
+        }
+        reset_address_completion(&w);
+        set_active_address_entry(&w, &entry_for_change);
+        if field.is_some() && field == w.active_address_field.get() {
+            update_address_suggestions_for_entry(&w, &st, &entry_for_change, &text);
+        } else {
+            hide_address_suggestions(&w);
+        }
         autosave_draft_from_widgets(&w, &st);
     });
     let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     let entry_clone = entry.clone();
     let w = widgets.clone();
     let st = state.clone();
     controller.connect_key_pressed(move |_, key, _, _| {
-        if key == gtk::gdk::Key::Tab && apply_recipient_completion(&entry_clone, &st) {
-            w.address_suggestions_popover.popdown();
+        set_active_address_entry(&w, &entry_clone);
+        w.active_address_field
+            .set(recipient_field_for_entry(&w, &entry_clone));
+        if key == gtk::gdk::Key::Tab && complete_recipient_entry(&w, &st, &entry_clone) {
             autosave_draft_from_widgets(&w, &st);
             return gtk::glib::Propagation::Stop;
-        } else if key == gtk::gdk::Key::Escape {
-            w.address_suggestions_popover.popdown();
+        }
+        if key == gtk::gdk::Key::Escape {
+            reset_address_completion(&w);
+            hide_address_suggestions(&w);
             return gtk::glib::Propagation::Stop;
         }
         gtk::glib::Propagation::Proceed
@@ -2007,7 +2707,26 @@ fn connect_recipient_autocomplete(entry: &gtk::Entry, widgets: &Widgets, state: 
 
     let w = widgets.clone();
     let focus = gtk::EventControllerFocus::new();
-    focus.connect_leave(move |_| w.address_suggestions_popover.popdown());
+    let entry_for_enter = entry.clone();
+    focus.connect_enter(move |_| {
+        set_active_address_entry(&w, &entry_for_enter);
+        w.active_address_field
+            .set(recipient_field_for_entry(&w, &entry_for_enter));
+        place_address_suggestions_after_entry(&w, &entry_for_enter);
+        hide_address_suggestions(&w);
+    });
+    let w = widgets.clone();
+    let entry_for_leave = entry.clone();
+    focus.connect_leave(move |_| {
+        let w = w.clone();
+        let field = recipient_field_for_entry(&w, &entry_for_leave);
+        gtk::glib::timeout_add_local_once(Duration::from_millis(150), move || {
+            if w.active_address_field.get() == field {
+                w.active_address_field.set(None);
+                hide_address_suggestions(&w);
+            }
+        });
+    });
     entry.add_controller(focus);
 }
 
@@ -2023,8 +2742,9 @@ fn connect_address_suggestion_list(widgets: &Widgets, state: &SharedState) {
             let Ok(label) = child.downcast::<gtk::Label>() else {
                 return;
             };
-            apply_recipient_suggestion(&w.compose_to, &label.text());
-            w.address_suggestions_popover.popdown();
+            let entry = active_address_entry(&w);
+            apply_recipient_suggestion(&entry, &label.text());
+            hide_address_suggestions(&w);
             autosave_draft_from_widgets(&w, &st);
         });
 }
@@ -2069,6 +2789,363 @@ fn connect_search_debounce(options: &LaunchOptions, widgets: &Widgets, state: &S
         }
         gtk::glib::ControlFlow::Continue
     });
+}
+
+fn connect_search_autocomplete(widgets: &Widgets, state: &SharedState) {
+    let completion_active = Rc::new(Cell::new(false));
+    let focus_generation = Rc::new(Cell::new(0_u64));
+    let w = widgets.clone();
+    let st = state.clone();
+    let active = completion_active.clone();
+    widgets.search_entry.connect_changed(move |entry| {
+        let text = entry.text().to_string();
+        {
+            let mut session_ref = w.search_completion.borrow_mut();
+            if let Some(session) = session_ref.as_mut()
+                && session.suppress_next_change
+            {
+                if session.generated_text.as_deref() == Some(text.as_str()) {
+                    session.suppress_next_change = false;
+                    return;
+                }
+                if text.is_empty() && session.generated_text.is_some() {
+                    return;
+                }
+            }
+        }
+        if search_completion_current_matches(&w, &text) {
+            return;
+        }
+        reset_search_completion(&w);
+        if active.get() {
+            update_search_suggestions(&w, &st, &text, entry.position());
+        } else {
+            hide_search_suggestions(&w);
+        }
+    });
+
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let entry = widgets.search_entry.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let active = completion_active.clone();
+    controller.connect_key_pressed(move |_, key, _, _| {
+        active.set(true);
+        if key == gtk::gdk::Key::Tab && apply_next_search_completion(&entry, &w, &st) {
+            return gtk::glib::Propagation::Stop;
+        }
+        if key == gtk::gdk::Key::Escape {
+            reset_search_completion(&w);
+            hide_search_suggestions(&w);
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    widgets.search_entry.add_controller(controller);
+
+    let w = widgets.clone();
+    let focus = gtk::EventControllerFocus::new();
+    let st = state.clone();
+    let active = completion_active.clone();
+    let generation = focus_generation.clone();
+    focus.connect_enter(move |_| {
+        active.set(true);
+        generation.set(generation.get().saturating_add(1));
+        update_search_suggestions(&w, &st, &w.search_entry.text(), w.search_entry.position());
+    });
+    let w = widgets.clone();
+    let active = completion_active.clone();
+    let generation = focus_generation.clone();
+    focus.connect_leave(move |_| {
+        let leave_generation = generation.get().saturating_add(1);
+        generation.set(leave_generation);
+        let w = w.clone();
+        let active = active.clone();
+        let generation = generation.clone();
+        gtk::glib::timeout_add_local_once(Duration::from_millis(150), move || {
+            if generation.get() == leave_generation {
+                active.set(false);
+                hide_search_suggestions(&w);
+            }
+        });
+    });
+    widgets.search_entry.add_controller(focus);
+
+    let w = widgets.clone();
+    widgets
+        .search_suggestions_list
+        .connect_row_activated(move |_, row| {
+            let Some(child) = row.child() else {
+                return;
+            };
+            let Ok(label) = child.downcast::<gtk::Label>() else {
+                return;
+            };
+            apply_search_completion(&w.search_entry, &label.text());
+            reset_search_completion(&w);
+            hide_search_suggestions(&w);
+        });
+}
+
+fn update_search_suggestions(
+    widgets: &Widgets,
+    state: &SharedState,
+    input: &str,
+    cursor_position: i32,
+) {
+    let suggestions = matching_search_suggestions(input, cursor_position, state, 8);
+    if suggestions.is_empty() {
+        hide_search_suggestions(widgets);
+    } else {
+        *widgets.search_completion.borrow_mut() = Some(SearchCompletionSession {
+            base: input.to_string(),
+            cursor_position,
+            suggestions: suggestions.clone(),
+            next_index: 0,
+            generated_text: None,
+            suppress_next_change: false,
+        });
+        populate_search_suggestions_list(widgets, &suggestions);
+        let width = widgets.search_entry.width().max(360);
+        widgets.search_suggestions_list.set_size_request(width, -1);
+        widgets.search_suggestions_list.set_visible(true);
+    }
+}
+
+fn hide_search_suggestions(widgets: &Widgets) {
+    populate_search_suggestions_list(widgets, &[]);
+    widgets.search_suggestions_list.set_visible(false);
+}
+
+fn reset_search_completion(widgets: &Widgets) {
+    *widgets.search_completion.borrow_mut() = None;
+}
+
+fn populate_search_suggestions_list(widgets: &Widgets, suggestions: &[String]) {
+    while let Some(child) = widgets.search_suggestions_list.first_child() {
+        widgets.search_suggestions_list.remove(&child);
+    }
+    for suggestion in suggestions {
+        let row = gtk::ListBoxRow::new();
+        row.set_widget_name(&format!(
+            "notm-search-suggestion-{}",
+            widget_token(suggestion)
+        ));
+        row.set_focusable(false);
+        let label = gtk::Label::new(Some(suggestion));
+        label.set_xalign(0.0);
+        label.set_margin_start(6);
+        label.set_margin_end(6);
+        label.set_margin_top(3);
+        label.set_margin_bottom(3);
+        row.set_child(Some(&label));
+        widgets.search_suggestions_list.append(&row);
+    }
+}
+
+fn apply_search_completion(entry: &gtk::Entry, replacement: &str) {
+    let current = entry.text().to_string();
+    let (next, next_cursor) = search_completion_text(&current, entry.position(), replacement);
+    entry.set_text(&next);
+    entry.set_position(next_cursor);
+}
+
+fn apply_next_search_completion(
+    entry: &gtk::Entry,
+    widgets: &Widgets,
+    state: &SharedState,
+) -> bool {
+    let current = entry.text().to_string();
+    let reuse_session = widgets
+        .search_completion
+        .borrow()
+        .as_ref()
+        .is_some_and(|session| search_session_matches_current(session, &current));
+    if !reuse_session {
+        let suggestions = matching_search_suggestions(&current, entry.position(), state, 20);
+        if suggestions.is_empty() {
+            hide_search_suggestions(widgets);
+            return false;
+        }
+        *widgets.search_completion.borrow_mut() = Some(SearchCompletionSession {
+            base: current.clone(),
+            cursor_position: entry.position(),
+            suggestions,
+            next_index: 0,
+            generated_text: None,
+            suppress_next_change: false,
+        });
+    }
+
+    let (next, next_cursor, index, suggestions) = {
+        let mut session_ref = widgets.search_completion.borrow_mut();
+        let Some(session) = session_ref.as_mut() else {
+            return false;
+        };
+        if session.suggestions.is_empty() {
+            *session_ref = None;
+            return false;
+        }
+        if let Some(current_index) = search_generated_index(session, &current) {
+            session.next_index = current_index.saturating_add(1);
+        }
+        let index = session.next_index % session.suggestions.len();
+        let (next, next_cursor) = search_completion_text(
+            &session.base,
+            session.cursor_position,
+            &session.suggestions[index],
+        );
+        session.generated_text = Some(next.clone());
+        session.suppress_next_change = true;
+        session.next_index = index + 1;
+        (next, next_cursor, index, session.suggestions.clone())
+    };
+
+    entry.set_text(&next);
+    entry.set_position(next_cursor);
+    populate_search_suggestions_list(widgets, &suggestions);
+    widgets.search_suggestions_list.set_visible(true);
+    if let Some(row) = widgets.search_suggestions_list.row_at_index(index as i32) {
+        widgets.search_suggestions_list.select_row(Some(&row));
+    }
+    true
+}
+
+fn search_completion_current_matches(widgets: &Widgets, text: &str) -> bool {
+    widgets
+        .search_completion
+        .borrow()
+        .as_ref()
+        .is_some_and(|session| search_session_matches_current(session, text))
+}
+
+fn search_session_matches_current(session: &SearchCompletionSession, current: &str) -> bool {
+    session.base == current
+        || session.generated_text.as_deref() == Some(current)
+        || search_generated_index(session, current).is_some()
+}
+
+fn search_generated_index(session: &SearchCompletionSession, current: &str) -> Option<usize> {
+    session.suggestions.iter().position(|suggestion| {
+        search_completion_text(&session.base, session.cursor_position, suggestion).0 == current
+    })
+}
+
+fn search_completion_text(current: &str, cursor_position: i32, replacement: &str) -> (String, i32) {
+    let cursor = char_index_to_byte(current, cursor_position.max(0) as usize);
+    let (start, end) = search_token_bounds(current, cursor);
+    let replacement = if replacement.ends_with(' ') || replacement.ends_with(':') {
+        replacement.to_string()
+    } else {
+        format!("{replacement} ")
+    };
+    let next = format!("{}{}{}", &current[..start], replacement, &current[end..]);
+    let next_cursor = start + replacement.len();
+    (next.clone(), byte_index_to_char(&next, next_cursor))
+}
+
+fn matching_search_suggestions(
+    input: &str,
+    cursor_position: i32,
+    state: &SharedState,
+    limit: usize,
+) -> Vec<String> {
+    let cursor = char_index_to_byte(input, cursor_position.max(0) as usize);
+    let (start, end) = search_token_bounds(input, cursor);
+    let token = input[start..end].trim();
+    if token.is_empty() {
+        return Vec::new();
+    }
+    let token_lower = token.to_lowercase();
+    let mut candidates = Vec::new();
+    if let Some(tag_prefix) = token_lower.strip_prefix("tag:") {
+        let raw_prefix = tag_prefix.trim_matches('"').trim_matches('\'');
+        let tags = state.borrow().visible_tags.clone();
+        for tag in tags {
+            let tag_lower = tag.to_lowercase();
+            if raw_prefix.is_empty()
+                || tag_lower.starts_with(raw_prefix)
+                || tag_lower.contains(raw_prefix)
+            {
+                candidates.push(format!("tag:{}", quote_notmuch_value(&tag)));
+            }
+        }
+    } else {
+        candidates.extend(
+            [
+                "tag:",
+                "from:",
+                "to:",
+                "cc:",
+                "subject:",
+                "thread:",
+                "id:",
+                "date:",
+                "folder:",
+                "path:",
+                "property:",
+                "and",
+                "or",
+                "not",
+                "*",
+            ]
+            .into_iter()
+            .filter(|candidate| candidate.starts_with(&token_lower))
+            .map(str::to_string),
+        );
+        for tag in state.borrow().visible_tags.iter() {
+            if tag.to_lowercase().starts_with(&token_lower) {
+                candidates.push(format!("tag:{}", quote_notmuch_value(tag)));
+            }
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates.truncate(limit);
+    candidates
+}
+
+fn search_token_bounds(input: &str, cursor: usize) -> (usize, usize) {
+    let cursor = cursor.min(input.len());
+    let start = input[..cursor]
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| search_token_separator(*ch))
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+    let end = input[cursor..]
+        .char_indices()
+        .find(|(_, ch)| search_token_separator(*ch))
+        .map(|(index, _)| cursor + index)
+        .unwrap_or(input.len());
+    (start, end)
+}
+
+fn search_token_separator(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '(' | ')')
+}
+
+fn char_index_to_byte(input: &str, char_index: usize) -> usize {
+    input
+        .char_indices()
+        .nth(char_index)
+        .map(|(index, _)| index)
+        .unwrap_or(input.len())
+}
+
+fn byte_index_to_char(input: &str, byte_index: usize) -> i32 {
+    input[..byte_index.min(input.len())].chars().count() as i32
+}
+
+fn quote_notmuch_value(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '@'))
+    {
+        value.to_string()
+    } else {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
 }
 
 fn set_input_mode(widgets: &Widgets, state: &SharedState, mode: InputMode, status: &str) {
@@ -2458,6 +3535,85 @@ fn scroll_html_view_to_edge(widgets: &Widgets, bottom: bool) {
     );
 }
 
+fn current_message_scroll_fraction(widgets: &Widgets) -> Option<f64> {
+    if html_view_is_visible(widgets) {
+        html_scroll_fraction(widgets)
+    } else if widgets
+        .message_stack
+        .visible_child_name()
+        .is_some_and(|name| name.as_str() == "text")
+    {
+        Some(adjustment_scroll_fraction(
+            &widgets.message_scrolled.vadjustment(),
+        ))
+    } else {
+        None
+    }
+}
+
+fn restore_message_scroll_fraction(widgets: &Widgets, fraction: Option<f64>) {
+    let Some(fraction) = fraction else {
+        return;
+    };
+    if html_view_is_visible(widgets) {
+        restore_html_scroll_fraction(widgets, fraction);
+    } else if widgets
+        .message_stack
+        .visible_child_name()
+        .is_some_and(|name| name.as_str() == "text")
+    {
+        let scrolled = widgets.message_scrolled.clone();
+        gtk::glib::idle_add_local_once(move || {
+            restore_adjustment_scroll_fraction(&scrolled.vadjustment(), fraction);
+        });
+    }
+}
+
+fn adjustment_scroll_fraction(adjustment: &gtk::Adjustment) -> f64 {
+    let max = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+    let range = max - adjustment.lower();
+    if range <= 0.0 {
+        0.0
+    } else {
+        ((adjustment.value() - adjustment.lower()) / range).clamp(0.0, 1.0)
+    }
+}
+
+fn restore_adjustment_scroll_fraction(adjustment: &gtk::Adjustment, fraction: f64) {
+    let lower = adjustment.lower();
+    let max = (adjustment.upper() - adjustment.page_size()).max(lower);
+    adjustment.set_value((lower + (max - lower) * fraction.clamp(0.0, 1.0)).clamp(lower, max));
+}
+
+fn html_scroll_fraction(widgets: &Widgets) -> Option<f64> {
+    let value = evaluate_html_javascript_json_sync(
+        widgets,
+        "const e = document.scrollingElement || document.documentElement || document.body; \
+         const max = Math.max(0, e.scrollHeight - e.clientHeight); \
+         JSON.stringify({fraction:max > 0 ? e.scrollTop / max : 0});",
+    )
+    .ok()?;
+    value.get("fraction").and_then(serde_json::Value::as_f64)
+}
+
+fn restore_html_scroll_fraction(widgets: &Widgets, fraction: f64) {
+    let view = widgets.html_view.clone();
+    gtk::glib::timeout_add_local_once(Duration::from_millis(100), move || {
+        view.evaluate_javascript(
+            &format!(
+                "const e = document.scrollingElement || document.documentElement || document.body; \
+                 const max = Math.max(0, e.scrollHeight - e.clientHeight); \
+                 e.scrollTo(0, max * {});",
+                fraction.clamp(0.0, 1.0)
+            ),
+            Some("notm-scroll"),
+            Some("notm://scroll-restore"),
+            None::<&gtk::gio::Cancellable>,
+            |_| {},
+        );
+    });
+}
+
 fn evaluate_html_scroll_script(widgets: &Widgets, script: &str) {
     let status = widgets.status_label.clone();
     widgets.html_view.evaluate_javascript(
@@ -2717,6 +3873,7 @@ fn update_button_binding_labels(widgets: &Widgets, state: &SharedState) {
     set_button_label(&widgets.debug_button, "Debug", "d", state);
     set_button_label(&widgets.palette_button, "Commands", "Ctrl+K", state);
     set_button_label(&widgets.settings_button, "Settings", ",", state);
+    set_button_label(&widgets.help_button, "Help", "?", state);
     set_button_label(&widgets.search_button, "Search", "/", state);
     set_button_label(&widgets.load_more_button, "Load more", "G", state);
     set_button_label(&widgets.archive_button, "Archive", "a", state);
@@ -2727,20 +3884,60 @@ fn update_button_binding_labels(widgets: &Widgets, state: &SharedState) {
     set_button_label(&widgets.trash_button, "Trash", "t", state);
     set_button_label(&widgets.spam_button, "Spam", "s", state);
     set_menu_button_label(&widgets.tag_menu_button, "Tag…", "T", state);
-    set_button_label(&widgets.undo_tag_button, "Undo tag", "z", state);
-    set_menu_button_label(&widgets.response_menu_button, "Respond", "r/R/F", state);
-    set_menu_button_label(&widgets.view_menu_button, "View", "v/H/O", state);
-    set_button_label(&widgets.view_text_button, "Text", "v", state);
-    set_button_label(&widgets.view_html_button, "Visual HTML", "v", state);
-    set_button_label(&widgets.view_headers_button, "Full headers", "H", state);
-    set_button_label(&widgets.view_raw_button, "Raw source", "O", state);
+    set_button_label(&widgets.add_custom_tag_button, "Add tag", "T t", state);
+    set_button_label(
+        &widgets.remove_custom_tag_button,
+        "Remove tag",
+        "T t",
+        state,
+    );
+    set_button_label(&widgets.tag_command_apply_button, "Apply", "T m", state);
+    set_menu_button_label(&widgets.undo_tag_button, "Undo", "z", state);
+    set_button_label(&widgets.undo_last_tag_button, "Undo last", "z z", state);
+    set_button_label(&widgets.undo_list_tag_button, "Undo multiple", "z m", state);
+    set_menu_button_label(&widgets.response_menu_button, "Respond", "r", state);
+    set_button_label(&widgets.reply_button, "Reply", "r r", state);
+    set_button_label(&widgets.reply_all_button, "Reply all", "r a", state);
+    set_button_label(&widgets.forward_button, "Forward", "r f", state);
+    set_button_label(
+        &widgets.forward_attachment_button,
+        "Forward attached",
+        "r A",
+        state,
+    );
+    set_menu_button_label(&widgets.view_menu_button, "View", "V", state);
+    set_button_label(&widgets.view_text_button, "Text", "V t", state);
+    set_button_label(&widgets.view_html_button, "Visual HTML", "V v", state);
+    set_button_label(&widgets.view_headers_button, "Full headers", "V h", state);
+    set_button_label(&widgets.view_raw_button, "Raw source", "V r", state);
     set_button_label(
         &widgets.collapse_quotes_button,
         "Collapse quotes",
         "q",
         state,
     );
-    set_menu_button_label(&widgets.copy_menu_button, "Copy", "y/Y", state);
+    set_menu_button_label(&widgets.copy_menu_button, "Copy", "y", state);
+    set_button_label(
+        &widgets.copy_message_id_button,
+        "Copy message id",
+        "y m",
+        state,
+    );
+    set_button_label(
+        &widgets.copy_thread_id_button,
+        "Copy thread id",
+        "y t",
+        state,
+    );
+    set_button_label(
+        &widgets.copy_from_email_button,
+        "Copy from email",
+        "y f",
+        state,
+    );
+    set_button_label(&widgets.copy_to_email_button, "Copy to email", "y o", state);
+    set_button_label(&widgets.copy_cc_email_button, "Copy cc email", "y c", state);
+    set_button_label(&widgets.copy_subject_button, "Copy subject", "y s", state);
     let image_base = strip_binding_suffix(&widgets.image_policy_button.label().unwrap_or_default());
     set_button_label(&widgets.image_policy_button, &image_base, "I", state);
     set_button_label(
@@ -2848,6 +4045,7 @@ fn install_shortcuts(
     widgets: &Widgets,
     state: &SharedState,
     undo_state: &UndoState,
+    saved_store: &SavedSearchStore,
 ) {
     let capture_controller = gtk::EventControllerKey::new();
     capture_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -2869,7 +4067,15 @@ fn install_shortcuts(
             return gtk::glib::Propagation::Stop;
         }
         if st.borrow().input_mode == InputMode::Insert {
+            if key == gtk::gdk::Key::Tab && complete_focused_recipient(&w, &st) {
+                autosave_draft_from_widgets(&w, &st);
+                return gtk::glib::Propagation::Stop;
+            }
             if key == gtk::gdk::Key::Escape {
+                if tag_editor_insert_mode_active(&w, &st) {
+                    close_custom_tag_editor(&w, &st);
+                    return gtk::glib::Propagation::Stop;
+                }
                 if w.compose_body.has_focus() {
                     if ctrl || compose_vim_ready_for_app_escape(&w.compose_vim_context) {
                         enter_normal_mode(&w, &st);
@@ -2881,6 +4087,10 @@ fn install_shortcuts(
                 return gtk::glib::Propagation::Stop;
             }
             return gtk::glib::Propagation::Proceed;
+        }
+        if key == gtk::gdk::Key::Escape && st.borrow().visual_select_mode {
+            clear_visual_selection(&w, &st);
+            return gtk::glib::Propagation::Stop;
         }
         if ctrl && (key == gtk::gdk::Key::h || key == gtk::gdk::Key::H) {
             move_active_pane(&w, &st, -1);
@@ -2938,8 +4148,26 @@ fn install_shortcuts(
     let w = widgets.clone();
     let st = state.clone();
     let undo = undo_state.clone();
+    let saved = saved_store.clone();
     let pending_go = Rc::new(RefCell::new(false));
+    let pending_custom_search = Rc::new(RefCell::new(false));
+    let pending_response = Rc::new(RefCell::new(false));
+    let pending_view = Rc::new(RefCell::new(false));
+    let pending_copy = Rc::new(RefCell::new(false));
+    let pending_tag = Rc::new(RefCell::new(false));
+    let pending_undo = Rc::new(RefCell::new(false));
     let numeric_prefix = Rc::new(RefCell::new(String::new()));
+    connect_dropdown_sequence_keys(
+        &opts,
+        &w,
+        &st,
+        pending_response.clone(),
+        pending_view.clone(),
+        pending_copy.clone(),
+        pending_tag.clone(),
+        pending_undo.clone(),
+        undo.clone(),
+    );
     controller.connect_key_pressed(move |_, key, _, mods| {
         let ctrl = mods.contains(gtk::gdk::ModifierType::CONTROL_MASK);
         if ctrl {
@@ -2947,6 +4175,158 @@ fn install_shortcuts(
         }
         if st.borrow().input_mode == InputMode::Insert {
             return gtk::glib::Propagation::Proceed;
+        }
+        if key == gtk::gdk::Key::Escape {
+            *pending_go.borrow_mut() = false;
+            *pending_custom_search.borrow_mut() = false;
+            *pending_response.borrow_mut() = false;
+            *pending_view.borrow_mut() = false;
+            *pending_copy.borrow_mut() = false;
+            *pending_tag.borrow_mut() = false;
+            *pending_undo.borrow_mut() = false;
+            w.response_menu_button.popdown();
+            w.view_menu_button.popdown();
+            w.copy_menu_button.popdown();
+            w.tag_menu_button.popdown();
+            w.undo_tag_button.popdown();
+            w.status_label.set_text("Normal mode");
+            return gtk::glib::Propagation::Stop;
+        }
+        if *pending_custom_search.borrow() {
+            *pending_custom_search.borrow_mut() = false;
+            clear_numeric_prefix(&numeric_prefix);
+            let handled = open_custom_saved_search_by_key(&opts, &w, &st, &saved, key);
+            clear_go_prompt_status(&w);
+            return if handled {
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            };
+        }
+        if *pending_response.borrow() {
+            *pending_response.borrow_mut() = false;
+            w.response_menu_button.popdown();
+            clear_numeric_prefix(&numeric_prefix);
+            let handled = if key == gtk::gdk::Key::r {
+                reply_selected(&opts, &w, &st, ReplyKind::Sender);
+                true
+            } else if key == gtk::gdk::Key::a {
+                reply_selected(&opts, &w, &st, ReplyKind::All);
+                true
+            } else if key == gtk::gdk::Key::f {
+                forward_selected(&opts, &w, &st);
+                true
+            } else if key == gtk::gdk::Key::A {
+                forward_as_attachment_selected(&opts, &w, &st);
+                true
+            } else {
+                false
+            };
+            return if handled {
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            };
+        }
+        if *pending_view.borrow() {
+            *pending_view.borrow_mut() = false;
+            w.view_menu_button.popdown();
+            clear_numeric_prefix(&numeric_prefix);
+            let handled = if key == gtk::gdk::Key::t {
+                let scroll = current_message_scroll_fraction(&w);
+                st.borrow_mut().prefer_html_view = false;
+                show_rendered_selected_thread(&opts, &w, &st);
+                restore_message_scroll_fraction(&w, scroll);
+                true
+            } else if key == gtk::gdk::Key::v {
+                let scroll = current_message_scroll_fraction(&w);
+                st.borrow_mut().prefer_html_view = true;
+                show_visual_html_selected_message(&opts, &w, &st);
+                restore_message_scroll_fraction(&w, scroll);
+                true
+            } else if key == gtk::gdk::Key::h {
+                show_full_headers(&opts, &w, &st);
+                true
+            } else if key == gtk::gdk::Key::r {
+                show_raw_source(&opts, &w, &st);
+                true
+            } else {
+                false
+            };
+            return if handled {
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            };
+        }
+        if *pending_copy.borrow() {
+            *pending_copy.borrow_mut() = false;
+            w.copy_menu_button.popdown();
+            clear_numeric_prefix(&numeric_prefix);
+            let handled = if key == gtk::gdk::Key::m {
+                copy_selected_message_id(&w, &st);
+                true
+            } else if key == gtk::gdk::Key::t {
+                copy_selected_thread_id(&w, &st);
+                true
+            } else if key == gtk::gdk::Key::f {
+                copy_selected_message_emails(&w, &st, MessageEmailField::From);
+                true
+            } else if key == gtk::gdk::Key::o {
+                copy_selected_message_emails(&w, &st, MessageEmailField::To);
+                true
+            } else if key == gtk::gdk::Key::c {
+                copy_selected_message_emails(&w, &st, MessageEmailField::Cc);
+                true
+            } else if key == gtk::gdk::Key::s {
+                copy_selected_message_subject(&w, &st);
+                true
+            } else {
+                false
+            };
+            return if handled {
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            };
+        }
+        if *pending_tag.borrow() {
+            *pending_tag.borrow_mut() = false;
+            clear_numeric_prefix(&numeric_prefix);
+            let handled = if key == gtk::gdk::Key::t {
+                open_custom_tag_editor(&w, &st);
+                true
+            } else if key == gtk::gdk::Key::m {
+                open_notmuch_tag_command_editor(&w, &st);
+                true
+            } else {
+                w.tag_menu_button.popdown();
+                false
+            };
+            return if handled {
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            };
+        }
+        if *pending_undo.borrow() {
+            *pending_undo.borrow_mut() = false;
+            w.undo_tag_button.popdown();
+            clear_numeric_prefix(&numeric_prefix);
+            let handled = if key == gtk::gdk::Key::z {
+                undo_last_tag(&opts, &w, &st, &undo);
+                true
+            } else if key == gtk::gdk::Key::m {
+                show_undo_tag_actions(&opts, &w, &st, &undo);
+                true
+            } else {
+                false
+            };
+            return if handled {
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            };
         }
         if *pending_go.borrow() {
             *pending_go.borrow_mut() = false;
@@ -2985,9 +4365,17 @@ fn install_shortcuts(
                 open_saved_search_name(&opts, &w, &st, "Drafts");
                 set_active_pane(&w, &st, ActivePane::Threads);
                 true
+            } else if key == gtk::gdk::Key::t {
+                open_saved_search_name(&opts, &w, &st, "Trash");
+                set_active_pane(&w, &st, ActivePane::Threads);
+                true
             } else if key == gtk::gdk::Key::a {
                 open_saved_search_name(&opts, &w, &st, "All");
                 set_active_pane(&w, &st, ActivePane::Threads);
+                true
+            } else if key == gtk::gdk::Key::c {
+                *pending_custom_search.borrow_mut() = true;
+                w.status_label.set_text(&custom_saved_search_prompt(&saved));
                 true
             } else {
                 false
@@ -3020,7 +4408,7 @@ fn install_shortcuts(
         } else if key == gtk::gdk::Key::g {
             *pending_go.borrow_mut() = true;
             w.status_label.set_text(
-                "Go: g top/count, 1-9 tags, i inbox, u unread, f flagged, s sent, d drafts, a all",
+                "Go: g top/count, 1-9 tags, i inbox, u unread, f flagged, s sent, d drafts, t trash, a all, c custom",
             );
             true
         } else if key == gtk::gdk::Key::j || key == gtk::gdk::Key::Down {
@@ -3088,15 +4476,17 @@ fn install_shortcuts(
             true
         } else if key == gtk::gdk::Key::T {
             clear_numeric_prefix(&numeric_prefix);
-            open_custom_tag_editor(&w, &st);
+            *pending_tag.borrow_mut() = true;
+            w.tag_menu_button.popup();
+            w.status_label
+                .set_text("Tag: t single tag, m multiple tag changes");
             true
         } else if key == gtk::gdk::Key::r {
             clear_numeric_prefix(&numeric_prefix);
-            reply_selected(&opts, &w, &st, ReplyKind::Sender);
-            true
-        } else if key == gtk::gdk::Key::R {
-            clear_numeric_prefix(&numeric_prefix);
-            reply_selected(&opts, &w, &st, ReplyKind::All);
+            *pending_response.borrow_mut() = true;
+            w.response_menu_button.popup();
+            w.status_label
+                .set_text("Respond: r reply, a reply all, f forward, A forward attached");
             true
         } else if key == gtk::gdk::Key::c {
             clear_numeric_prefix(&numeric_prefix);
@@ -3132,23 +4522,25 @@ fn install_shortcuts(
             true
         } else if key == gtk::gdk::Key::z {
             clear_numeric_prefix(&numeric_prefix);
-            undo_last_tag(&opts, &w, &st, &undo);
-            true
-        } else if key == gtk::gdk::Key::F {
-            clear_numeric_prefix(&numeric_prefix);
-            forward_selected(&opts, &w, &st);
+            *pending_undo.borrow_mut() = true;
+            w.undo_tag_button.popup();
+            w.status_label
+                .set_text("Undo: z last tag change, m choose from list");
             true
         } else if key == gtk::gdk::Key::v {
             clear_numeric_prefix(&numeric_prefix);
-            toggle_text_visual_view(&opts, &w, &st);
-            true
-        } else if key == gtk::gdk::Key::H {
+            if st.borrow().active_pane == ActivePane::Threads {
+                enter_visual_select_mode(&w, &st);
+                true
+            } else {
+                false
+            }
+        } else if key == gtk::gdk::Key::V {
             clear_numeric_prefix(&numeric_prefix);
-            show_full_headers(&opts, &w, &st);
-            true
-        } else if key == gtk::gdk::Key::O {
-            clear_numeric_prefix(&numeric_prefix);
-            show_raw_source(&opts, &w, &st);
+            *pending_view.borrow_mut() = true;
+            w.view_menu_button.popup();
+            w.status_label
+                .set_text("View: t text, v visual HTML, h headers, r raw source");
             true
         } else if key == gtk::gdk::Key::q {
             clear_numeric_prefix(&numeric_prefix);
@@ -3156,11 +4548,10 @@ fn install_shortcuts(
             true
         } else if key == gtk::gdk::Key::y {
             clear_numeric_prefix(&numeric_prefix);
-            copy_selected_message_id(&w, &st);
-            true
-        } else if key == gtk::gdk::Key::Y {
-            clear_numeric_prefix(&numeric_prefix);
-            copy_selected_thread_id(&w, &st);
+            *pending_copy.borrow_mut() = true;
+            w.copy_menu_button.popup();
+            w.status_label
+                .set_text("Copy: m message id, t thread id, f from, o to, c cc, s subject");
             true
         } else if key == gtk::gdk::Key::I {
             clear_numeric_prefix(&numeric_prefix);
@@ -3209,6 +4600,179 @@ fn install_shortcuts(
         }
     });
     widgets.window.add_controller(controller);
+}
+
+fn connect_dropdown_sequence_keys(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    pending_response: Rc<RefCell<bool>>,
+    pending_view: Rc<RefCell<bool>>,
+    pending_copy: Rc<RefCell<bool>>,
+    pending_tag: Rc<RefCell<bool>>,
+    pending_undo: Rc<RefCell<bool>>,
+    undo_state: UndoState,
+) {
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let pending = pending_response.clone();
+    controller.connect_key_pressed(move |_, key, _, _| {
+        let handled = if key == gtk::gdk::Key::r {
+            reply_selected(&opts, &w, &st, ReplyKind::Sender);
+            true
+        } else if key == gtk::gdk::Key::a {
+            reply_selected(&opts, &w, &st, ReplyKind::All);
+            true
+        } else if key == gtk::gdk::Key::f {
+            forward_selected(&opts, &w, &st);
+            true
+        } else if key == gtk::gdk::Key::A {
+            forward_as_attachment_selected(&opts, &w, &st);
+            true
+        } else {
+            false
+        };
+        if handled {
+            *pending.borrow_mut() = false;
+            w.response_menu_button.popdown();
+            gtk::glib::Propagation::Stop
+        } else {
+            gtk::glib::Propagation::Proceed
+        }
+    });
+    widgets.response_menu_box.add_controller(controller);
+
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let pending = pending_view.clone();
+    controller.connect_key_pressed(move |_, key, _, _| {
+        let handled = if key == gtk::gdk::Key::t {
+            let scroll = current_message_scroll_fraction(&w);
+            st.borrow_mut().prefer_html_view = false;
+            show_rendered_selected_thread(&opts, &w, &st);
+            restore_message_scroll_fraction(&w, scroll);
+            true
+        } else if key == gtk::gdk::Key::v {
+            let scroll = current_message_scroll_fraction(&w);
+            st.borrow_mut().prefer_html_view = true;
+            show_visual_html_selected_message(&opts, &w, &st);
+            restore_message_scroll_fraction(&w, scroll);
+            true
+        } else if key == gtk::gdk::Key::h {
+            show_full_headers(&opts, &w, &st);
+            true
+        } else if key == gtk::gdk::Key::r {
+            show_raw_source(&opts, &w, &st);
+            true
+        } else {
+            false
+        };
+        if handled {
+            *pending.borrow_mut() = false;
+            w.view_menu_button.popdown();
+            gtk::glib::Propagation::Stop
+        } else {
+            gtk::glib::Propagation::Proceed
+        }
+    });
+    widgets.view_menu_box.add_controller(controller);
+
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let w = widgets.clone();
+    let st = state.clone();
+    let pending = pending_copy;
+    controller.connect_key_pressed(move |_, key, _, _| {
+        let handled = if key == gtk::gdk::Key::m {
+            copy_selected_message_id(&w, &st);
+            true
+        } else if key == gtk::gdk::Key::t {
+            copy_selected_thread_id(&w, &st);
+            true
+        } else if key == gtk::gdk::Key::f {
+            copy_selected_message_emails(&w, &st, MessageEmailField::From);
+            true
+        } else if key == gtk::gdk::Key::o {
+            copy_selected_message_emails(&w, &st, MessageEmailField::To);
+            true
+        } else if key == gtk::gdk::Key::c {
+            copy_selected_message_emails(&w, &st, MessageEmailField::Cc);
+            true
+        } else if key == gtk::gdk::Key::s {
+            copy_selected_message_subject(&w, &st);
+            true
+        } else {
+            false
+        };
+        if handled {
+            *pending.borrow_mut() = false;
+            w.copy_menu_button.popdown();
+            gtk::glib::Propagation::Stop
+        } else {
+            gtk::glib::Propagation::Proceed
+        }
+    });
+    widgets.copy_menu_box.add_controller(controller);
+
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let w = widgets.clone();
+    let st = state.clone();
+    let pending = pending_tag;
+    controller.connect_key_pressed(move |_, key, _, _| {
+        if st.borrow().input_mode == InputMode::Insert {
+            return gtk::glib::Propagation::Proceed;
+        }
+        let handled = if key == gtk::gdk::Key::t {
+            open_custom_tag_editor(&w, &st);
+            true
+        } else if key == gtk::gdk::Key::m {
+            open_notmuch_tag_command_editor(&w, &st);
+            true
+        } else {
+            false
+        };
+        if handled {
+            *pending.borrow_mut() = false;
+            gtk::glib::Propagation::Stop
+        } else {
+            gtk::glib::Propagation::Proceed
+        }
+    });
+    widgets.tag_menu_box.add_controller(controller);
+
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let undo = undo_state;
+    let pending = pending_undo;
+    controller.connect_key_pressed(move |_, key, _, _| {
+        let handled = if key == gtk::gdk::Key::z {
+            undo_last_tag(&opts, &w, &st, &undo);
+            true
+        } else if key == gtk::gdk::Key::m {
+            show_undo_tag_actions(&opts, &w, &st, &undo);
+            true
+        } else {
+            false
+        };
+        if handled {
+            *pending.borrow_mut() = false;
+            w.undo_tag_button.popdown();
+            gtk::glib::Propagation::Stop
+        } else {
+            gtk::glib::Propagation::Proceed
+        }
+    });
+    widgets.undo_menu_box.add_controller(controller);
 }
 
 fn connect_auto_load_more(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -3289,6 +4853,7 @@ fn saved_search_query(name: &str) -> &'static str {
         "Flagged" => "tag:flagged",
         "Sent" => "tag:sent",
         "Drafts" => "tag:draft",
+        "Trash" => "tag:trash",
         "All" => "*",
         _ => "tag:inbox and not tag:trash and not tag:spam",
     }
@@ -3322,12 +4887,7 @@ fn toggle_unread_selected(
     state: &SharedState,
     undo_state: &UndoState,
 ) {
-    let has_unread = state
-        .borrow()
-        .selected_thread
-        .as_ref()
-        .map(|thread| thread.has_unread)
-        .unwrap_or(false);
+    let has_unread = tag_targets_any(state, |thread| thread.has_unread);
     let mutation = if has_unread {
         TagMutation {
             add: vec![],
@@ -3350,12 +4910,7 @@ fn toggle_flagged_selected(
     state: &SharedState,
     undo_state: &UndoState,
 ) {
-    let flagged = state
-        .borrow()
-        .selected_thread
-        .as_ref()
-        .map(|thread| thread.is_flagged)
-        .unwrap_or(false);
+    let flagged = tag_targets_any(state, |thread| thread.is_flagged);
     let mutation = if flagged {
         TagMutation {
             add: vec![],
@@ -3418,14 +4973,108 @@ fn refresh_address_suggestions(options: &LaunchOptions, widgets: &Widgets, state
 }
 
 fn update_address_suggestions_label(widgets: &Widgets, state: &SharedState, input: &str) {
+    let entry = active_address_entry(widgets);
+    update_address_suggestions_for_entry(widgets, state, &entry, input);
+}
+
+fn update_address_suggestions_for_entry(
+    widgets: &Widgets,
+    state: &SharedState,
+    entry: &gtk::Entry,
+    input: &str,
+) {
     let suggestions = matching_address_suggestions(input, &state.borrow().address_suggestions, 6);
     if suggestions.is_empty() {
-        populate_address_suggestions_list(widgets, &[]);
-        widgets.address_suggestions_popover.popdown();
+        hide_address_suggestions(widgets);
     } else {
+        set_active_address_entry(widgets, entry);
+        if let Some(field) = recipient_field_for_entry(widgets, entry) {
+            *widgets.address_completion.borrow_mut() = Some(AddressCompletionSession {
+                field,
+                base: input.to_string(),
+                suggestions: suggestions.clone(),
+                next_index: 0,
+                generated_text: None,
+                suppress_next_change: false,
+            });
+        }
+        place_address_suggestions_after_entry(widgets, entry);
         populate_address_suggestions_list(widgets, &suggestions);
-        widgets.address_suggestions_popover.popup();
+        widgets.address_suggestions_list.set_visible(true);
     }
+}
+
+fn hide_address_suggestions(widgets: &Widgets) {
+    populate_address_suggestions_list(widgets, &[]);
+    widgets.address_suggestions_list.set_visible(false);
+}
+
+fn reset_address_completion(widgets: &Widgets) {
+    *widgets.address_completion.borrow_mut() = None;
+}
+
+fn set_active_address_entry(widgets: &Widgets, entry: &gtk::Entry) {
+    *widgets.active_address_entry.borrow_mut() = Some(entry.clone());
+}
+
+fn active_address_entry(widgets: &Widgets) -> gtk::Entry {
+    widgets
+        .active_address_entry
+        .borrow()
+        .clone()
+        .unwrap_or_else(|| widgets.compose_to.clone())
+}
+
+fn recipient_field_for_entry(widgets: &Widgets, entry: &gtk::Entry) -> Option<RecipientField> {
+    if entry == &widgets.compose_to {
+        Some(RecipientField::To)
+    } else if entry == &widgets.compose_cc {
+        Some(RecipientField::Cc)
+    } else if entry == &widgets.compose_bcc {
+        Some(RecipientField::Bcc)
+    } else {
+        None
+    }
+}
+
+fn focused_recipient_entry(widgets: &Widgets) -> Option<(RecipientField, gtk::Entry)> {
+    match widgets.active_address_field.get()? {
+        RecipientField::To => Some((RecipientField::To, widgets.compose_to.clone())),
+        RecipientField::Cc => Some((RecipientField::Cc, widgets.compose_cc.clone())),
+        RecipientField::Bcc => Some((RecipientField::Bcc, widgets.compose_bcc.clone())),
+    }
+}
+
+fn address_completion_current_matches(
+    widgets: &Widgets,
+    field: Option<RecipientField>,
+    text: &str,
+) -> bool {
+    let Some(field) = field else {
+        return false;
+    };
+    widgets
+        .address_completion
+        .borrow()
+        .as_ref()
+        .is_some_and(|session| {
+            session.field == field && address_session_matches_current(session, text)
+        })
+}
+
+fn place_address_suggestions_after_entry(widgets: &Widgets, entry: &gtk::Entry) {
+    let Some(parent) = entry.parent() else {
+        return;
+    };
+    let Ok(parent_box) = parent.downcast::<gtk::Box>() else {
+        return;
+    };
+    if let Some(current_parent) = widgets.address_suggestions_list.parent()
+        && let Ok(current_box) = current_parent.downcast::<gtk::Box>()
+    {
+        current_box.remove(&widgets.address_suggestions_list);
+    }
+    parent_box.insert_child_after(&widgets.address_suggestions_list, Some(entry));
 }
 
 fn matching_address_suggestions(input: &str, suggestions: &[String], limit: usize) -> Vec<String> {
@@ -3469,15 +5118,115 @@ fn apply_recipient_completion(entry: &gtk::Entry, state: &SharedState) -> bool {
     true
 }
 
+fn complete_focused_recipient(widgets: &Widgets, state: &SharedState) -> bool {
+    let Some((field, entry)) = focused_recipient_entry(widgets) else {
+        return false;
+    };
+    complete_recipient_entry_for_field(widgets, state, &entry, field)
+}
+
+fn complete_recipient_entry(widgets: &Widgets, state: &SharedState, entry: &gtk::Entry) -> bool {
+    let Some(field) = recipient_field_for_entry(widgets, entry) else {
+        return false;
+    };
+    complete_recipient_entry_for_field(widgets, state, entry, field)
+}
+
+fn complete_recipient_entry_for_field(
+    widgets: &Widgets,
+    state: &SharedState,
+    entry: &gtk::Entry,
+    field: RecipientField,
+) -> bool {
+    set_active_address_entry(widgets, &entry);
+    place_address_suggestions_after_entry(widgets, &entry);
+
+    let current = entry.text().to_string();
+    let reuse_session = widgets
+        .address_completion
+        .borrow()
+        .as_ref()
+        .is_some_and(|session| {
+            session.field == field && address_session_matches_current(session, &current)
+        });
+
+    if !reuse_session {
+        let suggestions =
+            matching_address_suggestions(&current, &state.borrow().address_suggestions, 20);
+        if suggestions.is_empty() {
+            hide_address_suggestions(widgets);
+            return false;
+        }
+        *widgets.address_completion.borrow_mut() = Some(AddressCompletionSession {
+            field,
+            base: current.clone(),
+            suggestions,
+            next_index: 0,
+            generated_text: None,
+            suppress_next_change: false,
+        });
+    }
+
+    let (next, index, suggestions) = {
+        let mut completion = widgets.address_completion.borrow_mut();
+        let Some(session) = completion.as_mut() else {
+            return false;
+        };
+        if session.suggestions.is_empty() {
+            *completion = None;
+            return false;
+        }
+        if let Some(current_index) = address_generated_index(session, &current) {
+            session.next_index = current_index.saturating_add(1);
+        }
+        let index = session.next_index % session.suggestions.len();
+        let next = recipient_suggestion_text(&session.base, &session.suggestions[index]);
+        session.generated_text = Some(next.clone());
+        session.suppress_next_change = true;
+        session.next_index = index + 1;
+        (next, index, session.suggestions.clone())
+    };
+
+    entry.set_text(&next);
+    entry.set_position(-1);
+    populate_address_suggestions_list(widgets, &suggestions);
+    if let Some(row) = widgets.address_suggestions_list.row_at_index(index as i32) {
+        widgets.address_suggestions_list.select_row(Some(&row));
+    }
+    widgets.address_suggestions_list.set_visible(true);
+    true
+}
+
 fn apply_recipient_suggestion(entry: &gtk::Entry, suggestion: &str) {
     let current = entry.text().to_string();
-    let next = if let Some((head, _)) = current.rsplit_once(',') {
+    apply_recipient_suggestion_to_text(entry, &current, suggestion);
+}
+
+fn apply_recipient_suggestion_to_text(entry: &gtk::Entry, current: &str, suggestion: &str) {
+    let next = recipient_suggestion_text(current, suggestion);
+    entry.set_text(&next);
+    entry.set_position(-1);
+}
+
+fn recipient_suggestion_text(current: &str, suggestion: &str) -> String {
+    if let Some((head, _)) = current.rsplit_once(',') {
         format!("{}, {}", head.trim_end(), suggestion)
     } else {
         suggestion.to_string()
-    };
-    entry.set_text(&next);
-    entry.set_position(-1);
+    }
+}
+
+fn address_session_matches_current(session: &AddressCompletionSession, current: &str) -> bool {
+    session.base == current
+        || session.generated_text.as_deref() == Some(current)
+        || address_generated_index(session, current).is_some()
+}
+
+fn address_generated_index(session: &AddressCompletionSession, current: &str) -> Option<usize> {
+    session
+        .suggestions
+        .iter()
+        .position(|suggestion| recipient_suggestion_text(&session.base, suggestion) == current)
 }
 
 fn populate_address_suggestions_list(widgets: &Widgets, suggestions: &[String]) {
@@ -3829,7 +5578,7 @@ fn clear_draft_widgets(widgets: &Widgets, state: &SharedState) {
     };
     apply_compose_fields(widgets, state, fields);
     set_active_draft(widgets, state, None);
-    widgets.address_suggestions_popover.popdown();
+    widgets.address_suggestions_list.set_visible(false);
     widgets.message_stack.set_visible_child_name("text");
     refresh_thread_attachment_list(widgets, state);
 }
@@ -4339,6 +6088,7 @@ fn set_active_message_view(widgets: &Widgets, active: MessageViewKind) {
 }
 
 fn toggle_text_visual_view(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    let scroll = current_message_scroll_fraction(widgets);
     if html_view_is_visible(widgets) {
         state.borrow_mut().prefer_html_view = false;
         show_rendered_selected_thread(options, widgets, state);
@@ -4346,6 +6096,7 @@ fn toggle_text_visual_view(options: &LaunchOptions, widgets: &Widgets, state: &S
         state.borrow_mut().prefer_html_view = true;
         show_visual_html_selected_message(options, widgets, state);
     }
+    restore_message_scroll_fraction(widgets, scroll);
 }
 
 fn activate_image_policy_button(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -4383,15 +6134,22 @@ fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, sta
     widgets.response_menu_button.set_sensitive(has_message);
     widgets.read_toggle_button.set_sensitive(has_thread);
     widgets.flag_toggle_button.set_sensitive(has_thread);
-    if let Some(thread) = selected_thread {
-        widgets.read_toggle_button.set_label(if thread.has_unread {
-            "Mark read"
-        } else {
-            "Mark unread"
-        });
-        widgets
-            .flag_toggle_button
-            .set_label(if thread.is_flagged { "Unflag" } else { "Flag" });
+    let tag_targets = tag_target_threads(state);
+    if !tag_targets.is_empty() {
+        widgets.read_toggle_button.set_label(
+            if tag_targets.iter().any(|thread| thread.has_unread) {
+                "Mark read"
+            } else {
+                "Mark unread"
+            },
+        );
+        widgets.flag_toggle_button.set_label(
+            if tag_targets.iter().any(|thread| thread.is_flagged) {
+                "Unflag"
+            } else {
+                "Flag"
+            },
+        );
     } else {
         widgets.read_toggle_button.set_label("Mark read");
         widgets.flag_toggle_button.set_label("Flag");
@@ -4553,6 +6311,7 @@ fn open_saved_attachment_path(widgets: &Widgets, state: &SharedState, path: Path
 }
 
 fn show_raw_source(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    let scroll = current_message_scroll_fraction(widgets);
     let result = (|| -> anyhow::Result<String> {
         let filename = selected_message_filename(state)?;
         Ok(std::fs::read_to_string(filename)?)
@@ -4563,6 +6322,7 @@ fn show_raw_source(options: &LaunchOptions, widgets: &Widgets, state: &SharedSta
             set_active_message_view(widgets, MessageViewKind::Raw);
             widgets.message_view.set_monospace(true);
             widgets.message_view.buffer().set_text(&raw);
+            restore_message_scroll_fraction(widgets, scroll);
             widgets.status_label.set_text("Raw message source shown");
             state.borrow_mut().last_operation = Some("showed raw source".to_string());
         }
@@ -4577,6 +6337,7 @@ fn show_raw_source(options: &LaunchOptions, widgets: &Widgets, state: &SharedSta
 }
 
 fn show_full_headers(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    let scroll = current_message_scroll_fraction(widgets);
     let result = (|| -> anyhow::Result<String> {
         let filename = selected_message_filename(state)?;
         let raw = std::fs::read_to_string(filename)?;
@@ -4588,6 +6349,7 @@ fn show_full_headers(options: &LaunchOptions, widgets: &Widgets, state: &SharedS
             set_active_message_view(widgets, MessageViewKind::Headers);
             widgets.message_view.set_monospace(true);
             widgets.message_view.buffer().set_text(&headers);
+            restore_message_scroll_fraction(widgets, scroll);
             widgets.status_label.set_text("Full message headers shown");
             state.borrow_mut().last_operation = Some("showed full headers".to_string());
         }
@@ -4782,7 +6544,7 @@ fn show_text_message_view(options: &LaunchOptions, widgets: &Widgets, state: &Sh
 }
 
 fn show_compose_view(widgets: &Widgets) {
-    widgets.address_suggestions_popover.popdown();
+    widgets.address_suggestions_list.set_visible(false);
     widgets.html_policy_row.set_visible(false);
     widgets.message_header_label.set_visible(false);
     widgets.attachment_title.set_visible(false);
@@ -5298,7 +7060,8 @@ fn connect_actions(
     flag_button: &gtk::Button,
     trash_button: &gtk::Button,
     spam_button: &gtk::Button,
-    undo_button: &gtk::Button,
+    undo_last_button: &gtk::Button,
+    undo_list_button: &gtk::Button,
     compose_button: &gtk::Button,
     reply_button: &gtk::Button,
     reply_all_button: &gtk::Button,
@@ -5307,6 +7070,7 @@ fn connect_actions(
     debug_button: &gtk::Button,
     palette_button: &gtk::Button,
     settings_button: &gtk::Button,
+    help_button: &gtk::Button,
     send_button: &gtk::Button,
 ) {
     let opts = options.clone();
@@ -5391,7 +7155,13 @@ fn connect_actions(
     let w = widgets.clone();
     let st = state.clone();
     let undo = undo_state.clone();
-    undo_button.connect_clicked(move |_| undo_last_tag(&opts, &w, &st, &undo));
+    undo_last_button.connect_clicked(move |_| undo_last_tag(&opts, &w, &st, &undo));
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let undo = undo_state.clone();
+    undo_list_button.connect_clicked(move |_| show_undo_tag_actions(&opts, &w, &st, &undo));
 
     let w = widgets.clone();
     let st = state.clone();
@@ -5435,6 +7205,9 @@ fn connect_actions(
     let w = widgets.clone();
     let opts = options.clone();
     settings_button.connect_clicked(move |_| show_settings(&w, &opts));
+
+    let w = widgets.clone();
+    help_button.connect_clicked(move |_| show_shortcuts_overlay(&w));
 
     let opts = options.clone();
     let w = widgets.clone();
@@ -5576,6 +7349,9 @@ fn apply_search_data(
         s.selected_thread = None;
         s.selected_message = None;
         s.messages.clear();
+        s.visual_select_mode = false;
+        s.visual_select_anchor = None;
+        s.visual_selected_threads.clear();
         s.visible_tags = data.tags;
         s.database_path = Some(data.database_path);
         s.database_revision = Some(data.revision);
@@ -5734,6 +7510,80 @@ fn populate_thread_list(options: &LaunchOptions, widgets: &Widgets, state: &Shar
         let detail = details.get(&thread.thread_id).cloned().unwrap_or_default();
         set_thread_row_content(&row, idx, thread, &detail);
         widgets.thread_list.append(&row);
+    }
+    update_visual_selection_rows(widgets, state);
+}
+
+fn enter_visual_select_mode(widgets: &Widgets, state: &SharedState) {
+    let Some(index) = selected_thread_index(widgets) else {
+        widgets
+            .status_label
+            .set_text("No thread selected for visual select");
+        return;
+    };
+    {
+        let mut state = state.borrow_mut();
+        state.active_pane = ActivePane::Threads;
+        state.visual_select_mode = true;
+        state.visual_select_anchor = Some(index);
+    }
+    update_visual_selection_to_cursor(widgets, state);
+}
+
+fn clear_visual_selection(widgets: &Widgets, state: &SharedState) {
+    {
+        let mut state = state.borrow_mut();
+        state.visual_select_mode = false;
+        state.visual_select_anchor = None;
+        state.visual_selected_threads.clear();
+    }
+    update_visual_selection_rows(widgets, state);
+    widgets.status_label.set_text("Normal mode");
+}
+
+fn update_visual_selection_to_cursor(widgets: &Widgets, state: &SharedState) {
+    let Some(cursor) = selected_thread_index(widgets) else {
+        return;
+    };
+    let (anchor, ids) = {
+        let state = state.borrow();
+        if !state.visual_select_mode {
+            return;
+        }
+        let anchor = state.visual_select_anchor.unwrap_or(cursor);
+        let start = anchor.min(cursor);
+        let end = anchor.max(cursor);
+        let ids = state
+            .thread_list_items
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| (start..=end).contains(index))
+            .map(|(_, thread)| thread.thread_id.clone())
+            .collect::<BTreeSet<_>>();
+        (anchor, ids)
+    };
+    let count = ids.len();
+    {
+        let mut state = state.borrow_mut();
+        state.visual_select_anchor = Some(anchor);
+        state.visual_selected_threads = ids;
+    }
+    update_visual_selection_rows(widgets, state);
+    widgets
+        .status_label
+        .set_text(&format!("Visual select: {count} thread(s) selected"));
+}
+
+fn update_visual_selection_rows(widgets: &Widgets, state: &SharedState) {
+    let selected = state.borrow().visual_selected_threads.clone();
+    for (index, thread) in state.borrow().thread_list_items.iter().enumerate() {
+        if let Some(row) = widgets.thread_list.row_at_index(index as i32) {
+            if selected.contains(&thread.thread_id) {
+                row.add_css_class("notm-visual-selected");
+            } else {
+                row.remove_css_class("notm-visual-selected");
+            }
+        }
     }
 }
 
@@ -6010,6 +7860,9 @@ fn select_thread_by_index(
     if let Some(row) = widgets.thread_list.row_at_index(index as i32) {
         focus_thread_row(&row);
     }
+    if state.borrow().visual_select_mode {
+        update_visual_selection_to_cursor(widgets, state);
+    }
     update_custom_tag_controls(widgets, state);
     update_message_action_buttons(options, widgets, state);
     update_debug(widgets, state);
@@ -6075,34 +7928,127 @@ fn open_thread_by_index(
     update_debug(widgets, state);
 }
 
+fn push_undo_tag_action(undo_state: &UndoState, action: UndoTagAction) {
+    const MAX_UNDO_TAG_ACTIONS: usize = 30;
+    let snapshot = {
+        let mut actions = undo_state.borrow_mut();
+        actions.push(action);
+        if actions.len() > MAX_UNDO_TAG_ACTIONS {
+            let overflow = actions.len() - MAX_UNDO_TAG_ACTIONS;
+            actions.drain(0..overflow);
+        }
+        actions.clone()
+    };
+    let _ = persist_undo_tag_actions(&snapshot);
+}
+
+fn pop_last_undo_tag_action(undo_state: &UndoState) -> Option<UndoTagAction> {
+    let (action, snapshot) = {
+        let mut actions = undo_state.borrow_mut();
+        let action = actions.pop();
+        (action, actions.clone())
+    };
+    let _ = persist_undo_tag_actions(&snapshot);
+    action
+}
+
+fn remove_undo_tag_action(undo_state: &UndoState, index: usize) -> Option<UndoTagAction> {
+    let (action, snapshot) = {
+        let mut actions = undo_state.borrow_mut();
+        if index >= actions.len() {
+            (None, actions.clone())
+        } else {
+            (Some(actions.remove(index)), actions.clone())
+        }
+    };
+    let _ = persist_undo_tag_actions(&snapshot);
+    action
+}
+
+fn default_undo_history_path() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("notm")
+        .join("tag-undo.json")
+}
+
+fn load_undo_tag_actions() -> Vec<UndoTagAction> {
+    let path = default_undo_history_path();
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<UndoTagAction>>(&text).ok())
+        .unwrap_or_default()
+}
+
+fn persist_undo_tag_actions(actions: &[UndoTagAction]) -> anyhow::Result<()> {
+    let path = default_undo_history_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(actions)?)?;
+    Ok(())
+}
+
+fn tag_undo_label(
+    mutation: &TagMutation,
+    target_threads: usize,
+    changed_messages: usize,
+) -> String {
+    let adds = if mutation.add.is_empty() {
+        String::new()
+    } else {
+        format!("+{}", mutation.add.join(" +"))
+    };
+    let removes = if mutation.remove.is_empty() {
+        String::new()
+    } else {
+        format!("-{}", mutation.remove.join(" -"))
+    };
+    let ops = [adds, removes]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "{ops} on {} ({changed_messages} changed)",
+        tag_target_status_label(target_threads)
+    )
+}
+
 fn tag_selected(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
     undo_state: &UndoState,
     mutation: TagMutation,
-) {
-    let Some(thread) = state.borrow().selected_thread.clone() else {
+) -> bool {
+    let target_thread_ids = tag_target_thread_ids(state);
+    if target_thread_ids.is_empty() {
         widgets
             .status_label
             .set_text("No selected thread for tag operation");
-        return;
-    };
-    let query = format!("thread:{}", thread.thread_id);
+        return false;
+    }
+    let target_count = target_thread_ids.len();
+    let query = tag_query_for_thread_ids(&target_thread_ids);
     let result = (|| -> anyhow::Result<usize> {
         let db = Database::open(&open_config(options), DatabaseMode::ReadWrite)?;
         let report = db.apply_tags_to_query(&query, &mutation)?;
-        if report.changed_messages == 0 {
-            undo_state.borrow_mut().take();
-        } else {
-            *undo_state.borrow_mut() = Some((
-                query.clone(),
-                TagMutation {
-                    add: mutation.remove.clone(),
-                    remove: mutation.add.clone(),
-                    sync_maildir_flags: mutation.sync_maildir_flags,
+        if report.changed_messages > 0 {
+            push_undo_tag_action(
+                undo_state,
+                UndoTagAction {
+                    query: query.clone(),
+                    mutation: TagMutation {
+                        add: mutation.remove.clone(),
+                        remove: mutation.add.clone(),
+                        sync_maildir_flags: mutation.sync_maildir_flags,
+                    },
+                    label: tag_undo_label(&mutation, target_count, report.changed_messages),
                 },
-            ));
+            );
         }
         state.borrow_mut().last_operation = Some(format!(
             "tagged {} message(s): +{:?} -{:?}",
@@ -6112,21 +8058,23 @@ fn tag_selected(
     })();
     match result {
         Ok(changed_messages) => {
-            apply_local_tag_mutation(widgets, state, &mutation);
+            apply_local_tag_mutation(widgets, state, &mutation, &target_thread_ids);
             update_message_header(widgets, state);
             update_custom_tag_controls(widgets, state);
             update_message_action_buttons(options, widgets, state);
-            let undo_available = changed_messages > 0;
+            let undo_available = !undo_state.borrow().is_empty();
             set_undo_tag_available(widgets, undo_available);
-            if undo_available {
-                widgets
-                    .status_label
-                    .set_text("Tag operation complete; Undo tag reverses this change");
+            if changed_messages > 0 {
+                widgets.status_label.set_text(&format!(
+                    "Tag operation complete for {}; Undo menu shows recent tag actions",
+                    tag_target_status_label(target_count)
+                ));
             } else {
                 widgets
                     .status_label
                     .set_text("Tag operation made no changes");
             }
+            true
         }
         Err(err) => {
             state.borrow_mut().last_error = Some(err.to_string());
@@ -6134,49 +8082,60 @@ fn tag_selected(
                 .status_label
                 .set_text(&format!("Tag operation failed: {err}"));
             update_debug(widgets, state);
+            false
         }
     }
 }
 
-fn apply_local_tag_mutation(widgets: &Widgets, state: &SharedState, mutation: &TagMutation) {
-    let selected_thread_id = state
-        .borrow()
-        .selected_thread
-        .as_ref()
-        .map(|thread| thread.thread_id.clone());
-    let row_update = {
+fn apply_local_tag_mutation(
+    widgets: &Widgets,
+    state: &SharedState,
+    mutation: &TagMutation,
+    target_thread_ids: &BTreeSet<String>,
+) {
+    let row_updates = {
         let mut state = state.borrow_mut();
-        let mut updated_thread_index = None;
+        let mut updated_thread_indices = Vec::new();
         for (index, thread) in state.thread_list_items.iter_mut().enumerate() {
-            if selected_thread_id.as_ref() == Some(&thread.thread_id) {
+            if target_thread_ids.contains(&thread.thread_id) {
                 apply_tag_mutation_to_thread(thread, mutation);
-                updated_thread_index.get_or_insert(index);
+                updated_thread_indices.push(index);
             }
         }
-        if let Some(thread) = &mut state.selected_thread {
+        if let Some(thread) = &mut state.selected_thread
+            && target_thread_ids.contains(&thread.thread_id)
+        {
             apply_tag_mutation_to_thread(thread, mutation);
         }
         for message in &mut state.messages {
+            if target_thread_ids.contains(&message.thread_id) {
+                apply_tag_mutation_to_tags(&mut message.tags, mutation);
+            }
+        }
+        if let Some(message) = &mut state.selected_message
+            && target_thread_ids.contains(&message.thread_id)
+        {
             apply_tag_mutation_to_tags(&mut message.tags, mutation);
         }
-        if let Some(message) = &mut state.selected_message {
-            apply_tag_mutation_to_tags(&mut message.tags, mutation);
-        }
-        updated_thread_index.and_then(|index| {
-            let thread = state.thread_list_items.get(index)?.clone();
-            let detail = state
-                .thread_details
-                .get(&thread.thread_id)
-                .cloned()
-                .unwrap_or_default();
-            Some((index, thread, detail))
-        })
+        updated_thread_indices
+            .into_iter()
+            .filter_map(|index| {
+                let thread = state.thread_list_items.get(index)?.clone();
+                let detail = state
+                    .thread_details
+                    .get(&thread.thread_id)
+                    .cloned()
+                    .unwrap_or_default();
+                Some((index, thread, detail))
+            })
+            .collect::<Vec<_>>()
     };
-    if let Some((index, thread, detail)) = row_update
-        && let Some(row) = widgets.thread_list.row_at_index(index as i32)
-    {
-        set_thread_row_content(&row, index, &thread, &detail);
+    for (index, thread, detail) in row_updates {
+        if let Some(row) = widgets.thread_list.row_at_index(index as i32) {
+            set_thread_row_content(&row, index, &thread, &detail);
+        }
     }
+    update_visual_selection_rows(widgets, state);
 }
 
 fn apply_tag_mutation_to_thread(thread: &mut notm_notmuch::ThreadSummary, mutation: &TagMutation) {
@@ -6200,6 +8159,9 @@ fn set_undo_tag_available(widgets: &Widgets, available: bool) {
     widgets.undo_tag_button.set_visible(available);
     if available {
         widgets.undo_tag_button.add_css_class("suggested-action");
+        widgets
+            .undo_tag_button
+            .set_tooltip_text(Some("Undo recent tag operations"));
     } else {
         widgets.undo_tag_button.remove_css_class("suggested-action");
     }
@@ -6289,28 +8251,35 @@ fn undo_last_tag(
     state: &SharedState,
     undo_state: &UndoState,
 ) {
-    let Some((query, mutation)) = undo_state.borrow().clone() else {
+    let Some(action) = pop_last_undo_tag_action(undo_state) else {
         set_undo_tag_available(widgets, false);
         widgets.status_label.set_text("No tag operation to undo");
         return;
     };
+    undo_tag_action(options, widgets, state, undo_state, action);
+}
+
+fn undo_tag_action(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    undo_state: &UndoState,
+    action: UndoTagAction,
+) {
+    let query = action.query.clone();
+    let mutation = action.mutation.clone();
     let result = (|| -> anyhow::Result<()> {
         let db = Database::open(&open_config(options), DatabaseMode::ReadWrite)?;
         db.apply_tags_to_query(&query, &mutation)?;
-        state.borrow_mut().last_operation = Some("undid last tag operation".to_string());
+        state.borrow_mut().last_operation = Some(format!("undid tag operation: {}", action.label));
         Ok(())
     })();
     match result {
         Ok(()) => {
-            undo_state.borrow_mut().take();
-            set_undo_tag_available(widgets, false);
-            let selected_query_matches = state
-                .borrow()
-                .selected_thread
-                .as_ref()
-                .is_some_and(|thread| query == format!("thread:{}", thread.thread_id));
-            if selected_query_matches {
-                apply_local_tag_mutation(widgets, state, &mutation);
+            set_undo_tag_available(widgets, !undo_state.borrow().is_empty());
+            let target_thread_ids = thread_ids_from_tag_query(&query);
+            if !target_thread_ids.is_empty() {
+                apply_local_tag_mutation(widgets, state, &mutation, &target_thread_ids);
                 update_message_header(widgets, state);
                 update_custom_tag_controls(widgets, state);
                 update_message_action_buttons(options, widgets, state);
@@ -6318,9 +8287,12 @@ fn undo_last_tag(
                 let current = state.borrow().current_query.clone();
                 run_search(options, widgets, state, &current);
             }
-            widgets.status_label.set_text("Undid last tag operation");
+            widgets
+                .status_label
+                .set_text(&format!("Undid tag operation: {}", action.label));
         }
         Err(err) => {
+            push_undo_tag_action(undo_state, action);
             set_undo_tag_available(widgets, true);
             state.borrow_mut().last_error = Some(err.to_string());
             widgets
@@ -6331,46 +8303,472 @@ fn undo_last_tag(
     }
 }
 
-fn run_manual_sync(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
-    if !options.sync_enabled {
-        widgets.status_label.set_text("Manual sync is disabled");
-        state.borrow_mut().last_operation = Some("manual sync disabled".to_string());
-        update_debug(widgets, state);
+fn show_undo_tag_actions(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    undo_state: &UndoState,
+) {
+    let actions = undo_state.borrow().clone();
+    if actions.is_empty() {
+        set_undo_tag_available(widgets, false);
+        widgets.status_label.set_text("No tag operation to undo");
         return;
     }
-    let mut commands = Vec::new();
-    if options.external_receive_enabled && !options.external_receive_command.trim().is_empty() {
-        commands.push(("external_receive", options.external_receive_command.clone()));
+
+    let dialog = gtk::Dialog::builder()
+        .title("Undo tag operations")
+        .transient_for(&widgets.window)
+        .modal(true)
+        .default_width(620)
+        .default_height(320)
+        .build();
+    dialog.set_widget_name("notm-undo-tag-dialog");
+    let area = dialog.content_area();
+    area.set_spacing(6);
+
+    let help = gtk::Label::new(Some(
+        "Newest actions are listed first. Use j/k/gg/G/Ctrl+d/Ctrl+u, Space to select, v for visual selection, Enter to undo selected.",
+    ));
+    help.set_xalign(0.0);
+    help.add_css_class("dim-label");
+    area.append(&help);
+
+    let list = gtk::ListBox::new();
+    list.set_widget_name("notm-undo-tag-list");
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list.add_css_class("boxed-list");
+    list.set_focusable(true);
+    for (display_index, action) in actions.iter().rev().enumerate() {
+        let row = gtk::ListBoxRow::new();
+        row.set_widget_name(&format!("notm-undo-tag-row-{}", display_index + 1));
+        row.set_focusable(true);
+        let label = gtk::Label::new(Some(&action.label));
+        label.set_xalign(0.0);
+        label.set_wrap(true);
+        label.set_margin_start(8);
+        label.set_margin_end(8);
+        label.set_margin_top(6);
+        label.set_margin_bottom(6);
+        row.set_child(Some(&label));
+        list.append(&row);
     }
-    if options.notmuch_database_update_enabled
-        && !options.notmuch_database_update_command.trim().is_empty()
-    {
-        commands.push((
-            "notmuch_database_update",
-            options.notmuch_database_update_command.clone(),
+    let selected_rows = Rc::new(RefCell::new(BTreeSet::<usize>::new()));
+    let cursor_row = Rc::new(Cell::new(0_usize));
+    let visual_anchor = Rc::new(Cell::new(None::<usize>));
+    refresh_undo_dialog_selection(&list, &selected_rows.borrow(), cursor_row.get());
+
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .min_content_height(180)
+        .child(&list)
+        .build();
+    area.append(&scrolled);
+
+    let w = widgets.clone();
+    let selected = selected_rows.clone();
+    let cursor = cursor_row.clone();
+    let actions_len = actions.len();
+    let list_for_rows = list.clone();
+    list.connect_row_activated(move |_, row| {
+        let row_index = row.index();
+        if row_index < 0 {
+            return;
+        }
+        let row_index = row_index as usize;
+        cursor.set(row_index);
+        toggle_undo_dialog_row(&list_for_rows, &selected, row_index);
+        refresh_undo_dialog_selection(&list_for_rows, &selected.borrow(), row_index);
+        w.status_label.set_text(&format!(
+            "Undo list: {} selected; Enter to apply",
+            selected.borrow().len()
         ));
+    });
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let undo = undo_state.clone();
+    let d = dialog.clone();
+    let selected = selected_rows.clone();
+    let cursor = cursor_row.clone();
+    let visual = visual_anchor.clone();
+    let list_for_keys = list.clone();
+    let numeric_prefix = Rc::new(RefCell::new(String::new()));
+    let pending_g = Rc::new(Cell::new(false));
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    controller.connect_key_pressed(move |_, key, _, mods| {
+        let ctrl = mods.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+        if key == gtk::gdk::Key::Escape {
+            d.close();
+            return gtk::glib::Propagation::Stop;
+        }
+        if key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter {
+            apply_selected_undo_dialog_actions(
+                &opts,
+                &w,
+                &st,
+                &undo,
+                &d,
+                &selected.borrow(),
+                cursor.get(),
+                actions_len,
+            );
+            return gtk::glib::Propagation::Stop;
+        }
+        if key == gtk::gdk::Key::space {
+            visual.set(None);
+            toggle_undo_dialog_row(&list_for_keys, &selected, cursor.get());
+            refresh_undo_dialog_selection(&list_for_keys, &selected.borrow(), cursor.get());
+            return gtk::glib::Propagation::Stop;
+        }
+        if key == gtk::gdk::Key::v {
+            if visual.get().is_some() {
+                visual.set(None);
+                w.status_label.set_text("Undo visual selection ended");
+            } else {
+                let cursor = cursor.get();
+                visual.set(Some(cursor));
+                selected.borrow_mut().clear();
+                selected.borrow_mut().insert(cursor);
+                refresh_undo_dialog_selection(&list_for_keys, &selected.borrow(), cursor);
+                w.status_label
+                    .set_text("Undo visual selection: move with j/k/gg/G, Enter to apply");
+            }
+            return gtk::glib::Propagation::Stop;
+        }
+        if let Some(digit) = key_to_digit(key)
+            && (digit != 0 || !numeric_prefix.borrow().is_empty())
+        {
+            numeric_prefix.borrow_mut().push(char::from(b'0' + digit));
+            return gtk::glib::Propagation::Stop;
+        }
+        if pending_g.get() {
+            pending_g.set(false);
+            let count = take_numeric_prefix(&numeric_prefix);
+            if key == gtk::gdk::Key::g {
+                let target = count
+                    .map(|count| count.saturating_sub(1))
+                    .unwrap_or(0)
+                    .min(actions_len.saturating_sub(1));
+                move_undo_dialog_cursor(
+                    &list_for_keys,
+                    &selected,
+                    &cursor,
+                    &visual,
+                    target,
+                    actions_len,
+                );
+                return gtk::glib::Propagation::Stop;
+            }
+            clear_numeric_prefix(&numeric_prefix);
+            return gtk::glib::Propagation::Proceed;
+        }
+        let count = numeric_prefix_value(&numeric_prefix).unwrap_or(1);
+        let current = cursor.get();
+        let handled = if key == gtk::gdk::Key::g {
+            pending_g.set(true);
+            true
+        } else if key == gtk::gdk::Key::G {
+            let target = if !numeric_prefix.borrow().is_empty() {
+                count.saturating_sub(1).min(actions_len.saturating_sub(1))
+            } else {
+                actions_len.saturating_sub(1)
+            };
+            move_undo_dialog_cursor(
+                &list_for_keys,
+                &selected,
+                &cursor,
+                &visual,
+                target,
+                actions_len,
+            );
+            true
+        } else if key == gtk::gdk::Key::j || key == gtk::gdk::Key::Down {
+            let target = current
+                .saturating_add(count)
+                .min(actions_len.saturating_sub(1));
+            move_undo_dialog_cursor(
+                &list_for_keys,
+                &selected,
+                &cursor,
+                &visual,
+                target,
+                actions_len,
+            );
+            true
+        } else if key == gtk::gdk::Key::k || key == gtk::gdk::Key::Up {
+            let target = current.saturating_sub(count);
+            move_undo_dialog_cursor(
+                &list_for_keys,
+                &selected,
+                &cursor,
+                &visual,
+                target,
+                actions_len,
+            );
+            true
+        } else if ctrl && (key == gtk::gdk::Key::d || key == gtk::gdk::Key::D) {
+            let target = current
+                .saturating_add(UNDO_DIALOG_HALF_PAGE_ROWS)
+                .min(actions_len.saturating_sub(1));
+            move_undo_dialog_cursor(
+                &list_for_keys,
+                &selected,
+                &cursor,
+                &visual,
+                target,
+                actions_len,
+            );
+            true
+        } else if ctrl && (key == gtk::gdk::Key::u || key == gtk::gdk::Key::U) {
+            let target = current.saturating_sub(UNDO_DIALOG_HALF_PAGE_ROWS);
+            move_undo_dialog_cursor(
+                &list_for_keys,
+                &selected,
+                &cursor,
+                &visual,
+                target,
+                actions_len,
+            );
+            true
+        } else {
+            false
+        };
+        if handled {
+            if key != gtk::gdk::Key::g {
+                clear_numeric_prefix(&numeric_prefix);
+            }
+            gtk::glib::Propagation::Stop
+        } else {
+            clear_numeric_prefix(&numeric_prefix);
+            gtk::glib::Propagation::Proceed
+        }
+    });
+    list.add_controller(controller);
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let undo = undo_state.clone();
+    let d = dialog.clone();
+    let selected = selected_rows.clone();
+    let cursor = cursor_row.clone();
+    dialog.add_button("Undo selected", gtk::ResponseType::Accept);
+    dialog.add_button("Close", gtk::ResponseType::Close);
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk::ResponseType::Accept {
+            apply_selected_undo_dialog_actions(
+                &opts,
+                &w,
+                &st,
+                &undo,
+                &d,
+                &selected.borrow(),
+                cursor.get(),
+                actions_len,
+            );
+        } else {
+            dialog.close();
+        }
+    });
+    dialog.present();
+    let list_for_focus = list.clone();
+    gtk::glib::idle_add_local_once(move || {
+        if let Some(row) = list_for_focus.row_at_index(0) {
+            row.grab_focus();
+        } else {
+            list_for_focus.grab_focus();
+        }
+    });
+}
+
+const UNDO_DIALOG_HALF_PAGE_ROWS: usize = 5;
+
+fn toggle_undo_dialog_row(
+    list: &gtk::ListBox,
+    selected: &Rc<RefCell<BTreeSet<usize>>>,
+    index: usize,
+) {
+    {
+        let mut selected = selected.borrow_mut();
+        if !selected.remove(&index) {
+            selected.insert(index);
+        }
     }
-    if commands.is_empty() {
+    refresh_undo_dialog_selection(list, &selected.borrow(), index);
+}
+
+fn move_undo_dialog_cursor(
+    list: &gtk::ListBox,
+    selected: &Rc<RefCell<BTreeSet<usize>>>,
+    cursor: &Rc<Cell<usize>>,
+    visual_anchor: &Rc<Cell<Option<usize>>>,
+    target: usize,
+    actions_len: usize,
+) {
+    if actions_len == 0 {
+        return;
+    }
+    let target = target.min(actions_len - 1);
+    cursor.set(target);
+    if let Some(anchor) = visual_anchor.get() {
+        let start = anchor.min(target);
+        let end = anchor.max(target);
+        let mut selected = selected.borrow_mut();
+        selected.clear();
+        selected.extend(start..=end);
+    }
+    refresh_undo_dialog_selection(list, &selected.borrow(), target);
+}
+
+fn refresh_undo_dialog_selection(list: &gtk::ListBox, selected: &BTreeSet<usize>, cursor: usize) {
+    let mut index = 0_usize;
+    while let Some(row) = list.row_at_index(index as i32) {
+        if selected.contains(&index) {
+            row.add_css_class("notm-undo-selected");
+        } else {
+            row.remove_css_class("notm-undo-selected");
+        }
+        if index == cursor {
+            row.add_css_class("notm-keyboard-cursor");
+            row.grab_focus();
+        } else {
+            row.remove_css_class("notm-keyboard-cursor");
+        }
+        index += 1;
+    }
+}
+
+fn apply_selected_undo_dialog_actions(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    undo_state: &UndoState,
+    dialog: &gtk::Dialog,
+    selected: &BTreeSet<usize>,
+    cursor: usize,
+    actions_len: usize,
+) {
+    if actions_len == 0 {
+        widgets.status_label.set_text("No tag operation to undo");
+        dialog.close();
+        return;
+    }
+    let display_indices = if selected.is_empty() {
+        BTreeSet::from([cursor.min(actions_len - 1)])
+    } else {
+        selected
+            .iter()
+            .copied()
+            .filter(|index| *index < actions_len)
+            .collect::<BTreeSet<_>>()
+    };
+    let mut removed = Vec::new();
+    {
+        let original_len = undo_state.borrow().len();
+        let mut storage_indices = display_indices
+            .iter()
+            .filter_map(|display_index| original_len.checked_sub(1 + display_index))
+            .collect::<Vec<_>>();
+        storage_indices.sort_unstable();
+        for storage_index in storage_indices.into_iter().rev() {
+            if let Some(action) = remove_undo_tag_action(undo_state, storage_index) {
+                let display_index = original_len - 1 - storage_index;
+                removed.push((display_index, action));
+            }
+        }
+    }
+    removed.sort_by_key(|(display_index, _)| *display_index);
+    let count = removed.len();
+    for (_, action) in removed {
+        undo_tag_action(options, widgets, state, undo_state, action);
+    }
+    if count == 0 {
         widgets
             .status_label
-            .set_text("Manual sync enabled but no sync commands configured");
-        state.borrow_mut().last_operation = Some("manual sync no-op".to_string());
+            .set_text("No selected undo action found");
+    } else {
+        widgets
+            .status_label
+            .set_text(&format!("Undid {count} tag operation(s)"));
+    }
+    dialog.close();
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncRunKind {
+    Manual,
+    Startup,
+}
+
+#[derive(Debug, Clone)]
+struct SyncCommandSpec {
+    name: &'static str,
+    command: String,
+}
+
+fn run_manual_sync(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    run_sync_commands(options, widgets, state, SyncRunKind::Manual, true);
+}
+
+fn run_startup_sync(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    run_sync_commands(options, widgets, state, SyncRunKind::Startup, true);
+}
+
+fn run_sync_commands(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    kind: SyncRunKind,
+    refresh_after: bool,
+) {
+    if !options.sync_enabled {
+        if kind == SyncRunKind::Manual {
+            widgets.status_label.set_text("Manual sync is disabled");
+            state.borrow_mut().last_operation = Some("manual sync disabled".to_string());
+        }
         update_debug(widgets, state);
         return;
     }
+    let commands = sync_command_specs(options, kind);
+    if commands.is_empty() {
+        if kind == SyncRunKind::Manual {
+            widgets.status_label.set_text(
+                "Manual sync has no commands to run; enable and define receive and/or database update commands",
+            );
+            state.borrow_mut().last_operation = Some("manual sync no-op".to_string());
+            update_debug(widgets, state);
+        } else {
+            // No startup sync was requested; keep the normal startup search status/debug context.
+        }
+        return;
+    }
+    let label = match kind {
+        SyncRunKind::Manual => "Manual sync",
+        SyncRunKind::Startup => "Startup sync",
+    };
+    widgets
+        .status_label
+        .set_text(&format!("{label}: running {} command(s)…", commands.len()));
     let result = (|| -> anyhow::Result<Vec<String>> {
         let mut reports = Vec::new();
-        for (name, command) in commands {
-            let output = Command::new("sh").arg("-c").arg(&command).output()?;
+        for spec in commands {
+            let output = Command::new("sh").arg("-c").arg(&spec.command).output()?;
             reports.push(format!(
-                "{name}: status={:?} stdout={} stderr={}",
+                "{}: status={:?} stdout={} stderr={}",
+                spec.name,
                 output.status.code(),
                 String::from_utf8_lossy(&output.stdout).trim(),
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
             anyhow::ensure!(
                 output.status.success(),
-                "manual sync command `{name}` failed with status {:?}",
+                "{} command `{}` failed with status {:?}",
+                label,
+                spec.name,
                 output.status.code()
             );
         }
@@ -6378,20 +8776,48 @@ fn run_manual_sync(options: &LaunchOptions, widgets: &Widgets, state: &SharedSta
     })();
     match result {
         Ok(reports) => {
-            state.borrow_mut().last_operation =
-                Some(format!("manual sync: {}", reports.join("; ")));
-            widgets.status_label.set_text("Manual sync completed");
-            let current = state.borrow().current_query.clone();
-            run_search(options, widgets, state, &current);
+            state.borrow_mut().last_operation = Some(format!(
+                "{}: {}",
+                label.to_ascii_lowercase(),
+                reports.join("; ")
+            ));
+            widgets.status_label.set_text(&format!("{label} completed"));
+            if refresh_after {
+                let current = state.borrow().current_query.clone();
+                run_search(options, widgets, state, &current);
+            }
         }
         Err(err) => {
             state.borrow_mut().last_error = Some(err.to_string());
             widgets
                 .status_label
-                .set_text(&format!("Manual sync failed: {err}"));
+                .set_text(&format!("{label} failed: {err}"));
             update_debug(widgets, state);
         }
     }
+}
+
+fn sync_command_specs(options: &LaunchOptions, kind: SyncRunKind) -> Vec<SyncCommandSpec> {
+    let mut commands = Vec::new();
+    if options.external_receive_enabled
+        && !options.external_receive_command.trim().is_empty()
+        && (kind == SyncRunKind::Manual || options.external_receive_on_startup)
+    {
+        commands.push(SyncCommandSpec {
+            name: "receive",
+            command: options.external_receive_command.clone(),
+        });
+    }
+    if options.notmuch_database_update_enabled
+        && !options.notmuch_database_update_command.trim().is_empty()
+        && (kind == SyncRunKind::Manual || options.notmuch_database_update_on_startup)
+    {
+        commands.push(SyncCommandSpec {
+            name: "database_update",
+            command: options.notmuch_database_update_command.clone(),
+        });
+    }
+    commands
 }
 
 fn open_compose(widgets: &Widgets, state: &SharedState) {
@@ -6679,15 +9105,18 @@ fn send_message_with_config(
     options: &LaunchOptions,
     message: ComposedMessage,
 ) -> anyhow::Result<notm_mail::SendReport> {
+    if !options.send_enabled {
+        anyhow::bail!("send.enabled is false");
+    }
     if let Some(command) = &options.send_command {
         let rt = tokio::runtime::Runtime::new()?;
         let transport = ExternalCommandTransport {
             command: command.clone(),
             args: options.send_args.clone(),
             mode: options.send_mode.clone(),
-            working_dir: None,
-            env: Default::default(),
-            timeout: Duration::from_secs(120),
+            working_dir: options.send_working_dir.clone(),
+            env: options.send_env.clone(),
+            timeout: Duration::from_secs(options.send_timeout_seconds),
         };
         return rt.block_on(transport.send(message));
     }
@@ -6885,6 +9314,44 @@ fn handle_automation_request(
         "focus_search" => {
             widgets.search_entry.grab_focus();
             json!({"ok": true})
+        }
+        "focus_compose_field" => {
+            let field = req
+                .args
+                .get("field")
+                .and_then(|v| v.as_str())
+                .unwrap_or("to");
+            let entry = match field {
+                "from" => &widgets.compose_from,
+                "cc" => &widgets.compose_cc,
+                "bcc" => &widgets.compose_bcc,
+                "subject" => &widgets.compose_subject,
+                _ => &widgets.compose_to,
+            };
+            set_input_mode(
+                widgets,
+                state,
+                InputMode::Insert,
+                "Insert mode (automation focus)",
+            );
+            entry.grab_focus();
+            if matches!(field, "to" | "cc" | "bcc") {
+                set_active_address_entry(widgets, entry);
+                widgets
+                    .active_address_field
+                    .set(recipient_field_for_entry(widgets, entry));
+                place_address_suggestions_after_entry(widgets, entry);
+            }
+            json!({"ok": true, "field": field})
+        }
+        "entry_state" => {
+            json!({
+                "ok": true,
+                "search": widgets.search_entry.text().to_string(),
+                "compose_fields": compose_fields(widgets, state),
+                "search_suggestions_visible": widgets.search_suggestions_list.is_visible(),
+                "address_suggestions_visible": widgets.address_suggestions_list.is_visible(),
+            })
         }
         "set_search_query" => {
             let query = req
@@ -7590,6 +10057,14 @@ fn run_named_command(
             forward_as_attachment_selected(options, widgets, state);
             json!({"ok": true, "compose_fields": state.borrow().compose_fields, "last_error": state.borrow().last_error})
         }
+        "visual_select" => {
+            enter_visual_select_mode(widgets, state);
+            json!({"ok": true, "state": &*state.borrow()})
+        }
+        "clear_visual_selection" => {
+            clear_visual_selection(widgets, state);
+            json!({"ok": true, "state": &*state.borrow()})
+        }
         "archive" => {
             tag_selected(
                 options,
@@ -7840,9 +10315,43 @@ fn menu_button_with_box(label: &str, widget_name: &str) -> (gtk::MenuButton, gtk
     button.set_widget_name(widget_name);
     let popover = gtk::Popover::new();
     let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    connect_vim_menu_navigation(&menu);
+    let focus_menu = menu.clone();
+    popover.connect_show(move |_| {
+        focus_first_menu_child(&focus_menu);
+    });
     popover.set_child(Some(&menu));
     button.set_popover(Some(&popover));
     (button, menu)
+}
+
+fn connect_vim_menu_navigation(menu: &gtk::Box) {
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let menu_for_keys = menu.clone();
+    controller.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::j {
+            menu_for_keys.child_focus(gtk::DirectionType::Down);
+            return gtk::glib::Propagation::Stop;
+        }
+        if key == gtk::gdk::Key::k {
+            menu_for_keys.child_focus(gtk::DirectionType::Up);
+            return gtk::glib::Propagation::Stop;
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    menu.add_controller(controller);
+}
+
+fn focus_first_menu_child(menu: &gtk::Box) {
+    let mut child = menu.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if widget.is_focusable() {
+            widget.grab_focus();
+            return;
+        }
+    }
 }
 
 fn entry_with_placeholder(placeholder: &str) -> gtk::Entry {
@@ -7999,13 +10508,14 @@ fn show_shortcuts_overlay(widgets: &Widgets) {
 
 fn command_palette_commands() -> &'static [&'static str] {
     &[
-        "inbox, unread, flagged, sent, all",
+        "inbox, unread, flagged, sent, trash, all",
         "search, compose, reply, reply_all, forward, forward_as_attachment",
         "archive, mark_read, mark_unread, flag, unflag, trash, undo",
+        "visual_select, clear_visual_selection",
         "raw_source, full_headers, text, visual_html, image_policy, collapse_quotes",
         "save_attachment, open_attachment",
         "copy_message_id, copy_thread_id",
-        "debug, settings, shortcuts, manual_sync (only if explicitly enabled)",
+        "debug, settings, shortcuts, manual_sync (if Sync is enabled)",
     ]
 }
 
@@ -8014,82 +10524,1054 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
         .title("notm settings")
         .transient_for(&widgets.window)
         .modal(true)
-        .default_width(600)
+        .default_width(820)
+        .default_height(720)
         .build();
     dialog.set_widget_name("notm-settings-dialog");
     let area = dialog.content_area();
-    area.set_spacing(6);
-    let text = format!(
-        "Database: {}\nNotmuch config: {}\nApp config: {}\nProfile: {}\nSync: disabled by default; no startup sync is implemented.\nRemote images: {}.\nTrusted image senders: {}\nAutomation: {}\n",
-        options
-            .database_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "libnotmuch default".to_string()),
-        options
-            .config_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "libnotmuch default".to_string()),
-        options
+    area.set_spacing(8);
+
+    let existing = read_settings_toml(options);
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .min_content_height(560)
+        .build();
+    let form = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    form.set_margin_start(8);
+    form.set_margin_end(24);
+    form.set_margin_top(8);
+    form.set_margin_bottom(8);
+    scrolled.set_child(Some(&form));
+    area.append(&scrolled);
+
+    settings_section(&form, "Config files");
+    settings_readonly_row(
+        &form,
+        "App config file",
+        &options
             .app_config_path
             .as_ref()
-            .map(|p| p.display().to_string())
+            .map(|path| path.display().to_string())
             .unwrap_or_else(|| "not configured".to_string()),
-        options.profile.as_deref().unwrap_or("default"),
-        if options.remote_images {
-            "enabled"
-        } else {
-            "disabled"
-        },
-        options.trusted_image_senders.join(", "),
+        "This path is selected before the UI starts. Launch with --config or set the normal app config path to use another file.",
+    );
+
+    settings_section(&form, "Notmuch");
+    let database_path = settings_path_row(
+        &widgets.window,
+        &form,
+        "Database path",
+        &option_path_text(&options.database_path),
+        "Notmuch database/mail root. Blank means use libnotmuch/notmuch config resolution.",
+        SettingsPathKind::Directory,
+    );
+    let notmuch_config_path = settings_path_row(
+        &widgets.window,
+        &form,
+        "Notmuch config path",
+        &option_path_text(&options.config_path),
+        "Path to the notmuch config file. Blank means libnotmuch default.",
+        SettingsPathKind::File,
+    );
+    let notmuch_profile = settings_entry_row(
+        &form,
+        "Profile",
+        options.profile.as_deref().unwrap_or_default(),
+        "Optional notmuch profile name. Blank means default profile.",
+    );
+    let default_query = settings_entry_row(
+        &form,
+        "Default query",
+        &options.default_query,
+        "Search run at startup.",
+    );
+    let excluded_tags = settings_entry_row(
+        &form,
+        "Excluded tags",
+        &join_string_list(&options.excluded_tags),
+        "Tags excluded from searches, comma separated.",
+    );
+    let open_readwrite_only_for_mutations = settings_check_row(
+        &form,
+        "Keep searches read-only",
+        toml_bool(
+            &existing,
+            "notmuch",
+            "open_readwrite_only_for_mutations",
+            true,
+        ),
+        "Searches and message viewing open the database read-only. Notm switches to read/write only for actions that change tags or index saved sent/draft files. Leave this on.",
+    );
+    let sync_maildir_flags_after_tag_change = settings_check_row(
+        &form,
+        "Sync Maildir flags",
+        options.sync_maildir_flags_after_tag_change,
+        "After changing tags like unread or flagged, also update Maildir filename flags so other mail tools see the same read/star state.",
+    );
+
+    settings_section(&form, "Identity");
+    let identity_name = settings_entry_row(
+        &form,
+        "Name",
+        options.identity_name.as_deref().unwrap_or_default(),
+        "Display name used when composing mail.",
+    );
+    let primary_email = settings_entry_row(
+        &form,
+        "Primary email",
+        options.primary_email.as_deref().unwrap_or_default(),
+        "Primary sender identity.",
+    );
+    let other_email = settings_entry_row(
+        &form,
+        "Other emails",
+        &join_string_list(&options.other_email),
+        "Alternate own addresses, comma separated; used for reply-all de-duplication.",
+    );
+
+    settings_section(&form, "UI");
+    let theme = settings_combo_row(
+        &form,
+        "Theme preference",
+        &[
+            ("system", "System/default"),
+            ("dark", "Dark"),
+            ("light", "Light"),
+        ],
+        &toml_string(&existing, "ui", "theme").unwrap_or_else(|| "system".to_string()),
+        "Stored theme preference. Current UI uses the app theme CSS; relaunch required.",
+    );
+    let page_size = settings_entry_row(
+        &form,
+        "Page size",
+        &options.page_size.to_string(),
+        "Number of threads loaded per search page.",
+    );
+    let thread_preview_lines = settings_entry_row(
+        &form,
+        "Thread preview lines",
+        &toml_usize(&existing, "ui", "thread_preview_lines", 2).to_string(),
+        "Stored preview-line preference. Relaunch required for all effects.",
+    );
+    let html_mode = settings_combo_row(
+        &form,
+        "HTML rendering",
+        &[
+            (
+                "sanitize_then_render_text_fallback",
+                "Text first; sanitized HTML available",
+            ),
+            ("visual_html_preferred", "Visual HTML first when available"),
+        ],
+        &options.html_mode,
+        "Visual HTML is sanitized. Message scripts and in-app link navigation stay blocked.",
+    );
+    let start_maximized = settings_check_row(
+        &form,
+        "Start maximized",
+        options.start_maximized,
+        "Open the main window maximized on launch.",
+    );
+    let show_debug_panel = settings_check_row(
+        &form,
+        "Show debug panel",
+        options.show_debug_panel,
+        "Show the debug text panel by default.",
+    );
+    let remote_images = settings_check_row(
+        &form,
+        "Load remote images",
+        options.remote_images,
+        "If off, HTML mail starts with remote images blocked unless the sender is trusted.",
+    );
+    let trusted_image_senders = settings_entry_row(
+        &form,
+        "Trusted image senders",
+        &join_string_list(&options.trusted_image_senders),
+        "Senders whose remote images may load by default, comma separated.",
+    );
+    let hidden_tag_searches = settings_entry_row(
+        &form,
+        "Hidden tag searches",
+        &join_string_list(&options.hidden_tag_searches),
+        "Tag search buttons hidden from the sidebar, comma separated.",
+    );
+
+    settings_section(&form, "Send");
+    let send_enabled = settings_check_row(
+        &form,
+        "Sending enabled",
+        options.send_enabled,
+        "Config flag for send support. A send command is still required outside fixture mode.",
+    );
+    let send_transport = settings_combo_row(
+        &form,
+        "Transport",
+        &[("external", "External command")],
+        &toml_string(&existing, "send", "transport").unwrap_or_else(|| "external".to_string()),
+        "Transport type. Current supported normal value is external.",
+    );
+    let send_command = settings_path_row(
+        &widgets.window,
+        &form,
+        "Command",
+        &option_path_text(&options.send_command),
+        "External send helper path, for example aerc-gmail-send.",
+        SettingsPathKind::File,
+    );
+    let send_args = settings_entry_row(
+        &form,
+        "Arguments",
+        &join_string_list(&options.send_args),
+        "Extra send command args, comma separated.",
+    );
+    let send_mode = settings_combo_row(
+        &form,
+        "Mode",
+        &[
+            ("auto", "Auto"),
+            ("stdin_rfc5322", "Pipe RFC5322 on stdin"),
+            ("file_arg", "Write temp file and pass path"),
+            ("command_template", "Command template"),
+        ],
+        &transport_mode_name(&options.send_mode),
+        "auto, stdin_rfc5322, file_arg, or command_template.",
+    );
+    let send_working_dir = settings_path_row(
+        &widgets.window,
+        &form,
+        "Working directory",
+        &option_path_text(&options.send_working_dir),
+        "Optional working directory for the external send command.",
+        SettingsPathKind::Directory,
+    );
+    let send_env = settings_entry_row(
+        &form,
+        "Environment",
+        &format_env_map(&options.send_env),
+        "Extra environment for the send command as KEY=value pairs, comma or newline separated.",
+    );
+    let send_timeout_seconds = settings_entry_row(
+        &form,
+        "Timeout seconds",
+        &options.send_timeout_seconds.to_string(),
+        "External send command timeout.",
+    );
+    let save_sent = settings_check_row(
+        &form,
+        "Save sent locally",
+        options.save_sent,
+        "Save sent messages into a configured local Maildir after send.",
+    );
+    let sent_maildir = settings_path_row(
+        &widgets.window,
+        &form,
+        "Sent Maildir",
+        &option_path_text(&options.sent_maildir),
+        "Optional Maildir used when Save sent locally is enabled.",
+        SettingsPathKind::Directory,
+    );
+    let sent_tags = settings_entry_row(
+        &form,
+        "Sent tags",
+        &join_string_list(&options.sent_tags),
+        "Tags applied to locally indexed sent messages, comma separated.",
+    );
+    let index_sent_after_send = settings_check_row(
+        &form,
+        "Index sent after send",
+        options.index_sent_after_send,
+        "Index saved sent messages in notmuch after sending.",
+    );
+    settings_section(&form, "Drafts");
+    let save_drafts_to_maildir = settings_check_row(
+        &form,
+        "Save drafts to Maildir",
+        options.save_drafts_to_maildir,
+        "Explicit Save draft writes a local Maildir message tagged as draft.",
+    );
+    let draft_maildir = settings_path_row(
+        &widgets.window,
+        &form,
+        "Draft Maildir",
+        &option_path_text(&options.draft_maildir),
+        "Optional local Maildir for saved drafts.",
+        SettingsPathKind::Directory,
+    );
+    let draft_tags = settings_entry_row(
+        &form,
+        "Draft tags",
+        &join_string_list(&options.draft_tags),
+        "Tags applied to saved draft messages, comma separated.",
+    );
+    let index_draft_after_save = settings_check_row(
+        &form,
+        "Index draft after save",
+        options.index_draft_after_save,
+        "Index saved drafts in notmuch so tag:draft can find them.",
+    );
+
+    settings_section(&form, "Sync");
+    settings_note(
+        &form,
+        "Sync means: run the receive command you define, then run the database update command you define. Notm does not guess lieer/offlineimap/mbsync/notmuch new commands. Leave this off if another service already handles mail sync.",
+    );
+    let sync_enabled = settings_check_row(
+        &form,
+        "Enable Sync button",
+        options.sync_enabled,
+        "Show a Sync button in the sidebar. Pressing it runs the enabled commands below.",
+    );
+    let manual_sync_label = settings_entry_row(
+        &form,
+        "Sync button label",
+        &options.manual_sync_label,
+        "Text shown on the sidebar Sync button.",
+    );
+    let external_receive_enabled = settings_check_row(
+        &form,
+        "Run receive command",
+        options.external_receive_enabled,
+        "When Sync runs, run the receive command below first.",
+    );
+    let external_receive_on_startup = settings_check_row(
+        &form,
+        "Run receive at startup",
+        options.external_receive_on_startup,
+        "Also run the receive command when notm starts, then refresh the current search.",
+    );
+    let external_receive_command = settings_entry_row(
+        &form,
+        "Receive command",
+        &options.external_receive_command,
+        "Shell command to fetch or sync mail, for example a lieer/offlineimap/mbsync wrapper.",
+    );
+    let notmuch_database_update_enabled = settings_check_row(
+        &form,
+        "Run update command",
+        options.notmuch_database_update_enabled,
+        "When Sync runs, run the database update command below after receive.",
+    );
+    let notmuch_database_update_on_startup = settings_check_row(
+        &form,
+        "Update at startup",
+        options.notmuch_database_update_on_startup,
+        "Also run the database update command when notm starts, then refresh the current search.",
+    );
+    let notmuch_database_update_command = settings_entry_row(
+        &form,
+        "Database update command",
+        &options.notmuch_database_update_command,
+        "Shell command to update the local notmuch database, for example `notmuch new` or a wrapper.",
+    );
+
+    settings_section(&form, "Automation");
+    settings_note(
+        &form,
+        "Automation is for coding agents and tests to drive the actual notm UI and verify changes without clicking around or using separate GUI tools. It is not a Notmuch CLI replacement; it exercises notm itself. It is local, token-gated, and disabled by default.",
+    );
+    let automation_enabled = settings_check_row(
+        &form,
+        "Enable automation",
         options.automation_enabled,
+        "Start a local automation socket on launch.",
     );
-    let label = gtk::Label::new(Some(&text));
-    label.set_xalign(0.0);
-    label.set_wrap(true);
-    area.append(&label);
-    let default_query = entry_with_placeholder("Default query");
-    default_query.set_widget_name("notm-settings-default-query");
-    default_query.set_text(&options.default_query);
-    let page_size = entry_with_placeholder("Page size");
-    page_size.set_widget_name("notm-settings-page-size");
-    page_size.set_text(&options.page_size.to_string());
-    let send_command = entry_with_placeholder("Send command");
-    send_command.set_widget_name("notm-settings-send-command");
-    send_command.set_text(
-        &options
-            .send_command
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default(),
+    let automation_socket = settings_entry_row(
+        &form,
+        "Socket path",
+        &option_path_text(&options.automation_socket),
+        "Optional Unix socket path. Blank uses a temporary default.",
     );
-    area.append(&gtk::Label::new(Some(
-        "Editable settings below are written to the app config file. Restart or relaunch for all settings to take full effect.",
-    )));
-    area.append(&default_query);
-    area.append(&page_size);
-    area.append(&send_command);
+    let automation_token = settings_entry_row(
+        &form,
+        "Token",
+        options.automation_token.as_deref().unwrap_or_default(),
+        "Token required by automation clients.",
+    );
+    let screenshot_dir = settings_path_row(
+        &widgets.window,
+        &form,
+        "Screenshots",
+        &options.screenshot_dir.display().to_string(),
+        "Directory used by automation screenshots.",
+        SettingsPathKind::Directory,
+    );
+    let allow_live_send_test = settings_check_row(
+        &form,
+        "Allow self-send test",
+        toml_bool(&existing, "automation", "allow_live_send_test", true),
+        "Only affects the separate live-self-send validation command; normal sending uses the compose Send button and send settings above.",
+    );
+    let allow_live_tag_test = settings_check_row(
+        &form,
+        "Allow tag test",
+        toml_bool(&existing, "automation", "allow_live_tag_test", false),
+        "Safety gate for explicit automation tests that intentionally mutate tags in the real mail database.",
+    );
+
+    settings_note(
+        &form,
+        "Saving writes the app config file. Some changes require relaunch.",
+    );
+
     dialog.add_button("Save", gtk::ResponseType::Accept);
     dialog.add_button("Close", gtk::ResponseType::Close);
     let opts = options.clone();
     let status = widgets.status_label.clone();
     dialog.connect_response(move |d, response| {
         if response == gtk::ResponseType::Accept {
-            let page_size_value = page_size.text().parse::<usize>().unwrap_or(opts.page_size);
-            match persist_basic_settings(
-                &opts,
-                &default_query.text(),
-                page_size_value,
-                &send_command.text(),
-            ) {
-                Ok(()) => status.set_text("Settings saved to app config"),
+            let values = SettingsValues {
+                database_path: database_path.text().to_string(),
+                notmuch_config_path: notmuch_config_path.text().to_string(),
+                notmuch_profile: notmuch_profile.text().to_string(),
+                default_query: default_query.text().to_string(),
+                excluded_tags: excluded_tags.text().to_string(),
+                open_readwrite_only_for_mutations: open_readwrite_only_for_mutations.is_active(),
+                sync_maildir_flags_after_tag_change: sync_maildir_flags_after_tag_change
+                    .is_active(),
+                identity_name: identity_name.text().to_string(),
+                primary_email: primary_email.text().to_string(),
+                other_email: other_email.text().to_string(),
+                theme: combo_active_id(&theme),
+                page_size: page_size.text().parse::<usize>().unwrap_or(opts.page_size),
+                thread_preview_lines: thread_preview_lines.text().parse::<usize>().unwrap_or(2),
+                html_mode: combo_active_id(&html_mode),
+                start_maximized: start_maximized.is_active(),
+                show_debug_panel: show_debug_panel.is_active(),
+                remote_images: remote_images.is_active(),
+                trusted_image_senders: trusted_image_senders.text().to_string(),
+                hidden_tag_searches: hidden_tag_searches.text().to_string(),
+                send_enabled: send_enabled.is_active(),
+                send_transport: combo_active_id(&send_transport),
+                send_command: send_command.text().to_string(),
+                send_args: send_args.text().to_string(),
+                send_mode: combo_active_id(&send_mode),
+                send_working_dir: send_working_dir.text().to_string(),
+                send_env: send_env.text().to_string(),
+                send_timeout_seconds: send_timeout_seconds.text().parse::<u64>().unwrap_or(120),
+                save_sent: save_sent.is_active(),
+                sent_maildir: sent_maildir.text().to_string(),
+                sent_tags: sent_tags.text().to_string(),
+                index_sent_after_send: index_sent_after_send.is_active(),
+                save_drafts_to_maildir: save_drafts_to_maildir.is_active(),
+                draft_maildir: draft_maildir.text().to_string(),
+                draft_tags: draft_tags.text().to_string(),
+                index_draft_after_save: index_draft_after_save.is_active(),
+                sync_enabled: sync_enabled.is_active(),
+                manual_sync_label: manual_sync_label.text().to_string(),
+                notmuch_database_update_enabled: notmuch_database_update_enabled.is_active(),
+                notmuch_database_update_on_startup: notmuch_database_update_on_startup.is_active(),
+                notmuch_database_update_command: notmuch_database_update_command.text().to_string(),
+                external_receive_enabled: external_receive_enabled.is_active(),
+                external_receive_on_startup: external_receive_on_startup.is_active(),
+                external_receive_command: external_receive_command.text().to_string(),
+                automation_enabled: automation_enabled.is_active(),
+                automation_socket: automation_socket.text().to_string(),
+                automation_token: automation_token.text().to_string(),
+                screenshot_dir: screenshot_dir.text().to_string(),
+                allow_live_send_test: allow_live_send_test.is_active(),
+                allow_live_tag_test: allow_live_tag_test.is_active(),
+            };
+            match persist_settings_values(&opts, &values) {
+                Ok(()) => {
+                    status.set_text("Settings saved to app config; some changes require relaunch")
+                }
                 Err(err) => status.set_text(&format!("Settings save failed: {err}")),
             }
         }
         d.close();
     });
     dialog.present();
+}
+
+struct SettingsValues {
+    database_path: String,
+    notmuch_config_path: String,
+    notmuch_profile: String,
+    default_query: String,
+    excluded_tags: String,
+    open_readwrite_only_for_mutations: bool,
+    sync_maildir_flags_after_tag_change: bool,
+    identity_name: String,
+    primary_email: String,
+    other_email: String,
+    theme: String,
+    page_size: usize,
+    thread_preview_lines: usize,
+    html_mode: String,
+    start_maximized: bool,
+    show_debug_panel: bool,
+    remote_images: bool,
+    trusted_image_senders: String,
+    hidden_tag_searches: String,
+    send_enabled: bool,
+    send_transport: String,
+    send_command: String,
+    send_args: String,
+    send_mode: String,
+    send_working_dir: String,
+    send_env: String,
+    send_timeout_seconds: u64,
+    save_sent: bool,
+    sent_maildir: String,
+    sent_tags: String,
+    index_sent_after_send: bool,
+    save_drafts_to_maildir: bool,
+    draft_maildir: String,
+    draft_tags: String,
+    index_draft_after_save: bool,
+    sync_enabled: bool,
+    manual_sync_label: String,
+    notmuch_database_update_enabled: bool,
+    notmuch_database_update_on_startup: bool,
+    notmuch_database_update_command: String,
+    external_receive_enabled: bool,
+    external_receive_on_startup: bool,
+    external_receive_command: String,
+    automation_enabled: bool,
+    automation_socket: String,
+    automation_token: String,
+    screenshot_dir: String,
+    allow_live_send_test: bool,
+    allow_live_tag_test: bool,
+}
+
+fn settings_section(container: &gtk::Box, title: &str) {
+    if container.first_child().is_some() {
+        let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+        separator.set_margin_top(14);
+        separator.set_margin_bottom(6);
+        container.append(&separator);
+    }
+    let label = gtk::Label::new(Some(title));
+    label.add_css_class("heading");
+    label.add_css_class("notm-settings-section");
+    label.set_xalign(0.0);
+    label.set_margin_bottom(4);
+    container.append(&label);
+}
+
+fn settings_note(container: &gtk::Box, text: &str) {
+    let label = gtk::Label::new(Some(text));
+    label.add_css_class("dim-label");
+    label.add_css_class("notm-settings-note");
+    label.set_xalign(0.0);
+    label.set_wrap(true);
+    label.set_margin_bottom(4);
+    container.append(&label);
+}
+
+fn settings_label(label_text: &str, tooltip: &str) -> gtk::Label {
+    let text = if label_text.ends_with(':') {
+        label_text.to_string()
+    } else {
+        format!("{label_text}:")
+    };
+    let label = gtk::Label::new(Some(&text));
+    label.set_width_chars(24);
+    label.set_xalign(1.0);
+    label.set_tooltip_text(Some(tooltip));
+    label.add_css_class("notm-settings-label");
+    label
+}
+
+fn settings_entry_row(
+    container: &gtk::Box,
+    label_text: &str,
+    value: &str,
+    tooltip: &str,
+) -> gtk::Entry {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    row.set_hexpand(true);
+    let label = settings_label(label_text, tooltip);
+    let entry = gtk::Entry::new();
+    entry.set_hexpand(true);
+    entry.set_text(value);
+    entry.set_tooltip_text(Some(tooltip));
+    row.append(&label);
+    row.append(&entry);
+    container.append(&row);
+    entry
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SettingsPathKind {
+    File,
+    Directory,
+}
+
+fn settings_path_row(
+    parent: &gtk::ApplicationWindow,
+    container: &gtk::Box,
+    label_text: &str,
+    value: &str,
+    tooltip: &str,
+    kind: SettingsPathKind,
+) -> gtk::Entry {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    row.set_hexpand(true);
+    let label = settings_label(label_text, tooltip);
+    let field_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    field_box.set_hexpand(true);
+    let entry = gtk::Entry::new();
+    entry.set_hexpand(true);
+    entry.set_text(value);
+    entry.set_tooltip_text(Some(tooltip));
+    let browse = gtk::Button::with_label("Browse…");
+    browse.set_tooltip_text(Some("Choose a path"));
+    let parent = parent.clone();
+    let entry_for_dialog = entry.clone();
+    browse.connect_clicked(move |_| {
+        let action = match kind {
+            SettingsPathKind::File => gtk::FileChooserAction::Open,
+            SettingsPathKind::Directory => gtk::FileChooserAction::SelectFolder,
+        };
+        let title = match kind {
+            SettingsPathKind::File => "Choose file",
+            SettingsPathKind::Directory => "Choose directory",
+        };
+        let dialog = gtk::FileChooserNative::new(
+            Some(title),
+            Some(&parent),
+            action,
+            Some("Choose"),
+            Some("Cancel"),
+        );
+        let entry_for_response = entry_for_dialog.clone();
+        dialog.connect_response(move |dialog, response| {
+            if response == gtk::ResponseType::Accept
+                && let Some(file) = dialog.file()
+                && let Some(path) = file.path()
+            {
+                entry_for_response.set_text(&path.display().to_string());
+            }
+            dialog.destroy();
+        });
+        dialog.show();
+    });
+    field_box.append(&entry);
+    field_box.append(&browse);
+    row.append(&label);
+    row.append(&field_box);
+    container.append(&row);
+    entry
+}
+
+fn settings_combo_row(
+    container: &gtk::Box,
+    label_text: &str,
+    options: &[(&str, &str)],
+    active: &str,
+    tooltip: &str,
+) -> gtk::ComboBoxText {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    row.set_hexpand(true);
+    let label = settings_label(label_text, tooltip);
+    let combo = gtk::ComboBoxText::new();
+    combo.set_hexpand(true);
+    combo.set_tooltip_text(Some(tooltip));
+    let mut known_active = false;
+    for (value, display) in options {
+        known_active |= *value == active;
+        combo.append(Some(value), display);
+    }
+    if !known_active && !active.trim().is_empty() {
+        combo.append(Some(active), &format!("{active} (custom)"));
+    }
+    combo.set_active_id(Some(active));
+    if combo.active_id().is_none() && !options.is_empty() {
+        combo.set_active(Some(0));
+    }
+    row.append(&label);
+    row.append(&combo);
+    container.append(&row);
+    combo
+}
+
+fn combo_active_id(combo: &gtk::ComboBoxText) -> String {
+    combo
+        .active_id()
+        .map(|id| id.to_string())
+        .or_else(|| combo.active_text().map(|text| text.to_string()))
+        .unwrap_or_default()
+}
+
+fn settings_check_row(
+    container: &gtk::Box,
+    label_text: &str,
+    active: bool,
+    tooltip: &str,
+) -> gtk::CheckButton {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    row.set_hexpand(true);
+    let label = settings_label(label_text, tooltip);
+    let check = gtk::CheckButton::new();
+    check.set_active(active);
+    check.set_tooltip_text(Some(tooltip));
+    check.set_halign(gtk::Align::Start);
+    row.append(&label);
+    row.append(&check);
+    if !tooltip.trim().is_empty() {
+        let help = gtk::Label::new(Some(tooltip));
+        help.set_xalign(0.0);
+        help.set_wrap(true);
+        help.add_css_class("dim-label");
+        help.add_css_class("notm-settings-help");
+        help.set_hexpand(true);
+        row.append(&help);
+    }
+    container.append(&row);
+    check
+}
+
+fn settings_readonly_row(container: &gtk::Box, label_text: &str, value: &str, tooltip: &str) {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    row.set_hexpand(true);
+    let label = settings_label(label_text, tooltip);
+    let value_label = gtk::Label::new(Some(value));
+    value_label.set_xalign(0.0);
+    value_label.set_selectable(true);
+    value_label.set_wrap(true);
+    value_label.set_hexpand(true);
+    value_label.set_tooltip_text(Some(tooltip));
+    row.append(&label);
+    row.append(&value_label);
+    container.append(&row);
+}
+
+fn read_settings_toml(options: &LaunchOptions) -> toml::Value {
+    options
+        .app_config_path
+        .as_ref()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| text.parse::<toml::Value>().ok())
+        .unwrap_or_else(|| toml::Value::Table(Default::default()))
+}
+
+fn toml_section<'a>(
+    value: &'a toml::Value,
+    section: &str,
+) -> Option<&'a toml::map::Map<String, toml::Value>> {
+    value.get(section)?.as_table()
+}
+
+fn toml_string(value: &toml::Value, section: &str, key: &str) -> Option<String> {
+    toml_section(value, section)?
+        .get(key)?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
+fn toml_bool(value: &toml::Value, section: &str, key: &str, default: bool) -> bool {
+    toml_section(value, section)
+        .and_then(|table| table.get(key))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(default)
+}
+
+fn toml_usize(value: &toml::Value, section: &str, key: &str, default: usize) -> usize {
+    toml_section(value, section)
+        .and_then(|table| table.get(key))
+        .and_then(toml::Value::as_integer)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(default)
+}
+
+fn option_path_text(value: &Option<PathBuf>) -> String {
+    value
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default()
+}
+
+fn join_string_list(values: &[String]) -> String {
+    values.join(", ")
+}
+
+fn parse_string_list(value: &str) -> Vec<String> {
+    value
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn format_env_map(values: &BTreeMap<String, String>) -> String {
+    values
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn parse_env_map(value: &str) -> BTreeMap<String, String> {
+    value
+        .split([',', '\n'])
+        .filter_map(|item| item.trim().split_once('='))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .filter(|(key, _)| !key.is_empty())
+        .collect()
+}
+
+fn transport_mode_name(mode: &TransportMode) -> String {
+    match mode {
+        TransportMode::Auto => "auto",
+        TransportMode::StdinRfc5322 => "stdin_rfc5322",
+        TransportMode::FileArg => "file_arg",
+        TransportMode::CommandTemplate => "command_template",
+    }
+    .to_string()
+}
+
+fn persist_settings_values(options: &LaunchOptions, values: &SettingsValues) -> anyhow::Result<()> {
+    let Some(path) = &options.app_config_path else {
+        anyhow::bail!("app config path is not configured");
+    };
+    let mut value = read_settings_toml(options);
+    if !value.is_table() {
+        value = toml::Value::Table(Default::default());
+    }
+    let root = value.as_table_mut().expect("value is table");
+
+    set_optional_string(root, "notmuch", "database_path", &values.database_path);
+    set_optional_string(root, "notmuch", "config_path", &values.notmuch_config_path);
+    set_optional_string(root, "notmuch", "profile", &values.notmuch_profile);
+    set_string(root, "notmuch", "default_query", &values.default_query);
+    set_string_array(
+        root,
+        "notmuch",
+        "excluded_tags",
+        parse_string_list(&values.excluded_tags),
+    );
+    set_bool(
+        root,
+        "notmuch",
+        "open_readwrite_only_for_mutations",
+        values.open_readwrite_only_for_mutations,
+    );
+    set_bool(
+        root,
+        "notmuch",
+        "sync_maildir_flags_after_tag_change",
+        values.sync_maildir_flags_after_tag_change,
+    );
+
+    set_optional_string(root, "identity", "name", &values.identity_name);
+    set_optional_string(root, "identity", "primary_email", &values.primary_email);
+    set_string_array(
+        root,
+        "identity",
+        "other_email",
+        parse_string_list(&values.other_email),
+    );
+
+    set_string(root, "ui", "theme", &values.theme);
+    set_int(root, "ui", "page_size", values.page_size as i64);
+    set_int(
+        root,
+        "ui",
+        "thread_preview_lines",
+        values.thread_preview_lines as i64,
+    );
+    set_string(root, "ui", "html_mode", &values.html_mode);
+    set_bool(root, "ui", "start_maximized", values.start_maximized);
+    set_bool(root, "ui", "show_debug_panel", values.show_debug_panel);
+    set_bool(root, "ui", "remote_images", values.remote_images);
+    set_string_array(
+        root,
+        "ui",
+        "trusted_image_senders",
+        parse_string_list(&values.trusted_image_senders),
+    );
+    set_string_array(
+        root,
+        "ui",
+        "hidden_tag_searches",
+        parse_string_list(&values.hidden_tag_searches),
+    );
+
+    set_bool(root, "send", "enabled", values.send_enabled);
+    set_string(root, "send", "transport", &values.send_transport);
+    set_optional_string(root, "send", "command", &values.send_command);
+    set_string_array(root, "send", "args", parse_string_list(&values.send_args));
+    set_string(root, "send", "mode", &values.send_mode);
+    set_optional_string(root, "send", "working_dir", &values.send_working_dir);
+    set_string_map(root, "send", "env", parse_env_map(&values.send_env));
+    set_int(
+        root,
+        "send",
+        "timeout_seconds",
+        values.send_timeout_seconds as i64,
+    );
+    set_bool(root, "send", "save_sent", values.save_sent);
+    set_optional_string(root, "send", "sent_maildir", &values.sent_maildir);
+    set_string_array(
+        root,
+        "send",
+        "sent_tags",
+        parse_string_list(&values.sent_tags),
+    );
+    set_bool(
+        root,
+        "send",
+        "index_sent_after_send",
+        values.index_sent_after_send,
+    );
+    table_entry(root, "send").remove("one_live_self_test_per_run");
+    set_bool(
+        root,
+        "drafts",
+        "save_maildir",
+        values.save_drafts_to_maildir,
+    );
+    set_optional_string(root, "drafts", "maildir", &values.draft_maildir);
+    set_string_array(
+        root,
+        "drafts",
+        "tags",
+        parse_string_list(&values.draft_tags),
+    );
+    set_bool(
+        root,
+        "drafts",
+        "index_after_save",
+        values.index_draft_after_save,
+    );
+
+    set_bool(root, "sync", "enabled", values.sync_enabled);
+    set_string(
+        root,
+        "sync",
+        "manual_action_label",
+        &values.manual_sync_label,
+    );
+    table_entry(root, "sync").remove("show_manual_sync_button");
+    set_bool(
+        root,
+        "sync",
+        "notmuch_database_update_enabled",
+        values.notmuch_database_update_enabled,
+    );
+    set_bool(
+        root,
+        "sync",
+        "notmuch_database_update_on_startup",
+        values.notmuch_database_update_on_startup,
+    );
+    set_string(
+        root,
+        "sync",
+        "notmuch_database_update_command",
+        &values.notmuch_database_update_command,
+    );
+    set_bool(
+        root,
+        "sync",
+        "external_receive_enabled",
+        values.external_receive_enabled,
+    );
+    set_bool(
+        root,
+        "sync",
+        "external_receive_on_startup",
+        values.external_receive_on_startup,
+    );
+    set_string(
+        root,
+        "sync",
+        "external_receive_command",
+        &values.external_receive_command,
+    );
+
+    set_bool(root, "automation", "enabled", values.automation_enabled);
+    set_optional_string(root, "automation", "socket_path", &values.automation_socket);
+    set_optional_string(root, "automation", "token", &values.automation_token);
+    set_string(root, "automation", "screenshot_dir", &values.screenshot_dir);
+    set_bool(
+        root,
+        "automation",
+        "allow_live_send_test",
+        values.allow_live_send_test,
+    );
+    set_bool(
+        root,
+        "automation",
+        "allow_live_tag_test",
+        values.allow_live_tag_test,
+    );
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, toml::to_string_pretty(&value)?)?;
+    Ok(())
+}
+
+fn set_string(
+    root: &mut toml::map::Map<String, toml::Value>,
+    section: &str,
+    key: &str,
+    value: &str,
+) {
+    table_entry(root, section).insert(key.to_string(), toml::Value::String(value.to_string()));
+}
+
+fn set_optional_string(
+    root: &mut toml::map::Map<String, toml::Value>,
+    section: &str,
+    key: &str,
+    value: &str,
+) {
+    let table = table_entry(root, section);
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        table.remove(key);
+    } else {
+        table.insert(key.to_string(), toml::Value::String(trimmed.to_string()));
+    }
+}
+
+fn set_bool(root: &mut toml::map::Map<String, toml::Value>, section: &str, key: &str, value: bool) {
+    table_entry(root, section).insert(key.to_string(), toml::Value::Boolean(value));
+}
+
+fn set_int(root: &mut toml::map::Map<String, toml::Value>, section: &str, key: &str, value: i64) {
+    table_entry(root, section).insert(key.to_string(), toml::Value::Integer(value));
+}
+
+fn set_string_array(
+    root: &mut toml::map::Map<String, toml::Value>,
+    section: &str,
+    key: &str,
+    values: Vec<String>,
+) {
+    table_entry(root, section).insert(
+        key.to_string(),
+        toml::Value::Array(values.into_iter().map(toml::Value::String).collect()),
+    );
+}
+
+fn set_string_map(
+    root: &mut toml::map::Map<String, toml::Value>,
+    section: &str,
+    key: &str,
+    values: BTreeMap<String, String>,
+) {
+    if values.is_empty() {
+        table_entry(root, section).remove(key);
+        return;
+    }
+    table_entry(root, section).insert(
+        key.to_string(),
+        toml::Value::Table(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, toml::Value::String(value)))
+                .collect(),
+        ),
+    );
 }
 
 fn persist_basic_settings(
@@ -8234,5 +11716,40 @@ mod tests {
         assert!(document.contains("background: #ffffff;"));
         assert!(document.contains("color: #111111;"));
         assert!(!document.contains("CanvasText"));
+    }
+
+    #[test]
+    fn multi_thread_tag_query_round_trips_thread_ids() {
+        let ids = BTreeSet::from(["thread-a".to_string(), "thread-b".to_string()]);
+        let query = tag_query_for_thread_ids(&ids);
+
+        assert_eq!(query, "thread:thread-a or thread:thread-b");
+        assert_eq!(thread_ids_from_tag_query(&query), ids);
+    }
+
+    #[test]
+    fn sync_command_selection_separates_manual_from_startup() {
+        let mut options = LaunchOptions {
+            sync_enabled: true,
+            external_receive_enabled: true,
+            external_receive_command: "lieer-sync".to_string(),
+            notmuch_database_update_enabled: true,
+            notmuch_database_update_command: "notmuch new".to_string(),
+            ..LaunchOptions::default()
+        };
+
+        assert_eq!(sync_command_specs(&options, SyncRunKind::Manual).len(), 2);
+        assert!(sync_command_specs(&options, SyncRunKind::Startup).is_empty());
+
+        options.external_receive_on_startup = true;
+        let startup = sync_command_specs(&options, SyncRunKind::Startup);
+        assert_eq!(startup.len(), 1);
+        assert_eq!(startup[0].name, "receive");
+
+        options.notmuch_database_update_on_startup = true;
+        let startup = sync_command_specs(&options, SyncRunKind::Startup);
+        assert_eq!(startup.len(), 2);
+        assert_eq!(startup[0].name, "receive");
+        assert_eq!(startup[1].name, "database_update");
     }
 }

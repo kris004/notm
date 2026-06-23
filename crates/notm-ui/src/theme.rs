@@ -19,6 +19,15 @@ pub fn css() -> &'static str {
         box-shadow: inset 0 0 0 2px alpha(@theme_selected_bg_color, .85);
         background-color: alpha(@theme_selected_bg_color, .12);
     }
+    #notm-thread-list row.notm-visual-selected {
+        background-color: alpha(@theme_selected_bg_color, .28);
+    }
+    #notm-undo-tag-list row.notm-undo-selected {
+        background-color: alpha(@theme_selected_bg_color, .30);
+    }
+    #notm-undo-tag-list row.notm-keyboard-cursor {
+        box-shadow: inset 0 0 0 2px alpha(@theme_selected_bg_color, .85);
+    }
     #notm-thread-list row.unread label { font-weight: 700; }
     #notm-compose-body,
     #notm-compose-body text,
@@ -35,6 +44,50 @@ pub fn css() -> &'static str {
         border: 1px solid alpha(currentColor, .18);
         border-radius: 8px;
         background: alpha(currentColor, .06);
+    }
+    #notm-settings-dialog .notm-settings-section {
+        font-size: 1.08em;
+        font-weight: 800;
+        color: @theme_selected_bg_color;
+    }
+    #notm-settings-dialog .notm-settings-label {
+        font-weight: 700;
+    }
+    #notm-settings-dialog .notm-settings-note {
+        padding: 8px;
+        border-radius: 8px;
+        background: alpha(@theme_selected_bg_color, .10);
+    }
+    #notm-settings-dialog .notm-settings-help {
+        font-size: .92em;
+    }
+    #notm-search-suggestions-list,
+    #notm-address-suggestions-list {
+        padding: 2px;
+        border: 1px solid alpha(@theme_selected_bg_color, .45);
+        border-radius: 8px;
+        background: @theme_bg_color;
+        color: @theme_fg_color;
+    }
+    #notm-search-suggestions-list row,
+    #notm-address-suggestions-list row {
+        padding: 2px 4px;
+        border-radius: 6px;
+    }
+    #notm-search-suggestions-list row:hover,
+    #notm-search-suggestions-list row:selected,
+    #notm-address-suggestions-list row:hover,
+    #notm-address-suggestions-list row:selected {
+        background: alpha(@theme_selected_bg_color, .35);
+        color: @theme_selected_fg_color;
+    }
+    #notm-tag-command-row {
+        padding: 2px;
+        border-radius: 8px;
+        background: alpha(@theme_selected_bg_color, .10);
+    }
+    #notm-tag-command-row entry {
+        min-width: 180px;
     }
     #notm-debug-panel { font-family: monospace; }
     "#

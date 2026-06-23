@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 use notm_mail::SendReport;
 use notm_notmuch::{MessageSummary, Revision, ThreadSummary};
@@ -33,6 +36,9 @@ pub struct UiState {
     pub screenshot_path: Option<PathBuf>,
     pub quote_collapse_enabled: bool,
     pub prefer_html_view: bool,
+    pub visual_select_mode: bool,
+    pub visual_select_anchor: Option<usize>,
+    pub visual_selected_threads: BTreeSet<String>,
 }
 
 impl Default for UiState {
@@ -65,6 +71,9 @@ impl Default for UiState {
             screenshot_path: None,
             quote_collapse_enabled: false,
             prefer_html_view: false,
+            visual_select_mode: false,
+            visual_select_anchor: None,
+            visual_selected_threads: BTreeSet::new(),
         }
     }
 }

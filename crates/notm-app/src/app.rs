@@ -80,9 +80,13 @@ fn launch_options(cfg: &config::AppConfig, app_config_path: Option<PathBuf>) -> 
         identity_name: cfg.identity.name.clone(),
         primary_email: cfg.identity.primary_email.clone(),
         other_email: cfg.identity.other_email.clone(),
+        send_enabled: cfg.send.enabled,
         send_command: cfg.send.command.clone(),
         send_args: cfg.send.args.clone(),
         send_mode: config::transport_mode(&cfg.send.mode),
+        send_working_dir: cfg.send.working_dir.clone(),
+        send_env: cfg.send.env.clone(),
+        send_timeout_seconds: cfg.send.timeout_seconds,
         fake_send_capture_dir: None,
         save_sent: cfg.send.save_sent,
         sent_maildir: cfg.send.sent_maildir.clone(),
@@ -95,10 +99,11 @@ fn launch_options(cfg: &config::AppConfig, app_config_path: Option<PathBuf>) -> 
         sync_enabled: cfg.sync.enabled,
         manual_sync_label: cfg.sync.manual_action_label.clone(),
         notmuch_database_update_enabled: cfg.sync.notmuch_database_update_enabled,
+        notmuch_database_update_on_startup: cfg.sync.notmuch_database_update_on_startup,
         notmuch_database_update_command: cfg.sync.notmuch_database_update_command.clone(),
         external_receive_enabled: cfg.sync.external_receive_enabled,
+        external_receive_on_startup: cfg.sync.external_receive_on_startup,
         external_receive_command: cfg.sync.external_receive_command.clone(),
-        show_manual_sync_button: cfg.sync.show_manual_sync_button,
         screenshot_dir: cfg.automation.screenshot_dir.clone(),
         automation_enabled: cfg.automation.enabled,
         automation_socket: cfg.automation.socket_path.clone(),
@@ -106,6 +111,7 @@ fn launch_options(cfg: &config::AppConfig, app_config_path: Option<PathBuf>) -> 
         show_debug_panel: cfg.ui.show_debug_panel,
         start_maximized: cfg.ui.start_maximized,
         remote_images: cfg.ui.remote_images,
+        html_mode: cfg.ui.html_mode.clone(),
         trusted_image_senders: cfg.ui.trusted_image_senders.clone(),
         hidden_tag_searches: cfg.ui.hidden_tag_searches.clone(),
         sync_maildir_flags_after_tag_change: cfg.notmuch.sync_maildir_flags_after_tag_change,
@@ -133,6 +139,9 @@ fn open_config(cfg: &config::AppConfig) -> OpenConfig {
 }
 
 fn external_transport(cfg: &config::AppConfig) -> anyhow::Result<ExternalCommandTransport> {
+    if !cfg.send.enabled {
+        anyhow::bail!("send.enabled is false");
+    }
     let Some(command) = &cfg.send.command else {
         anyhow::bail!("send.command is not configured and no helper was detected");
     };

@@ -80,8 +80,6 @@ pub struct UiConfig {
     pub start_maximized: bool,
     #[serde(default)]
     pub show_debug_panel: bool,
-    #[serde(default = "default_true")]
-    pub confirm_destructive_tag_actions: bool,
     #[serde(default)]
     pub custom_saved_searches: Vec<SavedSearchConfig>,
     #[serde(default)]
@@ -105,7 +103,6 @@ impl Default for UiConfig {
             html_mode: "sanitize_then_render_text_fallback".to_string(),
             start_maximized: false,
             show_debug_panel: false,
-            confirm_destructive_tag_actions: true,
             custom_saved_searches: Vec::new(),
             hidden_tag_searches: Vec::new(),
         }
@@ -138,8 +135,6 @@ pub struct SendConfig {
     pub sent_tags: Vec<String>,
     #[serde(default)]
     pub index_sent_after_send: bool,
-    #[serde(default = "default_true")]
-    pub one_live_self_test_per_run: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,7 +175,6 @@ impl Default for SendConfig {
             sent_maildir: None,
             sent_tags: vec!["sent".to_string()],
             index_sent_after_send: false,
-            one_live_self_test_per_run: true,
         }
     }
 }
@@ -194,13 +188,15 @@ pub struct SyncConfig {
     #[serde(default)]
     pub notmuch_database_update_enabled: bool,
     #[serde(default)]
+    pub notmuch_database_update_on_startup: bool,
+    #[serde(default)]
     pub notmuch_database_update_command: String,
     #[serde(default)]
     pub external_receive_enabled: bool,
     #[serde(default)]
-    pub external_receive_command: String,
+    pub external_receive_on_startup: bool,
     #[serde(default)]
-    pub show_manual_sync_button: bool,
+    pub external_receive_command: String,
 }
 
 impl Default for SyncConfig {
@@ -209,10 +205,11 @@ impl Default for SyncConfig {
             enabled: false,
             manual_action_label: "Sync".to_string(),
             notmuch_database_update_enabled: false,
+            notmuch_database_update_on_startup: false,
             notmuch_database_update_command: String::new(),
             external_receive_enabled: false,
+            external_receive_on_startup: false,
             external_receive_command: String::new(),
-            show_manual_sync_button: false,
         }
     }
 }
