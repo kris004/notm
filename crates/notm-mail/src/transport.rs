@@ -150,6 +150,11 @@ impl ExternalCommandTransport {
     }
 
     async fn send_template(&self, message: ComposedMessage) -> anyhow::Result<SendReport> {
+        if !self.args.iter().any(|arg| arg.contains("{file}")) {
+            anyhow::bail!(
+                "command_template send mode requires at least one send arg containing `{{file}}`"
+            );
+        }
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("message.eml");
         std::fs::write(&path, message.to_rfc5322())?;
@@ -184,5 +189,34 @@ fn report_from_output(output: std::process::Output, captured_path: Option<String
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         captured_path,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn command_template_requires_file_placeholder() {
+        let transport = ExternalCommandTransport {
+            command: PathBuf::from("unused"),
+            args: vec!["--message".to_string()],
+            mode: TransportMode::CommandTemplate,
+            working_dir: None,
+            env: BTreeMap::new(),
+            timeout: Duration::from_secs(1),
+        };
+        let message = ComposedMessage::new(
+            "Sender <sender@example.test>".to_string(),
+            vec!["recipient@example.test".to_string()],
+            "Subject".to_string(),
+            "Body".to_string(),
+        );
+
+        let err = transport
+            .send(message)
+            .await
+            .expect_err("missing {file} should fail before running command");
+        assert!(err.to_string().contains("requires at least one send arg"));
     }
 }

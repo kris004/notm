@@ -13,7 +13,14 @@ The live UI refuses to fall back to the fake capture transport when no
 `send.command` is configured. Fake capture is only enabled for fixture/test
 launches so a real compose window cannot report success for an unsent message.
 
-`auto` currently behaves like `stdin_rfc5322`: notm writes the complete RFC5322 message to the command's standard input and passes exactly the configured `send.args`. Any helper-specific flags must be set explicitly in config.
+Transport mode behavior:
+
+- `auto`: currently the same as `stdin_rfc5322`. notm writes the complete RFC5322 message to the command's standard input and passes exactly the configured `send.args`.
+- `stdin_rfc5322`: writes the complete RFC5322 message to standard input. Use this for sendmail-style commands that read the message from stdin.
+- `file_arg`: writes the complete RFC5322 message to a temporary file, then appends that file path after all configured `send.args`.
+- `command_template`: writes the complete RFC5322 message to a temporary file, then replaces `{file}` wherever it appears in each configured argument. Use this when the command needs the message path in a specific position, such as `args = ["--message", "{file}"]`. This mode fails if no argument contains `{file}`.
+
+Any helper-specific flags must be set explicitly in config. notm does not inspect helper scripts or add implicit arguments.
 
 Optional post-send persistence is explicit:
 

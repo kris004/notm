@@ -11074,7 +11074,7 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
         &form,
         "Arguments",
         &join_string_list(&options.send_args),
-        "Extra send command args, comma separated.",
+        "Extra send command args, comma separated. In command_template mode, include {file} where the temporary RFC5322 message path should go.",
     );
     let send_mode = settings_combo_row(
         &form,
@@ -11083,10 +11083,10 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
             ("auto", "Auto"),
             ("stdin_rfc5322", "Pipe RFC5322 on stdin"),
             ("file_arg", "Write temp file and pass path"),
-            ("command_template", "Command template"),
+            ("command_template", "Template args with {file}"),
         ],
         &transport_mode_name(&options.send_mode),
-        "auto, stdin_rfc5322, file_arg, or command_template.",
+        "auto/stdin_rfc5322 pipe the RFC5322 message to stdin; file_arg appends a temporary message path; command_template replaces {file} inside args.",
     );
     let send_working_dir = settings_path_row(
         &widgets.window,
