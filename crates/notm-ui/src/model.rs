@@ -14,6 +14,7 @@ pub struct UiState {
     pub thread_list_items: Vec<ThreadSummary>,
     pub thread_total_count: u32,
     pub thread_loaded_count: usize,
+    pub thread_window_offset: usize,
     pub thread_page_size: usize,
     pub can_load_more_threads: bool,
     pub thread_details: BTreeMap<String, ThreadUiDetails>,
@@ -39,6 +40,7 @@ pub struct UiState {
     pub visual_select_mode: bool,
     pub visual_select_anchor: Option<usize>,
     pub visual_selected_threads: BTreeSet<String>,
+    pub visual_selection_pending_range: Option<(usize, usize)>,
 }
 
 impl Default for UiState {
@@ -49,6 +51,7 @@ impl Default for UiState {
             thread_list_items: Vec::new(),
             thread_total_count: 0,
             thread_loaded_count: 0,
+            thread_window_offset: 0,
             thread_page_size: 100,
             can_load_more_threads: false,
             thread_details: BTreeMap::new(),
@@ -74,6 +77,7 @@ impl Default for UiState {
             visual_select_mode: false,
             visual_select_anchor: None,
             visual_selected_threads: BTreeSet::new(),
+            visual_selection_pending_range: None,
         }
     }
 }

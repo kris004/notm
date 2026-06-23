@@ -339,6 +339,20 @@ struct SearchResponse {
     result: anyhow::Result<SearchData>,
 }
 
+struct ThreadPageResponse {
+    generation: u64,
+    target_index: usize,
+    visual_anchor_index: Option<usize>,
+    result: anyhow::Result<SearchData>,
+}
+
+struct ThreadRangeSelectionResponse {
+    generation: u64,
+    anchor_index: usize,
+    cursor_index: usize,
+    result: anyhow::Result<BTreeSet<String>>,
+}
+
 static SEARCH_CACHE: OnceLock<Mutex<BTreeMap<String, SearchData>>> = OnceLock::new();
 static THREAD_DETAIL_CACHE: OnceLock<Mutex<BTreeMap<String, ThreadUiDetails>>> = OnceLock::new();
 
@@ -450,6 +464,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     save_search_button.set_widget_name("notm-save-search-button");
     saved_editor_buttons.append(&save_search_button);
     custom_search_box.append(&saved_editor_buttons);
+    left.append(&custom_search_button);
 
     let tag_title = gtk::Label::new(Some("Tags"));
     tag_title.set_xalign(0.0);
@@ -458,7 +473,6 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     let tag_search_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     tag_search_box.set_widget_name("notm-tag-searches");
     left.append(&tag_search_box);
-    left.append(&custom_search_button);
     let manual_sync_button = if options.sync_enabled {
         let sync_button = gtk::Button::with_label(&options.manual_sync_label);
         sync_button.set_widget_name("notm-manual-sync-button");
@@ -2313,13 +2327,11 @@ fn tag_target_threads(state: &SharedState) -> Vec<notm_notmuch::ThreadSummary> {
     threads
 }
 
-fn tag_targets_any<F>(state: &SharedState, mut predicate: F) -> bool
+fn tag_targets_any<F>(state: &SharedState, predicate: F) -> bool
 where
     F: FnMut(&notm_notmuch::ThreadSummary) -> bool,
 {
-    tag_target_threads(state)
-        .iter()
-        .any(|thread| predicate(thread))
+    tag_target_threads(state).iter().any(predicate)
 }
 
 fn tag_query_for_thread_ids(thread_ids: &BTreeSet<String>) -> String {
@@ -3707,16 +3719,27 @@ fn select_thread_absolute(
     state: &SharedState,
     one_based: usize,
 ) {
-    let target = one_based.saturating_sub(1);
-    let len = state.borrow().thread_list_items.len();
+    let mut target = one_based.saturating_sub(1);
+    let (window_offset, len, total, query) = {
+        let state = state.borrow();
+        (
+            state.thread_window_offset,
+            state.thread_list_items.len(),
+            state.thread_total_count as usize,
+            state.current_query.clone(),
+        )
+    };
     if len == 0 {
         return;
     }
-    if target >= len && state.borrow().can_load_more_threads {
-        load_until_thread_index(options, widgets, state, target);
+    if total > 0 {
+        target = target.min(total - 1);
+    }
+    if (window_offset..window_offset + len).contains(&target) {
+        select_thread_index_clamped(options, widgets, state, target - window_offset);
         return;
     }
-    select_thread_index_clamped(options, widgets, state, target);
+    load_thread_page_containing_index(options, widgets, state, &query, target);
 }
 
 fn select_thread_index_clamped(
@@ -3740,47 +3763,78 @@ fn select_thread_index_clamped(
     }
 }
 
-fn load_until_thread_index(
+fn load_thread_page_containing_index(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
+    query: &str,
     target_index: usize,
 ) {
+    let visual_anchor_index = visual_selection_anchor_index(widgets, state);
     let target_number = target_index + 1;
-    set_thread_loading_indicator(widgets, &format!("Loading messages up to {target_number}…"));
-    loop {
-        let (query, offset, can_load_more) = {
-            let state = state.borrow();
-            (
-                state.current_query.clone(),
-                state.thread_list_items.len(),
-                state.can_load_more_threads,
-            )
-        };
-        if offset > target_index || !can_load_more {
-            break;
-        }
-        match execute_search_page(options, &query, offset) {
-            Ok(data) => {
-                set_thread_loading_indicator(
-                    widgets,
-                    &format!("Loading messages up to {target_number}… loaded {}", offset),
-                );
-                append_search_data(options, widgets, state, data);
+    let page_size = options.page_size.max(1);
+    let offset = (target_index / page_size) * page_size;
+    let page_start = offset + 1;
+    let page_end = offset + page_size;
+    set_thread_loading_indicator(
+        widgets,
+        &format!(
+            "Loading message {} (page {}-{})…",
+            format_count(target_number),
+            format_count(page_start),
+            format_count(page_end)
+        ),
+    );
+
+    let (tx, rx) = mpsc::channel::<ThreadPageResponse>();
+    let opts = options.clone();
+    let query = query.to_string();
+    let generation = widgets.search_generation.get().saturating_add(1);
+    widgets.search_generation.set(generation);
+    thread::spawn(move || {
+        let result = execute_search_page(&opts, &query, offset);
+        let _ = tx.send(ThreadPageResponse {
+            generation,
+            target_index,
+            visual_anchor_index,
+            result,
+        });
+    });
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    gtk::glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(response) => {
+            if response.generation == w.search_generation.get() {
+                match response.result {
+                    Ok(data) => {
+                        let keep_visual = response.visual_anchor_index.is_some()
+                            && st.borrow().visual_select_mode
+                            && st.borrow().current_query == data.query;
+                        apply_search_data(&opts, &w, &st, data);
+                        if keep_visual {
+                            let mut state = st.borrow_mut();
+                            state.visual_select_mode = true;
+                            state.visual_select_anchor = response.visual_anchor_index;
+                        }
+                        let local_index = response
+                            .target_index
+                            .saturating_sub(st.borrow().thread_window_offset);
+                        select_thread_index_clamped(&opts, &w, &st, local_index);
+                        update_thread_result_label(&w, &st);
+                    }
+                    Err(err) => apply_search_error(&w, &st, err),
+                }
             }
-            Err(err) => {
-                apply_search_error(widgets, state, err);
-                return;
-            }
+            gtk::glib::ControlFlow::Break
         }
-    }
-    let len = state.borrow().thread_list_items.len();
-    if len == 0 {
-        update_thread_result_label(widgets, state);
-        return;
-    }
-    select_thread_index_clamped(options, widgets, state, target_index);
-    update_thread_result_label(widgets, state);
+        Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            apply_search_error(&w, &st, anyhow::anyhow!("thread page load cancelled"));
+            gtk::glib::ControlFlow::Break
+        }
+    });
 }
 
 fn set_thread_loading_indicator(widgets: &Widgets, message: &str) {
@@ -4602,6 +4656,7 @@ fn install_shortcuts(
     widgets.window.add_controller(controller);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn connect_dropdown_sequence_keys(
     options: &LaunchOptions,
     widgets: &Widgets,
@@ -4792,7 +4847,10 @@ fn connect_auto_load_more(options: &LaunchOptions, widgets: &Widgets, state: &Sh
         }
         let (can_load_more, offset) = {
             let state = st.borrow();
-            (state.can_load_more_threads, state.thread_list_items.len())
+            (
+                state.can_load_more_threads,
+                state.thread_window_offset + state.thread_list_items.len(),
+            )
         };
         if !can_load_more || last_auto_offset.get() == offset {
             return;
@@ -4865,19 +4923,43 @@ fn select_relative_thread(
     state: &SharedState,
     delta: isize,
 ) {
-    let len = state.borrow().thread_list_items.len();
+    let (window_offset, len, total, query) = {
+        let state = state.borrow();
+        (
+            state.thread_window_offset,
+            state.thread_list_items.len(),
+            state.thread_total_count as usize,
+            state.current_query.clone(),
+        )
+    };
     if len == 0 {
         return;
     }
-    let current = selected_thread_index(widgets).unwrap_or(0) as isize;
-    let next = (current + delta).clamp(0, len.saturating_sub(1) as isize) as i32;
-    if let Some(row) = widgets.thread_list.row_at_index(next) {
+    let current_local = selected_thread_index(widgets).unwrap_or(0);
+    let current_abs = window_offset + current_local;
+    let max_abs = if total > 0 {
+        total - 1
+    } else {
+        window_offset + len - 1
+    };
+    let target_abs = if delta.is_negative() {
+        current_abs.saturating_sub(delta.unsigned_abs())
+    } else {
+        current_abs.saturating_add(delta as usize).min(max_abs)
+    };
+    if (window_offset..window_offset + len).contains(&target_abs) {
+        let next = (target_abs - window_offset) as i32;
+        let Some(row) = widgets.thread_list.row_at_index(next) else {
+            return;
+        };
         let already_selected = selected_thread_index(widgets) == Some(next as usize);
         widgets.thread_list.select_row(Some(&row));
         focus_thread_row(&row);
         if already_selected {
             select_thread_by_index(options, widgets, state, next as usize, false);
         }
+    } else {
+        load_thread_page_containing_index(options, widgets, state, &query, target_abs);
     }
 }
 
@@ -5138,8 +5220,8 @@ fn complete_recipient_entry_for_field(
     entry: &gtk::Entry,
     field: RecipientField,
 ) -> bool {
-    set_active_address_entry(widgets, &entry);
-    place_address_suggestions_after_entry(widgets, &entry);
+    set_active_address_entry(widgets, entry);
+    place_address_suggestions_after_entry(widgets, entry);
 
     let current = entry.text().to_string();
     let reuse_session = widgets
@@ -7314,7 +7396,7 @@ fn load_more_threads(options: &LaunchOptions, widgets: &Widgets, state: &SharedS
         let state = state.borrow();
         (
             state.current_query.clone(),
-            state.thread_list_items.len(),
+            state.thread_window_offset + state.thread_list_items.len(),
             state.can_load_more_threads,
         )
     };
@@ -7324,11 +7406,38 @@ fn load_more_threads(options: &LaunchOptions, widgets: &Widgets, state: &SharedS
             .set_text("All currently counted threads are already loaded");
         return;
     }
-    set_thread_loading_indicator(widgets, "Loading more messages…");
-    match execute_search_page(options, &query, offset) {
-        Ok(data) => append_search_data(options, widgets, state, data),
-        Err(err) => apply_search_error(widgets, state, err),
-    }
+    set_thread_loading_indicator(
+        widgets,
+        &format!("Loading more messages from {}…", format_count(offset + 1)),
+    );
+    let (tx, rx) = mpsc::channel::<SearchResponse>();
+    let opts = options.clone();
+    let generation = widgets.search_generation.get().saturating_add(1);
+    widgets.search_generation.set(generation);
+    thread::spawn(move || {
+        let result = execute_search_page(&opts, &query, offset);
+        let _ = tx.send(SearchResponse { generation, result });
+    });
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    gtk::glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(response) => {
+            if response.generation == w.search_generation.get() {
+                match response.result {
+                    Ok(data) => append_search_data(&opts, &w, &st, data),
+                    Err(err) => apply_search_error(&w, &st, err),
+                }
+            }
+            gtk::glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            apply_search_error(&w, &st, anyhow::anyhow!("thread page load cancelled"));
+            gtk::glib::ControlFlow::Break
+        }
+    });
 }
 
 fn apply_search_data(
@@ -7340,11 +7449,13 @@ fn apply_search_data(
     {
         let mut s = state.borrow_mut();
         s.current_query = data.query.clone();
+        s.thread_window_offset = data.offset;
         s.thread_list_items = data.threads;
         s.thread_total_count = data.count;
         s.thread_loaded_count = s.thread_list_items.len();
         s.thread_page_size = data.limit;
-        s.can_load_more_threads = s.thread_list_items.len() < data.count as usize;
+        s.can_load_more_threads =
+            s.thread_window_offset + s.thread_list_items.len() < data.count as usize;
         s.thread_details.clear();
         s.selected_thread = None;
         s.selected_message = None;
@@ -7352,15 +7463,17 @@ fn apply_search_data(
         s.visual_select_mode = false;
         s.visual_select_anchor = None;
         s.visual_selected_threads.clear();
+        s.visual_selection_pending_range = None;
         s.visible_tags = data.tags;
         s.database_path = Some(data.database_path);
         s.database_revision = Some(data.revision);
         s.last_error = None;
         s.last_operation = Some(format!(
-            "search `{}` loaded {} of {} thread(s){}",
+            "search `{}` loaded {} of {} thread(s) from offset {}{}",
             data.query,
             s.thread_list_items.len(),
             data.count,
+            data.offset,
             if data.cached { " from cache" } else { "" }
         ));
     }
@@ -7369,9 +7482,8 @@ fn apply_search_data(
     refresh_thread_attachment_list(widgets, state);
     update_message_menu(options, widgets, state);
     widgets.status_label.set_text(&format!(
-        "{} of {} thread(s) for {}{}",
-        state.borrow().thread_loaded_count,
-        state.borrow().thread_total_count,
+        "{} for {}{}",
+        thread_window_status(state),
         data.query,
         if data.cached { " (cached)" } else { "" }
     ));
@@ -7397,20 +7509,28 @@ fn append_search_data(
     {
         let mut s = state.borrow_mut();
         s.current_query = data.query.clone();
+        if data.offset != s.thread_window_offset + s.thread_list_items.len() {
+            s.thread_window_offset = data.offset;
+            s.thread_list_items.clear();
+        }
         s.thread_list_items.extend(data.threads);
         s.thread_total_count = data.count;
         s.thread_loaded_count = s.thread_list_items.len();
         s.thread_page_size = data.limit;
-        s.can_load_more_threads = s.thread_list_items.len() < data.count as usize;
+        s.can_load_more_threads =
+            s.thread_window_offset + s.thread_list_items.len() < data.count as usize;
         s.visible_tags = data.tags;
         s.database_path = Some(data.database_path);
         s.database_revision = Some(data.revision);
         s.last_error = None;
         s.last_operation = Some(format!(
-            "loaded page at offset {}: {} of {} thread(s){}",
+            "loaded page at offset {}: {}{}",
             data.offset,
-            s.thread_list_items.len(),
-            data.count,
+            thread_window_status_from_parts(
+                s.thread_window_offset,
+                s.thread_list_items.len(),
+                data.count as usize,
+            ),
             if data.cached { " from cache" } else { "" }
         ));
     }
@@ -7423,11 +7543,9 @@ fn append_search_data(
             .status_label
             .set_text(&message_position_status(state, index, "Selected"));
     } else {
-        widgets.status_label.set_text(&format!(
-            "Loaded {} of {} thread(s)",
-            state.borrow().thread_loaded_count,
-            state.borrow().thread_total_count
-        ));
+        widgets
+            .status_label
+            .set_text(&format!("Loaded {}", thread_window_status(state)));
     }
     update_thread_result_label(widgets, state);
     update_debug(widgets, state);
@@ -7460,14 +7578,51 @@ fn restore_thread_selection(
 
 fn update_thread_result_label(widgets: &Widgets, state: &SharedState) {
     let state_ref = state.borrow();
+    let status = thread_window_status_from_parts(
+        state_ref.thread_window_offset,
+        state_ref.thread_list_items.len(),
+        state_ref.thread_total_count as usize,
+    );
     widgets.thread_result_label.set_text(&format!(
-        "Loaded {} of {} thread(s) · page size {}",
-        state_ref.thread_loaded_count, state_ref.thread_total_count, state_ref.thread_page_size
+        "{status} · page size {}",
+        state_ref.thread_page_size
     ));
     let can_load_more = state_ref.can_load_more_threads;
     drop(state_ref);
     set_button_label(&widgets.load_more_button, "Load more", "G", state);
     widgets.load_more_button.set_sensitive(can_load_more);
+}
+
+fn thread_window_status(state: &SharedState) -> String {
+    let state = state.borrow();
+    thread_window_status_from_parts(
+        state.thread_window_offset,
+        state.thread_list_items.len(),
+        state.thread_total_count as usize,
+    )
+}
+
+fn thread_window_status_from_parts(offset: usize, loaded: usize, total: usize) -> String {
+    if loaded == 0 {
+        return format!("Loaded 0 of {} thread(s)", format_count(total));
+    }
+    let start = offset + 1;
+    let end = offset + loaded;
+    if offset == 0 {
+        format!(
+            "Loaded {} of {} thread(s)",
+            format_count(loaded),
+            format_count(total.max(loaded))
+        )
+    } else {
+        format!(
+            "Showing {}-{} of {} thread(s) ({} loaded)",
+            format_count(start),
+            format_count(end),
+            format_count(total.max(end)),
+            format_count(loaded)
+        )
+    }
 }
 
 fn search_cache_key(
@@ -7501,14 +7656,17 @@ fn populate_thread_list(options: &LaunchOptions, widgets: &Widgets, state: &Shar
     while let Some(child) = widgets.thread_list.first_child() {
         widgets.thread_list.remove(&child);
     }
-    let threads = state.borrow().thread_list_items.clone();
+    let (threads, window_offset) = {
+        let state = state.borrow();
+        (state.thread_list_items.clone(), state.thread_window_offset)
+    };
     let details = visible_thread_details(options, state, &threads);
     state.borrow_mut().thread_details = details.clone();
     for (idx, thread) in threads.iter().enumerate() {
         let row = gtk::ListBoxRow::new();
         row.set_widget_name(&format!("notm-thread-row-{idx}"));
         let detail = details.get(&thread.thread_id).cloned().unwrap_or_default();
-        set_thread_row_content(&row, idx, thread, &detail);
+        set_thread_row_content(&row, window_offset + idx, thread, &detail);
         widgets.thread_list.append(&row);
     }
     update_visual_selection_rows(widgets, state);
@@ -7525,7 +7683,8 @@ fn enter_visual_select_mode(widgets: &Widgets, state: &SharedState) {
         let mut state = state.borrow_mut();
         state.active_pane = ActivePane::Threads;
         state.visual_select_mode = true;
-        state.visual_select_anchor = Some(index);
+        state.visual_select_anchor = Some(state.thread_window_offset + index);
+        state.visual_selection_pending_range = None;
     }
     update_visual_selection_to_cursor(widgets, state);
 }
@@ -7536,6 +7695,7 @@ fn clear_visual_selection(widgets: &Widgets, state: &SharedState) {
         state.visual_select_mode = false;
         state.visual_select_anchor = None;
         state.visual_selected_threads.clear();
+        state.visual_selection_pending_range = None;
     }
     update_visual_selection_rows(widgets, state);
     widgets.status_label.set_text("Normal mode");
@@ -7550,6 +7710,7 @@ fn update_visual_selection_to_cursor(widgets: &Widgets, state: &SharedState) {
         if !state.visual_select_mode {
             return;
         }
+        let cursor = state.thread_window_offset + cursor;
         let anchor = state.visual_select_anchor.unwrap_or(cursor);
         let start = anchor.min(cursor);
         let end = anchor.max(cursor);
@@ -7557,7 +7718,7 @@ fn update_visual_selection_to_cursor(widgets: &Widgets, state: &SharedState) {
             .thread_list_items
             .iter()
             .enumerate()
-            .filter(|(index, _)| (start..=end).contains(index))
+            .filter(|(index, _)| (start..=end).contains(&(state.thread_window_offset + *index)))
             .map(|(_, thread)| thread.thread_id.clone())
             .collect::<BTreeSet<_>>();
         (anchor, ids)
@@ -7572,6 +7733,145 @@ fn update_visual_selection_to_cursor(widgets: &Widgets, state: &SharedState) {
     widgets
         .status_label
         .set_text(&format!("Visual select: {count} thread(s) selected"));
+}
+
+fn visual_selection_anchor_index(widgets: &Widgets, state: &SharedState) -> Option<usize> {
+    let cursor = selected_thread_index(widgets);
+    let state = state.borrow();
+    if !state.visual_select_mode {
+        return None;
+    }
+    Some(
+        state
+            .visual_select_anchor
+            .or_else(|| cursor.map(|index| state.thread_window_offset + index))
+            .unwrap_or(state.thread_window_offset),
+    )
+}
+
+fn maybe_load_visual_selection_range(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    cursor_index: usize,
+) {
+    let Some(anchor_index) = visual_selection_anchor_index(widgets, state) else {
+        return;
+    };
+    let (query, window_offset, loaded_len, generation) = {
+        let state = state.borrow();
+        (
+            state.current_query.clone(),
+            state.thread_window_offset,
+            state.thread_list_items.len(),
+            widgets.search_generation.get(),
+        )
+    };
+    let start = anchor_index.min(cursor_index);
+    let end = anchor_index.max(cursor_index);
+    if loaded_len == 0
+        || (window_offset..window_offset + loaded_len).contains(&start)
+            && (window_offset..window_offset + loaded_len).contains(&end)
+    {
+        state.borrow_mut().visual_selection_pending_range = None;
+        return;
+    }
+    state.borrow_mut().visual_selection_pending_range = Some((start, end));
+    widgets.status_label.set_text(&format!(
+        "Visual select: loading IDs for messages {}-{}…",
+        format_count(start + 1),
+        format_count(end + 1)
+    ));
+    let (tx, rx) = mpsc::channel::<ThreadRangeSelectionResponse>();
+    let opts = options.clone();
+    thread::spawn(move || {
+        let result = collect_thread_ids_for_range(&opts, &query, start, end);
+        let _ = tx.send(ThreadRangeSelectionResponse {
+            generation,
+            anchor_index,
+            cursor_index,
+            result,
+        });
+    });
+
+    let w = widgets.clone();
+    let st = state.clone();
+    gtk::glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(response) => {
+            if response.generation == w.search_generation.get()
+                && st.borrow().visual_select_mode
+                && st.borrow().visual_select_anchor == Some(response.anchor_index)
+                && selected_thread_index(&w).map(|index| st.borrow().thread_window_offset + index)
+                    == Some(response.cursor_index)
+            {
+                match response.result {
+                    Ok(ids) => {
+                        let count = ids.len();
+                        {
+                            let mut state = st.borrow_mut();
+                            state.visual_selected_threads = ids;
+                            state.visual_selection_pending_range = None;
+                        }
+                        update_visual_selection_rows(&w, &st);
+                        w.status_label.set_text(&format!(
+                            "Visual select: {} thread(s) selected",
+                            format_count(count)
+                        ));
+                    }
+                    Err(err) => {
+                        {
+                            let mut state = st.borrow_mut();
+                            state.visual_selection_pending_range = None;
+                            state.last_error = Some(err.to_string());
+                        }
+                        w.status_label
+                            .set_text(&format!("Visual select range load failed: {err}"));
+                        update_debug(&w, &st);
+                    }
+                }
+            }
+            gtk::glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            st.borrow_mut().visual_selection_pending_range = None;
+            apply_search_error(
+                &w,
+                &st,
+                anyhow::anyhow!("visual selection range load cancelled"),
+            );
+            gtk::glib::ControlFlow::Break
+        }
+    });
+}
+
+fn collect_thread_ids_for_range(
+    options: &LaunchOptions,
+    query: &str,
+    start: usize,
+    end: usize,
+) -> anyhow::Result<BTreeSet<String>> {
+    let page_size = options.page_size.max(1);
+    let mut offset = (start / page_size) * page_size;
+    let mut ids = BTreeSet::new();
+    while offset <= end {
+        let data = execute_search_page(options, query, offset)?;
+        if data.threads.is_empty() {
+            break;
+        }
+        for (index, thread) in data.threads.iter().enumerate() {
+            let absolute_index = data.offset + index;
+            if (start..=end).contains(&absolute_index) {
+                ids.insert(thread.thread_id.clone());
+            }
+        }
+        let next_offset = offset.saturating_add(page_size);
+        if next_offset <= offset {
+            break;
+        }
+        offset = next_offset;
+    }
+    Ok(ids)
 }
 
 fn update_visual_selection_rows(widgets: &Widgets, state: &SharedState) {
@@ -7759,8 +8059,9 @@ fn truncate_status_text(value: &str, max_chars: usize) -> String {
 fn message_position_status(state: &SharedState, index: usize, verb: &str) -> String {
     let state = state.borrow();
     let loaded = state.thread_list_items.len();
-    let total = (state.thread_total_count as usize).max(loaded);
-    let number = index.saturating_add(1).min(total.max(1));
+    let absolute_index = state.thread_window_offset + index;
+    let total = (state.thread_total_count as usize).max(state.thread_window_offset + loaded);
+    let number = absolute_index.saturating_add(1).min(total.max(1));
     let position = if total > loaded {
         format!(
             "{} of {} ({} loaded)",
@@ -7862,6 +8163,8 @@ fn select_thread_by_index(
     }
     if state.borrow().visual_select_mode {
         update_visual_selection_to_cursor(widgets, state);
+        let absolute_index = state.borrow().thread_window_offset + index;
+        maybe_load_visual_selection_range(options, widgets, state, absolute_index);
     }
     update_custom_tag_controls(widgets, state);
     update_message_action_buttons(options, widgets, state);
@@ -8024,6 +8327,14 @@ fn tag_selected(
     undo_state: &UndoState,
     mutation: TagMutation,
 ) -> bool {
+    if let Some((start, end)) = state.borrow().visual_selection_pending_range {
+        widgets.status_label.set_text(&format!(
+            "Visual selection {}-{} is still loading; wait for the selected count before tagging",
+            format_count(start + 1),
+            format_count(end + 1)
+        ));
+        return false;
+    }
     let target_thread_ids = tag_target_thread_ids(state);
     if target_thread_ids.is_empty() {
         widgets
@@ -8642,6 +8953,7 @@ fn refresh_undo_dialog_selection(list: &gtk::ListBox, selected: &BTreeSet<usize>
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_selected_undo_dialog_actions(
     options: &LaunchOptions,
     widgets: &Widgets,
@@ -9381,6 +9693,9 @@ fn handle_automation_request(
             json!({
                 "ok": true,
                 "loaded": state.thread_loaded_count,
+                "window_offset": state.thread_window_offset,
+                "window_start": if state.thread_list_items.is_empty() { 0 } else { state.thread_window_offset + 1 },
+                "window_end": state.thread_window_offset + state.thread_list_items.len(),
                 "total": state.thread_total_count,
                 "page_size": state.thread_page_size,
                 "can_load_more": state.can_load_more_threads,
