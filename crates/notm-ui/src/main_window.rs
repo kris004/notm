@@ -457,8 +457,11 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     let saved_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     saved_box.set_widget_name("notm-saved-searches");
     left.append(&saved_box);
-    let (custom_search_button, custom_search_box) =
-        menu_button_with_box("Add custom search", "notm-custom-search-menu-button");
+    let (custom_search_button, custom_search_box) = menu_button_with_box(
+        "Add custom search",
+        "notm-custom-search-menu-button",
+        &state,
+    );
     let saved_editor_title = gtk::Label::new(Some("Custom saved search"));
     saved_editor_title.set_xalign(0.0);
     saved_editor_title.add_css_class("dim-label");
@@ -555,7 +558,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     flag_button.set_widget_name("notm-flag-toggle-button");
     let trash_button = gtk::Button::with_label("Trash");
     let spam_button = gtk::Button::with_label("Spam");
-    let (undo_button, undo_menu_box) = menu_button_with_box("Undo", "notm-undo-tag-menu-button");
+    let (undo_button, undo_menu_box) =
+        menu_button_with_box("Undo", "notm-undo-tag-menu-button", &state);
     undo_button.set_widget_name("notm-undo-tag-button");
     undo_button.add_css_class("suggested-action");
     undo_button.set_halign(gtk::Align::End);
@@ -575,7 +579,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     undo_menu_box.append(&undo_last_button);
     undo_menu_box.append(&undo_list_button);
     let (tag_menu_button, tag_menu_box) =
-        menu_button_with_box("Tag…", "notm-custom-tag-menu-button");
+        menu_button_with_box("Tag…", "notm-custom-tag-menu-button", &state);
     tag_menu_box.set_spacing(6);
     tag_menu_box.set_margin_start(6);
     tag_menu_box.set_margin_end(6);
@@ -672,7 +676,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     message_actions.set_widget_name("notm-message-actions");
     message_actions.set_halign(gtk::Align::Start);
     let (response_menu_button, response_menu_box) =
-        menu_button_with_box("Respond", "notm-response-menu-button");
+        menu_button_with_box("Respond", "notm-response-menu-button", &state);
     let reply_button = gtk::Button::with_label("Reply");
     reply_button.set_widget_name("notm-reply-button");
     let reply_all_button = gtk::Button::with_label("Reply all");
@@ -690,8 +694,9 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         response_menu_box.append(b);
     }
     let (message_menu_button, message_menu_box) =
-        menu_button_with_box("Message", "notm-message-menu-button");
-    let (view_menu_button, view_menu_box) = menu_button_with_box("View", "notm-view-menu-button");
+        menu_button_with_box("Message", "notm-message-menu-button", &state);
+    let (view_menu_button, view_menu_box) =
+        menu_button_with_box("View", "notm-view-menu-button", &state);
     let view_text_button = gtk::Button::with_label("Text");
     view_text_button.set_widget_name("notm-view-text-button");
     let view_html_button = gtk::Button::with_label("Visual HTML");
@@ -712,7 +717,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     image_policy_button.set_widget_name("notm-image-policy-button");
     let collapse_quotes_button = gtk::Button::with_label("Collapse quotes");
     collapse_quotes_button.set_widget_name("notm-collapse-quotes-button");
-    let (copy_menu_button, copy_menu_box) = menu_button_with_box("Copy", "notm-copy-menu-button");
+    let (copy_menu_button, copy_menu_box) =
+        menu_button_with_box("Copy", "notm-copy-menu-button", &state);
     let copy_message_id_button = gtk::Button::with_label("Copy message id");
     copy_message_id_button.set_widget_name("notm-copy-message-id-button");
     let copy_thread_id_button = gtk::Button::with_label("Copy thread id");
@@ -1458,8 +1464,11 @@ fn update_tag_searches(options: &LaunchOptions, widgets: &Widgets, state: &Share
 
     for (root, mut tags) in grouped {
         tags.sort_by_key(|tag| tag.to_lowercase());
-        let (button, menu) =
-            menu_button_with_box(&root, &format!("notm-tag-group-{}", widget_token(&root)));
+        let (button, menu) = menu_button_with_box(
+            &root,
+            &format!("notm-tag-group-{}", widget_token(&root)),
+            state,
+        );
         button.set_tooltip_text(Some(&root));
         for tag in tags {
             let label = tag
@@ -1499,8 +1508,74 @@ fn append_tag_search_button_to_box(
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
+    connect_tag_search_context_menu(options, widgets, state, &button, &tag);
     button.connect_clicked(move |_| activate_saved_search(&opts, &w, &st, &tag, &query));
     container.append(&button);
+}
+
+fn connect_tag_search_context_menu(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    button: &gtk::Button,
+    tag: &str,
+) {
+    let click = gtk::GestureClick::new();
+    click.set_button(3);
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let tag_name = tag.to_string();
+    let parent = button.downgrade();
+    click.connect_pressed(move |_, _, x, y| {
+        let Some(parent) = parent.upgrade() else {
+            return;
+        };
+        let popover = gtk::Popover::new();
+        popover.set_has_arrow(true);
+        popover.set_parent(&parent);
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let hide = gtk::Button::with_label("Hide tag search");
+        menu.append(&hide);
+        popover.set_child(Some(&menu));
+        let opts = opts.clone();
+        let w = w.clone();
+        let st = st.clone();
+        let tag_name = tag_name.clone();
+        let popover_for_hide = popover.clone();
+        hide.connect_clicked(move |_| {
+            popover_for_hide.popdown();
+            popover_for_hide.unparent();
+            {
+                let mut hidden = w.hidden_tag_searches.borrow_mut();
+                hidden.insert(tag_name.clone());
+                match persist_hidden_tag_searches(&opts, &hidden) {
+                    Ok(()) => {
+                        if opts.app_config_path.is_some() {
+                            w.status_label.set_text("Hidden tag search");
+                        } else {
+                            w.status_label
+                                .set_text("Hidden tag search for this session only");
+                        }
+                    }
+                    Err(err) => {
+                        hidden.remove(&tag_name);
+                        w.status_label.set_text(&format!("Hide tag failed: {err}"));
+                        update_debug(&w, &st);
+                        return;
+                    }
+                }
+            }
+            if st.borrow().visible_saved_search.as_deref() == Some(tag_name.as_str()) {
+                st.borrow_mut().visible_saved_search = None;
+            }
+            update_tag_searches(&opts, &w, &st);
+            update_debug(&w, &st);
+        });
+        popover.popup();
+    });
+    button.add_controller(click);
 }
 
 fn tag_query(tag: &str) -> String {
@@ -9833,6 +9908,8 @@ fn handle_automation_request(
             json!({
                 "ok": true,
                 "search": widgets.search_entry.text().to_string(),
+                "custom_tag": widgets.custom_tag_entry.text().to_string(),
+                "tag_command": widgets.tag_command_entry.text().to_string(),
                 "compose_fields": compose_fields(widgets, state),
                 "search_suggestions_visible": widgets.search_suggestions_list.is_visible(),
                 "address_suggestions_visible": widgets.address_suggestions_list.is_visible(),
@@ -10797,13 +10874,17 @@ fn button_flow(spacing: u32) -> gtk::FlowBox {
     flow
 }
 
-fn menu_button_with_box(label: &str, widget_name: &str) -> (gtk::MenuButton, gtk::Box) {
+fn menu_button_with_box(
+    label: &str,
+    widget_name: &str,
+    state: &SharedState,
+) -> (gtk::MenuButton, gtk::Box) {
     let button = gtk::MenuButton::new();
     button.set_label(label);
     button.set_widget_name(widget_name);
     let popover = gtk::Popover::new();
     let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    connect_vim_menu_navigation(&menu);
+    connect_vim_menu_navigation(&menu, state);
     let focus_menu = menu.clone();
     popover.connect_show(move |_| {
         focus_first_menu_child(&focus_menu);
@@ -10813,11 +10894,15 @@ fn menu_button_with_box(label: &str, widget_name: &str) -> (gtk::MenuButton, gtk
     (button, menu)
 }
 
-fn connect_vim_menu_navigation(menu: &gtk::Box) {
+fn connect_vim_menu_navigation(menu: &gtk::Box, state: &SharedState) {
     let controller = gtk::EventControllerKey::new();
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     let menu_for_keys = menu.clone();
+    let st = state.clone();
     controller.connect_key_pressed(move |_, key, _, _| {
+        if st.borrow().input_mode == InputMode::Insert {
+            return gtk::glib::Propagation::Proceed;
+        }
         if key == gtk::gdk::Key::j {
             menu_for_keys.child_focus(gtk::DirectionType::Down);
             return gtk::glib::Propagation::Stop;
