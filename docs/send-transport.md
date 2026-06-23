@@ -13,7 +13,7 @@ The live UI refuses to fall back to the fake capture transport when no
 `send.command` is configured. Fake capture is only enabled for fixture/test
 launches so a real compose window cannot report success for an unsent message.
 
-For configured helper scripts whose contents invoke `gmi send`, auto mode uses stdin-RFC5322 and appends `-t` when no explicit recipient/template args are configured, because `gmi send` requires `-t` to trust RFC5322 recipients from headers.
+`auto` currently behaves like `stdin_rfc5322`: notm writes the complete RFC5322 message to the command's standard input and passes exactly the configured `send.args`. Any helper-specific flags must be set explicitly in config.
 
 Optional post-send persistence is explicit:
 
@@ -43,4 +43,4 @@ tags = ["draft"]
 index_after_save = true
 ```
 
-The completed live send validations used bounded unique subjects with prefix `notm validation self-test`. Final polish did not send additional live mail because fixture/fake transport covered the remaining send/indexing behavior.
+Live send validation is explicitly gated and should only be run against a user-configured throwaway or personal test transport.

@@ -78,7 +78,7 @@ This repository builds and runs a native GTK4 Notmuch client. Implemented daily-
 - thread/message view with safe text and visual sanitized WebKitGTK HTML toggle, one-shot/trusted-sender remote image controls, HTML-to-text fallback, full headers, raw source, filenames, tags, MIME tree, selectable attachment list, and quote collapse,
 - tag operations and undo through libnotmuch,
 - compose, reply, reply-all, inline forward, and forward-as-`message/rfc822` attachment,
-- external send transport with stdin/file/template/auto modes and optional configured-helper auto behavior,
+- external send transport with stdin/file/template/auto modes,
 - fake send contract tests,
 - optional sent Maildir save/indexing only when configured,
 - local JSON compose crash recovery, local Maildir draft save/indexing under `tag:draft`, draft reopening in the composer, and explicit local draft deletion,

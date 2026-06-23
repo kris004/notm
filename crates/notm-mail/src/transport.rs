@@ -102,18 +102,6 @@ impl SendTransport for ExternalCommandTransport {
                 });
             }
         }
-        if let Ok(text) = std::fs::read_to_string(&self.command)
-            && text.contains("gmi send")
-        {
-            details.push("script looks like the configured Gmail/lieer send helper; auto mode uses stdin-RFC5322 and appends -t when no explicit recipient/template args are configured".to_string());
-            if let Some(repo) = extract_gmailieer_repo(&text) {
-                if std::path::Path::new(&repo).is_dir() {
-                    details.push(format!("lieer repo exists: {repo}"));
-                } else {
-                    details.push(format!("lieer repo not found: {repo}"));
-                }
-            }
-        }
         Ok(ProbeReport { ok: true, details })
     }
 
@@ -135,7 +123,7 @@ impl ExternalCommandTransport {
     async fn send_stdin(&self, message: ComposedMessage) -> anyhow::Result<SendReport> {
         let mut command = self.base_command();
         command
-            .args(self.effective_stdin_args())
+            .args(&self.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -179,23 +167,6 @@ impl ExternalCommandTransport {
         Ok(report_from_output(output, Some(path.display().to_string())))
     }
 
-    fn effective_stdin_args(&self) -> Vec<String> {
-        let mut args = self.args.clone();
-        if matches!(self.mode, TransportMode::Auto)
-            && !args.iter().any(|arg| arg == "-t")
-            && self.looks_like_lieer_send_helper()
-        {
-            args.push("-t".to_string());
-        }
-        args
-    }
-
-    fn looks_like_lieer_send_helper(&self) -> bool {
-        std::fs::read_to_string(&self.command)
-            .map(|text| text.contains("gmi send"))
-            .unwrap_or(false)
-    }
-
     fn base_command(&self) -> Command {
         let mut command = Command::new(&self.command);
         if let Some(dir) = &self.working_dir {
@@ -214,13 +185,4 @@ fn report_from_output(output: std::process::Output, captured_path: Option<String
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         captured_path,
     }
-}
-
-fn extract_gmailieer_repo(script: &str) -> Option<String> {
-    script.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix("repo=${GMAILIEER_REPO:-")
-            .and_then(|rest| rest.strip_suffix('}'))
-            .map(ToOwned::to_owned)
-    })
 }
