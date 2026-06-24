@@ -21,7 +21,8 @@ pub fn css() -> &'static str {
         box-shadow: inset 0 0 0 2px alpha(@theme_selected_bg_color, .85);
         background-color: alpha(@theme_selected_bg_color, .12);
     }
-    #notm-thread-list row.notm-visual-selected {
+    #notm-thread-list row.notm-visual-selected,
+    #notm-thread-list .notm-visual-selected {
         background-color: alpha(@theme_selected_bg_color, .28);
     }
     #notm-undo-tag-list row.notm-undo-selected {
@@ -30,7 +31,8 @@ pub fn css() -> &'static str {
     #notm-undo-tag-list row.notm-keyboard-cursor {
         box-shadow: inset 0 0 0 2px alpha(@theme_selected_bg_color, .85);
     }
-    #notm-thread-list row.unread label { font-weight: 700; }
+    #notm-thread-list row.unread label,
+    #notm-thread-list .unread label { font-weight: 700; }
     #notm-compose-body,
     #notm-compose-body text,
     #notm-compose-body gutter {

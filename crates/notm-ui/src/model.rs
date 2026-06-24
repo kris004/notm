@@ -39,6 +39,7 @@ pub struct UiState {
     pub prefer_html_view: bool,
     pub visual_select_mode: bool,
     pub visual_select_anchor: Option<usize>,
+    pub visual_select_cursor: Option<usize>,
     pub visual_selected_threads: BTreeSet<String>,
     pub visual_selection_pending_range: Option<(usize, usize)>,
 }
@@ -76,6 +77,7 @@ impl Default for UiState {
             prefer_html_view: false,
             visual_select_mode: false,
             visual_select_anchor: None,
+            visual_select_cursor: None,
             visual_selected_threads: BTreeSet::new(),
             visual_selection_pending_range: None,
         }

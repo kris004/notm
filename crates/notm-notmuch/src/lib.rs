@@ -14,6 +14,6 @@ pub mod thread;
 pub use config::{ConfigProfile, LoadedIdentity};
 pub use database::{Database, DatabaseMode, OpenConfig, Revision};
 pub use error::{Error, Result};
-pub use message::{MessageSummary, TagMutation, TagOperationReport};
+pub use message::{MessageSummary, TagMutation, TagOperationReport, ThreadRangeTagReport};
 pub use query::{QueryOptions, SortOrder};
 pub use thread::ThreadSummary;

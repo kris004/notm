@@ -27,3 +27,17 @@ pub struct TagOperationReport {
     pub added: Vec<String>,
     pub removed: Vec<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadRangeTagReport {
+    pub query: String,
+    pub start: usize,
+    pub end: usize,
+    pub changed_threads: usize,
+    pub changed_messages: usize,
+    pub revision_before: u64,
+    pub revision_after: u64,
+    pub revision_uuid: String,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}

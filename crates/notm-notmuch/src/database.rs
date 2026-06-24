@@ -6,7 +6,7 @@ use crate::{
     Error, Result, ThreadSummary,
     error::{check, check_index},
     ffi,
-    message::{MessageSummary, TagMutation, TagOperationReport},
+    message::{MessageSummary, TagMutation, TagOperationReport, ThreadRangeTagReport},
     query::{QueryOptions, SortOrder},
     safe::{cstr_to_string, path_to_cstring, take_malloc_string},
     tags::validate_tag,
@@ -335,6 +335,78 @@ impl Database {
         })
     }
 
+    pub fn apply_tags_to_thread_range(
+        &self,
+        query: &str,
+        options: &QueryOptions,
+        start: usize,
+        end: usize,
+        mutation: &TagMutation,
+    ) -> Result<ThreadRangeTagReport> {
+        for tag in mutation.add.iter().chain(mutation.remove.iter()) {
+            validate_tag(tag)?;
+        }
+        let revision_before = self.revision();
+        let q = self.create_query(query, options)?;
+        let mut threads = std::ptr::null_mut();
+        let status = unsafe { ffi::notmuch_query_search_threads(q.as_ptr(), &mut threads) };
+        check(status, self.status_string())?;
+        let begin = unsafe { ffi::notmuch_database_begin_atomic(self.ptr.as_ptr()) };
+        check(begin, self.status_string())?;
+        let mut index = 0usize;
+        let mut changed_threads = 0usize;
+        let mut changed_messages = 0usize;
+        let result: Result<()> = (|| {
+            while unsafe { ffi::notmuch_threads_valid(threads) } != 0 {
+                let thread = unsafe { ffi::notmuch_threads_get(threads) };
+                if !thread.is_null() {
+                    if (start..=end).contains(&index) {
+                        let thread_changed = mutate_thread_messages(
+                            thread,
+                            mutation,
+                            &self.status_string(),
+                            &mut changed_messages,
+                        )?;
+                        if thread_changed {
+                            changed_threads += 1;
+                        }
+                    }
+                    unsafe { ffi::notmuch_thread_destroy(thread) };
+                }
+                if index >= end {
+                    break;
+                }
+                index = index.saturating_add(1);
+                unsafe { ffi::notmuch_threads_move_to_next(threads) };
+            }
+            if index < end {
+                let iter_status = unsafe { ffi::notmuch_threads_status(threads) };
+                if iter_status != ffi::notmuch_status_t::NOTMUCH_STATUS_SUCCESS
+                    && iter_status != ffi::notmuch_status_t::NOTMUCH_STATUS_ITERATOR_EXHAUSTED
+                {
+                    check(iter_status, self.status_string())?;
+                }
+            }
+            Ok(())
+        })();
+        let end_atomic = unsafe { ffi::notmuch_database_end_atomic(self.ptr.as_ptr()) };
+        check(end_atomic, self.status_string())?;
+        result?;
+        let revision_after = self.revision();
+        Ok(ThreadRangeTagReport {
+            query: query.to_string(),
+            start,
+            end,
+            changed_threads,
+            changed_messages,
+            revision_before: revision_before.revision,
+            revision_after: revision_after.revision,
+            revision_uuid: revision_after.uuid,
+            added: mutation.add.clone(),
+            removed: mutation.remove.clone(),
+        })
+    }
+
     fn create_query(&self, query: &str, options: &QueryOptions) -> Result<QueryGuard> {
         let query = CString::new(query)?;
         let q = unsafe { ffi::notmuch_query_create(self.ptr.as_ptr(), query.as_ptr()) };
@@ -468,6 +540,33 @@ fn header(message: *mut ffi::notmuch_message_t, name: &str) -> String {
         return String::new();
     };
     unsafe { cstr_to_string(ffi::notmuch_message_get_header(message, name.as_ptr())) }
+}
+
+fn mutate_thread_messages(
+    thread: *mut ffi::notmuch_thread_t,
+    mutation: &TagMutation,
+    detail: &str,
+    changed_messages: &mut usize,
+) -> Result<bool> {
+    let messages = unsafe { ffi::notmuch_thread_get_messages(thread) };
+    let mut changed = false;
+    while unsafe { ffi::notmuch_messages_valid(messages) } != 0 {
+        let message = unsafe { ffi::notmuch_messages_get(messages) };
+        if !message.is_null() {
+            mutate_message(message, mutation, detail)?;
+            *changed_messages += 1;
+            changed = true;
+            unsafe { ffi::notmuch_message_destroy(message) };
+        }
+        unsafe { ffi::notmuch_messages_move_to_next(messages) };
+    }
+    let iter_status = unsafe { ffi::notmuch_messages_status(messages) };
+    if iter_status != ffi::notmuch_status_t::NOTMUCH_STATUS_SUCCESS
+        && iter_status != ffi::notmuch_status_t::NOTMUCH_STATUS_ITERATOR_EXHAUSTED
+    {
+        check(iter_status, detail.to_string())?;
+    }
+    Ok(changed)
 }
 
 unsafe fn collect_tags(tags: *mut ffi::notmuch_tags_t) -> Vec<String> {

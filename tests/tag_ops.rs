@@ -63,6 +63,63 @@ fn applies_path_style_tags() -> anyhow::Result<()> {
 }
 
 #[test]
+fn applies_tags_to_thread_range_without_expanding_ids() -> anyhow::Result<()> {
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let options = QueryOptions {
+        limit: 20,
+        offset: 0,
+        sort: SortOrder::NewestFirst,
+        excluded_tags: vec![],
+    };
+    let db = fixture.open_readwrite()?;
+    let threads = db.search_threads("tag:inbox", &options)?;
+    assert!(threads.len() >= 4);
+    let selected = &threads[1..=2];
+    let expected_messages = selected
+        .iter()
+        .map(|thread| {
+            db.thread_messages(&thread.thread_id)
+                .map(|messages| messages.len())
+        })
+        .sum::<notm_notmuch::Result<usize>>()?;
+
+    let report = db.apply_tags_to_thread_range(
+        "tag:inbox",
+        &QueryOptions {
+            limit: usize::MAX,
+            offset: 0,
+            sort: SortOrder::NewestFirst,
+            excluded_tags: vec![],
+        },
+        1,
+        2,
+        &TagMutation {
+            add: vec!["notm/range-test".into()],
+            remove: vec![],
+            sync_maildir_flags: true,
+        },
+    )?;
+
+    assert_eq!(report.changed_threads, selected.len());
+    assert_eq!(report.changed_messages, expected_messages);
+    assert_eq!(
+        db.count_messages("tag:\"notm/range-test\"", &options)? as usize,
+        expected_messages
+    );
+    assert_eq!(
+        db.count_messages(
+            &format!(
+                "thread:{} and tag:\"notm/range-test\"",
+                threads[0].thread_id
+            ),
+            &options,
+        )?,
+        0
+    );
+    Ok(())
+}
+
+#[test]
 fn removes_indexed_message_file_from_database() -> anyhow::Result<()> {
     let fixture = notm_test_support::FixtureDatabase::create()?;
     let options = QueryOptions {
