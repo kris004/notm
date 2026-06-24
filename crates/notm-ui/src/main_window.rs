@@ -366,6 +366,8 @@ const THREAD_LIST_MIN_WIDTH: i32 = 320;
 const COMPOSE_BODY_MIN_HEIGHT: i32 = 96;
 const COMPOSE_BODY_NATURAL_HEIGHT: i32 = 260;
 const KEYBOARD_CURSOR_CLASS: &str = "notm-keyboard-cursor";
+const STATUS_BAR_MAX_WIDTH_CHARS: i32 = 120;
+const HTML_LINK_STATUS_URI_MAX_CHARS: usize = 96;
 
 fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     install_css();
@@ -946,12 +948,14 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     let status_label = gtk::Label::new(Some("Ready"));
     status_label.set_widget_name("notm-status-bar");
     status_label.set_xalign(0.0);
+    configure_status_label(&status_label);
     status_label.set_margin_start(8);
     status_label.set_margin_end(8);
     status_label.set_margin_bottom(8);
     root.append(&status_label);
     window.set_child(Some(&root));
     connect_html_navigation_policy(&html_view, &status_label);
+    connect_html_hover_status(&html_view, &status_label);
 
     let widgets = Widgets {
         window: window.clone(),
@@ -1151,6 +1155,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     widgets
         .thread_result_label
         .set_text("Loading initial search…");
+    show_thread_list_loading(&widgets, "Loading initial search…");
     {
         let opts = options.clone();
         let w = widgets.clone();
@@ -3982,6 +3987,49 @@ fn set_thread_loading_indicator(widgets: &Widgets, message: &str) {
     }
 }
 
+fn show_thread_list_loading(widgets: &Widgets, message: &str) {
+    set_thread_list_status_row(widgets, "notm-thread-loading-row", message, true);
+}
+
+fn show_thread_list_message(widgets: &Widgets, message: &str) {
+    set_thread_list_status_row(widgets, "notm-thread-message-row", message, false);
+}
+
+fn set_thread_list_status_row(widgets: &Widgets, row_name: &str, message: &str, spinning: bool) {
+    while let Some(child) = widgets.thread_list.first_child() {
+        widgets.thread_list.remove(&child);
+    }
+
+    let row = gtk::ListBoxRow::new();
+    row.set_widget_name(row_name);
+    row.set_selectable(false);
+    row.set_activatable(false);
+
+    let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    box_.set_margin_start(12);
+    box_.set_margin_end(12);
+    box_.set_margin_top(12);
+    box_.set_margin_bottom(12);
+    box_.set_valign(gtk::Align::Center);
+
+    if spinning {
+        let spinner = gtk::Spinner::new();
+        spinner.set_widget_name("notm-thread-loading-spinner");
+        spinner.start();
+        box_.append(&spinner);
+    }
+
+    let label = gtk::Label::new(Some(message));
+    label.set_widget_name("notm-thread-loading-label");
+    label.set_xalign(0.0);
+    label.set_wrap(true);
+    label.add_css_class("dim-label");
+    box_.append(&label);
+
+    row.set_child(Some(&box_));
+    widgets.thread_list.append(&row);
+}
+
 fn visible_thread_row_count(widgets: &Widgets) -> isize {
     let row_height = widgets
         .thread_list
@@ -6806,6 +6854,14 @@ fn show_compose_view(widgets: &Widgets) {
     widgets.message_stack.set_visible_child_name("compose");
 }
 
+fn configure_status_label(label: &gtk::Label) {
+    label.set_hexpand(true);
+    label.set_single_line_mode(true);
+    label.set_width_chars(1);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_max_width_chars(STATUS_BAR_MAX_WIDTH_CHARS);
+}
+
 fn configure_html_webview(view: &webkit6::WebView, allow_remote_images: bool) {
     if let Some(settings) = WebViewExt::settings(view) {
         settings.set_enable_javascript(true);
@@ -6844,15 +6900,71 @@ fn connect_html_navigation_policy(view: &webkit6::WebView, status_label: &gtk::L
     });
 }
 
+fn connect_html_hover_status(view: &webkit6::WebView, status_label: &gtk::Label) {
+    let status = status_label.clone();
+    let previous_status = Rc::new(RefCell::new(None::<String>));
+    view.connect_mouse_target_changed(move |_, hit_test, _| {
+        if let Some(uri) = html_hover_link_uri(hit_test) {
+            if previous_status.borrow().is_none() && !status.text().as_str().starts_with("Link: ") {
+                *previous_status.borrow_mut() = Some(status.text().to_string());
+            }
+            status.set_text(&html_link_hover_status(&uri));
+            status.set_tooltip_text(Some(&uri));
+        } else {
+            let previous = previous_status.borrow_mut().take();
+            if status.text().as_str().starts_with("Link: ") {
+                status.set_text(previous.as_deref().unwrap_or("Ready"));
+            }
+            status.set_tooltip_text(None);
+        }
+    });
+}
+
+fn html_hover_link_uri(hit_test: &webkit6::HitTestResult) -> Option<String> {
+    if !hit_test.context_is_link() {
+        return None;
+    }
+    hit_test
+        .link_uri()
+        .map(|uri| uri.to_string())
+        .filter(|uri| !uri.is_empty())
+}
+
 fn open_html_link_externally(uri: &str, status_label: &gtk::Label) {
     if !html_link_scheme_is_external_safe(uri) {
-        status_label.set_text(&format!("Blocked unsupported HTML link target: {uri}"));
+        status_label.set_text(&html_link_blocked_status(uri));
         return;
     }
     match gtk::gio::AppInfo::launch_default_for_uri(uri, None::<&gtk::gio::AppLaunchContext>) {
-        Ok(()) => status_label.set_text(&format!("Opened link externally: {uri}")),
-        Err(err) => status_label.set_text(&format!("Open link failed: {err}; target: {uri}")),
+        Ok(()) => status_label.set_text(&html_link_opened_status(uri)),
+        Err(err) => status_label.set_text(&html_link_failed_status(uri, &err.to_string())),
     }
+}
+
+fn html_link_opened_status(uri: &str) -> String {
+    format!("Opened link externally: {}", html_link_status_uri(uri))
+}
+
+fn html_link_hover_status(uri: &str) -> String {
+    format!("Link: {}", html_link_status_uri(uri))
+}
+
+fn html_link_blocked_status(uri: &str) -> String {
+    format!(
+        "Blocked unsupported HTML link target: {}",
+        html_link_status_uri(uri)
+    )
+}
+
+fn html_link_failed_status(uri: &str, error: &str) -> String {
+    format!(
+        "Open link failed: {error}; target: {}",
+        html_link_status_uri(uri)
+    )
+}
+
+fn html_link_status_uri(uri: &str) -> String {
+    truncate_status_text(uri, HTML_LINK_STATUS_URI_MAX_CHARS)
 }
 
 fn html_link_scheme_is_external_safe(uri: &str) -> bool {
@@ -7891,10 +8003,21 @@ fn search_cache_key(
 }
 
 fn apply_search_error(widgets: &Widgets, state: &SharedState, err: anyhow::Error) {
-    state.borrow_mut().last_error = Some(err.to_string());
-    widgets
-        .status_label
-        .set_text(&format!("Search failed: {err}"));
+    let message = format!("Search failed: {err}");
+    {
+        let mut state = state.borrow_mut();
+        state.last_error = Some(err.to_string());
+        if state.thread_list_items.is_empty() {
+            state.thread_loaded_count = 0;
+            state.thread_total_count = 0;
+            state.can_load_more_threads = false;
+        }
+    }
+    widgets.status_label.set_text(&message);
+    if state.borrow().thread_list_items.is_empty() {
+        show_thread_list_message(widgets, &message);
+        update_thread_result_label(widgets, state);
+    }
     update_debug(widgets, state);
 }
 
@@ -12298,6 +12421,30 @@ mod tests {
         assert!(document.contains("background: #ffffff;"));
         assert!(document.contains("color: #111111;"));
         assert!(!document.contains("CanvasText"));
+    }
+
+    #[test]
+    fn html_link_status_keeps_short_uri_visible() {
+        let uri = "https://example.test/message";
+
+        assert_eq!(
+            html_link_opened_status(uri),
+            "Opened link externally: https://example.test/message"
+        );
+        assert_eq!(
+            html_link_hover_status(uri),
+            "Link: https://example.test/message"
+        );
+    }
+
+    #[test]
+    fn html_link_status_truncates_long_tracking_uri() {
+        let uri = format!("https://example.test/{}", "tracking".repeat(40));
+        let status = html_link_opened_status(&uri);
+
+        assert!(status.starts_with("Opened link externally: https://example.test/"));
+        assert!(status.ends_with('…'));
+        assert!(status.chars().count() < uri.chars().count());
     }
 
     #[test]
