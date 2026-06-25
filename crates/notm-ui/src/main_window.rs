@@ -2759,6 +2759,7 @@ fn connect_compose_helpers(
         refresh_draft_list(&w);
     });
 
+    let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
     clear_draft_button.connect_clicked(move |_| {
@@ -2766,7 +2767,7 @@ fn connect_compose_helpers(
         let has_unsaved_changes = active_draft
             .as_ref()
             .is_some_and(|draft| compose_fields(&w, &st) != draft.saved_fields);
-        clear_draft_widgets(&w, &st);
+        clear_draft_widgets(&opts, &w, &st);
         match clear_draft_file(&w.draft_path) {
             Ok(()) => {
                 let status = match (active_draft.is_some(), has_unsaved_changes) {
@@ -5106,7 +5107,7 @@ fn install_shortcuts(
             true
         } else if key == gtk::gdk::Key::x && compose_view_is_visible(&w) {
             clear_numeric_prefix(&numeric_prefix);
-            clear_draft_widgets(&w, &st);
+            clear_draft_widgets(&opts, &w, &st);
             let _ = clear_draft_file(&w.draft_path);
             w.status_label.set_text("Composer closed");
             true
@@ -6271,7 +6272,7 @@ fn delete_active_draft_from_ui(options: &LaunchOptions, widgets: &Widgets, state
     };
     match delete_draft_source(options, &draft) {
         Ok(()) => {
-            clear_draft_widgets(widgets, state);
+            clear_draft_widgets(options, widgets, state);
             let _ = clear_draft_file(&widgets.draft_path);
             let current = state.borrow().current_query.clone();
             run_search(options, widgets, state, &current);
@@ -6418,7 +6419,7 @@ fn clear_draft_file(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn clear_draft_widgets(widgets: &Widgets, state: &SharedState) {
+fn clear_draft_widgets(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     let fields = ComposeFields {
         from: widgets.compose_from.text().to_string(),
         ..ComposeFields::default()
@@ -6426,8 +6427,24 @@ fn clear_draft_widgets(widgets: &Widgets, state: &SharedState) {
     apply_compose_fields(widgets, state, fields);
     set_active_draft(widgets, state, None);
     widgets.address_suggestions_list.set_visible(false);
-    widgets.message_stack.set_visible_child_name("text");
-    refresh_thread_attachment_list(widgets, state);
+    restore_message_view_after_compose(options, widgets, state);
+}
+
+fn restore_message_view_after_compose(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) {
+    if state.borrow().selected_message.is_some() {
+        let status = widgets.status_label.text().to_string();
+        show_preferred_selected_message_view(options, widgets, state);
+        widgets.status_label.set_text(&status);
+    } else {
+        widgets.message_stack.set_visible_child_name("text");
+        widgets.message_header_box.set_visible(false);
+        widgets.attachment_title.set_visible(false);
+        widgets.attachment_scrolled.set_visible(false);
+    }
 }
 
 fn apply_compose_fields(widgets: &Widgets, state: &SharedState, fields: ComposeFields) {
@@ -10653,7 +10670,7 @@ fn send_compose(options: &LaunchOptions, widgets: &Widgets, state: &SharedState)
                         .set_text(&format!("Send accepted; draft delete failed: {err}"));
                 }
                 let _ = clear_draft_file(&widgets.draft_path);
-                clear_draft_widgets(widgets, state);
+                clear_draft_widgets(options, widgets, state);
             }
         }
         Err(err) => {
@@ -11396,7 +11413,7 @@ fn handle_automation_request(
             json!({"ok": true, "compose_fields": state.borrow().compose_fields})
         }
         "clear_draft" => {
-            clear_draft_widgets(widgets, state);
+            clear_draft_widgets(options, widgets, state);
             match clear_draft_file(&widgets.draft_path) {
                 Ok(()) => json!({"ok": true, "compose_fields": state.borrow().compose_fields}),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),
