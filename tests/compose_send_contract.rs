@@ -51,3 +51,30 @@ async fn fake_transport_preserves_attachment_part() -> anyhow::Result<()> {
     assert!(raw.contains("YXR0YWNoZWQgYm9keQo="));
     Ok(())
 }
+
+#[tokio::test]
+async fn fake_transport_sends_html_reply_as_alternative() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let transport = FakeSendTransport {
+        capture_dir: dir.path().to_path_buf(),
+    };
+    let mut message = ComposedMessage::new(
+        "Sender <sender@example.test>".into(),
+        vec!["recipient@example.test".into()],
+        "Re: HTML".into(),
+        "Thanks".into(),
+    );
+    message.text_reply_quote = Some("\n\n> Original text".into());
+    message.html_reply_quote = Some("<br><br><blockquote><b>Original HTML</b></blockquote>".into());
+
+    let report = transport.send(message).await?;
+    assert!(report.accepted);
+    let path = report.captured_path.expect("captured path");
+    let raw = std::fs::read_to_string(path)?;
+    assert!(raw.contains("Content-Type: multipart/alternative;"));
+    assert!(raw.contains("Content-Type: text/plain; charset=utf-8"));
+    assert!(raw.contains("Thanks\r\n\r\n> Original text"));
+    assert!(raw.contains("Content-Type: text/html; charset=utf-8"));
+    assert!(raw.contains("<div>Thanks</div><br><br><blockquote><b>Original HTML</b></blockquote>"));
+    Ok(())
+}

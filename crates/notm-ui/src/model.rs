@@ -127,6 +127,10 @@ pub struct ComposeFields {
     pub in_reply_to: Option<String>,
     #[serde(default)]
     pub references: Vec<String>,
+    #[serde(default)]
+    pub text_reply_quote: Option<String>,
+    #[serde(default)]
+    pub html_reply_quote: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

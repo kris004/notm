@@ -49,10 +49,19 @@ pub fn render_message(message: &ComposedMessage) -> String {
         out.push_str(&format!("References: {}\r\n", message.references.join(" ")));
     }
     out.push_str("MIME-Version: 1.0\r\n");
-    if message.attachments.is_empty() {
+    let text_body = rendered_text_body(message);
+    let html_body = rendered_html_body(message);
+    if message.attachments.is_empty() && html_body.is_none() {
         out.push_str("Content-Type: text/plain; charset=utf-8\r\n");
         out.push_str("Content-Transfer-Encoding: 8bit\r\n\r\n");
-        out.push_str(&normalize_body(&message.body));
+        out.push_str(&normalize_body(&text_body));
+    } else if message.attachments.is_empty() {
+        let boundary = format!("notm-alt-{}", Uuid::new_v4());
+        out.push_str(&format!(
+            "Content-Type: multipart/alternative; boundary=\"{}\"\r\n\r\n",
+            boundary
+        ));
+        render_alternative_parts(&mut out, &boundary, &text_body, html_body.as_deref());
     } else {
         let boundary = format!("notm-{}", Uuid::new_v4());
         out.push_str(&format!(
@@ -60,10 +69,19 @@ pub fn render_message(message: &ComposedMessage) -> String {
             boundary
         ));
         out.push_str(&format!("--{}\r\n", boundary));
-        out.push_str("Content-Type: text/plain; charset=utf-8\r\n");
-        out.push_str("Content-Transfer-Encoding: 8bit\r\n\r\n");
-        out.push_str(&normalize_body(&message.body));
-        out.push_str("\r\n");
+        if html_body.is_some() {
+            let alt_boundary = format!("notm-alt-{}", Uuid::new_v4());
+            out.push_str(&format!(
+                "Content-Type: multipart/alternative; boundary=\"{}\"\r\n\r\n",
+                alt_boundary
+            ));
+            render_alternative_parts(&mut out, &alt_boundary, &text_body, html_body.as_deref());
+        } else {
+            out.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+            out.push_str("Content-Transfer-Encoding: 8bit\r\n\r\n");
+            out.push_str(&normalize_body(&text_body));
+            out.push_str("\r\n");
+        }
         for attachment in &message.attachments {
             out.push_str(&format!("--{}\r\n", boundary));
             out.push_str(&format!(
@@ -88,10 +106,69 @@ pub fn render_message(message: &ComposedMessage) -> String {
     out
 }
 
+fn rendered_text_body(message: &ComposedMessage) -> String {
+    match &message.text_reply_quote {
+        Some(quote) => format!("{}{}", message.body, quote),
+        None => message.body.clone(),
+    }
+}
+
+fn rendered_html_body(message: &ComposedMessage) -> Option<String> {
+    if let Some(html) = &message.html_body {
+        return Some(html.clone());
+    }
+    message
+        .html_reply_quote
+        .as_ref()
+        .map(|quote| format!("{}{}", plain_text_to_html_fragment(&message.body), quote))
+}
+
+fn render_alternative_parts(
+    out: &mut String,
+    boundary: &str,
+    text_body: &str,
+    html_body: Option<&str>,
+) {
+    out.push_str(&format!("--{}\r\n", boundary));
+    out.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+    out.push_str("Content-Transfer-Encoding: 8bit\r\n\r\n");
+    out.push_str(&normalize_body(text_body));
+    out.push_str("\r\n");
+    if let Some(html) = html_body {
+        out.push_str(&format!("--{}\r\n", boundary));
+        out.push_str("Content-Type: text/html; charset=utf-8\r\n");
+        out.push_str("Content-Transfer-Encoding: 8bit\r\n\r\n");
+        out.push_str(&normalize_body(html));
+        out.push_str("\r\n");
+    }
+    out.push_str(&format!("--{}--\r\n", boundary));
+}
+
 fn sanitize_header(value: &str) -> String {
     value.replace(['\r', '\n'], " ")
 }
 
 fn normalize_body(body: &str) -> String {
     body.replace('\n', "\r\n")
+}
+
+fn plain_text_to_html_fragment(body: &str) -> String {
+    let mut out = String::from("<div>");
+    for (index, line) in body.lines().enumerate() {
+        if index > 0 {
+            out.push_str("<br>");
+        }
+        out.push_str(&escape_html(line));
+    }
+    out.push_str("</div>");
+    out
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }

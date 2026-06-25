@@ -6065,6 +6065,8 @@ fn compose_fields(widgets: &Widgets, state: &SharedState) -> ComposeFields {
     fields.attachments = stored.attachments;
     fields.in_reply_to = stored.in_reply_to;
     fields.references = stored.references;
+    fields.text_reply_quote = stored.text_reply_quote;
+    fields.html_reply_quote = stored.html_reply_quote;
     fields
 }
 
@@ -6484,6 +6486,8 @@ fn composed_message_from_fields(fields: &ComposeFields) -> anyhow::Result<Compos
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .collect();
+    message.text_reply_quote = fields.text_reply_quote.clone();
+    message.html_reply_quote = fields.html_reply_quote.clone();
     message.attachments = load_compose_attachments(fields)?;
     Ok(message)
 }
@@ -7383,6 +7387,8 @@ fn draft_fields_from_message_file(path: impl AsRef<Path>) -> anyhow::Result<Comp
         attachments,
         in_reply_to: nonempty_string(parsed.in_reply_to),
         references: references_from_header(&parsed.references),
+        text_reply_quote: None,
+        html_reply_quote: None,
     })
 }
 
@@ -10328,6 +10334,8 @@ fn open_compose(widgets: &Widgets, state: &SharedState) {
         state.active_pane = ActivePane::Message;
         state.compose_fields.in_reply_to = None;
         state.compose_fields.references.clear();
+        state.compose_fields.text_reply_quote = None;
+        state.compose_fields.html_reply_quote = None;
         state.last_operation = Some("opened composer".to_string());
     }
     if state.borrow().input_mode == InputMode::Insert {
@@ -10461,6 +10469,8 @@ fn fill_composer(widgets: &Widgets, state: &SharedState, message: ComposedMessag
     let mut fields = compose_fields(widgets, state);
     fields.in_reply_to = message.in_reply_to;
     fields.references = message.references;
+    fields.text_reply_quote = message.text_reply_quote;
+    fields.html_reply_quote = message.html_reply_quote;
     match cache_composer_attachments(&message.attachments) {
         Ok(paths) => {
             fields.attachments = paths;
@@ -12032,6 +12042,8 @@ fn read_compose_fields(widgets: &Widgets) -> ComposeFields {
         attachments: Vec::new(),
         in_reply_to: None,
         references: Vec::new(),
+        text_reply_quote: None,
+        html_reply_quote: None,
     }
 }
 
