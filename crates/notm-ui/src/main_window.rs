@@ -4616,6 +4616,18 @@ fn install_shortcuts(
             }
             return gtk::glib::Propagation::Stop;
         }
+        if ctrl && (key == gtk::gdk::Key::b || key == gtk::gdk::Key::B) {
+            if st.borrow().active_pane == ActivePane::Threads {
+                select_thread_page(&opts, &w, &st, -1);
+            } else if st.borrow().active_pane == ActivePane::Sidebar {
+                move_sidebar_focus(&w, -10);
+            } else if compose_view_is_visible(&w) {
+                move_composer_focus(&w, -10);
+            } else {
+                vim_scroll_pages(&w, &st, -1.0);
+            }
+            return gtk::glib::Propagation::Stop;
+        }
         if key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter {
             match st.borrow().active_pane {
                 ActivePane::Threads => {
@@ -4667,6 +4679,16 @@ fn install_shortcuts(
         }
         if st.borrow().input_mode == InputMode::Insert {
             return gtk::glib::Propagation::Proceed;
+        }
+        if key == gtk::gdk::Key::h || key == gtk::gdk::Key::H {
+            clear_numeric_prefix(&numeric_prefix);
+            move_active_pane(&w, &st, -1);
+            return gtk::glib::Propagation::Stop;
+        }
+        if key == gtk::gdk::Key::l || key == gtk::gdk::Key::L {
+            clear_numeric_prefix(&numeric_prefix);
+            move_active_pane(&w, &st, 1);
+            return gtk::glib::Propagation::Stop;
         }
         if key == gtk::gdk::Key::Escape {
             *pending_go.borrow_mut() = false;
@@ -12469,8 +12491,13 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
         },
         HelpEntry {
             section: "Pane navigation",
-            key: "Ctrl+h / Ctrl+l",
+            key: "h / l",
             description: "Move the active pane left or right.",
+        },
+        HelpEntry {
+            section: "Pane navigation",
+            key: "Ctrl+h / Ctrl+l",
+            description: "Also move the active pane left or right.",
         },
         HelpEntry {
             section: "Thread navigation",
@@ -12496,6 +12523,11 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
             section: "Thread navigation",
             key: "Ctrl+d / Ctrl+u",
             description: "Move half a page down or up.",
+        },
+        HelpEntry {
+            section: "Thread navigation",
+            key: "Ctrl+b",
+            description: "Move back one full page.",
         },
         HelpEntry {
             section: "Thread navigation",
