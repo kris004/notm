@@ -154,9 +154,11 @@ impl Default for LaunchOptions {
 }
 
 pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
-    let app = gtk::Application::builder()
-        .application_id("dev.notm.Notm")
-        .build();
+    let mut app_builder = gtk::Application::builder().application_id("dev.notm.Notm");
+    if options.automation_enabled {
+        app_builder = app_builder.flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
+    }
+    let app = app_builder.build();
     app.connect_activate(move |app| build_ui(app, options.clone()));
     app.run_with_args(&["notm"]);
     Ok(())
