@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
@@ -181,6 +183,7 @@ struct Widgets {
     thread_model: gtk::StringList,
     thread_selection: gtk::SingleSelection,
     thread_selection_refreshing: Rc<Cell<bool>>,
+    thread_scroll_generation: Rc<Cell<u64>>,
     thread_result_label: gtk::Label,
     load_more_button: gtk::Button,
     thread_scrolled: gtk::ScrolledWindow,
@@ -304,6 +307,8 @@ struct UndoTagAction {
     query: String,
     mutation: TagMutation,
     label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -653,6 +658,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
     thread_selection.set_autoselect(false);
     thread_selection.set_can_unselect(true);
     let thread_selection_refreshing = Rc::new(Cell::new(false));
+    let thread_scroll_generation = Rc::new(Cell::new(0_u64));
     let thread_factory = thread_list_factory(&state);
     let thread_list = gtk::ListView::new(Some(thread_selection.clone()), Some(thread_factory));
     thread_list.set_widget_name("notm-thread-list");
@@ -983,6 +989,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         thread_model,
         thread_selection,
         thread_selection_refreshing,
+        thread_scroll_generation,
         thread_result_label,
         load_more_button,
         thread_scrolled: scrolled_threads,
@@ -2960,7 +2967,7 @@ fn connect_search_debounce(options: &LaunchOptions, widgets: &Widgets, state: &S
         while let Ok(response) = rx.try_recv() {
             if response.generation == w.search_generation.get() {
                 match response.result {
-                    Ok(data) => apply_search_data(&poll_opts, &w, &st, data),
+                    Ok(data) => apply_search_data(&poll_opts, &w, &st, data, true),
                     Err(err) => apply_search_error(&w, &st, err),
                 }
             } else {
@@ -4003,7 +4010,7 @@ fn load_thread_page_containing_index(
                         let keep_visual = response.visual_anchor_index.is_some()
                             && st.borrow().visual_select_mode
                             && st.borrow().current_query == data.query;
-                        apply_search_data(&opts, &w, &st, data);
+                        apply_search_data(&opts, &w, &st, data, false);
                         if keep_visual {
                             let mut state = st.borrow_mut();
                             state.visual_select_mode = true;
@@ -4095,7 +4102,7 @@ fn thread_list_factory(state: &SharedState) -> gtk::SignalListItemFactory {
 }
 
 fn thread_row_widget_for_index(state: &SharedState, index: usize) -> Option<gtk::Widget> {
-    let (absolute_index, thread, detail, visual_selected) = {
+    let (thread, detail, absolute_index, show_thread_numbers, visual_selected) = {
         let state = state.borrow();
         let thread = state.thread_list_items.get(index)?.clone();
         let detail = state
@@ -4104,13 +4111,27 @@ fn thread_row_widget_for_index(state: &SharedState, index: usize) -> Option<gtk:
             .cloned()
             .unwrap_or_default();
         let absolute_index = state.thread_window_offset + index;
+        let show_thread_numbers = state.show_thread_numbers;
         let visual_selected = visual_selection_range_from_state(&state)
             .is_some_and(|(start, end)| (start..=end).contains(&absolute_index));
-        (absolute_index, thread, detail, visual_selected)
+        (
+            thread,
+            detail,
+            absolute_index,
+            show_thread_numbers,
+            visual_selected,
+        )
     };
     Some(
-        thread_row_widget(absolute_index, &thread, &detail, visual_selected)
-            .upcast::<gtk::Widget>(),
+        thread_row_widget(
+            index,
+            absolute_index,
+            show_thread_numbers,
+            &thread,
+            &detail,
+            visual_selected,
+        )
+        .upcast::<gtk::Widget>(),
     )
 }
 
@@ -4170,10 +4191,11 @@ fn clear_thread_model(widgets: &Widgets) {
     }
 }
 
-fn thread_row_token(index: usize, visual_selected: bool) -> String {
+fn thread_row_token(index: usize, visual_selected: bool, show_thread_numbers: bool) -> String {
     format!(
-        "{THREAD_ROW_PREFIX}|{index}|{}",
-        if visual_selected { 1 } else { 0 }
+        "{THREAD_ROW_PREFIX}|{index}|{}|{}",
+        if visual_selected { 1 } else { 0 },
+        if show_thread_numbers { 1 } else { 0 }
     )
 }
 
@@ -4185,11 +4207,12 @@ fn thread_status_token(message: &str, spinning: bool) -> String {
 }
 
 fn parse_thread_model_row(token: &str) -> Option<ThreadModelRow> {
-    let mut parts = token.splitn(3, '|');
+    let mut parts = token.splitn(4, '|');
     match parts.next()? {
         THREAD_ROW_PREFIX => {
             let index = parts.next()?.parse::<usize>().ok()?;
             let _visual_selected = parts.next();
+            let _show_thread_numbers = parts.next();
             Some(ThreadModelRow::Thread { index })
         }
         THREAD_STATUS_PREFIX => {
@@ -4285,7 +4308,7 @@ fn update_button_binding_labels(widgets: &Widgets, state: &SharedState) {
     set_button_label(&widgets.settings_button, "Settings", ",", state);
     set_button_label(&widgets.help_button, "Help", "?", state);
     set_button_label(&widgets.search_button, "Search", "/", state);
-    set_button_label(&widgets.load_more_button, "Load more", "G", state);
+    set_button_label(&widgets.load_more_button, "Load more", "Ctrl+f", state);
     set_button_label(&widgets.archive_button, "Archive", "a", state);
     let read_base = strip_binding_suffix(&widgets.read_toggle_button.label().unwrap_or_default());
     set_button_label(&widgets.read_toggle_button, &read_base, "u", state);
@@ -4509,6 +4532,13 @@ fn install_shortcuts(
         if ctrl && (key == gtk::gdk::Key::l || key == gtk::gdk::Key::L) {
             move_active_pane(&w, &st, 1);
             return gtk::glib::Propagation::Stop;
+        }
+        if ctrl && (key == gtk::gdk::Key::f || key == gtk::gdk::Key::F) {
+            if st.borrow().active_pane == ActivePane::Threads {
+                load_more_threads(&opts, &w, &st, true);
+                return gtk::glib::Propagation::Stop;
+            }
+            return gtk::glib::Propagation::Proceed;
         }
         if ctrl && (key == gtk::gdk::Key::d || key == gtk::gdk::Key::D) {
             if st.borrow().active_pane == ActivePane::Threads {
@@ -4814,6 +4844,10 @@ fn install_shortcuts(
         let handled = if key == gtk::gdk::Key::slash {
             clear_numeric_prefix(&numeric_prefix);
             enter_insert_mode_for_search(&w, &st);
+            true
+        } else if key == gtk::gdk::Key::colon {
+            clear_numeric_prefix(&numeric_prefix);
+            show_command_palette(&opts, &w, &st, &undo);
             true
         } else if key == gtk::gdk::Key::i {
             clear_numeric_prefix(&numeric_prefix);
@@ -5228,7 +5262,7 @@ fn connect_auto_load_more(options: &LaunchOptions, widgets: &Widgets, state: &Sh
         let scheduled = auto_load_scheduled.clone();
         gtk::glib::timeout_add_local_once(Duration::from_millis(120), move || {
             scheduled.set(false);
-            load_more_threads(&opts, &w, &st);
+            load_more_threads(&opts, &w, &st, false);
         });
     });
 }
@@ -5284,31 +5318,221 @@ fn scroll_thread_index_into_view(widgets: &Widgets, index: usize) {
     if index >= widgets.thread_model.n_items() as usize {
         return;
     }
+    let generation = widgets.thread_scroll_generation.get().saturating_add(1);
+    widgets.thread_scroll_generation.set(generation);
+    scroll_thread_index_into_view_once(&widgets.thread_list, index);
     let scrolled = widgets.thread_scrolled.clone();
-    let item_count = widgets.thread_model.n_items().max(1) as f64;
+    let list = widgets.thread_list.clone();
+    let scroll_generation = widgets.thread_scroll_generation.clone();
     gtk::glib::idle_add_local_once(move || {
-        let adjustment = scrolled.vadjustment();
-        let lower = adjustment.lower();
-        let upper = adjustment.upper();
-        let page = adjustment.page_size();
-        let max_value = (upper - page).max(lower);
-        if max_value <= lower {
+        if scroll_generation.get() != generation {
             return;
         }
-        let row_height = (upper / item_count).clamp(48.0, 180.0);
-        let top = lower + index as f64 * row_height;
-        let bottom = top + row_height;
-        let value = adjustment.value();
-        let visible_bottom = value + page;
-        let target = if top < value {
-            top
-        } else if bottom > visible_bottom {
-            bottom - page
-        } else {
-            return;
-        };
-        adjustment.set_value(target.clamp(lower, max_value));
+        scroll_thread_index_into_view_once(&list, index);
+        for delay_ms in [25_u64, 75, 160] {
+            let scrolled = scrolled.clone();
+            let list = list.clone();
+            let scroll_generation = scroll_generation.clone();
+            gtk::glib::timeout_add_local_once(Duration::from_millis(delay_ms), move || {
+                if scroll_generation.get() != generation {
+                    return;
+                }
+                scroll_thread_index_into_view_once(&list, index);
+                nudge_realized_thread_row_into_view(&scrolled, &list, index);
+            });
+        }
     });
+}
+
+fn scroll_thread_index_into_view_once(list: &gtk::ListView, index: usize) {
+    list.scroll_to(index as u32, gtk::ListScrollFlags::NONE, None);
+}
+
+fn nudge_realized_thread_row_into_view(
+    scrolled: &gtk::ScrolledWindow,
+    list: &gtk::ListView,
+    index: usize,
+) {
+    let relative_to = scrolled.clone().upcast::<gtk::Widget>();
+    let Some((top, bottom)) = realized_thread_row_bounds_relative(list, &relative_to, index) else {
+        return;
+    };
+    let adjustment = scrolled.vadjustment();
+    let lower = adjustment.lower();
+    let page = visible_adjustment_page_size(&adjustment, scrolled);
+    let max_value = (adjustment.upper() - page).max(lower);
+    if max_value <= lower {
+        return;
+    }
+    let value = adjustment.value();
+    let visible_top = 0.0;
+    let visible_bottom = page;
+    let padding = 12.0;
+    let delta = if top < visible_top + padding {
+        top - visible_top - padding
+    } else if bottom > visible_bottom - padding {
+        bottom - visible_bottom + padding
+    } else {
+        return;
+    };
+    adjustment.set_value((value + delta).clamp(lower, max_value));
+}
+
+fn visible_adjustment_page_size(
+    adjustment: &gtk::Adjustment,
+    scrolled: &gtk::ScrolledWindow,
+) -> f64 {
+    let page = adjustment.page_size();
+    if page > 0.0 {
+        page
+    } else {
+        scrolled.height().max(0) as f64
+    }
+}
+
+fn realized_thread_row_bounds_relative(
+    list: &gtk::ListView,
+    relative_to: &gtk::Widget,
+    index: usize,
+) -> Option<(f64, f64)> {
+    let target_name = format!("notm-thread-row-{index}");
+    let root = list.clone().upcast::<gtk::Widget>();
+    let row = find_widget_by_name(&root, &target_name)?;
+    let bounds = row.compute_bounds(relative_to)?;
+    let top = bounds.y() as f64;
+    let bottom = top + bounds.height() as f64;
+    (bottom > top).then_some((top, bottom))
+}
+
+fn find_widget_by_name(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
+    if root.widget_name().as_str() == name {
+        return Some(root.clone());
+    }
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        if let Some(found) = find_widget_by_name(&widget, name) {
+            return Some(found);
+        }
+        child = widget.next_sibling();
+    }
+    None
+}
+
+fn thread_selection_view_state(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
+    let adjustment = widgets.thread_scrolled.vadjustment();
+    let value = adjustment.value();
+    let page = visible_adjustment_page_size(&adjustment, &widgets.thread_scrolled);
+    let selected_local = selected_thread_index(widgets);
+    let selected_absolute = selected_local.map(|index| state.borrow().thread_window_offset + index);
+    let relative_to = widgets.thread_scrolled.clone().upcast::<gtk::Widget>();
+    let bounds = selected_local.and_then(|index| {
+        realized_thread_row_bounds_relative(&widgets.thread_list, &relative_to, index)
+    });
+    let (row_top, row_bottom, row_visible) = if let Some((top, bottom)) = bounds {
+        (
+            Some(top),
+            Some(bottom),
+            Some(top >= -1.0 && bottom <= page + 1.0),
+        )
+    } else {
+        (None, None, None)
+    };
+    json!({
+        "ok": true,
+        "selected_local": selected_local,
+        "selected_abs": selected_absolute,
+        "scroll_value": value,
+        "scroll_upper": adjustment.upper(),
+        "scroll_page_size": page,
+        "row_top": row_top,
+        "row_bottom": row_bottom,
+        "row_visible": row_visible,
+    })
+}
+
+fn thread_row_layout_state(widgets: &Widgets, index: usize) -> serde_json::Value {
+    let adjustment = widgets.thread_scrolled.vadjustment();
+    let viewport_height = visible_adjustment_page_size(&adjustment, &widgets.thread_scrolled);
+    let viewport_width = widgets.thread_scrolled.width().max(0) as f64;
+    let relative_to = widgets.thread_scrolled.clone().upcast::<gtk::Widget>();
+    let root = widgets.thread_list.clone().upcast::<gtk::Widget>();
+    json!({
+        "ok": true,
+        "index": index,
+        "viewport_width": viewport_width,
+        "viewport_height": viewport_height,
+        "row": named_widget_bounds_json(
+            &root,
+            &relative_to,
+            &format!("notm-thread-row-{index}"),
+            viewport_width,
+            viewport_height,
+        ),
+        "number": named_widget_bounds_json(
+            &root,
+            &relative_to,
+            &format!("notm-thread-number-{index}"),
+            viewport_width,
+            viewport_height,
+        ),
+        "title": named_widget_bounds_json(
+            &root,
+            &relative_to,
+            &format!("notm-thread-title-{index}"),
+            viewport_width,
+            viewport_height,
+        ),
+        "date": named_widget_bounds_json(
+            &root,
+            &relative_to,
+            &format!("notm-thread-date-{index}"),
+            viewport_width,
+            viewport_height,
+        ),
+        "meta": named_widget_bounds_json(
+            &root,
+            &relative_to,
+            &format!("notm-thread-meta-{index}"),
+            viewport_width,
+            viewport_height,
+        ),
+        "preview": named_widget_bounds_json(
+            &root,
+            &relative_to,
+            &format!("notm-thread-preview-{index}"),
+            viewport_width,
+            viewport_height,
+        ),
+    })
+}
+
+fn named_widget_bounds_json(
+    root: &gtk::Widget,
+    relative_to: &gtk::Widget,
+    name: &str,
+    viewport_width: f64,
+    viewport_height: f64,
+) -> Option<serde_json::Value> {
+    let widget = find_widget_by_name(root, name)?;
+    let bounds = widget.compute_bounds(relative_to)?;
+    let x = bounds.x() as f64;
+    let y = bounds.y() as f64;
+    let width = bounds.width() as f64;
+    let height = bounds.height() as f64;
+    let right = x + width;
+    let bottom = y + height;
+    Some(json!({
+        "x": x,
+        "y": y,
+        "width": width,
+        "height": height,
+        "right": right,
+        "bottom": bottom,
+        "fully_visible": x >= -1.0
+            && y >= -1.0
+            && right <= viewport_width + 1.0
+            && bottom <= viewport_height + 1.0,
+    }))
 }
 
 fn open_saved_search_name(
@@ -7701,7 +7925,7 @@ fn connect_actions(
     let st = state.clone();
     widgets
         .load_more_button
-        .connect_clicked(move |_| load_more_threads(&opts, &w, &st));
+        .connect_clicked(move |_| load_more_threads(&opts, &w, &st, true));
 
     let opts = options.clone();
     let w = widgets.clone();
@@ -7865,7 +8089,7 @@ fn run_search(options: &LaunchOptions, widgets: &Widgets, state: &SharedState, q
         .search_generation
         .set(widgets.search_generation.get().saturating_add(1));
     match execute_search_page(options, query, 0) {
-        Ok(data) => apply_search_data(options, widgets, state, data),
+        Ok(data) => apply_search_data(options, widgets, state, data, true),
         Err(err) => {
             state.borrow_mut().last_error = Some(err.to_string());
             widgets
@@ -7900,7 +8124,7 @@ fn run_search_async(options: &LaunchOptions, widgets: &Widgets, state: &SharedSt
         Ok(response) => {
             if response.generation == w.search_generation.get() {
                 match response.result {
-                    Ok(data) => apply_search_data(&opts, &w, &st, data),
+                    Ok(data) => apply_search_data(&opts, &w, &st, data, true),
                     Err(err) => apply_search_error(&w, &st, err),
                 }
             } else {
@@ -7974,7 +8198,12 @@ fn execute_search_page(
     Ok(data)
 }
 
-fn load_more_threads(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+fn load_more_threads(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    select_last_loaded: bool,
+) {
     let (query, offset, can_load_more) = {
         let state = state.borrow();
         (
@@ -8009,7 +8238,7 @@ fn load_more_threads(options: &LaunchOptions, widgets: &Widgets, state: &SharedS
         Ok(response) => {
             if response.generation == w.search_generation.get() {
                 match response.result {
-                    Ok(data) => append_search_data(&opts, &w, &st, data),
+                    Ok(data) => append_search_data(&opts, &w, &st, data, select_last_loaded),
                     Err(err) => apply_search_error(&w, &st, err),
                 }
             }
@@ -8028,6 +8257,7 @@ fn apply_search_data(
     widgets: &Widgets,
     state: &SharedState,
     data: SearchData,
+    select_first: bool,
 ) {
     let query = data.query.clone();
     let count = data.count;
@@ -8067,14 +8297,19 @@ fn apply_search_data(
     }
     populate_thread_list(options, widgets, state);
     update_tag_searches(options, widgets, state);
-    refresh_thread_attachment_list(widgets, state);
-    update_message_menu(options, widgets, state);
-    widgets.status_label.set_text(&format!(
-        "{} for {}{}",
-        thread_window_status(state),
-        query,
-        if cached { " (cached)" } else { "" }
-    ));
+    let selected_first = select_first && !state.borrow().thread_list_items.is_empty();
+    if selected_first {
+        select_thread_index_clamped(options, widgets, state, 0);
+    } else {
+        refresh_thread_attachment_list(widgets, state);
+        update_message_menu(options, widgets, state);
+        widgets.status_label.set_text(&format!(
+            "{} for {}{}",
+            thread_window_status(state),
+            query,
+            if cached { " (cached)" } else { "" }
+        ));
+    }
     update_thread_result_label(widgets, state);
     if state.borrow().input_mode == InputMode::Normal {
         focus_active_pane(widgets, state);
@@ -8087,6 +8322,7 @@ fn append_search_data(
     widgets: &Widgets,
     state: &SharedState,
     data: SearchData,
+    select_last_loaded: bool,
 ) {
     let query = data.query.clone();
     let count = data.count;
@@ -8143,8 +8379,14 @@ fn append_search_data(
         update_visual_selection_rows(widgets, state);
         selected_thread_index(widgets).or(selected_index)
     };
+    let selected_index = if select_last_loaded && append_count > 0 {
+        Some(append_start + append_count - 1)
+    } else {
+        restored_index
+    };
     update_tag_searches(options, widgets, state);
-    if let Some(index) = restored_index {
+    if let Some(index) = selected_index {
+        select_thread_index_clamped(options, widgets, state, index);
         widgets
             .status_label
             .set_text(&message_position_status(state, index, "Selected"));
@@ -8192,7 +8434,7 @@ fn update_thread_result_label(widgets: &Widgets, state: &SharedState) {
     ));
     let can_load_more = state_ref.can_load_more_threads;
     drop(state_ref);
-    set_button_label(&widgets.load_more_button, "Load more", "G", state);
+    set_button_label(&widgets.load_more_button, "Load more", "Ctrl+f", state);
     widgets.load_more_button.set_sensitive(can_load_more);
 }
 
@@ -8284,6 +8526,7 @@ fn append_thread_model_rows(widgets: &Widgets, state: &SharedState, start: usize
                 Some(thread_row_token(
                     index,
                     range.is_some_and(|(start, end)| (start..=end).contains(&absolute_index)),
+                    state.show_thread_numbers,
                 ))
             })
             .collect::<Vec<_>>()
@@ -8295,6 +8538,7 @@ fn append_thread_model_rows(widgets: &Widgets, state: &SharedState, start: usize
 }
 
 fn refresh_thread_model_rows(widgets: &Widgets, state: &SharedState, indices: &[usize]) {
+    let selected_position = selected_thread_position(widgets);
     let tokens = {
         let state = state.borrow();
         let range = visual_selection_range_from_state(&state);
@@ -8308,16 +8552,25 @@ fn refresh_thread_model_rows(widgets: &Widgets, state: &SharedState, indices: &[
                     thread_row_token(
                         *index,
                         range.is_some_and(|(start, end)| (start..=end).contains(&absolute_index)),
+                        state.show_thread_numbers,
                     ),
                 ))
             })
             .collect::<Vec<_>>()
     };
+    widgets.thread_selection_refreshing.set(true);
     for (position, token) in tokens {
         if position < widgets.thread_model.n_items() {
             widgets.thread_model.splice(position, 1, &[token.as_str()]);
         }
     }
+    if let Some(position) = selected_position
+        && position < widgets.thread_model.n_items()
+        && widgets.thread_selection.selected() != position
+    {
+        widgets.thread_selection.set_selected(position);
+    }
+    widgets.thread_selection_refreshing.set(false);
 }
 
 fn toggle_visual_select_mode(widgets: &Widgets, state: &SharedState) {
@@ -8420,6 +8673,7 @@ fn update_visual_selection_rows(widgets: &Widgets, state: &SharedState) {
                 thread_row_token(
                     index,
                     range.is_some_and(|(start, end)| (start..=end).contains(&absolute_index)),
+                    state.show_thread_numbers,
                 )
             })
             .collect::<Vec<_>>()
@@ -8444,8 +8698,20 @@ fn update_visual_selection_rows(widgets: &Widgets, state: &SharedState) {
     widgets.thread_selection_refreshing.set(false);
 }
 
+fn set_thread_numbers_visible(widgets: &Widgets, state: &SharedState, visible: bool) {
+    state.borrow_mut().show_thread_numbers = visible;
+    update_visual_selection_rows(widgets, state);
+    widgets.status_label.set_text(if visible {
+        "Thread numbers on"
+    } else {
+        "Thread numbers off"
+    });
+}
+
 fn thread_row_widget(
     idx: usize,
+    absolute_index: usize,
+    show_thread_numbers: bool,
     thread: &notm_notmuch::ThreadSummary,
     detail: &ThreadUiDetails,
     visual_selected: bool,
@@ -8462,13 +8728,27 @@ fn thread_row_widget(
     if visual_selected {
         box_.add_css_class("notm-visual-selected");
     }
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let row_content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    row_content.set_hexpand(true);
+    row_content.set_halign(gtk::Align::Fill);
+    row_content.set_margin_start(6);
+    row_content.set_margin_end(6);
+    row_content.set_margin_top(6);
+    row_content.set_margin_bottom(6);
+    if show_thread_numbers {
+        let number = gtk::Label::new(Some(&format!("{}.", format_count(absolute_index + 1))));
+        number.set_widget_name(&format!("notm-thread-number-{idx}"));
+        number.set_xalign(0.0);
+        number.set_yalign(0.0);
+        number.set_valign(gtk::Align::Start);
+        number.add_css_class("dim-label");
+        number.add_css_class("monospace");
+        number.add_css_class("notm-thread-number");
+        row_content.append(&number);
+    }
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 3);
     content.set_hexpand(true);
     content.set_halign(gtk::Align::Fill);
-    content.set_margin_start(6);
-    content.set_margin_end(6);
-    content.set_margin_top(6);
-    content.set_margin_bottom(6);
     let title = gtk::Label::new(Some(&format!(
         "{}{}{}{}{}{}",
         if thread.has_unread { "● " } else { "" },
@@ -8483,6 +8763,18 @@ fn thread_row_widget(
     title.set_hexpand(true);
     title.set_halign(gtk::Align::Fill);
     title.set_wrap(true);
+    let meta_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    meta_row.set_hexpand(true);
+    meta_row.set_halign(gtk::Align::Fill);
+    let date = gtk::Label::new(Some(&format_thread_list_date(thread.newest_date)));
+    date.set_widget_name(&format!("notm-thread-date-{idx}"));
+    date.set_width_chars(16);
+    date.set_xalign(1.0);
+    date.set_yalign(0.0);
+    date.set_valign(gtk::Align::Start);
+    date.add_css_class("dim-label");
+    date.add_css_class("monospace");
+    date.add_css_class("notm-thread-date");
     let meta = gtk::Label::new(Some(&format!(
         "{}  ·  {}/{}  ·  {}",
         thread.authors,
@@ -8497,7 +8789,9 @@ fn thread_row_widget(
     meta.add_css_class("dim-label");
     meta.set_wrap(true);
     content.append(&title);
-    content.append(&meta);
+    meta_row.append(&date);
+    meta_row.append(&meta);
+    content.append(&meta_row);
     if !detail.preview.is_empty() {
         let preview = gtk::Label::new(Some(&detail.preview));
         preview.set_widget_name(&format!("notm-thread-preview-{idx}"));
@@ -8508,8 +8802,19 @@ fn thread_row_widget(
         preview.set_wrap(true);
         content.append(&preview);
     }
-    box_.append(&content);
+    row_content.append(&content);
+    box_.append(&row_content);
     box_
+}
+
+fn format_thread_list_date(timestamp: i64) -> String {
+    chrono::DateTime::<Utc>::from_timestamp(timestamp, 0)
+        .map(|date| {
+            date.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| timestamp.to_string())
 }
 
 fn thread_details_for_threads(
@@ -8880,6 +9185,64 @@ fn tag_undo_label(
     )
 }
 
+fn undo_detail_for_visual_range(query: &str, start: usize, end: usize) -> String {
+    format!(
+        "Range {}-{} in query: {}",
+        format_count(start.saturating_add(1)),
+        format_count(end.saturating_add(1)),
+        truncate_status_text(query, 180)
+    )
+}
+
+fn undo_detail_for_thread_targets(state: &SharedState, target_threads: usize) -> Option<String> {
+    let state = state.borrow();
+    if target_threads == 1 {
+        if let Some(message) = &state.selected_message {
+            return Some(undo_detail_for_message(message));
+        }
+        if let Some(thread) = &state.selected_thread {
+            return Some(undo_detail_for_thread(thread));
+        }
+    }
+    (target_threads > 1).then(|| {
+        format!(
+            "{} in query: {}",
+            tag_target_status_label(target_threads),
+            truncate_status_text(&state.current_query, 180)
+        )
+    })
+}
+
+fn undo_detail_for_message(message: &notm_notmuch::MessageSummary) -> String {
+    let subject = if message.subject.trim().is_empty() {
+        "(no subject)"
+    } else {
+        message.subject.trim()
+    };
+    format!(
+        "Message: {} · From: {} · Date: {} · ID: {}",
+        truncate_status_text(subject, 80),
+        truncate_status_text(&message.from, 80),
+        format_message_date(message.date),
+        message.message_id
+    )
+}
+
+fn undo_detail_for_thread(thread: &notm_notmuch::ThreadSummary) -> String {
+    let subject = if thread.subject.trim().is_empty() {
+        "(no subject)"
+    } else {
+        thread.subject.trim()
+    };
+    format!(
+        "Thread: {} · Authors: {} · Newest: {} · ID: {}",
+        truncate_status_text(subject, 80),
+        truncate_status_text(&thread.authors, 80),
+        format_message_date(thread.newest_date),
+        thread.thread_id
+    )
+}
+
 fn tag_selected(
     options: &LaunchOptions,
     widgets: &Widgets,
@@ -8924,6 +9287,7 @@ fn tag_selected(
                             sync_maildir_flags: mutation.sync_maildir_flags,
                         },
                         label: tag_undo_label(&mutation, target_count, report.changed_messages),
+                        detail: Some(undo_detail_for_visual_range(&query, start, end)),
                     },
                 );
             }
@@ -8983,6 +9347,7 @@ fn tag_selected_threads(
         return false;
     }
     let target_count = target_thread_ids.len();
+    let undo_detail = undo_detail_for_thread_targets(state, target_count);
     let query = tag_query_for_thread_ids(&target_thread_ids);
     let result = (|| -> anyhow::Result<usize> {
         let db = Database::open(&open_config(options), DatabaseMode::ReadWrite)?;
@@ -8998,6 +9363,7 @@ fn tag_selected_threads(
                         sync_maildir_flags: mutation.sync_maildir_flags,
                     },
                     label: tag_undo_label(&mutation, target_count, report.changed_messages),
+                    detail: undo_detail,
                 },
             );
         }
@@ -9299,14 +9665,25 @@ fn show_undo_tag_actions(
         let row = gtk::ListBoxRow::new();
         row.set_widget_name(&format!("notm-undo-tag-row-{}", display_index + 1));
         row.set_focusable(true);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        content.set_margin_start(8);
+        content.set_margin_end(8);
+        content.set_margin_top(6);
+        content.set_margin_bottom(6);
         let label = gtk::Label::new(Some(&action.label));
         label.set_xalign(0.0);
         label.set_wrap(true);
-        label.set_margin_start(8);
-        label.set_margin_end(8);
-        label.set_margin_top(6);
-        label.set_margin_bottom(6);
-        row.set_child(Some(&label));
+        content.append(&label);
+        if let Some(detail) = action.detail.as_deref().filter(|detail| !detail.is_empty()) {
+            let detail_label = gtk::Label::new(Some(detail));
+            detail_label
+                .set_widget_name(&format!("notm-undo-tag-row-{}-detail", display_index + 1));
+            detail_label.set_xalign(0.0);
+            detail_label.set_wrap(true);
+            detail_label.add_css_class("dim-label");
+            content.append(&detail_label);
+        }
+        row.set_child(Some(&content));
         list.append(&row);
     }
     let selected_rows = Rc::new(RefCell::new(BTreeSet::<usize>::new()));
@@ -10332,7 +10709,12 @@ fn handle_automation_request(
             json!({"ok": true, "state": &*state.borrow()})
         }
         "load_more_threads" => {
-            load_more_threads(options, widgets, state);
+            let select_last = req
+                .args
+                .get("select_last")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true);
+            load_more_threads(options, widgets, state, select_last);
             json!({"ok": state.borrow().last_error.is_none(), "state": &*state.borrow()})
         }
         "thread_page_info" => {
@@ -10349,6 +10731,21 @@ fn handle_automation_request(
                 "current_query": state.current_query,
             })
         }
+        "thread_selection_view_state" | "selection_view_state" => {
+            spin_main_context_for(Duration::from_millis(150));
+            thread_selection_view_state(widgets, state)
+        }
+        "thread_row_layout" => {
+            let index = req
+                .args
+                .get("index")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok())
+                .or_else(|| selected_thread_index(widgets))
+                .unwrap_or(0);
+            spin_main_context_for(Duration::from_millis(150));
+            thread_row_layout_state(widgets, index)
+        }
         "scroll_thread_list_to_bottom" => {
             let adjustment = widgets.thread_scrolled.vadjustment();
             let before_loaded = state.borrow().thread_loaded_count;
@@ -10358,7 +10755,7 @@ fn handle_automation_request(
                 let at_bottom = adjustment.upper() <= adjustment.page_size() + 24.0
                     || adjustment.value() + adjustment.page_size() + 24.0 >= adjustment.upper();
                 if at_bottom && state.borrow().can_load_more_threads {
-                    load_more_threads(options, widgets, state);
+                    load_more_threads(options, widgets, state, false);
                 }
             }
             let state = state.borrow();
@@ -10372,6 +10769,24 @@ fn handle_automation_request(
                 "scroll_upper": adjustment.upper(),
                 "scroll_page_size": adjustment.page_size(),
             })
+        }
+        "resize_window" => {
+            let width = req
+                .args
+                .get("width")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(900)
+                .clamp(360, 4000) as i32;
+            let height = req
+                .args
+                .get("height")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(500)
+                .clamp(240, 3000) as i32;
+            widgets.window.set_default_size(width, height);
+            widgets.window.present();
+            spin_main_context_for(Duration::from_millis(250));
+            json!({"ok": true, "width": widgets.window.width(), "height": widgets.window.height()})
         }
         "select_saved_search" => {
             let name = req
@@ -10608,6 +11023,15 @@ fn handle_automation_request(
         "undo_last_tag" => {
             undo_last_tag(options, widgets, state, undo_state);
             json!({"ok": true, "state": &*state.borrow()})
+        }
+        "undo_tag_actions" => {
+            let actions = undo_state
+                .borrow()
+                .iter()
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>();
+            json!({"ok": true, "actions": actions})
         }
         "run_manual_sync" => {
             run_manual_sync(options, widgets, state);
@@ -10855,6 +11279,30 @@ fn handle_automation_request(
         "thread_ui_details" => {
             json!({"ok": true, "thread_details": state.borrow().thread_details})
         }
+        "thread_list_rows" => {
+            let state = state.borrow();
+            let rows = state
+                .thread_list_items
+                .iter()
+                .enumerate()
+                .map(|(index, thread)| {
+                    json!({
+                        "index": index,
+                        "absolute": state.thread_window_offset + index,
+                        "display_number": state.thread_window_offset + index + 1,
+                        "show_thread_numbers": state.show_thread_numbers,
+                        "thread_id": &thread.thread_id,
+                        "subject": &thread.subject,
+                        "authors": &thread.authors,
+                        "date": format_thread_list_date(thread.newest_date),
+                        "matched_messages": thread.matched_messages,
+                        "total_messages": thread.total_messages,
+                        "tags": &thread.tags,
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({"ok": true, "rows": rows})
+        }
         "copy_message_id" => {
             copy_selected_message_id(widgets, state);
             json!({"ok": true, "selected_message": state.borrow().selected_message})
@@ -10867,9 +11315,30 @@ fn handle_automation_request(
             show_command_palette(options, widgets, state, undo_state);
             json!({"ok": true})
         }
+        "command_completion" => {
+            let input = req
+                .args
+                .get("input")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            json!({
+                "ok": true,
+                "input": input,
+                "completion": command_completion(input),
+                "matches": command_completion_matches(input),
+            })
+        }
         "open_shortcuts" | "show_shortcuts" => {
             show_shortcuts_overlay(widgets);
             json!({"ok": true})
+        }
+        "help_search" => {
+            let query = req
+                .args
+                .get("query")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            json!({"ok": true, "query": query, "results": help_search_results(query)})
         }
         "open_settings" => {
             show_settings(widgets, options);
@@ -10981,7 +11450,8 @@ fn run_named_command(
     state: &SharedState,
     undo_state: &UndoState,
 ) -> serde_json::Value {
-    match command {
+    let command = normalize_command_input(command);
+    match command.as_str() {
         "search" => {
             let query = widgets.search_entry.text().to_string();
             run_search(options, widgets, state, &query);
@@ -11001,6 +11471,10 @@ fn run_named_command(
         }
         "sent" => {
             open_saved_search_name(options, widgets, state, "Sent");
+            json!({"ok": true, "state": &*state.borrow()})
+        }
+        "drafts" => {
+            open_saved_search_name(options, widgets, state, "Drafts");
             json!({"ok": true, "state": &*state.borrow()})
         }
         "all" => {
@@ -11186,6 +11660,14 @@ fn run_named_command(
             toggle_quote_collapse(options, widgets, state);
             json!({"ok": true, "quote_collapse_enabled": state.borrow().quote_collapse_enabled})
         }
+        "nu" | "number" => {
+            set_thread_numbers_visible(widgets, state, true);
+            json!({"ok": true, "show_thread_numbers": state.borrow().show_thread_numbers})
+        }
+        "nonu" | "nonumber" => {
+            set_thread_numbers_visible(widgets, state, false);
+            json!({"ok": true, "show_thread_numbers": state.borrow().show_thread_numbers})
+        }
         "save_attachment" => match save_selected_attachment(widgets, state, 0, None) {
             Ok(path) => json!({"ok": true, "path": path}),
             Err(err) => json!({"ok": false, "error": err.to_string()}),
@@ -11207,6 +11689,10 @@ fn run_named_command(
             json!({"ok": true})
         }
         "shortcuts" | "show_shortcuts" => {
+            show_shortcuts_overlay(widgets);
+            json!({"ok": true})
+        }
+        "help" | "commands" => {
             show_shortcuts_overlay(widgets);
             json!({"ok": true})
         }
@@ -11378,6 +11864,112 @@ fn install_css() {
     }
 }
 
+fn command_name_candidates() -> &'static [&'static str] {
+    &[
+        "inbox",
+        "unread",
+        "flagged",
+        "sent",
+        "drafts",
+        "trash",
+        "all",
+        "search",
+        "compose",
+        "reply",
+        "reply_all",
+        "forward",
+        "forward_as_attachment",
+        "archive",
+        "mark_read",
+        "mark_unread",
+        "flag",
+        "unflag",
+        "visual_select",
+        "clear_visual_selection",
+        "raw_source",
+        "full_headers",
+        "text",
+        "visual_html",
+        "image_policy",
+        "load_images_once",
+        "trust_sender_images",
+        "collapse_quotes",
+        "nu",
+        "nonu",
+        "number",
+        "nonumber",
+        "save_attachment",
+        "open_attachment",
+        "copy_message_id",
+        "copy_thread_id",
+        "undo",
+        "undo_last_tag",
+        "sync",
+        "manual_sync",
+        "debug",
+        "settings",
+        "shortcuts",
+        "help",
+        "commands",
+    ]
+}
+
+fn normalize_command_input(input: &str) -> String {
+    input
+        .trim()
+        .trim_start_matches(':')
+        .trim()
+        .replace(' ', "_")
+        .to_lowercase()
+}
+
+fn command_completion_matches(input: &str) -> Vec<&'static str> {
+    let prefix = normalize_command_input(input);
+    command_name_candidates()
+        .iter()
+        .copied()
+        .filter(|command| prefix.is_empty() || command.starts_with(&prefix))
+        .collect()
+}
+
+fn command_completion(input: &str) -> Option<String> {
+    let prefix = normalize_command_input(input);
+    let matches = command_completion_matches(input);
+    if matches.is_empty() {
+        return None;
+    }
+    let common = common_prefix(&matches);
+    if common.len() > prefix.len() {
+        Some(common)
+    } else {
+        matches.first().map(|command| (*command).to_string())
+    }
+}
+
+fn common_prefix(values: &[&str]) -> String {
+    let Some(first) = values.first() else {
+        return String::new();
+    };
+    let mut prefix = (*first).to_string();
+    for value in &values[1..] {
+        while !value.starts_with(&prefix) {
+            if prefix.pop().is_none() {
+                return String::new();
+            }
+        }
+    }
+    prefix
+}
+
+fn apply_command_completion(entry: &gtk::Entry) -> bool {
+    let Some(completion) = command_completion(&entry.text()) else {
+        return false;
+    };
+    entry.set_text(&completion);
+    entry.set_position(-1);
+    true
+}
+
 fn show_command_palette(
     options: &LaunchOptions,
     widgets: &Widgets,
@@ -11385,41 +11977,54 @@ fn show_command_palette(
     undo_state: &UndoState,
 ) {
     let dialog = gtk::Dialog::builder()
-        .title("notm command palette")
+        .title("Run notm command")
         .transient_for(&widgets.window)
         .modal(true)
-        .default_width(560)
+        .default_width(420)
         .build();
     dialog.set_widget_name("notm-command-palette");
     let area = dialog.content_area();
     area.set_spacing(6);
     let entry = gtk::Entry::new();
     entry.set_widget_name("notm-command-palette-entry");
-    entry.set_placeholder_text(Some(
-        "Type a command: inbox, unread, search, compose, reply, forward_as_attachment, raw_source...",
-    ));
+    entry.set_placeholder_text(Some(":command; Tab completes, Enter runs"));
     area.append(&entry);
-    let help = gtk::Label::new(Some("Common commands"));
-    help.add_css_class("heading");
-    help.set_xalign(0.0);
-    area.append(&help);
-    for command in command_palette_commands() {
-        let label = gtk::Label::new(Some(command));
-        label.set_xalign(0.0);
-        label.add_css_class("dim-label");
-        area.append(&label);
-    }
-    let shortcut_help = gtk::Label::new(Some("Shortcuts"));
-    shortcut_help.add_css_class("heading");
-    shortcut_help.set_xalign(0.0);
-    area.append(&shortcut_help);
-    for (key, desc) in shortcuts::SHORTCUTS {
-        let label = gtk::Label::new(Some(&format!("{key:<12} {desc}")));
-        label.set_xalign(0.0);
-        area.append(&label);
-    }
     dialog.add_button("Run", gtk::ResponseType::Accept);
     dialog.add_button("Close", gtk::ResponseType::Close);
+    let entry_key_controller = gtk::EventControllerKey::new();
+    entry_key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let entry_for_keys = entry.clone();
+    entry_key_controller.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Tab {
+            return if apply_command_completion(&entry_for_keys) {
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            };
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    entry.add_controller(entry_key_controller);
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let undo = undo_state.clone();
+    let d = dialog.clone();
+    entry.connect_activate(move |entry| {
+        let command = normalize_command_input(&entry.text());
+        let result = run_named_command(&command, &opts, &w, &st, &undo);
+        if result
+            .get("ok")
+            .and_then(|ok| ok.as_bool())
+            .unwrap_or(false)
+        {
+            w.status_label.set_text(&format!("Command `{command}` ran"));
+        } else {
+            w.status_label
+                .set_text(&format!("Command `{command}` failed: {result}"));
+        }
+        d.close();
+    });
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
@@ -11427,21 +12032,17 @@ fn show_command_palette(
     let entry_for_response = entry.clone();
     dialog.connect_response(move |d, response| {
         if response == gtk::ResponseType::Accept {
-            let command = entry_for_response.text().to_string();
-            let result = run_named_command(command.trim(), &opts, &w, &st, &undo);
+            let command = normalize_command_input(&entry_for_response.text());
+            let result = run_named_command(&command, &opts, &w, &st, &undo);
             if result
                 .get("ok")
                 .and_then(|ok| ok.as_bool())
                 .unwrap_or(false)
             {
-                w.status_label
-                    .set_text(&format!("Command `{}` ran", command.trim()));
+                w.status_label.set_text(&format!("Command `{command}` ran"));
             } else {
-                w.status_label.set_text(&format!(
-                    "Command `{}` failed: {}",
-                    command.trim(),
-                    result
-                ));
+                w.status_label
+                    .set_text(&format!("Command `{command}` failed: {result}"));
             }
         }
         d.close();
@@ -11452,7 +12053,7 @@ fn show_command_palette(
 
 fn show_shortcuts_overlay(widgets: &Widgets) {
     let dialog = gtk::Dialog::builder()
-        .title("notm keyboard shortcuts")
+        .title("notm help")
         .transient_for(&widgets.window)
         .modal(true)
         .default_width(520)
@@ -11464,8 +12065,14 @@ fn show_shortcuts_overlay(widgets: &Widgets) {
     title.add_css_class("heading");
     title.set_xalign(0.0);
     area.append(&title);
+    let search = gtk::SearchEntry::new();
+    search.set_widget_name("notm-help-search-entry");
+    search.set_placeholder_text(Some("Search help"));
+    area.append(&search);
+    let rows = Rc::new(RefCell::new(Vec::<(gtk::Box, String)>::new()));
     for (key, desc) in shortcuts::SHORTCUTS {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        row.set_widget_name(&format!("notm-shortcut-row-{}", widget_token(key)));
         let key_label = gtk::Label::new(Some(key));
         key_label.set_widget_name(&format!("notm-shortcut-key-{}", widget_token(key)));
         key_label.set_xalign(0.0);
@@ -11478,10 +12085,59 @@ fn show_shortcuts_overlay(widgets: &Widgets) {
         row.append(&key_label);
         row.append(&desc_label);
         area.append(&row);
+        rows.borrow_mut()
+            .push((row, format!("{} {}", key, desc).to_lowercase()));
     }
+    let command_title = gtk::Label::new(Some("Commands"));
+    command_title.add_css_class("heading");
+    command_title.set_xalign(0.0);
+    area.append(&command_title);
+    for (index, command) in command_palette_commands().iter().enumerate() {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        row.set_widget_name(&format!("notm-command-help-row-{}", index + 1));
+        let prefix_label = gtk::Label::new(Some(":"));
+        prefix_label.set_xalign(0.0);
+        prefix_label.set_width_chars(14);
+        prefix_label.add_css_class("monospace");
+        let command_label = gtk::Label::new(Some(command));
+        command_label.set_xalign(0.0);
+        command_label.set_hexpand(true);
+        command_label.set_wrap(true);
+        row.append(&prefix_label);
+        row.append(&command_label);
+        area.append(&row);
+        rows.borrow_mut()
+            .push((row, format!("commands :{command}").to_lowercase()));
+    }
+    let rows_for_search = rows.clone();
+    search.connect_search_changed(move |entry| {
+        let query = entry.text().trim().to_lowercase();
+        for (row, haystack) in rows_for_search.borrow().iter() {
+            row.set_visible(query.is_empty() || haystack.contains(&query));
+        }
+    });
     dialog.add_button("Close", gtk::ResponseType::Close);
     dialog.connect_response(|dialog, _| dialog.close());
     dialog.present();
+    search.grab_focus();
+}
+
+fn help_search_results(query: &str) -> Vec<serde_json::Value> {
+    let query = query.trim().to_lowercase();
+    let mut out = shortcuts::SHORTCUTS
+        .iter()
+        .filter(|(key, desc)| {
+            query.is_empty() || format!("{} {}", key, desc).to_lowercase().contains(&query)
+        })
+        .map(|(key, desc)| json!({"key": key, "description": desc}))
+        .collect::<Vec<_>>();
+    out.extend(
+        command_palette_commands()
+            .iter()
+            .filter(|command| query.is_empty() || command.to_lowercase().contains(&query))
+            .map(|command| json!({"key": ":", "description": command})),
+    );
+    out
 }
 
 fn command_palette_commands() -> &'static [&'static str] {
@@ -11491,6 +12147,7 @@ fn command_palette_commands() -> &'static [&'static str] {
         "archive, mark_read, mark_unread, flag, unflag, trash, undo",
         "visual_select, clear_visual_selection",
         "raw_source, full_headers, text, visual_html, image_policy, collapse_quotes",
+        "nu, nonu (show/hide thread numbers)",
         "save_attachment, open_attachment",
         "copy_message_id, copy_thread_id",
         "debug, settings, shortcuts, manual_sync (if Sync is enabled)",

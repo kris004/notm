@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
-gtk4 = "0.11"
+gtk4 = { version = "0.11", features = ["v4_12"] }
 notm-mail = { path = "../notm-mail" }
 notm-notmuch = { path = "../notm-notmuch" }
 parking_lot.workspace = true

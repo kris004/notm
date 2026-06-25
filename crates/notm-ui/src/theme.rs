@@ -33,6 +33,19 @@ pub fn css() -> &'static str {
     }
     #notm-thread-list row.unread label,
     #notm-thread-list .unread label { font-weight: 700; }
+    #notm-thread-list .notm-thread-number,
+    #notm-thread-list .notm-thread-date {
+        font-feature-settings: "tnum";
+        opacity: .78;
+    }
+    #notm-thread-list .notm-thread-number {
+        padding-right: 6px;
+        border-right: 1px solid alpha(currentColor, .14);
+    }
+    #notm-thread-list .notm-thread-date {
+        padding-right: 8px;
+        border-right: 1px solid alpha(currentColor, .14);
+    }
     #notm-compose-body,
     #notm-compose-body text,
     #notm-compose-body gutter {

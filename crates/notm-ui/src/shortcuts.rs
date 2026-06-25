@@ -2,6 +2,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("Esc", "Return to normal mode from an input"),
     ("i", "Insert mode: focus nearest input for the active pane"),
     ("/", "Insert mode in search"),
+    (":", "Open command entry; Tab completes commands"),
     ("Ctrl+h/l", "Move active pane left/right"),
     (
         "j/k",
@@ -10,10 +11,12 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("<count>j/k", "Move selected thread by count"),
     ("gg/G", "Top/bottom of the thread list or active pane"),
     ("<count>gg/G", "Load up to that thread number and select it"),
+    (":nu/:nonu", "Show/hide thread numbers"),
     (
         "Ctrl+d/u",
         "Half page down/up through threads or active pane",
     ),
+    ("Ctrl+f", "Load more thread results"),
     ("Enter", "Open selected thread from the thread pane"),
     ("a", "Archive"),
     ("u", "Toggle unread"),
@@ -62,7 +65,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
         "Attachment right-click",
         "Save or open selected thread attachment",
     ),
-    ("Ctrl+K", "Command palette"),
+    ("Ctrl+K", "Run command"),
     ("Ctrl+Enter", "Send compose"),
     ("?", "Shortcuts overlay"),
 ];
