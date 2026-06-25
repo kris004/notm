@@ -192,6 +192,7 @@ struct Widgets {
     thread_pane: gtk::Box,
     message_pane: gtk::Box,
     saved_box: gtk::Box,
+    custom_search_menu_button: gtk::MenuButton,
     saved_name_entry: gtk::Entry,
     saved_query_entry: gtk::Entry,
     save_search_button: gtk::Button,
@@ -1032,6 +1033,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
         thread_pane: middle.clone(),
         message_pane: right.clone(),
         saved_box,
+        custom_search_menu_button: custom_search_button.clone(),
         saved_name_entry,
         saved_query_entry,
         save_search_button: save_search_button.clone(),
@@ -1878,7 +1880,10 @@ fn connect_saved_search_editor(
     let store = saved_store.clone();
     save_search_button.connect_clicked(move |_| {
         match save_custom_search_from_entries(&opts, &w, &st, &store) {
-            Ok(()) => w.status_label.set_text("Saved custom search"),
+            Ok(()) => {
+                w.custom_search_menu_button.popdown();
+                w.status_label.set_text("Saved custom search");
+            }
             Err(err) => w
                 .status_label
                 .set_text(&format!("Save search failed: {err}")),
@@ -2209,7 +2214,7 @@ fn connect_custom_tag_editor(
     let undo = undo_state.clone();
     add_tag_button.connect_clicked(move |_| {
         if apply_custom_tag_from_entry(&opts, &w, &st, &undo, true) {
-            prepare_custom_tag_entry_for_next(&w, &st);
+            close_custom_tag_editor(&w, &st);
         }
     });
 
@@ -2229,7 +2234,7 @@ fn connect_custom_tag_editor(
     let undo = undo_state.clone();
     remove_tag_button.connect_clicked(move |_| {
         if apply_custom_tag_from_entry(&opts, &w, &st, &undo, false) {
-            prepare_custom_tag_entry_for_next(&w, &st);
+            close_custom_tag_editor(&w, &st);
         }
     });
 
@@ -2818,6 +2823,7 @@ fn connect_message_actions(options: &LaunchOptions, widgets: &Widgets, state: &S
         st.borrow_mut().prefer_html_view = false;
         show_rendered_selected_thread(&opts, &w, &st);
         restore_message_scroll_fraction(&w, scroll);
+        w.view_menu_button.popdown();
     });
 
     let opts = options.clone();
@@ -2828,21 +2834,24 @@ fn connect_message_actions(options: &LaunchOptions, widgets: &Widgets, state: &S
         st.borrow_mut().prefer_html_view = true;
         show_visual_html_selected_message(&opts, &w, &st);
         restore_message_scroll_fraction(&w, scroll);
+        w.view_menu_button.popdown();
     });
 
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
-    widgets
-        .view_headers_button
-        .connect_clicked(move |_| show_full_headers(&opts, &w, &st));
+    widgets.view_headers_button.connect_clicked(move |_| {
+        show_full_headers(&opts, &w, &st);
+        w.view_menu_button.popdown();
+    });
 
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
-    widgets
-        .view_raw_button
-        .connect_clicked(move |_| show_raw_source(&opts, &w, &st));
+    widgets.view_raw_button.connect_clicked(move |_| {
+        show_raw_source(&opts, &w, &st);
+        w.view_menu_button.popdown();
+    });
 
     let opts = options.clone();
     let w = widgets.clone();
@@ -2860,39 +2869,45 @@ fn connect_message_actions(options: &LaunchOptions, widgets: &Widgets, state: &S
 
     let w = widgets.clone();
     let st = state.clone();
-    widgets
-        .copy_message_id_button
-        .connect_clicked(move |_| copy_selected_message_id(&w, &st));
+    widgets.copy_message_id_button.connect_clicked(move |_| {
+        copy_selected_message_id(&w, &st);
+        w.copy_menu_button.popdown();
+    });
 
     let w = widgets.clone();
     let st = state.clone();
-    widgets
-        .copy_thread_id_button
-        .connect_clicked(move |_| copy_selected_thread_id(&w, &st));
+    widgets.copy_thread_id_button.connect_clicked(move |_| {
+        copy_selected_thread_id(&w, &st);
+        w.copy_menu_button.popdown();
+    });
 
     let w = widgets.clone();
     let st = state.clone();
-    widgets
-        .copy_from_email_button
-        .connect_clicked(move |_| copy_selected_message_emails(&w, &st, MessageEmailField::From));
+    widgets.copy_from_email_button.connect_clicked(move |_| {
+        copy_selected_message_emails(&w, &st, MessageEmailField::From);
+        w.copy_menu_button.popdown();
+    });
 
     let w = widgets.clone();
     let st = state.clone();
-    widgets
-        .copy_to_email_button
-        .connect_clicked(move |_| copy_selected_message_emails(&w, &st, MessageEmailField::To));
+    widgets.copy_to_email_button.connect_clicked(move |_| {
+        copy_selected_message_emails(&w, &st, MessageEmailField::To);
+        w.copy_menu_button.popdown();
+    });
 
     let w = widgets.clone();
     let st = state.clone();
-    widgets
-        .copy_cc_email_button
-        .connect_clicked(move |_| copy_selected_message_emails(&w, &st, MessageEmailField::Cc));
+    widgets.copy_cc_email_button.connect_clicked(move |_| {
+        copy_selected_message_emails(&w, &st, MessageEmailField::Cc);
+        w.copy_menu_button.popdown();
+    });
 
     let w = widgets.clone();
     let st = state.clone();
-    widgets
-        .copy_subject_button
-        .connect_clicked(move |_| copy_selected_message_subject(&w, &st));
+    widgets.copy_subject_button.connect_clicked(move |_| {
+        copy_selected_message_subject(&w, &st);
+        w.copy_menu_button.popdown();
+    });
 }
 
 fn connect_recipient_autocomplete(entry: &gtk::Entry, widgets: &Widgets, state: &SharedState) {
@@ -8143,13 +8158,19 @@ fn connect_actions(
     let w = widgets.clone();
     let st = state.clone();
     let undo = undo_state.clone();
-    undo_last_button.connect_clicked(move |_| undo_last_tag(&opts, &w, &st, &undo));
+    undo_last_button.connect_clicked(move |_| {
+        undo_last_tag(&opts, &w, &st, &undo);
+        w.undo_tag_button.popdown();
+    });
 
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
     let undo = undo_state.clone();
-    undo_list_button.connect_clicked(move |_| show_undo_tag_actions(&opts, &w, &st, &undo));
+    undo_list_button.connect_clicked(move |_| {
+        show_undo_tag_actions(&opts, &w, &st, &undo);
+        w.undo_tag_button.popdown();
+    });
 
     let w = widgets.clone();
     let st = state.clone();
@@ -8158,23 +8179,33 @@ fn connect_actions(
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
-    reply_button.connect_clicked(move |_| reply_selected(&opts, &w, &st, ReplyKind::Sender));
+    reply_button.connect_clicked(move |_| {
+        reply_selected(&opts, &w, &st, ReplyKind::Sender);
+        w.response_menu_button.popdown();
+    });
 
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
-    reply_all_button.connect_clicked(move |_| reply_selected(&opts, &w, &st, ReplyKind::All));
+    reply_all_button.connect_clicked(move |_| {
+        reply_selected(&opts, &w, &st, ReplyKind::All);
+        w.response_menu_button.popdown();
+    });
 
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
-    forward_button.connect_clicked(move |_| forward_selected(&opts, &w, &st));
+    forward_button.connect_clicked(move |_| {
+        forward_selected(&opts, &w, &st);
+        w.response_menu_button.popdown();
+    });
 
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
     forward_attachment_button.connect_clicked(move |_| {
         forward_as_attachment_selected(&opts, &w, &st);
+        w.response_menu_button.popdown();
     });
 
     let w = widgets.clone();
@@ -9715,7 +9746,10 @@ fn update_message_menu(options: &LaunchOptions, widgets: &Widgets, state: &Share
         let opts = options.clone();
         let w = widgets.clone();
         let st = state.clone();
-        button.connect_clicked(move |_| select_message_by_index(&opts, &w, &st, index));
+        button.connect_clicked(move |_| {
+            select_message_by_index(&opts, &w, &st, index);
+            w.message_menu_button.popdown();
+        });
         widgets.message_menu_box.append(&button);
     }
     update_message_action_buttons(options, widgets, state);
