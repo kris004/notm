@@ -3,7 +3,6 @@ pub mod main_window;
 pub mod messages;
 pub mod model;
 pub mod screenshot;
-pub mod shortcuts;
 pub mod theme;
 pub mod widgets;
 

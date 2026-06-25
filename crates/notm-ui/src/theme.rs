@@ -63,12 +63,25 @@ pub fn css() -> &'static str {
         border-radius: 8px;
         background: alpha(currentColor, .06);
     }
+    #notm-command-palette {
+        padding: 0;
+        border-radius: 8px;
+        box-shadow: 0 8px 24px alpha(black, .35);
+    }
     #notm-settings-dialog .notm-settings-section {
         font-size: 1.08em;
         font-weight: 800;
         color: @theme_selected_bg_color;
     }
+    #notm-shortcuts-overlay .notm-settings-section {
+        font-size: 1.08em;
+        font-weight: 800;
+        color: @theme_selected_bg_color;
+    }
     #notm-settings-dialog .notm-settings-label {
+        font-weight: 700;
+    }
+    #notm-shortcuts-overlay .notm-settings-label {
         font-weight: 700;
     }
     #notm-settings-dialog .notm-settings-note {

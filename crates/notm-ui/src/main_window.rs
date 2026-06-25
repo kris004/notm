@@ -37,7 +37,7 @@ use webkit6::{
 use crate::{
     automation::{self, AutomationConfig, AutomationRequest},
     model::{ActiveDraft, ActivePane, ComposeFields, InputMode, ThreadUiDetails, UiState},
-    screenshot, shortcuts,
+    screenshot,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +187,7 @@ pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
 #[derive(Clone)]
 struct Widgets {
     window: gtk::ApplicationWindow,
+    overlay: gtk::Overlay,
     left_pane: gtk::ScrolledWindow,
     thread_pane: gtk::Box,
     message_pane: gtk::Box,
@@ -1020,12 +1021,15 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
     status_label.set_margin_end(8);
     status_label.set_margin_bottom(8);
     root.append(&status_label);
-    window.set_child(Some(&root));
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&root));
+    window.set_child(Some(&overlay));
     connect_html_navigation_policy(&html_view, &status_label);
     connect_html_hover_status(&html_view, &status_label);
 
     let widgets = Widgets {
         window: window.clone(),
+        overlay: overlay.clone(),
         left_pane: sidebar_scrolled.clone(),
         thread_pane: middle.clone(),
         message_pane: right.clone(),
@@ -12104,33 +12108,45 @@ fn apply_command_completion(entry: &gtk::Entry) -> bool {
     true
 }
 
+fn remove_named_overlay(overlay: &gtk::Overlay, widget_name: &str) {
+    let mut child = overlay.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if widget.widget_name() == widget_name {
+            overlay.remove_overlay(&widget);
+        }
+    }
+}
+
 fn show_command_palette(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
     undo_state: &UndoState,
 ) {
+    remove_named_overlay(&widgets.overlay, "notm-command-palette");
     let entry = gtk::Entry::new();
     entry.set_widget_name("notm-command-palette-entry");
     entry.set_placeholder_text(Some(":command"));
-    let window = gtk::Window::builder()
-        .transient_for(&widgets.window)
-        .modal(true)
-        .decorated(false)
-        .resizable(false)
-        .default_width(420)
-        .child(&entry)
-        .default_widget(&entry)
-        .destroy_with_parent(true)
-        .build();
-    window.set_widget_name("notm-command-palette");
+    entry.set_width_chars(36);
+    entry.set_hexpand(true);
+
+    let panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    panel.set_widget_name("notm-command-palette");
+    panel.set_halign(gtk::Align::Center);
+    panel.set_valign(gtk::Align::Center);
+    panel.set_width_request(420);
+    panel.append(&entry);
+    widgets.overlay.add_overlay(&panel);
+
     let entry_key_controller = gtk::EventControllerKey::new();
     entry_key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     let entry_for_keys = entry.clone();
-    let window_for_keys = window.clone();
+    let overlay_for_keys = widgets.overlay.clone();
+    let panel_for_keys = panel.clone().upcast::<gtk::Widget>();
     entry_key_controller.connect_key_pressed(move |_, key, _, _| {
         if key == gtk::gdk::Key::Escape {
-            window_for_keys.close();
+            overlay_for_keys.remove_overlay(&panel_for_keys);
             return gtk::glib::Propagation::Stop;
         }
         if key == gtk::gdk::Key::Tab {
@@ -12147,7 +12163,8 @@ fn show_command_palette(
     let w = widgets.clone();
     let st = state.clone();
     let undo = undo_state.clone();
-    let run_window = window.clone();
+    let overlay_for_activate = widgets.overlay.clone();
+    let panel_for_activate = panel.clone().upcast::<gtk::Widget>();
     entry.connect_activate(move |entry| {
         let command = normalize_command_input(&entry.text());
         let result = run_named_command(&command, &opts, &w, &st, &undo);
@@ -12161,10 +12178,16 @@ fn show_command_palette(
             w.status_label
                 .set_text(&format!("Command `{command}` failed: {result}"));
         }
-        run_window.close();
+        overlay_for_activate.remove_overlay(&panel_for_activate);
     });
-    window.present();
     entry.grab_focus();
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HelpEntry {
+    section: &'static str,
+    key: &'static str,
+    description: &'static str,
 }
 
 fn show_shortcuts_overlay(widgets: &Widgets) {
@@ -12172,66 +12195,54 @@ fn show_shortcuts_overlay(widgets: &Widgets) {
         .title("notm help")
         .transient_for(&widgets.window)
         .modal(true)
-        .default_width(520)
+        .default_width(820)
+        .default_height(720)
         .build();
     dialog.set_widget_name("notm-shortcuts-overlay");
     let area = dialog.content_area();
-    area.set_spacing(6);
-    let title = gtk::Label::new(Some("Keyboard shortcuts"));
-    title.add_css_class("heading");
-    title.set_xalign(0.0);
-    area.append(&title);
+    area.set_spacing(8);
+
     let search = gtk::SearchEntry::new();
     search.set_widget_name("notm-help-search-entry");
     search.set_placeholder_text(Some("Search help"));
     area.append(&search);
-    let rows = Rc::new(RefCell::new(Vec::<(gtk::Box, String)>::new()));
-    for (key, desc) in shortcuts::SHORTCUTS {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        row.set_widget_name(&format!("notm-shortcut-row-{}", widget_token(key)));
-        let key_label = gtk::Label::new(Some(key));
-        key_label.set_widget_name(&format!("notm-shortcut-key-{}", widget_token(key)));
-        key_label.set_xalign(0.0);
-        key_label.set_width_chars(14);
-        key_label.add_css_class("monospace");
-        let desc_label = gtk::Label::new(Some(desc));
-        desc_label.set_xalign(0.0);
-        desc_label.set_hexpand(true);
-        desc_label.set_wrap(true);
-        row.append(&key_label);
-        row.append(&desc_label);
-        area.append(&row);
-        rows.borrow_mut()
-            .push((row, format!("{} {}", key, desc).to_lowercase()));
-    }
-    let command_title = gtk::Label::new(Some("Commands"));
-    command_title.add_css_class("heading");
-    command_title.set_xalign(0.0);
-    area.append(&command_title);
-    for (index, command) in command_palette_commands().iter().enumerate() {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        row.set_widget_name(&format!("notm-command-help-row-{}", index + 1));
-        let prefix_label = gtk::Label::new(Some(":"));
-        prefix_label.set_xalign(0.0);
-        prefix_label.set_width_chars(14);
-        prefix_label.add_css_class("monospace");
-        let command_label = gtk::Label::new(Some(command));
-        command_label.set_xalign(0.0);
-        command_label.set_hexpand(true);
-        command_label.set_wrap(true);
-        row.append(&prefix_label);
-        row.append(&command_label);
-        area.append(&row);
-        rows.borrow_mut()
-            .push((row, format!("commands :{command}").to_lowercase()));
-    }
-    let rows_for_search = rows.clone();
+
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .min_content_height(560)
+        .build();
+    let form = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    form.set_margin_start(8);
+    form.set_margin_end(24);
+    form.set_margin_top(8);
+    form.set_margin_bottom(8);
+    scrolled.set_child(Some(&form));
+    area.append(&scrolled);
+
+    let sections = Rc::new(RefCell::new(Vec::<HelpSectionFilter>::new()));
+    append_help_sections(&form, &sections, shortcut_help_entries());
+    append_help_sections(&form, &sections, command_help_entries());
+
+    let sections_for_search = sections.clone();
     search.connect_search_changed(move |entry| {
         let query = entry.text().trim().to_lowercase();
-        for (row, haystack) in rows_for_search.borrow().iter() {
-            row.set_visible(query.is_empty() || haystack.contains(&query));
+        for section in sections_for_search.borrow().iter() {
+            let section_matches = !query.is_empty() && section.haystack.contains(&query);
+            let mut any_visible = false;
+            for (row, haystack) in &section.rows {
+                let visible = query.is_empty() || section_matches || haystack.contains(&query);
+                row.set_visible(visible);
+                any_visible |= visible;
+            }
+            for header in &section.headers {
+                header.set_visible(query.is_empty() || section_matches || any_visible);
+            }
         }
     });
+
     dialog.add_button("Close", gtk::ResponseType::Close);
     let key_controller = gtk::EventControllerKey::new();
     key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -12249,35 +12260,559 @@ fn show_shortcuts_overlay(widgets: &Widgets) {
     search.grab_focus();
 }
 
-fn help_search_results(query: &str) -> Vec<serde_json::Value> {
-    let query = query.trim().to_lowercase();
-    let mut out = shortcuts::SHORTCUTS
-        .iter()
-        .filter(|(key, desc)| {
-            query.is_empty() || format!("{} {}", key, desc).to_lowercase().contains(&query)
-        })
-        .map(|(key, desc)| json!({"key": key, "description": desc}))
-        .collect::<Vec<_>>();
-    out.extend(
-        command_palette_commands()
-            .iter()
-            .filter(|command| query.is_empty() || command.to_lowercase().contains(&query))
-            .map(|command| json!({"key": ":", "description": command})),
-    );
-    out
+#[derive(Clone)]
+struct HelpSectionFilter {
+    headers: Vec<gtk::Widget>,
+    haystack: String,
+    rows: Vec<(gtk::Widget, String)>,
 }
 
-fn command_palette_commands() -> &'static [&'static str] {
+fn append_help_sections(
+    form: &gtk::Box,
+    sections: &Rc<RefCell<Vec<HelpSectionFilter>>>,
+    entries: &'static [HelpEntry],
+) {
+    let mut start = 0;
+    while start < entries.len() {
+        let title = entries[start].section;
+        let mut end = start + 1;
+        while end < entries.len() && entries[end].section == title {
+            end += 1;
+        }
+        append_help_section(form, sections, title, &entries[start..end]);
+        start = end;
+    }
+}
+
+fn append_help_section(
+    form: &gtk::Box,
+    sections: &Rc<RefCell<Vec<HelpSectionFilter>>>,
+    title: &'static str,
+    entries: &[HelpEntry],
+) {
+    let headers = help_section_header(form, title);
+    let mut rows = Vec::new();
+    for entry in entries {
+        let row = help_row(entry.key, entry.description);
+        let haystack =
+            format!("{} {} {}", entry.section, entry.key, entry.description).to_lowercase();
+        form.append(&row);
+        rows.push((row.upcast::<gtk::Widget>(), haystack));
+    }
+    sections.borrow_mut().push(HelpSectionFilter {
+        headers,
+        haystack: title.to_lowercase(),
+        rows,
+    });
+}
+
+fn help_section_header(form: &gtk::Box, title: &str) -> Vec<gtk::Widget> {
+    let mut headers = Vec::new();
+    if form.first_child().is_some() {
+        let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+        separator.set_margin_top(14);
+        separator.set_margin_bottom(6);
+        form.append(&separator);
+        headers.push(separator.upcast::<gtk::Widget>());
+    }
+    let label = gtk::Label::new(Some(title));
+    label.add_css_class("heading");
+    label.add_css_class("notm-settings-section");
+    label.set_xalign(0.0);
+    label.set_margin_bottom(4);
+    form.append(&label);
+    headers.push(label.upcast::<gtk::Widget>());
+    headers
+}
+
+fn help_row(key: &str, description: &str) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    row.set_hexpand(true);
+    let key_label = gtk::Label::new(Some(key));
+    key_label.set_widget_name(&format!("notm-help-key-{}", widget_token(key)));
+    key_label.set_width_chars(24);
+    key_label.set_xalign(1.0);
+    key_label.set_valign(gtk::Align::Start);
+    key_label.add_css_class("monospace");
+    key_label.add_css_class("notm-help-key");
+    key_label.add_css_class("notm-settings-label");
+    let desc_label = gtk::Label::new(Some(description));
+    desc_label.set_xalign(0.0);
+    desc_label.set_hexpand(true);
+    desc_label.set_wrap(true);
+    row.append(&key_label);
+    row.append(&desc_label);
+    row
+}
+
+fn help_search_results(query: &str) -> Vec<serde_json::Value> {
+    let query = query.trim().to_lowercase();
+    shortcut_help_entries()
+        .iter()
+        .chain(command_help_entries().iter())
+        .filter(|entry| {
+            query.is_empty()
+                || format!("{} {} {}", entry.section, entry.key, entry.description)
+                    .to_lowercase()
+                    .contains(&query)
+        })
+        .map(|entry| {
+            json!({
+                "section": entry.section,
+                "key": entry.key,
+                "description": entry.description,
+            })
+        })
+        .collect()
+}
+
+fn shortcut_help_entries() -> &'static [HelpEntry] {
     &[
-        "inbox, unread, flagged, sent, trash, all",
-        "search, compose, reply, reply_all, forward, forward_as_attachment",
-        "archive, mark_read, mark_unread, flag, unflag, trash, undo",
-        "visual_select, clear_visual_selection",
-        "raw_source, full_headers, text, visual_html, image_policy, collapse_quotes",
-        "nu/nonu, date/nodate, tags/notags, preview/nopreview (thread list columns)",
-        "save_attachment, open_attachment",
-        "copy_message_id, copy_thread_id",
-        "debug, settings, shortcuts, manual_sync (if Sync is enabled)",
+        HelpEntry {
+            section: "Basics",
+            key: "Esc",
+            description: "Close dialogs, cancel prompts, or return to normal mode from an input.",
+        },
+        HelpEntry {
+            section: "Basics",
+            key: "i",
+            description: "Focus the nearest input for the active pane.",
+        },
+        HelpEntry {
+            section: "Basics",
+            key: "/",
+            description: "Focus the search field.",
+        },
+        HelpEntry {
+            section: "Basics",
+            key: ":",
+            description: "Open the run-command prompt. Tab completes commands; Enter runs them.",
+        },
+        HelpEntry {
+            section: "Basics",
+            key: "?",
+            description: "Open this help window.",
+        },
+        HelpEntry {
+            section: "Pane navigation",
+            key: "Ctrl+h / Ctrl+l",
+            description: "Move the active pane left or right.",
+        },
+        HelpEntry {
+            section: "Thread navigation",
+            key: "j / k",
+            description: "Move the selected thread down or up; in other panes, scroll the active pane.",
+        },
+        HelpEntry {
+            section: "Thread navigation",
+            key: "<count>j / <count>k",
+            description: "Move the selected thread by count.",
+        },
+        HelpEntry {
+            section: "Thread navigation",
+            key: "gg / G",
+            description: "Go to the actual top or bottom of the current thread result set.",
+        },
+        HelpEntry {
+            section: "Thread navigation",
+            key: "<count>gg",
+            description: "Load/select an absolute thread number, for example 25gg.",
+        },
+        HelpEntry {
+            section: "Thread navigation",
+            key: "Ctrl+d / Ctrl+u",
+            description: "Move half a page down or up.",
+        },
+        HelpEntry {
+            section: "Thread navigation",
+            key: "Ctrl+f",
+            description: "Load the next page of thread results and select the last loaded row.",
+        },
+        HelpEntry {
+            section: "Thread navigation",
+            key: "Enter",
+            description: "Open the selected thread from the thread pane.",
+        },
+        HelpEntry {
+            section: "Thread actions",
+            key: "a",
+            description: "Archive selected thread(s).",
+        },
+        HelpEntry {
+            section: "Thread actions",
+            key: "u",
+            description: "Toggle unread on selected thread(s).",
+        },
+        HelpEntry {
+            section: "Thread actions",
+            key: "f",
+            description: "Toggle flagged on selected thread(s).",
+        },
+        HelpEntry {
+            section: "Thread actions",
+            key: "t",
+            description: "Move selected thread(s) to trash.",
+        },
+        HelpEntry {
+            section: "Thread actions",
+            key: "s",
+            description: "Mark selected thread(s) as spam.",
+        },
+        HelpEntry {
+            section: "Thread actions",
+            key: "v",
+            description: "Start or clear visual thread selection.",
+        },
+        HelpEntry {
+            section: "Thread actions",
+            key: "T t",
+            description: "Add or remove one tag on selected message(s).",
+        },
+        HelpEntry {
+            section: "Thread actions",
+            key: "T m",
+            description: "Apply multiple tag changes, for example -inbox +books.",
+        },
+        HelpEntry {
+            section: "Thread actions",
+            key: "z z",
+            description: "Undo the last tag operation.",
+        },
+        HelpEntry {
+            section: "Thread actions",
+            key: "z m",
+            description: "Open the undoable tag-operation list.",
+        },
+        HelpEntry {
+            section: "Saved searches",
+            key: "g i/u/f/s/d/t/a",
+            description: "Open Inbox, Unread, Flagged, Sent, Drafts, Trash, or All.",
+        },
+        HelpEntry {
+            section: "Saved searches",
+            key: "g c 1-9",
+            description: "Open a numbered custom saved search.",
+        },
+        HelpEntry {
+            section: "Saved searches",
+            key: "g 1-9",
+            description: "Open a numbered found-tag search or tag-path dropdown.",
+        },
+        HelpEntry {
+            section: "Message actions",
+            key: "r r",
+            description: "Reply to the selected message.",
+        },
+        HelpEntry {
+            section: "Message actions",
+            key: "r a",
+            description: "Reply all.",
+        },
+        HelpEntry {
+            section: "Message actions",
+            key: "r f",
+            description: "Forward inline.",
+        },
+        HelpEntry {
+            section: "Message actions",
+            key: "r A",
+            description: "Forward as attachment.",
+        },
+        HelpEntry {
+            section: "Message actions",
+            key: "V t / V v / V h / V r",
+            description: "Show text, visual HTML, full headers, or raw source.",
+        },
+        HelpEntry {
+            section: "Message actions",
+            key: "q",
+            description: "Toggle quote collapse.",
+        },
+        HelpEntry {
+            section: "Message actions",
+            key: "I",
+            description: "Load or trust remote images for the current HTML message.",
+        },
+        HelpEntry {
+            section: "Message actions",
+            key: "y m/t/f/o/c/s",
+            description: "Copy message id, thread id, from, to, cc, or subject.",
+        },
+        HelpEntry {
+            section: "Compose",
+            key: "c",
+            description: "Compose a new message.",
+        },
+        HelpEntry {
+            section: "Compose",
+            key: "Ctrl+Enter",
+            description: "Send compose.",
+        },
+        HelpEntry {
+            section: "Compose",
+            key: "S",
+            description: "Save draft in compose.",
+        },
+        HelpEntry {
+            section: "Compose",
+            key: "x",
+            description: "Discard draft or changes in compose.",
+        },
+        HelpEntry {
+            section: "Compose",
+            key: "D",
+            description: "Delete the opened local draft in compose.",
+        },
+        HelpEntry {
+            section: "Menus",
+            key: "Message menu",
+            description: "Choose which message in a thread is selected.",
+        },
+        HelpEntry {
+            section: "Menus",
+            key: "View menu",
+            description: "Switch between text, HTML, headers, and raw source.",
+        },
+        HelpEntry {
+            section: "Menus",
+            key: "Copy menu",
+            description: "Copy message/thread IDs and selected message fields.",
+        },
+        HelpEntry {
+            section: "Menus",
+            key: "Attachment right-click",
+            description: "Save or open a selected thread attachment.",
+        },
+    ]
+}
+
+fn command_help_entries() -> &'static [HelpEntry] {
+    &[
+        HelpEntry {
+            section: "Search commands",
+            key: ":search",
+            description: "Run the query currently typed in the search field.",
+        },
+        HelpEntry {
+            section: "Search commands",
+            key: ":inbox",
+            description: "Open the Inbox saved search.",
+        },
+        HelpEntry {
+            section: "Search commands",
+            key: ":unread",
+            description: "Open the Unread saved search.",
+        },
+        HelpEntry {
+            section: "Search commands",
+            key: ":flagged",
+            description: "Open the Flagged saved search.",
+        },
+        HelpEntry {
+            section: "Search commands",
+            key: ":sent",
+            description: "Open the Sent saved search.",
+        },
+        HelpEntry {
+            section: "Search commands",
+            key: ":drafts",
+            description: "Open the Drafts saved search.",
+        },
+        HelpEntry {
+            section: "Search commands",
+            key: ":all",
+            description: "Open the All saved search.",
+        },
+        HelpEntry {
+            section: "Search commands",
+            key: ":manual_sync",
+            description: "Run the configured manual Sync action when Sync is enabled.",
+        },
+        HelpEntry {
+            section: "Compose and response commands",
+            key: ":compose",
+            description: "Compose a new message.",
+        },
+        HelpEntry {
+            section: "Compose and response commands",
+            key: ":reply",
+            description: "Reply to the selected message.",
+        },
+        HelpEntry {
+            section: "Compose and response commands",
+            key: ":reply_all",
+            description: "Reply to all recipients on the selected message.",
+        },
+        HelpEntry {
+            section: "Compose and response commands",
+            key: ":forward",
+            description: "Forward the selected message inline.",
+        },
+        HelpEntry {
+            section: "Compose and response commands",
+            key: ":forward_as_attachment",
+            description: "Forward the selected message as a message/rfc822 attachment.",
+        },
+        HelpEntry {
+            section: "Thread action commands",
+            key: ":archive",
+            description: "Remove the inbox tag from the selected thread(s).",
+        },
+        HelpEntry {
+            section: "Thread action commands",
+            key: ":mark_read",
+            description: "Remove the unread tag from the selected thread(s).",
+        },
+        HelpEntry {
+            section: "Thread action commands",
+            key: ":mark_unread",
+            description: "Add the unread tag to the selected thread(s).",
+        },
+        HelpEntry {
+            section: "Thread action commands",
+            key: ":flag",
+            description: "Add the flagged tag to the selected thread(s).",
+        },
+        HelpEntry {
+            section: "Thread action commands",
+            key: ":unflag",
+            description: "Remove the flagged tag from the selected thread(s).",
+        },
+        HelpEntry {
+            section: "Thread action commands",
+            key: ":trash",
+            description: "Move the selected thread(s) to trash.",
+        },
+        HelpEntry {
+            section: "Thread action commands",
+            key: ":undo",
+            description: "Undo the last tag operation.",
+        },
+        HelpEntry {
+            section: "Thread action commands",
+            key: ":visual_select",
+            description: "Start visual thread selection from the selected row.",
+        },
+        HelpEntry {
+            section: "Thread action commands",
+            key: ":clear_visual_selection",
+            description: "Clear the current visual thread selection.",
+        },
+        HelpEntry {
+            section: "Message view commands",
+            key: ":text",
+            description: "Show the rendered text view for the selected message.",
+        },
+        HelpEntry {
+            section: "Message view commands",
+            key: ":visual_html",
+            description: "Show the sanitized visual HTML view for the selected message.",
+        },
+        HelpEntry {
+            section: "Message view commands",
+            key: ":full_headers",
+            description: "Show full message headers.",
+        },
+        HelpEntry {
+            section: "Message view commands",
+            key: ":raw_source",
+            description: "Show the raw message source.",
+        },
+        HelpEntry {
+            section: "Message view commands",
+            key: ":image_policy",
+            description: "Open the remote-image policy action for the current HTML message.",
+        },
+        HelpEntry {
+            section: "Message view commands",
+            key: ":load_images_once",
+            description: "Load remote images once for the current HTML message.",
+        },
+        HelpEntry {
+            section: "Message view commands",
+            key: ":trust_sender_images",
+            description: "Always load remote images from this sender.",
+        },
+        HelpEntry {
+            section: "Message view commands",
+            key: ":collapse_quotes",
+            description: "Toggle collapsed quoted text.",
+        },
+        HelpEntry {
+            section: "Thread list display commands",
+            key: ":nu / :number",
+            description: "Show thread numbers.",
+        },
+        HelpEntry {
+            section: "Thread list display commands",
+            key: ":nonu / :nonumber",
+            description: "Hide thread numbers.",
+        },
+        HelpEntry {
+            section: "Thread list display commands",
+            key: ":date / :dates",
+            description: "Show dates in the thread list.",
+        },
+        HelpEntry {
+            section: "Thread list display commands",
+            key: ":nodate / :nodates",
+            description: "Hide dates in the thread list.",
+        },
+        HelpEntry {
+            section: "Thread list display commands",
+            key: ":tags",
+            description: "Show tags in the thread list.",
+        },
+        HelpEntry {
+            section: "Thread list display commands",
+            key: ":notags",
+            description: "Hide tags in the thread list.",
+        },
+        HelpEntry {
+            section: "Thread list display commands",
+            key: ":preview",
+            description: "Show body previews in the thread list.",
+        },
+        HelpEntry {
+            section: "Thread list display commands",
+            key: ":nopreview",
+            description: "Hide body previews in the thread list.",
+        },
+        HelpEntry {
+            section: "Attachment and copy commands",
+            key: ":save_attachment",
+            description: "Save the selected attachment.",
+        },
+        HelpEntry {
+            section: "Attachment and copy commands",
+            key: ":open_attachment",
+            description: "Open the selected attachment.",
+        },
+        HelpEntry {
+            section: "Attachment and copy commands",
+            key: ":copy_message_id",
+            description: "Copy the selected message id.",
+        },
+        HelpEntry {
+            section: "Attachment and copy commands",
+            key: ":copy_thread_id",
+            description: "Copy the selected thread id.",
+        },
+        HelpEntry {
+            section: "Application commands",
+            key: ":debug",
+            description: "Toggle the debug panel.",
+        },
+        HelpEntry {
+            section: "Application commands",
+            key: ":settings",
+            description: "Open Settings.",
+        },
+        HelpEntry {
+            section: "Application commands",
+            key: ":help / :shortcuts / :commands",
+            description: "Open this help window.",
+        },
     ]
 }
 
