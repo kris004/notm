@@ -42,15 +42,6 @@ pub fn css() -> &'static str {
     }
     #notm-thread-list row.unread label,
     #notm-thread-list .unread label { font-weight: 700; }
-    #notm-thread-list .notm-thread-row.unread .notm-thread-title {
-        color: @theme_selected_bg_color;
-        font-weight: 800;
-    }
-    #notm-thread-list .notm-thread-row.unread .notm-thread-number,
-    #notm-thread-list .notm-thread-row.unread .notm-thread-date {
-        color: @theme_selected_bg_color;
-        opacity: .95;
-    }
     #notm-thread-list row:selected .notm-thread-row.unread,
     #notm-thread-list .notm-thread-row.unread.notm-visual-selected,
     #notm-thread-list .notm-thread-row.unread.notm-multi-selected {
