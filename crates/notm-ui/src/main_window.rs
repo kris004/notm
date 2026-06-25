@@ -88,6 +88,10 @@ pub struct LaunchOptions {
     pub show_debug_panel: bool,
     pub start_maximized: bool,
     pub remote_images: bool,
+    pub show_thread_numbers: bool,
+    pub show_thread_dates: bool,
+    pub show_thread_tags: bool,
+    pub show_thread_preview: bool,
     pub html_mode: String,
     pub trusted_image_senders: Vec<String>,
     pub hidden_tag_searches: Vec<String>,
@@ -141,6 +145,10 @@ impl Default for LaunchOptions {
             show_debug_panel: false,
             start_maximized: false,
             remote_images: false,
+            show_thread_numbers: true,
+            show_thread_dates: true,
+            show_thread_tags: true,
+            show_thread_preview: true,
             html_mode: "sanitize_then_render_text_fallback".to_string(),
             trusted_image_senders: Vec::new(),
             hidden_tag_searches: Vec::new(),
@@ -159,7 +167,19 @@ pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
         app_builder = app_builder.flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
     }
     let app = app_builder.build();
-    app.connect_activate(move |app| build_ui(app, options.clone()));
+    let main_window = Rc::new(RefCell::new(None::<gtk::ApplicationWindow>));
+    app.connect_activate(move |app| {
+        if !options.automation_enabled
+            && let Some(window) = main_window.borrow().as_ref()
+        {
+            window.present();
+            return;
+        }
+        let window = build_ui(app, options.clone());
+        if !options.automation_enabled {
+            *main_window.borrow_mut() = Some(window);
+        }
+    });
     app.run_with_args(&["notm"]);
     Ok(())
 }
@@ -374,7 +394,36 @@ const HTML_LINK_STATUS_URI_MAX_CHARS: usize = 96;
 const THREAD_ROW_PREFIX: &str = "thread";
 const THREAD_STATUS_PREFIX: &str = "status";
 
-fn build_ui(app: &gtk::Application, options: LaunchOptions) {
+#[derive(Debug, Clone, Copy)]
+struct ThreadListDisplay {
+    numbers: bool,
+    dates: bool,
+    tags: bool,
+    preview: bool,
+}
+
+impl ThreadListDisplay {
+    fn from_state(state: &UiState) -> Self {
+        Self {
+            numbers: state.show_thread_numbers,
+            dates: state.show_thread_dates,
+            tags: state.show_thread_tags,
+            preview: state.show_thread_preview,
+        }
+    }
+
+    fn token_bits(self) -> String {
+        format!(
+            "{}{}{}{}",
+            if self.numbers { 1 } else { 0 },
+            if self.dates { 1 } else { 0 },
+            if self.tags { 1 } else { 0 },
+            if self.preview { 1 } else { 0 }
+        )
+    }
+}
+
+fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationWindow {
     install_css();
 
     let initial_state = UiState {
@@ -386,6 +435,10 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
             .as_ref()
             .map(|p| p.display().to_string()),
         prefer_html_view: options.html_mode == "visual_html_preferred",
+        show_thread_numbers: options.show_thread_numbers,
+        show_thread_dates: options.show_thread_dates,
+        show_thread_tags: options.show_thread_tags,
+        show_thread_preview: options.show_thread_preview,
         trusted_image_senders: normalize_sender_list(&options.trusted_image_senders),
         compose_fields: ComposeFields {
             from: identity(&options)
@@ -1193,6 +1246,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) {
         });
     }
     update_debug(&widgets, &state);
+    window
 }
 
 fn built_in_saved_searches() -> Vec<SavedSearch> {
@@ -4104,7 +4158,7 @@ fn thread_list_factory(state: &SharedState) -> gtk::SignalListItemFactory {
 }
 
 fn thread_row_widget_for_index(state: &SharedState, index: usize) -> Option<gtk::Widget> {
-    let (thread, detail, absolute_index, show_thread_numbers, visual_selected) = {
+    let (thread, detail, absolute_index, display, visual_selected) = {
         let state = state.borrow();
         let thread = state.thread_list_items.get(index)?.clone();
         let detail = state
@@ -4113,22 +4167,16 @@ fn thread_row_widget_for_index(state: &SharedState, index: usize) -> Option<gtk:
             .cloned()
             .unwrap_or_default();
         let absolute_index = state.thread_window_offset + index;
-        let show_thread_numbers = state.show_thread_numbers;
+        let display = ThreadListDisplay::from_state(&state);
         let visual_selected = visual_selection_range_from_state(&state)
             .is_some_and(|(start, end)| (start..=end).contains(&absolute_index));
-        (
-            thread,
-            detail,
-            absolute_index,
-            show_thread_numbers,
-            visual_selected,
-        )
+        (thread, detail, absolute_index, display, visual_selected)
     };
     Some(
         thread_row_widget(
             index,
             absolute_index,
-            show_thread_numbers,
+            display,
             &thread,
             &detail,
             visual_selected,
@@ -4193,11 +4241,11 @@ fn clear_thread_model(widgets: &Widgets) {
     }
 }
 
-fn thread_row_token(index: usize, visual_selected: bool, show_thread_numbers: bool) -> String {
+fn thread_row_token(index: usize, visual_selected: bool, display: ThreadListDisplay) -> String {
     format!(
         "{THREAD_ROW_PREFIX}|{index}|{}|{}",
         if visual_selected { 1 } else { 0 },
-        if show_thread_numbers { 1 } else { 0 }
+        display.token_bits()
     )
 }
 
@@ -4214,7 +4262,7 @@ fn parse_thread_model_row(token: &str) -> Option<ThreadModelRow> {
         THREAD_ROW_PREFIX => {
             let index = parts.next()?.parse::<usize>().ok()?;
             let _visual_selected = parts.next();
-            let _show_thread_numbers = parts.next();
+            let _display_bits = parts.next();
             Some(ThreadModelRow::Thread { index })
         }
         THREAD_STATUS_PREFIX => {
@@ -8521,6 +8569,7 @@ fn append_thread_model_rows(widgets: &Widgets, state: &SharedState, start: usize
     let tokens = {
         let state = state.borrow();
         let range = visual_selection_range_from_state(&state);
+        let display = ThreadListDisplay::from_state(&state);
         (start..start.saturating_add(count))
             .filter_map(|index| {
                 state.thread_list_items.get(index)?;
@@ -8528,7 +8577,7 @@ fn append_thread_model_rows(widgets: &Widgets, state: &SharedState, start: usize
                 Some(thread_row_token(
                     index,
                     range.is_some_and(|(start, end)| (start..=end).contains(&absolute_index)),
-                    state.show_thread_numbers,
+                    display,
                 ))
             })
             .collect::<Vec<_>>()
@@ -8544,6 +8593,7 @@ fn refresh_thread_model_rows(widgets: &Widgets, state: &SharedState, indices: &[
     let tokens = {
         let state = state.borrow();
         let range = visual_selection_range_from_state(&state);
+        let display = ThreadListDisplay::from_state(&state);
         indices
             .iter()
             .filter_map(|index| {
@@ -8554,7 +8604,7 @@ fn refresh_thread_model_rows(widgets: &Widgets, state: &SharedState, indices: &[
                     thread_row_token(
                         *index,
                         range.is_some_and(|(start, end)| (start..=end).contains(&absolute_index)),
-                        state.show_thread_numbers,
+                        display,
                     ),
                 ))
             })
@@ -8666,6 +8716,7 @@ fn update_visual_selection_rows(widgets: &Widgets, state: &SharedState) {
     let tokens = {
         let state = state.borrow();
         let range = visual_selection_range_from_state(&state);
+        let display = ThreadListDisplay::from_state(&state);
         state
             .thread_list_items
             .iter()
@@ -8675,7 +8726,7 @@ fn update_visual_selection_rows(widgets: &Widgets, state: &SharedState) {
                 thread_row_token(
                     index,
                     range.is_some_and(|(start, end)| (start..=end).contains(&absolute_index)),
-                    state.show_thread_numbers,
+                    display,
                 )
             })
             .collect::<Vec<_>>()
@@ -8701,19 +8752,55 @@ fn update_visual_selection_rows(widgets: &Widgets, state: &SharedState) {
 }
 
 fn set_thread_numbers_visible(widgets: &Widgets, state: &SharedState, visible: bool) {
-    state.borrow_mut().show_thread_numbers = visible;
+    set_thread_display_visible(widgets, state, ThreadDisplayToggle::Numbers, visible);
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ThreadDisplayToggle {
+    Numbers,
+    Dates,
+    Tags,
+    Preview,
+}
+
+impl ThreadDisplayToggle {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Numbers => "Thread numbers",
+            Self::Dates => "Thread dates",
+            Self::Tags => "Thread tags",
+            Self::Preview => "Thread preview",
+        }
+    }
+}
+
+fn set_thread_display_visible(
+    widgets: &Widgets,
+    state: &SharedState,
+    toggle: ThreadDisplayToggle,
+    visible: bool,
+) {
+    {
+        let mut state = state.borrow_mut();
+        match toggle {
+            ThreadDisplayToggle::Numbers => state.show_thread_numbers = visible,
+            ThreadDisplayToggle::Dates => state.show_thread_dates = visible,
+            ThreadDisplayToggle::Tags => state.show_thread_tags = visible,
+            ThreadDisplayToggle::Preview => state.show_thread_preview = visible,
+        }
+    }
     update_visual_selection_rows(widgets, state);
-    widgets.status_label.set_text(if visible {
-        "Thread numbers on"
-    } else {
-        "Thread numbers off"
-    });
+    widgets.status_label.set_text(&format!(
+        "{} {}",
+        toggle.label(),
+        if visible { "on" } else { "off" }
+    ));
 }
 
 fn thread_row_widget(
     idx: usize,
     absolute_index: usize,
-    show_thread_numbers: bool,
+    display: ThreadListDisplay,
     thread: &notm_notmuch::ThreadSummary,
     detail: &ThreadUiDetails,
     visual_selected: bool,
@@ -8737,7 +8824,7 @@ fn thread_row_widget(
     row_content.set_margin_end(6);
     row_content.set_margin_top(6);
     row_content.set_margin_bottom(6);
-    if show_thread_numbers {
+    if display.numbers {
         let number = gtk::Label::new(Some(&format!("{}.", format_count(absolute_index + 1))));
         number.set_widget_name(&format!("notm-thread-number-{idx}"));
         number.set_xalign(0.0);
@@ -8768,22 +8855,33 @@ fn thread_row_widget(
     let meta_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     meta_row.set_hexpand(true);
     meta_row.set_halign(gtk::Align::Fill);
-    let date = gtk::Label::new(Some(&format_thread_list_date(thread.newest_date)));
-    date.set_widget_name(&format!("notm-thread-date-{idx}"));
-    date.set_width_chars(16);
-    date.set_xalign(1.0);
-    date.set_yalign(0.0);
-    date.set_valign(gtk::Align::Start);
-    date.add_css_class("dim-label");
-    date.add_css_class("monospace");
-    date.add_css_class("notm-thread-date");
-    let meta = gtk::Label::new(Some(&format!(
-        "{}  ·  {}/{}  ·  {}",
-        thread.authors,
-        thread.matched_messages,
-        thread.total_messages,
-        thread.tags.join(" ")
-    )));
+    if display.dates {
+        let date = gtk::Label::new(Some(&format_thread_list_date(thread.newest_date)));
+        date.set_widget_name(&format!("notm-thread-date-{idx}"));
+        date.set_width_chars(16);
+        date.set_xalign(1.0);
+        date.set_yalign(0.0);
+        date.set_valign(gtk::Align::Start);
+        date.add_css_class("dim-label");
+        date.add_css_class("monospace");
+        date.add_css_class("notm-thread-date");
+        meta_row.append(&date);
+    }
+    let meta_text = if display.tags {
+        format!(
+            "{}  ·  {}/{}  ·  {}",
+            thread.authors,
+            thread.matched_messages,
+            thread.total_messages,
+            thread.tags.join(" ")
+        )
+    } else {
+        format!(
+            "{}  ·  {}/{}",
+            thread.authors, thread.matched_messages, thread.total_messages
+        )
+    };
+    let meta = gtk::Label::new(Some(&meta_text));
     meta.set_widget_name(&format!("notm-thread-meta-{idx}"));
     meta.set_xalign(0.0);
     meta.set_hexpand(true);
@@ -8791,10 +8889,9 @@ fn thread_row_widget(
     meta.add_css_class("dim-label");
     meta.set_wrap(true);
     content.append(&title);
-    meta_row.append(&date);
     meta_row.append(&meta);
     content.append(&meta_row);
-    if !detail.preview.is_empty() {
+    if display.preview && !detail.preview.is_empty() {
         let preview = gtk::Label::new(Some(&detail.preview));
         preview.set_widget_name(&format!("notm-thread-preview-{idx}"));
         preview.set_xalign(0.0);
@@ -11300,6 +11397,9 @@ fn handle_automation_request(
                         "matched_messages": thread.matched_messages,
                         "total_messages": thread.total_messages,
                         "tags": &thread.tags,
+                        "show_thread_dates": state.show_thread_dates,
+                        "show_thread_tags": state.show_thread_tags,
+                        "show_thread_preview": state.show_thread_preview,
                     })
                 })
                 .collect::<Vec<_>>();
@@ -11670,6 +11770,30 @@ fn run_named_command(
             set_thread_numbers_visible(widgets, state, false);
             json!({"ok": true, "show_thread_numbers": state.borrow().show_thread_numbers})
         }
+        "date" | "dates" => {
+            set_thread_display_visible(widgets, state, ThreadDisplayToggle::Dates, true);
+            json!({"ok": true, "show_thread_dates": state.borrow().show_thread_dates})
+        }
+        "nodate" | "nodates" => {
+            set_thread_display_visible(widgets, state, ThreadDisplayToggle::Dates, false);
+            json!({"ok": true, "show_thread_dates": state.borrow().show_thread_dates})
+        }
+        "tags" => {
+            set_thread_display_visible(widgets, state, ThreadDisplayToggle::Tags, true);
+            json!({"ok": true, "show_thread_tags": state.borrow().show_thread_tags})
+        }
+        "notags" => {
+            set_thread_display_visible(widgets, state, ThreadDisplayToggle::Tags, false);
+            json!({"ok": true, "show_thread_tags": state.borrow().show_thread_tags})
+        }
+        "preview" => {
+            set_thread_display_visible(widgets, state, ThreadDisplayToggle::Preview, true);
+            json!({"ok": true, "show_thread_preview": state.borrow().show_thread_preview})
+        }
+        "nopreview" => {
+            set_thread_display_visible(widgets, state, ThreadDisplayToggle::Preview, false);
+            json!({"ok": true, "show_thread_preview": state.borrow().show_thread_preview})
+        }
         "save_attachment" => match save_selected_attachment(widgets, state, 0, None) {
             Ok(path) => json!({"ok": true, "path": path}),
             Err(err) => json!({"ok": false, "error": err.to_string()}),
@@ -11900,6 +12024,14 @@ fn command_name_candidates() -> &'static [&'static str] {
         "nonu",
         "number",
         "nonumber",
+        "date",
+        "nodate",
+        "dates",
+        "nodates",
+        "tags",
+        "notags",
+        "preview",
+        "nopreview",
         "save_attachment",
         "open_attachment",
         "copy_message_id",
@@ -12101,6 +12233,17 @@ fn show_shortcuts_overlay(widgets: &Widgets) {
         }
     });
     dialog.add_button("Close", gtk::ResponseType::Close);
+    let key_controller = gtk::EventControllerKey::new();
+    key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let dialog_for_keys = dialog.clone();
+    key_controller.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            dialog_for_keys.close();
+            return gtk::glib::Propagation::Stop;
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    dialog.add_controller(key_controller);
     dialog.connect_response(|dialog, _| dialog.close());
     dialog.present();
     search.grab_focus();
@@ -12131,7 +12274,7 @@ fn command_palette_commands() -> &'static [&'static str] {
         "archive, mark_read, mark_unread, flag, unflag, trash, undo",
         "visual_select, clear_visual_selection",
         "raw_source, full_headers, text, visual_html, image_policy, collapse_quotes",
-        "nu, nonu (show/hide thread numbers)",
+        "nu/nonu, date/nodate, tags/notags, preview/nopreview (thread list columns)",
         "save_attachment, open_attachment",
         "copy_message_id, copy_thread_id",
         "debug, settings, shortcuts, manual_sync (if Sync is enabled)",
@@ -12272,6 +12415,30 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
         "Thread preview lines",
         &toml_usize(&existing, "ui", "thread_preview_lines", 2).to_string(),
         "Stored preview-line preference. Relaunch required for all effects.",
+    );
+    let show_thread_numbers = settings_check_row(
+        &form,
+        "Show thread numbers",
+        options.show_thread_numbers,
+        "Show message numbers in the thread list. Runtime command: :nu or :nonu.",
+    );
+    let show_thread_dates = settings_check_row(
+        &form,
+        "Show thread dates",
+        options.show_thread_dates,
+        "Show newest-message dates in the thread list. Runtime command: :date or :nodate.",
+    );
+    let show_thread_tags = settings_check_row(
+        &form,
+        "Show thread tags",
+        options.show_thread_tags,
+        "Show tags in the thread list metadata line. Runtime command: :tags or :notags.",
+    );
+    let show_thread_preview = settings_check_row(
+        &form,
+        "Show body preview",
+        options.show_thread_preview,
+        "Show message body previews in the thread list. Runtime command: :preview or :nopreview.",
     );
     let html_mode = settings_combo_row(
         &form,
@@ -12555,6 +12722,10 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
                 theme: combo_active_id(&theme),
                 page_size: page_size.text().parse::<usize>().unwrap_or(opts.page_size),
                 thread_preview_lines: thread_preview_lines.text().parse::<usize>().unwrap_or(2),
+                show_thread_numbers: show_thread_numbers.is_active(),
+                show_thread_dates: show_thread_dates.is_active(),
+                show_thread_tags: show_thread_tags.is_active(),
+                show_thread_preview: show_thread_preview.is_active(),
                 html_mode: combo_active_id(&html_mode),
                 start_maximized: start_maximized.is_active(),
                 show_debug_panel: show_debug_panel.is_active(),
@@ -12618,6 +12789,10 @@ struct SettingsValues {
     theme: String,
     page_size: usize,
     thread_preview_lines: usize,
+    show_thread_numbers: bool,
+    show_thread_dates: bool,
+    show_thread_tags: bool,
+    show_thread_preview: bool,
     html_mode: String,
     start_maximized: bool,
     show_debug_panel: bool,
@@ -12993,6 +13168,20 @@ fn persist_settings_values(options: &LaunchOptions, values: &SettingsValues) -> 
         "ui",
         "thread_preview_lines",
         values.thread_preview_lines as i64,
+    );
+    set_bool(
+        root,
+        "ui",
+        "show_thread_numbers",
+        values.show_thread_numbers,
+    );
+    set_bool(root, "ui", "show_thread_dates", values.show_thread_dates);
+    set_bool(root, "ui", "show_thread_tags", values.show_thread_tags);
+    set_bool(
+        root,
+        "ui",
+        "show_thread_preview",
+        values.show_thread_preview,
     );
     set_string(root, "ui", "html_mode", &values.html_mode);
     set_bool(root, "ui", "start_maximized", values.start_maximized);

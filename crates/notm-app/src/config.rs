@@ -70,6 +70,14 @@ pub struct UiConfig {
     pub page_size: usize,
     #[serde(default = "default_thread_preview_lines")]
     pub thread_preview_lines: usize,
+    #[serde(default = "default_true")]
+    pub show_thread_numbers: bool,
+    #[serde(default = "default_true")]
+    pub show_thread_dates: bool,
+    #[serde(default = "default_true")]
+    pub show_thread_tags: bool,
+    #[serde(default = "default_true")]
+    pub show_thread_preview: bool,
     #[serde(default)]
     pub remote_images: bool,
     #[serde(default)]
@@ -98,6 +106,10 @@ impl Default for UiConfig {
             theme: "system".to_string(),
             page_size: 100,
             thread_preview_lines: 2,
+            show_thread_numbers: true,
+            show_thread_dates: true,
+            show_thread_tags: true,
+            show_thread_preview: true,
             remote_images: false,
             trusted_image_senders: Vec::new(),
             html_mode: "sanitize_then_render_text_fallback".to_string(),

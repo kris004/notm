@@ -11,7 +11,10 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("<count>j/k", "Move selected thread by count"),
     ("gg/G", "Top/bottom of the thread list or active pane"),
     ("<count>gg/G", "Load up to that thread number and select it"),
-    (":nu/:nonu", "Show/hide thread numbers"),
+    (
+        ":nu/:nonu",
+        "Show/hide thread numbers; also :date/:nodate, :tags/:notags, :preview/:nopreview",
+    ),
     (
         "Ctrl+d/u",
         "Half page down/up through threads or active pane",
