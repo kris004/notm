@@ -7,7 +7,9 @@ pub fn sanitize_html(html: &str) -> String {
             "script", "style", "iframe", "object", "embed", "link", "meta",
         ])
         .url_schemes(["http", "https", "mailto"].into_iter().collect())
+        .add_tags(&["font"])
         .add_generic_attributes(&["style"])
+        .add_tag_attributes("font", &["size"])
         .add_tag_attributes(
             "table",
             &[
@@ -25,8 +27,10 @@ pub fn sanitize_html(html: &str) -> String {
         .add_tag_attributes("tr", &["width", "height", "bgcolor", "valign"])
         .add_tag_attributes("td", &["width", "height", "bgcolor", "valign"])
         .add_tag_attributes("th", &["width", "height", "bgcolor", "valign"])
-        .attribute_filter(|_, attr, value| {
-            if attr == "style" && style_value_looks_dangerous(value) {
+        .attribute_filter(|element, attr, value| {
+            if (attr == "style" && style_value_looks_dangerous(value))
+                || (element == "font" && attr == "size" && !font_size_value_is_safe(value))
+            {
                 None
             } else {
                 Some(value.into())
@@ -106,6 +110,14 @@ fn style_value_looks_dangerous(value: &str) -> bool {
     .any(|needle| value.contains(needle))
 }
 
+fn font_size_value_is_safe(value: &str) -> bool {
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix(['+', '-']) {
+        return matches!(rest, "1" | "2" | "3" | "4" | "5" | "6" | "7");
+    }
+    matches!(value, "1" | "2" | "3" | "4" | "5" | "6" | "7")
+}
+
 #[cfg(test)]
 mod tests {
     use super::sanitize_html;
@@ -138,5 +150,24 @@ mod tests {
         assert!(!sanitized.contains("url("));
         assert!(!sanitized.contains("style="));
         assert!(sanitized.contains(">Hello</div>"));
+    }
+
+    #[test]
+    fn preserves_legacy_font_size_markup_from_html_mail() {
+        let sanitized = sanitize_html(
+            r#"<div><font size="6">Large</font><font size="4">Medium</font><font size="1">Small</font></div>"#,
+        );
+
+        assert!(sanitized.contains(r#"<font size="6">Large</font>"#));
+        assert!(sanitized.contains(r#"<font size="4">Medium</font>"#));
+        assert!(sanitized.contains(r#"<font size="1">Small</font>"#));
+    }
+
+    #[test]
+    fn drops_unbounded_legacy_font_size_values() {
+        let sanitized = sanitize_html(r#"<font size="999999">Huge</font>"#);
+
+        assert!(sanitized.contains("<font>Huge</font>"));
+        assert!(!sanitized.contains("999999"));
     }
 }

@@ -87,6 +87,9 @@ pub struct LaunchOptions {
     pub automation_token: Option<String>,
     pub show_debug_panel: bool,
     pub start_maximized: bool,
+    pub show_sidebar: bool,
+    pub show_message_list: bool,
+    pub show_message_view: bool,
     pub remote_images: bool,
     pub show_thread_numbers: bool,
     pub show_thread_dates: bool,
@@ -144,6 +147,9 @@ impl Default for LaunchOptions {
             automation_token: None,
             show_debug_panel: false,
             start_maximized: false,
+            show_sidebar: true,
+            show_message_list: true,
+            show_message_view: true,
             remote_images: false,
             show_thread_numbers: true,
             show_thread_dates: true,
@@ -188,6 +194,8 @@ pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
 struct Widgets {
     window: gtk::ApplicationWindow,
     overlay: gtk::Overlay,
+    outer_paned: gtk::Paned,
+    content_paned: gtk::Paned,
     left_pane: gtk::ScrolledWindow,
     thread_pane: gtk::Box,
     message_pane: gtk::Box,
@@ -216,6 +224,10 @@ struct Widgets {
     palette_button: gtk::Button,
     settings_button: gtk::Button,
     help_button: gtk::Button,
+    sidebar_toggle_button: gtk::ToggleButton,
+    thread_list_toggle_button: gtk::ToggleButton,
+    message_pane_toggle_button: gtk::ToggleButton,
+    pane_toggle_syncing: Rc<Cell<bool>>,
     archive_button: gtk::Button,
     read_toggle_button: gtk::Button,
     flag_toggle_button: gtk::Button,
@@ -470,11 +482,18 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
     }
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let top_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    top_bar.set_widget_name("notm-top-bar");
+    top_bar.set_margin_start(8);
+    top_bar.set_margin_end(8);
+    top_bar.set_margin_top(8);
+    top_bar.set_margin_bottom(8);
     let toolbar = button_flow(8);
-    toolbar.set_margin_start(8);
-    toolbar.set_margin_end(8);
-    toolbar.set_margin_top(8);
-    toolbar.set_margin_bottom(8);
+    toolbar.set_hexpand(true);
+    let view_controls = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    view_controls.set_widget_name("notm-pane-toggle-bar");
+    view_controls.set_halign(gtk::Align::End);
+    view_controls.set_valign(gtk::Align::Center);
 
     let compose_button = gtk::Button::with_label("Compose");
     compose_button.set_widget_name("notm-compose-button");
@@ -482,6 +501,21 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
     let palette_button = gtk::Button::with_label("Commands");
     let settings_button = gtk::Button::with_label("Settings");
     let help_button = gtk::Button::with_label("Help");
+    let sidebar_toggle_button = pane_toggle_button(
+        "sidebar-show-symbolic",
+        "notm-sidebar-toggle-button",
+        "Show/hide sidebar (Ctrl+1)",
+    );
+    let thread_list_toggle_button = pane_toggle_button(
+        "view-list-symbolic",
+        "notm-thread-list-toggle-button",
+        "Show/hide message list (Ctrl+2)",
+    );
+    let message_pane_toggle_button = pane_toggle_button(
+        "sidebar-show-right-symbolic",
+        "notm-message-pane-toggle-button",
+        "Show/hide message view (Ctrl+3)",
+    );
     for b in [
         &compose_button,
         &debug_button,
@@ -491,7 +525,12 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
     ] {
         toolbar.insert(b, -1);
     }
-    root.append(&toolbar);
+    view_controls.append(&sidebar_toggle_button);
+    view_controls.append(&thread_list_toggle_button);
+    view_controls.append(&message_pane_toggle_button);
+    top_bar.append(&toolbar);
+    top_bar.append(&view_controls);
+    root.append(&top_bar);
 
     let left = gtk::Box::new(gtk::Orientation::Vertical, 6);
     left.set_widget_name("notm-left-sidebar-content");
@@ -519,32 +558,38 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
     let saved_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     saved_box.set_widget_name("notm-saved-searches");
     left.append(&saved_box);
-    let (custom_search_button, custom_search_box) = menu_button_with_box(
-        "Add custom search",
-        "notm-custom-search-menu-button",
-        &state,
-    );
-    let saved_editor_title = gtk::Label::new(Some("Custom saved search"));
+    let (custom_search_button, custom_search_box) =
+        menu_button_with_box("Save", "notm-custom-search-menu-button", &state);
+    custom_search_button.set_tooltip_text(Some(
+        "Save the current search as a sidebar shortcut (Ctrl+s).",
+    ));
+    custom_search_box.set_spacing(6);
+    custom_search_box.set_margin_start(6);
+    custom_search_box.set_margin_end(6);
+    custom_search_box.set_margin_top(6);
+    custom_search_box.set_margin_bottom(6);
+    let saved_editor_title = gtk::Label::new(Some("Save current search"));
     saved_editor_title.set_xalign(0.0);
     saved_editor_title.add_css_class("dim-label");
     saved_editor_title.set_wrap(true);
     custom_search_box.append(&saved_editor_title);
+    let saved_editor_help = gtk::Label::new(Some("Enter a name for the search bar query."));
+    saved_editor_help.set_xalign(0.0);
+    saved_editor_help.add_css_class("dim-label");
+    saved_editor_help.set_wrap(true);
+    custom_search_box.append(&saved_editor_help);
     let saved_name_entry = entry_with_placeholder("Name");
     saved_name_entry.set_widget_name("notm-saved-search-name");
-    saved_name_entry.set_width_chars(10);
-    saved_name_entry.set_max_width_chars(10);
+    saved_name_entry.set_width_chars(18);
     let saved_query_entry = entry_with_placeholder("Query");
     saved_query_entry.set_widget_name("notm-saved-search-query");
-    saved_query_entry.set_width_chars(10);
-    saved_query_entry.set_max_width_chars(10);
+    saved_query_entry.set_visible(false);
     custom_search_box.append(&saved_name_entry);
-    custom_search_box.append(&saved_query_entry);
     let saved_editor_buttons = gtk::Box::new(gtk::Orientation::Vertical, 4);
     let save_search_button = gtk::Button::with_label("Save search");
     save_search_button.set_widget_name("notm-save-search-button");
     saved_editor_buttons.append(&save_search_button);
     custom_search_box.append(&saved_editor_buttons);
-    left.append(&custom_search_button);
 
     let tag_title = gtk::Label::new(Some("Tags"));
     tag_title.set_xalign(0.0);
@@ -596,6 +641,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
     search_button.set_widget_name("notm-search-button");
     search_row.append(&search_entry);
     search_row.append(&search_button);
+    search_row.append(&custom_search_button);
     controls_box.append(&search_row);
     controls_box.append(&search_suggestions_list);
     let helper = gtk::Label::new(Some(
@@ -1029,6 +1075,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
     let widgets = Widgets {
         window: window.clone(),
         overlay: overlay.clone(),
+        outer_paned: outer_paned.clone(),
+        content_paned: content_paned.clone(),
         left_pane: sidebar_scrolled.clone(),
         thread_pane: middle.clone(),
         message_pane: right.clone(),
@@ -1057,6 +1105,10 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
         palette_button: palette_button.clone(),
         settings_button: settings_button.clone(),
         help_button: help_button.clone(),
+        sidebar_toggle_button: sidebar_toggle_button.clone(),
+        thread_list_toggle_button: thread_list_toggle_button.clone(),
+        message_pane_toggle_button: message_pane_toggle_button.clone(),
+        pane_toggle_syncing: Rc::new(Cell::new(false)),
         archive_button: archive_button.clone(),
         read_toggle_button: read_button.clone(),
         flag_toggle_button: flag_button.clone(),
@@ -1140,6 +1192,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
             .clone()
             .unwrap_or_else(default_drafts_dir),
     };
+    apply_initial_pane_visibility(&options, &widgets, &state);
     update_active_pane_visuals(&widgets, &state);
     update_message_action_buttons(&options, &widgets, &state);
     set_undo_tag_available(&widgets, !undo_state.borrow().is_empty());
@@ -1196,6 +1249,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
         &help_button,
         &send_button,
     );
+    connect_pane_visibility_toggles(&widgets, &state);
     connect_compose_helpers(
         &options,
         &widgets,
@@ -1874,21 +1928,57 @@ fn connect_saved_search_editor(
     saved_store: &SavedSearchStore,
     save_search_button: &gtk::Button,
 ) {
+    if let Some(popover) = widgets.custom_search_menu_button.popover() {
+        let w = widgets.clone();
+        let st = state.clone();
+        let store = saved_store.clone();
+        popover.connect_show(move |_| {
+            w.saved_name_entry.set_text("");
+            w.saved_query_entry.set_text(w.search_entry.text().trim());
+            update_saved_search_editor_actions(&w, &st, &store);
+            set_input_mode(
+                &w,
+                &st,
+                InputMode::Insert,
+                "Save current search: enter a name",
+            );
+            w.saved_name_entry.grab_focus();
+        });
+    }
+
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
     let store = saved_store.clone();
     save_search_button.connect_clicked(move |_| {
-        match save_custom_search_from_entries(&opts, &w, &st, &store) {
+        match save_custom_search_from_current_query(&opts, &w, &st, &store) {
             Ok(()) => {
                 w.custom_search_menu_button.popdown();
                 w.status_label.set_text("Saved custom search");
+                enter_normal_mode(&w, &st);
             }
             Err(err) => w
                 .status_label
                 .set_text(&format!("Save search failed: {err}")),
         }
     });
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let store = saved_store.clone();
+    widgets.saved_name_entry.connect_activate(
+        move |_| match save_custom_search_from_current_query(&opts, &w, &st, &store) {
+            Ok(()) => {
+                w.custom_search_menu_button.popdown();
+                w.status_label.set_text("Saved custom search");
+                enter_normal_mode(&w, &st);
+            }
+            Err(err) => w
+                .status_label
+                .set_text(&format!("Save search failed: {err}")),
+        },
+    );
 
     for entry in [
         widgets.saved_name_entry.clone(),
@@ -1916,7 +2006,7 @@ fn update_saved_search_editor_actions(
     saved_store: &SavedSearchStore,
 ) {
     let name = widgets.saved_name_entry.text().trim().to_string();
-    let query = widgets.saved_query_entry.text().trim().to_string();
+    let query = widgets.search_entry.text().trim().to_string();
     let has_values = !name.is_empty() && !query.is_empty();
     let built_in_name = built_in_saved_searches()
         .iter()
@@ -1928,6 +2018,44 @@ fn update_saved_search_editor_actions(
     let save_visible = has_values && changed && !built_in_name;
 
     widgets.save_search_button.set_visible(save_visible);
+}
+
+fn save_custom_search_from_current_query(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    saved_store: &SavedSearchStore,
+) -> anyhow::Result<()> {
+    let query = widgets.search_entry.text().trim().to_string();
+    anyhow::ensure!(!query.is_empty(), "search query is empty");
+    widgets.saved_query_entry.set_text(&query);
+    save_custom_search_from_entries(options, widgets, state, saved_store)
+}
+
+fn open_save_current_search_prompt(
+    widgets: &Widgets,
+    state: &SharedState,
+    saved_store: &SavedSearchStore,
+) {
+    let query = widgets.search_entry.text().trim().to_string();
+    if query.is_empty() {
+        widgets.status_label.set_text("Search query is empty");
+        return;
+    }
+    widgets.saved_name_entry.set_text("");
+    widgets.saved_query_entry.set_text(&query);
+    update_saved_search_editor_actions(widgets, state, saved_store);
+    set_input_mode(
+        widgets,
+        state,
+        InputMode::Insert,
+        "Save current search: enter a name",
+    );
+    widgets.custom_search_menu_button.popup();
+    let entry = widgets.saved_name_entry.clone();
+    gtk::glib::idle_add_local_once(move || {
+        entry.grab_focus();
+    });
 }
 
 fn selected_saved_search_baseline(
@@ -3465,6 +3593,7 @@ fn enter_insert_mode_for_active_pane(widgets: &Widgets, state: &SharedState) {
 }
 
 fn focus_active_pane(widgets: &Widgets, state: &SharedState) {
+    ensure_active_pane_visible(widgets, state);
     update_active_pane_visuals(widgets, state);
     match state.borrow().active_pane {
         ActivePane::Sidebar => {
@@ -3486,6 +3615,11 @@ fn focus_active_pane(widgets: &Widgets, state: &SharedState) {
 }
 
 fn set_active_pane(widgets: &Widgets, state: &SharedState, pane: ActivePane) {
+    let pane = if pane_is_visible(widgets, pane) {
+        pane
+    } else {
+        first_visible_pane(widgets).unwrap_or(pane)
+    };
     state.borrow_mut().active_pane = pane;
     if state.borrow().input_mode == InputMode::Normal {
         focus_active_pane(widgets, state);
@@ -3504,18 +3638,224 @@ fn set_active_pane(widgets: &Widgets, state: &SharedState, pane: ActivePane) {
 }
 
 fn move_active_pane(widgets: &Widgets, state: &SharedState, delta: isize) {
-    let current = match state.borrow().active_pane {
-        ActivePane::Sidebar => 0_i32,
-        ActivePane::Threads => 1,
-        ActivePane::Message => 2,
+    let panes = visible_panes(widgets);
+    let Some(first) = panes.first().copied() else {
+        return;
     };
-    let next = (current + delta as i32).clamp(0, 2);
-    let pane = match next {
-        0 => ActivePane::Sidebar,
-        1 => ActivePane::Threads,
-        _ => ActivePane::Message,
-    };
-    set_active_pane(widgets, state, pane);
+    let current = state.borrow().active_pane;
+    let current_index = panes.iter().position(|pane| *pane == current).unwrap_or(0);
+    let next_index = (current_index as isize + delta).clamp(0, panes.len() as isize - 1) as usize;
+    set_active_pane(
+        widgets,
+        state,
+        panes.get(next_index).copied().unwrap_or(first),
+    );
+}
+
+fn connect_pane_visibility_toggles(widgets: &Widgets, state: &SharedState) {
+    sync_pane_toggle_buttons(widgets);
+
+    {
+        let w = widgets.clone();
+        let st = state.clone();
+        widgets
+            .sidebar_toggle_button
+            .connect_toggled(move |button| {
+                if w.pane_toggle_syncing.get() {
+                    return;
+                }
+                set_pane_visibility_from_toggle(&w, &st, ActivePane::Sidebar, button.is_active());
+            });
+    }
+    {
+        let w = widgets.clone();
+        let st = state.clone();
+        widgets
+            .thread_list_toggle_button
+            .connect_toggled(move |button| {
+                if w.pane_toggle_syncing.get() {
+                    return;
+                }
+                set_pane_visibility_from_toggle(&w, &st, ActivePane::Threads, button.is_active());
+            });
+    }
+    {
+        let w = widgets.clone();
+        let st = state.clone();
+        widgets
+            .message_pane_toggle_button
+            .connect_toggled(move |button| {
+                if w.pane_toggle_syncing.get() {
+                    return;
+                }
+                set_pane_visibility_from_toggle(&w, &st, ActivePane::Message, button.is_active());
+            });
+    }
+}
+
+fn apply_initial_pane_visibility(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    let sidebar = options.show_sidebar;
+    let list = options.show_message_list;
+    let message = options.show_message_view;
+    let any_visible = sidebar || list || message;
+    widgets.left_pane.set_visible(sidebar || !any_visible);
+    widgets.thread_pane.set_visible(list || !any_visible);
+    widgets.message_pane.set_visible(message || !any_visible);
+    ensure_active_pane_visible(widgets, state);
+    sync_pane_toggle_buttons(widgets);
+}
+
+fn set_pane_visibility_from_toggle(
+    widgets: &Widgets,
+    state: &SharedState,
+    pane: ActivePane,
+    visible: bool,
+) {
+    if !visible && visible_panes(widgets).len() <= 1 {
+        widgets
+            .status_label
+            .set_text("At least one pane must stay visible");
+        sync_pane_toggle_buttons(widgets);
+        return;
+    }
+    set_pane_visibility(widgets, state, pane, visible);
+    sync_pane_toggle_buttons(widgets);
+}
+
+fn set_pane_visibility(widgets: &Widgets, state: &SharedState, pane: ActivePane, visible: bool) {
+    match pane {
+        ActivePane::Sidebar => widgets.left_pane.set_visible(visible),
+        ActivePane::Threads => widgets.thread_pane.set_visible(visible),
+        ActivePane::Message => widgets.message_pane.set_visible(visible),
+    }
+    if visible {
+        restore_pane_position(widgets, pane);
+    } else if state.borrow().active_pane == pane {
+        ensure_active_pane_visible(widgets, state);
+    }
+    update_active_pane_visuals(widgets, state);
+    widgets.status_label.set_text(&format!(
+        "{} {}",
+        pane_display_name(pane),
+        if visible { "shown" } else { "hidden" }
+    ));
+    update_debug(widgets, state);
+}
+
+fn sync_pane_toggle_buttons(widgets: &Widgets) {
+    widgets.pane_toggle_syncing.set(true);
+    widgets
+        .sidebar_toggle_button
+        .set_active(pane_is_visible(widgets, ActivePane::Sidebar));
+    widgets
+        .thread_list_toggle_button
+        .set_active(pane_is_visible(widgets, ActivePane::Threads));
+    widgets
+        .message_pane_toggle_button
+        .set_active(pane_is_visible(widgets, ActivePane::Message));
+    widgets.pane_toggle_syncing.set(false);
+}
+
+fn ensure_active_pane_visible(widgets: &Widgets, state: &SharedState) {
+    let active = state.borrow().active_pane;
+    if pane_is_visible(widgets, active) {
+        return;
+    }
+    if let Some(pane) = first_visible_pane(widgets) {
+        state.borrow_mut().active_pane = pane;
+    }
+}
+
+fn pane_is_visible(widgets: &Widgets, pane: ActivePane) -> bool {
+    match pane {
+        ActivePane::Sidebar => widgets.left_pane.is_visible(),
+        ActivePane::Threads => widgets.thread_pane.is_visible(),
+        ActivePane::Message => widgets.message_pane.is_visible(),
+    }
+}
+
+fn visible_panes(widgets: &Widgets) -> Vec<ActivePane> {
+    [
+        ActivePane::Sidebar,
+        ActivePane::Threads,
+        ActivePane::Message,
+    ]
+    .into_iter()
+    .filter(|pane| pane_is_visible(widgets, *pane))
+    .collect()
+}
+
+fn first_visible_pane(widgets: &Widgets) -> Option<ActivePane> {
+    [
+        ActivePane::Threads,
+        ActivePane::Message,
+        ActivePane::Sidebar,
+    ]
+    .into_iter()
+    .find(|pane| pane_is_visible(widgets, *pane))
+}
+
+fn pane_display_name(pane: ActivePane) -> &'static str {
+    match pane {
+        ActivePane::Sidebar => "Sidebar",
+        ActivePane::Threads => "Message list",
+        ActivePane::Message => "Message view",
+    }
+}
+
+fn parse_pane_name(name: &str) -> Option<ActivePane> {
+    match name.trim().replace('-', "_").to_lowercase().as_str() {
+        "sidebar" | "side_bar" => Some(ActivePane::Sidebar),
+        "list" | "message_list" | "thread_list" | "threads" => Some(ActivePane::Threads),
+        "message" | "message_view" | "message_pane" => Some(ActivePane::Message),
+        _ => None,
+    }
+}
+
+fn pane_visibility_json(widgets: &Widgets) -> serde_json::Value {
+    json!({
+        "ok": true,
+        "sidebar": pane_is_visible(widgets, ActivePane::Sidebar),
+        "message_list": pane_is_visible(widgets, ActivePane::Threads),
+        "message_view": pane_is_visible(widgets, ActivePane::Message),
+    })
+}
+
+fn restore_pane_position(widgets: &Widgets, pane: ActivePane) {
+    match pane {
+        ActivePane::Sidebar => {
+            if widgets.outer_paned.position() < SIDEBAR_MIN_WIDTH / 2 {
+                widgets.outer_paned.set_position(SIDEBAR_MIN_WIDTH);
+            }
+        }
+        ActivePane::Threads => {
+            if widgets.content_paned.position() < 80 {
+                widgets
+                    .content_paned
+                    .set_position(default_content_split(&widgets.content_paned));
+            }
+        }
+        ActivePane::Message => {
+            let width = widgets.content_paned.width();
+            if width <= 0 || widgets.content_paned.position() >= width.saturating_sub(80) {
+                widgets
+                    .content_paned
+                    .set_position(default_content_split(&widgets.content_paned));
+            }
+        }
+    }
+}
+
+fn default_content_split(paned: &gtk::Paned) -> i32 {
+    let width = paned.width();
+    if width <= 0 {
+        return 560;
+    }
+    let minimum_message_width = 280;
+    let maximum = (width - minimum_message_width).max(1);
+    (width / 2)
+        .max(THREAD_LIST_MIN_WIDTH.min(width))
+        .min(maximum)
 }
 
 fn update_active_pane_visuals(widgets: &Widgets, state: &SharedState) {
@@ -3560,7 +3900,7 @@ fn focus_sidebar_insert_target(widgets: &Widgets) {
     {
         return;
     }
-    widgets.saved_query_entry.grab_focus();
+    widgets.saved_name_entry.grab_focus();
 }
 
 fn focus_sidebar_default(widgets: &Widgets) {
@@ -4571,11 +4911,39 @@ fn install_shortcuts(
     let w = widgets.clone();
     let st = state.clone();
     let undo = undo_state.clone();
+    let saved_for_capture = saved_store.clone();
     capture_controller.connect_key_pressed(move |_, key, _, mods| {
         let ctrl = mods.contains(gtk::gdk::ModifierType::CONTROL_MASK);
         if ctrl && (key == gtk::gdk::Key::k || key == gtk::gdk::Key::K) {
             show_command_palette(&opts, &w, &st, &undo);
             return gtk::glib::Propagation::Stop;
+        }
+        if ctrl && (key == gtk::gdk::Key::s || key == gtk::gdk::Key::S) {
+            if !compose_view_is_visible(&w) {
+                open_save_current_search_prompt(&w, &st, &saved_for_capture);
+                return gtk::glib::Propagation::Stop;
+            }
+            return gtk::glib::Propagation::Proceed;
+        }
+        if ctrl && let Some(digit) = key_to_digit(key) {
+            match digit {
+                1 => {
+                    w.sidebar_toggle_button
+                        .set_active(!w.sidebar_toggle_button.is_active());
+                    return gtk::glib::Propagation::Stop;
+                }
+                2 => {
+                    w.thread_list_toggle_button
+                        .set_active(!w.thread_list_toggle_button.is_active());
+                    return gtk::glib::Propagation::Stop;
+                }
+                3 => {
+                    w.message_pane_toggle_button
+                        .set_active(!w.message_pane_toggle_button.is_active());
+                    return gtk::glib::Propagation::Stop;
+                }
+                _ => {}
+            }
         }
         if key == gtk::gdk::Key::Escape && close_command_palette(&w, &st) {
             return gtk::glib::Propagation::Stop;
@@ -6730,18 +7098,30 @@ fn connect_attachment_context_menu(
     let w = widgets.clone();
     let st = state.clone();
     let open_popover = popover.clone();
+    let open_item = item.clone();
     open_button.connect_clicked(move |_| {
         open_popover.popdown();
-        match save_thread_attachment(&w, &st, &item, None) {
-            Ok(path) => open_saved_attachment_path(&w, &st, path),
-            Err(err) => {
-                st.borrow_mut().last_error = Some(err.to_string());
-                w.status_label
-                    .set_text(&format!("Open attachment failed: {err}"));
-                update_debug(&w, &st);
-            }
-        }
+        open_thread_attachment(&w, &st, &open_item);
     });
+
+    let open_click = gtk::GestureClick::new();
+    open_click.set_button(1);
+    let w = widgets.clone();
+    let st = state.clone();
+    let open_item = item.clone();
+    let open_row = row.clone();
+    open_click.connect_pressed(move |_, n_press, _, _| {
+        if n_press != 2 {
+            return;
+        }
+        if let Some(parent) = open_row.parent()
+            && let Ok(list) = parent.downcast::<gtk::ListBox>()
+        {
+            list.select_row(Some(&open_row));
+        }
+        open_thread_attachment(&w, &st, &open_item);
+    });
+    row.add_controller(open_click);
 
     let click = gtk::GestureClick::new();
     click.set_button(3);
@@ -6757,6 +7137,19 @@ fn connect_attachment_context_menu(
         menu_popover.popup();
     });
     row.add_controller(click);
+}
+
+fn open_thread_attachment(widgets: &Widgets, state: &SharedState, item: &ThreadAttachmentItem) {
+    match save_thread_attachment(widgets, state, item, None) {
+        Ok(path) => open_saved_attachment_path(widgets, state, path),
+        Err(err) => {
+            state.borrow_mut().last_error = Some(err.to_string());
+            widgets
+                .status_label
+                .set_text(&format!("Open attachment failed: {err}"));
+            update_debug(widgets, state);
+        }
+    }
 }
 
 fn selected_thread_attachment(widgets: &Widgets) -> Option<ThreadAttachmentItem> {
@@ -6956,22 +7349,12 @@ fn update_message_header(widgets: &Widgets, state: &SharedState) {
     summary_row.append(&count);
     widgets.message_header_box.append(&summary_row);
 
-    let subject = gtk::Label::new(Some(non_empty_or(&message.subject, "(no subject)")));
-    subject.add_css_class("heading");
-    subject.add_css_class("notm-message-header-subject");
-    subject.set_xalign(0.0);
-    subject.set_wrap(true);
-    subject.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    subject.set_lines(2);
-    subject.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    subject.set_selectable(true);
-    widgets.message_header_box.append(&subject);
-
     let grid = gtk::Grid::new();
     grid.set_column_spacing(10);
     grid.set_row_spacing(4);
     grid.set_hexpand(true);
     let mut row = 0;
+    append_message_header_field(&grid, &mut row, "Subject", &message.subject);
     append_message_header_field(&grid, &mut row, "Date", &format_message_date(message.date));
     append_message_header_field(&grid, &mut row, "From", &message.from);
     append_message_header_field(&grid, &mut row, "To", &message.to);
@@ -11186,6 +11569,20 @@ fn handle_automation_request(
         "custom_saved_searches" => {
             json!({"ok": true, "custom_saved_searches": &*saved_store.borrow()})
         }
+        "save_current_search" => {
+            let name = req
+                .args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            widgets.saved_name_entry.set_text(name);
+            match save_custom_search_from_current_query(options, widgets, state, saved_store) {
+                Ok(()) => {
+                    json!({"ok": true, "custom_saved_searches": &*saved_store.borrow(), "state": &*state.borrow()})
+                }
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            }
+        }
         "save_custom_search" => {
             let name = req
                 .args
@@ -11218,6 +11615,34 @@ fn handle_automation_request(
                     json!({"ok": true, "custom_saved_searches": &*saved_store.borrow()})
                 }
                 Err(err) => json!({"ok": false, "error": err.to_string()}),
+            }
+        }
+        "pane_visibility" => pane_visibility_json(widgets),
+        "set_pane_visibility" => {
+            let pane = req
+                .args
+                .get("pane")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let visible = req
+                .args
+                .get("visible")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            match parse_pane_name(pane) {
+                Some(pane)
+                    if !visible
+                        && pane_is_visible(widgets, pane)
+                        && visible_panes(widgets).len() <= 1 =>
+                {
+                    json!({"ok": false, "error": "at least one pane must stay visible", "visibility": pane_visibility_json(widgets)})
+                }
+                Some(pane) => {
+                    set_pane_visibility(widgets, state, pane, visible);
+                    sync_pane_toggle_buttons(widgets);
+                    json!({"ok": true, "visibility": pane_visibility_json(widgets)})
+                }
+                None => json!({"ok": false, "error": format!("unknown pane: {pane}")}),
             }
         }
         "select_thread_by_index" => {
@@ -11802,15 +12227,7 @@ fn handle_automation_request(
         "open_selected_attachment" | "open_attachment" => {
             let index = req.args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             if let Some(item) = widgets.attachment_items.borrow().get(index).cloned() {
-                match save_thread_attachment(widgets, state, &item, None) {
-                    Ok(path) => open_saved_attachment_path(widgets, state, path),
-                    Err(err) => {
-                        state.borrow_mut().last_error = Some(err.to_string());
-                        widgets
-                            .status_label
-                            .set_text(&format!("Open attachment failed: {err}"));
-                    }
-                }
+                open_thread_attachment(widgets, state, &item);
             } else {
                 open_selected_attachment(widgets, state, index);
             }
@@ -12181,6 +12598,17 @@ fn button_flow(spacing: u32) -> gtk::FlowBox {
     flow.set_hexpand(true);
     flow.set_valign(gtk::Align::Start);
     flow
+}
+
+fn pane_toggle_button(icon_name: &str, widget_name: &str, tooltip: &str) -> gtk::ToggleButton {
+    let button = gtk::ToggleButton::new();
+    button.set_widget_name(widget_name);
+    button.set_tooltip_text(Some(tooltip));
+    button.set_active(true);
+    let icon = gtk::Image::from_icon_name(icon_name);
+    icon.set_pixel_size(16);
+    button.set_child(Some(&icon));
+    button
 }
 
 fn menu_button_with_box(
@@ -12710,6 +13138,11 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
             description: "Also move the active pane left or right.",
         },
         HelpEntry {
+            section: "Pane navigation",
+            key: "Ctrl+1 / Ctrl+2 / Ctrl+3",
+            description: "Show or hide the sidebar, message list, or message view.",
+        },
+        HelpEntry {
             section: "Thread navigation",
             key: "j / k",
             description: "Move the selected thread down or up; in other panes, scroll the active pane.",
@@ -12821,6 +13254,11 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
         },
         HelpEntry {
             section: "Saved searches",
+            key: "Ctrl+s",
+            description: "Save the current search-bar query as a custom saved search.",
+        },
+        HelpEntry {
+            section: "Saved searches",
             key: "g 1-9",
             description: "Open a numbered found-tag search or tag-path dropdown.",
         },
@@ -12906,8 +13344,8 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
         },
         HelpEntry {
             section: "Menus",
-            key: "Attachment right-click",
-            description: "Save or open a selected thread attachment.",
+            key: "Attachment double-click / right-click",
+            description: "Open a thread attachment, or right-click to save or open it.",
         },
     ]
 }
@@ -13301,6 +13739,24 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
         options.show_thread_preview,
         "Show message body previews in the thread list. Runtime command: :preview or :nopreview.",
     );
+    let show_sidebar = settings_check_row(
+        &form,
+        "Show sidebar at startup",
+        options.show_sidebar,
+        "Show the saved-search sidebar when notm starts. Runtime toggle: Ctrl+1.",
+    );
+    let show_message_list = settings_check_row(
+        &form,
+        "Show message list at startup",
+        options.show_message_list,
+        "Show the thread/message list when notm starts. Runtime toggle: Ctrl+2.",
+    );
+    let show_message_view = settings_check_row(
+        &form,
+        "Show message view at startup",
+        options.show_message_view,
+        "Show the message reading pane when notm starts. Runtime toggle: Ctrl+3.",
+    );
     let html_mode = settings_combo_row(
         &form,
         "HTML rendering",
@@ -13587,6 +14043,9 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
                 show_thread_dates: show_thread_dates.is_active(),
                 show_thread_tags: show_thread_tags.is_active(),
                 show_thread_preview: show_thread_preview.is_active(),
+                show_sidebar: show_sidebar.is_active(),
+                show_message_list: show_message_list.is_active(),
+                show_message_view: show_message_view.is_active(),
                 html_mode: combo_active_id(&html_mode),
                 start_maximized: start_maximized.is_active(),
                 show_debug_panel: show_debug_panel.is_active(),
@@ -13654,6 +14113,9 @@ struct SettingsValues {
     show_thread_dates: bool,
     show_thread_tags: bool,
     show_thread_preview: bool,
+    show_sidebar: bool,
+    show_message_list: bool,
+    show_message_view: bool,
     html_mode: String,
     start_maximized: bool,
     show_debug_panel: bool,
@@ -14044,6 +14506,9 @@ fn persist_settings_values(options: &LaunchOptions, values: &SettingsValues) -> 
         "show_thread_preview",
         values.show_thread_preview,
     );
+    set_bool(root, "ui", "show_sidebar", values.show_sidebar);
+    set_bool(root, "ui", "show_message_list", values.show_message_list);
+    set_bool(root, "ui", "show_message_view", values.show_message_view);
     set_string(root, "ui", "html_mode", &values.html_mode);
     set_bool(root, "ui", "start_maximized", values.start_maximized);
     set_bool(root, "ui", "show_debug_panel", values.show_debug_panel);

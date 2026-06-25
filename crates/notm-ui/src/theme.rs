@@ -7,6 +7,11 @@ pub fn css() -> &'static str {
     #notm-left-sidebar-content entry {
         min-width: 96px;
     }
+    #notm-pane-toggle-bar button {
+        min-width: 36px;
+        padding-left: 8px;
+        padding-right: 8px;
+    }
     #notm-left-sidebar,
     #notm-thread-pane,
     #notm-message-pane {

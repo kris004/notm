@@ -86,6 +86,12 @@ pub struct UiConfig {
     pub html_mode: String,
     #[serde(default)]
     pub start_maximized: bool,
+    #[serde(default = "default_true")]
+    pub show_sidebar: bool,
+    #[serde(default = "default_true")]
+    pub show_message_list: bool,
+    #[serde(default = "default_true")]
+    pub show_message_view: bool,
     #[serde(default)]
     pub show_debug_panel: bool,
     #[serde(default)]
@@ -114,6 +120,9 @@ impl Default for UiConfig {
             trusted_image_senders: Vec::new(),
             html_mode: "sanitize_then_render_text_fallback".to_string(),
             start_maximized: false,
+            show_sidebar: true,
+            show_message_list: true,
+            show_message_view: true,
             show_debug_panel: false,
             custom_saved_searches: Vec::new(),
             hidden_tag_searches: Vec::new(),
