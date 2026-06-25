@@ -33,8 +33,29 @@ pub fn css() -> &'static str {
     #notm-undo-tag-list row.notm-keyboard-cursor {
         box-shadow: inset 0 0 0 2px alpha(@theme_selected_bg_color, .85);
     }
+    #notm-thread-list .notm-thread-row {
+        border-radius: 6px;
+    }
+    #notm-thread-list .notm-thread-row.unread {
+        background: alpha(@theme_selected_bg_color, .09);
+        box-shadow: inset 4px 0 0 alpha(@theme_selected_bg_color, .92);
+    }
     #notm-thread-list row.unread label,
     #notm-thread-list .unread label { font-weight: 700; }
+    #notm-thread-list .notm-thread-row.unread .notm-thread-title {
+        color: @theme_selected_bg_color;
+        font-weight: 800;
+    }
+    #notm-thread-list .notm-thread-row.unread .notm-thread-number,
+    #notm-thread-list .notm-thread-row.unread .notm-thread-date {
+        color: @theme_selected_bg_color;
+        opacity: .95;
+    }
+    #notm-thread-list row:selected .notm-thread-row.unread,
+    #notm-thread-list .notm-thread-row.unread.notm-visual-selected,
+    #notm-thread-list .notm-thread-row.unread.notm-multi-selected {
+        background: alpha(@theme_selected_bg_color, .26);
+    }
     #notm-thread-list .notm-thread-number,
     #notm-thread-list .notm-thread-date {
         font-feature-settings: "tnum";

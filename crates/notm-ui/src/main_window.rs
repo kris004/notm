@@ -9032,6 +9032,7 @@ fn thread_row_widget(
 ) -> gtk::Box {
     let box_ = gtk::Box::new(gtk::Orientation::Vertical, 2);
     box_.set_widget_name(&format!("notm-thread-row-{idx}"));
+    box_.add_css_class("notm-thread-row");
     box_.set_hexpand(true);
     box_.set_halign(gtk::Align::Fill);
     if thread.has_unread {
@@ -9078,6 +9079,7 @@ fn thread_row_widget(
     title.set_hexpand(true);
     title.set_halign(gtk::Align::Fill);
     title.set_wrap(true);
+    title.add_css_class("notm-thread-title");
     let meta_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     meta_row.set_hexpand(true);
     meta_row.set_halign(gtk::Align::Fill);
@@ -9113,6 +9115,7 @@ fn thread_row_widget(
     meta.set_hexpand(true);
     meta.set_halign(gtk::Align::Fill);
     meta.add_css_class("dim-label");
+    meta.add_css_class("notm-thread-meta");
     meta.set_wrap(true);
     content.append(&title);
     meta_row.append(&meta);
@@ -9124,6 +9127,7 @@ fn thread_row_widget(
         preview.set_hexpand(true);
         preview.set_halign(gtk::Align::Fill);
         preview.add_css_class("dim-label");
+        preview.add_css_class("notm-thread-preview");
         preview.set_wrap(true);
         content.append(&preview);
     }
