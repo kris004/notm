@@ -58,10 +58,25 @@ pub fn css() -> &'static str {
         color: @theme_selected_fg_color;
     }
     #notm-message-header {
-        padding: 8px;
+        padding: 10px;
         border: 1px solid alpha(currentColor, .18);
         border-radius: 8px;
         background: alpha(currentColor, .06);
+    }
+    #notm-message-header .notm-message-header-badge {
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: alpha(@theme_selected_bg_color, .16);
+        color: @theme_selected_bg_color;
+        font-weight: 800;
+    }
+    #notm-message-header .notm-message-header-subject {
+        font-size: 1.08em;
+        font-weight: 800;
+    }
+    #notm-message-header .notm-message-header-key {
+        color: @theme_selected_bg_color;
+        font-weight: 800;
     }
     #notm-command-palette {
         padding: 0;

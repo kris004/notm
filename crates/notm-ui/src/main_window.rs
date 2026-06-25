@@ -252,7 +252,7 @@ struct Widgets {
     image_policy_button: gtk::Button,
     html_policy_row: gtk::Box,
     html_policy_label: gtk::Label,
-    message_header_label: gtk::Label,
+    message_header_box: gtk::Box,
     collapse_quotes_button: gtk::Button,
     copy_menu_button: gtk::MenuButton,
     copy_menu_box: gtk::Box,
@@ -856,13 +856,11 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
     html_policy_row.append(&image_policy_button);
     right.append(&html_policy_row);
 
-    let message_header_label = gtk::Label::new(None);
-    message_header_label.set_widget_name("notm-message-header");
-    message_header_label.set_xalign(0.0);
-    message_header_label.set_wrap(true);
-    message_header_label.set_selectable(true);
-    message_header_label.set_visible(false);
-    right.append(&message_header_label);
+    let message_header_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    message_header_box.set_widget_name("notm-message-header");
+    message_header_box.set_hexpand(true);
+    message_header_box.set_visible(false);
+    right.append(&message_header_box);
 
     let message_view = gtk::TextView::new();
     message_view.set_widget_name("notm-message-view");
@@ -1094,7 +1092,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
         image_policy_button,
         html_policy_row,
         html_policy_label,
-        message_header_label,
+        message_header_box,
         collapse_quotes_button,
         copy_menu_button,
         copy_menu_box: copy_menu_box.clone(),
@@ -6849,27 +6847,91 @@ fn selected_message_index(state: &SharedState) -> Option<usize> {
 }
 
 fn update_message_header(widgets: &Widgets, state: &SharedState) {
+    clear_box(&widgets.message_header_box);
     let Some(message) = state.borrow().selected_message.clone() else {
-        widgets.message_header_label.set_visible(false);
-        widgets.message_header_label.set_text("");
+        widgets.message_header_box.set_visible(false);
+        widgets.message_header_box.set_tooltip_text(None);
         return;
     };
     let index = selected_message_index(state)
         .map(|index| index + 1)
         .unwrap_or(1);
     let total = state.borrow().messages.len().max(1);
-    widgets.message_header_label.set_text(&format!(
-        "Message {index} of {total}\nFrom: {}\nTo: {}\nCc: {}\nSubject: {}\nDate: {}\nTags: {}\nMessage-ID: {}\nFilenames: {}",
-        message.from,
-        message.to,
-        message.cc,
-        message.subject,
-        format_message_date(message.date),
-        message.tags.join(" "),
+    widgets.message_header_box.set_tooltip_text(Some(&format!(
+        "Message-ID: {}\nFiles: {}",
         message.message_id,
         message.filenames.join(", ")
-    ));
-    widgets.message_header_label.set_visible(true);
+    )));
+
+    let summary_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    summary_row.set_hexpand(true);
+    let count = gtk::Label::new(Some(&format!("Message {index} of {total}")));
+    count.add_css_class("notm-message-header-badge");
+    count.set_xalign(0.0);
+    summary_row.append(&count);
+    widgets.message_header_box.append(&summary_row);
+
+    let subject = gtk::Label::new(Some(non_empty_or(&message.subject, "(no subject)")));
+    subject.add_css_class("heading");
+    subject.add_css_class("notm-message-header-subject");
+    subject.set_xalign(0.0);
+    subject.set_wrap(true);
+    subject.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    subject.set_lines(2);
+    subject.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    subject.set_selectable(true);
+    widgets.message_header_box.append(&subject);
+
+    let grid = gtk::Grid::new();
+    grid.set_column_spacing(10);
+    grid.set_row_spacing(4);
+    grid.set_hexpand(true);
+    let mut row = 0;
+    append_message_header_field(&grid, &mut row, "Date", &format_message_date(message.date));
+    append_message_header_field(&grid, &mut row, "From", &message.from);
+    append_message_header_field(&grid, &mut row, "To", &message.to);
+    if !message.cc.trim().is_empty() {
+        append_message_header_field(&grid, &mut row, "Cc", &message.cc);
+    }
+    append_message_header_field(&grid, &mut row, "Tags", &message.tags.join(" "));
+    widgets.message_header_box.append(&grid);
+    widgets.message_header_box.set_visible(true);
+}
+
+fn clear_box(container: &gtk::Box) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+}
+
+fn append_message_header_field(grid: &gtk::Grid, row: &mut i32, key: &str, value: &str) {
+    let key_label = gtk::Label::new(Some(key));
+    key_label.add_css_class("notm-message-header-key");
+    key_label.set_width_chars(10);
+    key_label.set_xalign(1.0);
+    key_label.set_valign(gtk::Align::Start);
+    let value_label = gtk::Label::new(Some(non_empty_or(value, "—")));
+    value_label.add_css_class("notm-message-header-value");
+    value_label.set_xalign(0.0);
+    value_label.set_wrap(true);
+    value_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    value_label.set_lines(2);
+    value_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    value_label.set_max_width_chars(44);
+    value_label.set_selectable(true);
+    value_label.set_tooltip_text(Some(value));
+    value_label.set_hexpand(true);
+    grid.attach(&key_label, 0, *row, 1, 1);
+    grid.attach(&value_label, 1, *row, 1, 1);
+    *row += 1;
+}
+
+fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.trim().is_empty() {
+        fallback
+    } else {
+        value
+    }
 }
 
 fn format_message_date(timestamp: i64) -> String {
@@ -6935,7 +6997,7 @@ fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, sta
     let has_thread = selected_thread.is_some();
     let multiple_messages = message_count > 1;
     if !has_message {
-        widgets.message_header_label.set_visible(false);
+        widgets.message_header_box.set_visible(false);
     }
     widgets.message_menu_button.set_visible(multiple_messages);
     widgets
@@ -7356,7 +7418,7 @@ fn show_text_message_view(options: &LaunchOptions, widgets: &Widgets, state: &Sh
 fn show_compose_view(widgets: &Widgets) {
     widgets.address_suggestions_list.set_visible(false);
     widgets.html_policy_row.set_visible(false);
-    widgets.message_header_label.set_visible(false);
+    widgets.message_header_box.set_visible(false);
     widgets.attachment_title.set_visible(false);
     widgets.attachment_scrolled.set_visible(false);
     widgets.message_stack.set_visible_child_name("compose");
