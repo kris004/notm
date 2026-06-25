@@ -4577,6 +4577,9 @@ fn install_shortcuts(
             show_command_palette(&opts, &w, &st, &undo);
             return gtk::glib::Propagation::Stop;
         }
+        if key == gtk::gdk::Key::Escape && close_command_palette(&w, &st) {
+            return gtk::glib::Propagation::Stop;
+        }
         if ctrl
             && (key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter)
             && compose_view_is_visible(&w)
@@ -8882,23 +8885,8 @@ fn clear_multi_selection(widgets: &Widgets, state: &SharedState) {
         let mut state = state.borrow_mut();
         state.multi_selected_threads.clear();
     }
-    update_visual_selection_rows(widgets, state);
+    update_visual_selection_rows_with_force(widgets, state, true);
     widgets.status_label.set_text("Multi-selection cleared");
-}
-
-fn set_multi_selected_thread_id(state: &SharedState, thread_id: &str, selected: bool) -> usize {
-    let mut state = state.borrow_mut();
-    state.visual_select_mode = false;
-    state.visual_select_anchor = None;
-    state.visual_select_cursor = None;
-    state.visual_selected_threads.clear();
-    state.visual_selection_pending_range = None;
-    if selected {
-        state.multi_selected_threads.insert(thread_id.to_string());
-    } else {
-        state.multi_selected_threads.remove(thread_id);
-    }
-    state.multi_selected_threads.len()
 }
 
 fn update_visual_selection_to_cursor(widgets: &Widgets, state: &SharedState) {
@@ -8945,6 +8933,10 @@ fn visual_selection_anchor_index(widgets: &Widgets, state: &SharedState) -> Opti
 }
 
 fn update_visual_selection_rows(widgets: &Widgets, state: &SharedState) {
+    update_visual_selection_rows_with_force(widgets, state, false);
+}
+
+fn update_visual_selection_rows_with_force(widgets: &Widgets, state: &SharedState, force: bool) {
     let selected_position = selected_thread_position(widgets);
     let tokens = {
         let state = state.borrow();
@@ -8966,10 +8958,11 @@ fn update_visual_selection_rows(widgets: &Widgets, state: &SharedState) {
     widgets.thread_selection_refreshing.set(true);
     for (index, token) in tokens.iter().enumerate() {
         let position = index as u32;
-        if widgets
-            .thread_model
-            .string(position)
-            .is_some_and(|current| current.as_str() != token)
+        if force
+            || widgets
+                .thread_model
+                .string(position)
+                .is_none_or(|current| current.as_str() != token)
         {
             widgets.thread_model.splice(position, 1, &[token.as_str()]);
         }
@@ -9177,23 +9170,6 @@ fn connect_thread_row_multi_select(row: &gtk::Box, state: &SharedState, thread_i
         gesture.set_state(gtk::EventSequenceState::Claimed);
     });
     row.add_controller(click);
-
-    let motion = gtk::EventControllerMotion::new();
-    let row_for_motion = row.clone();
-    let st = state.clone();
-    let id = thread_id.to_string();
-    motion.connect_enter(move |controller, _, _| {
-        let mods = controller.current_event_state();
-        if !(mods.contains(gtk::gdk::ModifierType::CONTROL_MASK)
-            && mods.contains(gtk::gdk::ModifierType::BUTTON1_MASK))
-        {
-            return;
-        }
-        set_multi_selected_thread_id(&st, &id, true);
-        row_for_motion.add_css_class("notm-multi-selected");
-        row_for_motion.add_css_class("notm-visual-selected");
-    });
-    row.add_controller(motion);
 }
 
 fn format_thread_list_date(timestamp: i64) -> String {
@@ -11263,6 +11239,10 @@ fn handle_automation_request(
             }
             json!({"ok": index.is_some(), "selected_thread_index": selected_thread_index(widgets), "multi_selected_threads": state.borrow().multi_selected_threads})
         }
+        "clear_multi_selection" => {
+            clear_multi_selection(widgets, state);
+            json!({"ok": true, "multi_selected_threads": state.borrow().multi_selected_threads})
+        }
         "select_relative_thread" => {
             let delta = req.args.get("delta").and_then(|v| v.as_i64()).unwrap_or(0) as isize;
             select_relative_thread(options, widgets, state, delta);
@@ -12417,13 +12397,25 @@ fn apply_command_completion(entry: &gtk::Entry) -> bool {
     true
 }
 
-fn remove_named_overlay(overlay: &gtk::Overlay, widget_name: &str) {
+fn remove_named_overlay(overlay: &gtk::Overlay, widget_name: &str) -> bool {
+    let mut removed = false;
     let mut child = overlay.first_child();
     while let Some(widget) = child {
         child = widget.next_sibling();
         if widget.widget_name() == widget_name {
             overlay.remove_overlay(&widget);
+            removed = true;
         }
+    }
+    removed
+}
+
+fn close_command_palette(widgets: &Widgets, state: &SharedState) -> bool {
+    if remove_named_overlay(&widgets.overlay, "notm-command-palette") {
+        enter_normal_mode(widgets, state);
+        true
+    } else {
+        false
     }
 }
 
@@ -12434,6 +12426,12 @@ fn show_command_palette(
     undo_state: &UndoState,
 ) {
     remove_named_overlay(&widgets.overlay, "notm-command-palette");
+    set_input_mode(
+        widgets,
+        state,
+        InputMode::Insert,
+        "Command mode (Esc to close)",
+    );
     let entry = gtk::Entry::new();
     entry.set_widget_name("notm-command-palette-entry");
     entry.set_placeholder_text(Some(":command"));
@@ -12451,11 +12449,11 @@ fn show_command_palette(
     let entry_key_controller = gtk::EventControllerKey::new();
     entry_key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     let entry_for_keys = entry.clone();
-    let overlay_for_keys = widgets.overlay.clone();
-    let panel_for_keys = panel.clone().upcast::<gtk::Widget>();
+    let w_for_keys = widgets.clone();
+    let st_for_keys = state.clone();
     entry_key_controller.connect_key_pressed(move |_, key, _, _| {
         if key == gtk::gdk::Key::Escape {
-            overlay_for_keys.remove_overlay(&panel_for_keys);
+            close_command_palette(&w_for_keys, &st_for_keys);
             return gtk::glib::Propagation::Stop;
         }
         if key == gtk::gdk::Key::Tab {
@@ -12472,10 +12470,9 @@ fn show_command_palette(
     let w = widgets.clone();
     let st = state.clone();
     let undo = undo_state.clone();
-    let overlay_for_activate = widgets.overlay.clone();
-    let panel_for_activate = panel.clone().upcast::<gtk::Widget>();
     entry.connect_activate(move |entry| {
         let command = normalize_command_input(&entry.text());
+        close_command_palette(&w, &st);
         let result = run_named_command(&command, &opts, &w, &st, &undo);
         if result
             .get("ok")
@@ -12487,7 +12484,6 @@ fn show_command_palette(
             w.status_label
                 .set_text(&format!("Command `{command}` failed: {result}"));
         }
-        overlay_for_activate.remove_overlay(&panel_for_activate);
     });
     entry.grab_focus();
 }
@@ -12789,8 +12785,8 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
         },
         HelpEntry {
             section: "Thread actions",
-            key: "Ctrl+click / Ctrl+drag",
-            description: "Add or remove threads with normal pointer multi-select.",
+            key: "Ctrl+click",
+            description: "Toggle the clicked thread in the multi-selection.",
         },
         HelpEntry {
             section: "Thread actions",
