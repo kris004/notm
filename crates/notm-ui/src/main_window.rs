@@ -11976,25 +11976,29 @@ fn show_command_palette(
     state: &SharedState,
     undo_state: &UndoState,
 ) {
-    let dialog = gtk::Dialog::builder()
-        .title("Run notm command")
-        .transient_for(&widgets.window)
-        .modal(true)
-        .default_width(420)
-        .build();
-    dialog.set_widget_name("notm-command-palette");
-    let area = dialog.content_area();
-    area.set_spacing(6);
     let entry = gtk::Entry::new();
     entry.set_widget_name("notm-command-palette-entry");
-    entry.set_placeholder_text(Some(":command; Tab completes, Enter runs"));
-    area.append(&entry);
-    dialog.add_button("Run", gtk::ResponseType::Accept);
-    dialog.add_button("Close", gtk::ResponseType::Close);
+    entry.set_placeholder_text(Some(":command"));
+    let window = gtk::Window::builder()
+        .transient_for(&widgets.window)
+        .modal(true)
+        .decorated(false)
+        .resizable(false)
+        .default_width(420)
+        .child(&entry)
+        .default_widget(&entry)
+        .destroy_with_parent(true)
+        .build();
+    window.set_widget_name("notm-command-palette");
     let entry_key_controller = gtk::EventControllerKey::new();
     entry_key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     let entry_for_keys = entry.clone();
+    let window_for_keys = window.clone();
     entry_key_controller.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            window_for_keys.close();
+            return gtk::glib::Propagation::Stop;
+        }
         if key == gtk::gdk::Key::Tab {
             return if apply_command_completion(&entry_for_keys) {
                 gtk::glib::Propagation::Stop
@@ -12009,7 +12013,7 @@ fn show_command_palette(
     let w = widgets.clone();
     let st = state.clone();
     let undo = undo_state.clone();
-    let d = dialog.clone();
+    let run_window = window.clone();
     entry.connect_activate(move |entry| {
         let command = normalize_command_input(&entry.text());
         let result = run_named_command(&command, &opts, &w, &st, &undo);
@@ -12023,31 +12027,9 @@ fn show_command_palette(
             w.status_label
                 .set_text(&format!("Command `{command}` failed: {result}"));
         }
-        d.close();
+        run_window.close();
     });
-    let opts = options.clone();
-    let w = widgets.clone();
-    let st = state.clone();
-    let undo = undo_state.clone();
-    let entry_for_response = entry.clone();
-    dialog.connect_response(move |d, response| {
-        if response == gtk::ResponseType::Accept {
-            let command = normalize_command_input(&entry_for_response.text());
-            let result = run_named_command(&command, &opts, &w, &st, &undo);
-            if result
-                .get("ok")
-                .and_then(|ok| ok.as_bool())
-                .unwrap_or(false)
-            {
-                w.status_label.set_text(&format!("Command `{command}` ran"));
-            } else {
-                w.status_label
-                    .set_text(&format!("Command `{command}` failed: {result}"));
-            }
-        }
-        d.close();
-    });
-    dialog.present();
+    window.present();
     entry.grab_focus();
 }
 
