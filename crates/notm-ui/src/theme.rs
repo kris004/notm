@@ -22,7 +22,9 @@ pub fn css() -> &'static str {
         background-color: alpha(@theme_selected_bg_color, .12);
     }
     #notm-thread-list row.notm-visual-selected,
-    #notm-thread-list .notm-visual-selected {
+    #notm-thread-list .notm-visual-selected,
+    #notm-thread-list row.notm-multi-selected,
+    #notm-thread-list .notm-multi-selected {
         background-color: alpha(@theme_selected_bg_color, .28);
     }
     #notm-undo-tag-list row.notm-undo-selected {

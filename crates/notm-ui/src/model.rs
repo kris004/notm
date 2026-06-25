@@ -46,6 +46,7 @@ pub struct UiState {
     pub visual_select_cursor: Option<usize>,
     pub visual_selected_threads: BTreeSet<String>,
     pub visual_selection_pending_range: Option<(usize, usize)>,
+    pub multi_selected_threads: BTreeSet<String>,
 }
 
 impl Default for UiState {
@@ -88,6 +89,7 @@ impl Default for UiState {
             visual_select_cursor: None,
             visual_selected_threads: BTreeSet::new(),
             visual_selection_pending_range: None,
+            multi_selected_threads: BTreeSet::new(),
         }
     }
 }

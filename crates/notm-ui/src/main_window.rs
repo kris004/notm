@@ -2521,6 +2521,8 @@ fn tag_target_thread_ids(state: &SharedState) -> BTreeSet<String> {
             .filter(|(index, _)| (start..=end).contains(&(state.thread_window_offset + *index)))
             .map(|(_, thread)| thread.thread_id.clone())
             .collect()
+    } else if !state.multi_selected_threads.is_empty() {
+        state.multi_selected_threads.clone()
     } else {
         state
             .selected_thread
@@ -2541,6 +2543,8 @@ fn tag_target_threads(state: &SharedState) -> Vec<notm_notmuch::ThreadSummary> {
                 .filter(|(index, _)| (start..=end).contains(&(state.thread_window_offset + *index)))
                 .map(|(_, thread)| thread.thread_id.clone())
                 .collect()
+        } else if !state.multi_selected_threads.is_empty() {
+            state.multi_selected_threads.clone()
         } else {
             state
                 .selected_thread
@@ -4187,20 +4191,33 @@ fn thread_row_widget_for_index(state: &SharedState, index: usize) -> Option<gtk:
         let absolute_index = state.thread_window_offset + index;
         let display = ThreadListDisplay::from_state(&state);
         let visual_selected = visual_selection_range_from_state(&state)
-            .is_some_and(|(start, end)| (start..=end).contains(&absolute_index));
+            .is_some_and(|(start, end)| (start..=end).contains(&absolute_index))
+            || state.multi_selected_threads.contains(&thread.thread_id);
         (thread, detail, absolute_index, display, visual_selected)
     };
-    Some(
-        thread_row_widget(
-            index,
-            absolute_index,
-            display,
-            &thread,
-            &detail,
-            visual_selected,
-        )
-        .upcast::<gtk::Widget>(),
-    )
+    let row = thread_row_widget(
+        index,
+        absolute_index,
+        display,
+        &thread,
+        &detail,
+        visual_selected,
+    );
+    connect_thread_row_multi_select(&row, state, &thread.thread_id);
+    Some(row.upcast::<gtk::Widget>())
+}
+
+fn thread_row_is_marked_selected(
+    state: &UiState,
+    index: usize,
+    range: Option<(usize, usize)>,
+) -> bool {
+    let Some(thread) = state.thread_list_items.get(index) else {
+        return false;
+    };
+    let absolute_index = state.thread_window_offset + index;
+    range.is_some_and(|(start, end)| (start..=end).contains(&absolute_index))
+        || state.multi_selected_threads.contains(&thread.thread_id)
 }
 
 fn show_thread_list_loading(widgets: &Widgets, message: &str) {
@@ -4696,6 +4713,11 @@ fn install_shortcuts(
         if st.borrow().input_mode == InputMode::Insert {
             return gtk::glib::Propagation::Proceed;
         }
+        if key == gtk::gdk::Key::space && st.borrow().active_pane == ActivePane::Threads {
+            clear_numeric_prefix(&numeric_prefix);
+            toggle_multi_selected_thread(&w, &st);
+            return gtk::glib::Propagation::Stop;
+        }
         if key == gtk::gdk::Key::h || key == gtk::gdk::Key::H {
             clear_numeric_prefix(&numeric_prefix);
             move_active_pane(&w, &st, -1);
@@ -4721,6 +4743,8 @@ fn install_shortcuts(
             w.undo_tag_button.popdown();
             if st.borrow().visual_select_mode {
                 clear_visual_selection(&w, &st);
+            } else if !st.borrow().multi_selected_threads.is_empty() {
+                clear_multi_selection(&w, &st);
             } else {
                 w.status_label.set_text("Normal mode");
             }
@@ -8474,6 +8498,7 @@ fn apply_search_data(
         s.visual_select_cursor = None;
         s.visual_selected_threads.clear();
         s.visual_selection_pending_range = None;
+        s.multi_selected_threads.clear();
         s.visible_tags = data.tags;
         s.database_path = Some(data.database_path);
         s.database_revision = Some(data.revision);
@@ -8715,10 +8740,9 @@ fn append_thread_model_rows(widgets: &Widgets, state: &SharedState, start: usize
         (start..start.saturating_add(count))
             .filter_map(|index| {
                 state.thread_list_items.get(index)?;
-                let absolute_index = state.thread_window_offset + index;
                 Some(thread_row_token(
                     index,
-                    range.is_some_and(|(start, end)| (start..=end).contains(&absolute_index)),
+                    thread_row_is_marked_selected(&state, index, range),
                     display,
                 ))
             })
@@ -8740,12 +8764,11 @@ fn refresh_thread_model_rows(widgets: &Widgets, state: &SharedState, indices: &[
             .iter()
             .filter_map(|index| {
                 state.thread_list_items.get(*index)?;
-                let absolute_index = state.thread_window_offset + *index;
                 Some((
                     *index as u32,
                     thread_row_token(
                         *index,
-                        range.is_some_and(|(start, end)| (start..=end).contains(&absolute_index)),
+                        thread_row_is_marked_selected(&state, *index, range),
                         display,
                     ),
                 ))
@@ -8810,6 +8833,74 @@ fn clear_visual_selection(widgets: &Widgets, state: &SharedState) {
     widgets.status_label.set_text("Normal mode");
 }
 
+fn toggle_multi_selected_thread(widgets: &Widgets, state: &SharedState) {
+    let Some(index) = selected_thread_index(widgets) else {
+        widgets.status_label.set_text("No thread selected");
+        return;
+    };
+    toggle_multi_selected_thread_index(widgets, state, index);
+}
+
+fn toggle_multi_selected_thread_index(widgets: &Widgets, state: &SharedState, index: usize) {
+    let (thread_id, count, selected) = {
+        let mut state = state.borrow_mut();
+        let Some(thread_id) = state
+            .thread_list_items
+            .get(index)
+            .map(|thread| thread.thread_id.clone())
+        else {
+            widgets
+                .status_label
+                .set_text("Thread row is not selectable");
+            return;
+        };
+        state.visual_select_mode = false;
+        state.visual_select_anchor = None;
+        state.visual_select_cursor = None;
+        state.visual_selected_threads.clear();
+        state.visual_selection_pending_range = None;
+        let selected = if state.multi_selected_threads.contains(&thread_id) {
+            state.multi_selected_threads.remove(&thread_id);
+            false
+        } else {
+            state.multi_selected_threads.insert(thread_id.clone());
+            true
+        };
+        (thread_id, state.multi_selected_threads.len(), selected)
+    };
+    refresh_thread_model_rows(widgets, state, &[index]);
+    widgets.status_label.set_text(&format!(
+        "{} thread `{}`; {} selected",
+        if selected { "Selected" } else { "Unselected" },
+        thread_id,
+        format_count(count)
+    ));
+}
+
+fn clear_multi_selection(widgets: &Widgets, state: &SharedState) {
+    {
+        let mut state = state.borrow_mut();
+        state.multi_selected_threads.clear();
+    }
+    update_visual_selection_rows(widgets, state);
+    widgets.status_label.set_text("Multi-selection cleared");
+}
+
+fn set_multi_selected_thread_id(state: &SharedState, thread_id: &str, selected: bool) -> usize {
+    let mut state = state.borrow_mut();
+    state.visual_select_mode = false;
+    state.visual_select_anchor = None;
+    state.visual_select_cursor = None;
+    state.visual_selected_threads.clear();
+    state.visual_selection_pending_range = None;
+    if selected {
+        state.multi_selected_threads.insert(thread_id.to_string());
+    } else {
+        state.multi_selected_threads.remove(thread_id);
+    }
+    state.multi_selected_threads.len()
+}
+
 fn update_visual_selection_to_cursor(widgets: &Widgets, state: &SharedState) {
     let Some(cursor) = selected_thread_index(widgets) else {
         return;
@@ -8864,10 +8955,9 @@ fn update_visual_selection_rows(widgets: &Widgets, state: &SharedState) {
             .iter()
             .enumerate()
             .map(|(index, _)| {
-                let absolute_index = state.thread_window_offset + index;
                 thread_row_token(
                     index,
-                    range.is_some_and(|(start, end)| (start..=end).contains(&absolute_index)),
+                    thread_row_is_marked_selected(&state, index, range),
                     display,
                 )
             })
@@ -8958,6 +9048,7 @@ fn thread_row_widget(
     }
     if visual_selected {
         box_.add_css_class("notm-visual-selected");
+        box_.add_css_class("notm-multi-selected");
     }
     let row_content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     row_content.set_hexpand(true);
@@ -9046,6 +9137,63 @@ fn thread_row_widget(
     row_content.append(&content);
     box_.append(&row_content);
     box_
+}
+
+fn connect_thread_row_multi_select(row: &gtk::Box, state: &SharedState, thread_id: &str) {
+    let click = gtk::GestureClick::new();
+    click.set_button(0);
+    let row_for_click = row.clone();
+    let st = state.clone();
+    let id = thread_id.to_string();
+    click.connect_pressed(move |gesture, _, _, _| {
+        if !gesture
+            .current_event_state()
+            .contains(gtk::gdk::ModifierType::CONTROL_MASK)
+        {
+            return;
+        }
+        let selected = {
+            let mut state = st.borrow_mut();
+            state.visual_select_mode = false;
+            state.visual_select_anchor = None;
+            state.visual_select_cursor = None;
+            state.visual_selected_threads.clear();
+            state.visual_selection_pending_range = None;
+            if state.multi_selected_threads.contains(&id) {
+                state.multi_selected_threads.remove(&id);
+                false
+            } else {
+                state.multi_selected_threads.insert(id.clone());
+                true
+            }
+        };
+        if selected {
+            row_for_click.add_css_class("notm-multi-selected");
+            row_for_click.add_css_class("notm-visual-selected");
+        } else {
+            row_for_click.remove_css_class("notm-multi-selected");
+            row_for_click.remove_css_class("notm-visual-selected");
+        }
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    row.add_controller(click);
+
+    let motion = gtk::EventControllerMotion::new();
+    let row_for_motion = row.clone();
+    let st = state.clone();
+    let id = thread_id.to_string();
+    motion.connect_enter(move |controller, _, _| {
+        let mods = controller.current_event_state();
+        if !(mods.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+            && mods.contains(gtk::gdk::ModifierType::BUTTON1_MASK))
+        {
+            return;
+        }
+        set_multi_selected_thread_id(&st, &id, true);
+        row_for_motion.add_css_class("notm-multi-selected");
+        row_for_motion.add_css_class("notm-visual-selected");
+    });
+    row.add_controller(motion);
 }
 
 fn format_thread_list_date(timestamp: i64) -> String {
@@ -11101,6 +11249,20 @@ fn handle_automation_request(
             select_thread_by_index(options, widgets, state, index, false);
             json!({"ok": true, "selected_thread_index": selected_thread_index(widgets), "selected_thread": state.borrow().selected_thread})
         }
+        "toggle_multi_select_thread" => {
+            let index = req
+                .args
+                .get("index")
+                .and_then(|v| v.as_u64())
+                .map(|value| value as usize)
+                .or_else(|| selected_thread_index(widgets));
+            if let Some(index) = index {
+                select_thread_index_in_list(widgets, index);
+                select_thread_by_index(options, widgets, state, index, false);
+                toggle_multi_selected_thread_index(widgets, state, index);
+            }
+            json!({"ok": index.is_some(), "selected_thread_index": selected_thread_index(widgets), "multi_selected_threads": state.borrow().multi_selected_threads})
+        }
         "select_relative_thread" => {
             let delta = req.args.get("delta").and_then(|v| v.as_i64()).unwrap_or(0) as isize;
             select_relative_thread(options, widgets, state, delta);
@@ -12619,6 +12781,16 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
             section: "Thread actions",
             key: "v",
             description: "Start or clear visual thread selection.",
+        },
+        HelpEntry {
+            section: "Thread actions",
+            key: "Space",
+            description: "Toggle the selected thread in the multi-selection.",
+        },
+        HelpEntry {
+            section: "Thread actions",
+            key: "Ctrl+click / Ctrl+drag",
+            description: "Add or remove threads with normal pointer multi-select.",
         },
         HelpEntry {
             section: "Thread actions",
