@@ -78,6 +78,8 @@ pub struct UiConfig {
     pub show_thread_tags: bool,
     #[serde(default = "default_true")]
     pub show_thread_preview: bool,
+    #[serde(default = "default_true")]
+    pub show_keybind_hints: bool,
     #[serde(default)]
     pub remote_images: bool,
     #[serde(default)]
@@ -116,6 +118,7 @@ impl Default for UiConfig {
             show_thread_dates: true,
             show_thread_tags: true,
             show_thread_preview: true,
+            show_keybind_hints: true,
             remote_images: false,
             trusted_image_senders: Vec::new(),
             html_mode: "sanitize_then_render_text_fallback".to_string(),

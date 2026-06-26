@@ -11,6 +11,27 @@ pub fn css() -> &'static str {
         min-width: 36px;
         padding-left: 8px;
         padding-right: 8px;
+        border-bottom: 3px solid transparent;
+    }
+    #notm-pane-toggle-bar button.notm-pane-visible {
+        background-color: alpha(@theme_selected_bg_color, .11);
+        box-shadow: inset 0 0 0 1px alpha(@theme_selected_bg_color, .22);
+    }
+    #notm-pane-toggle-bar button.notm-pane-visible:hover,
+    #notm-pane-toggle-bar button.notm-pane-visible:focus,
+    #notm-pane-toggle-bar button.notm-pane-visible:active {
+        background-color: alpha(@theme_selected_bg_color, .16);
+        box-shadow: inset 0 0 0 1px alpha(@theme_selected_bg_color, .36);
+    }
+    #notm-pane-toggle-bar button.notm-pane-hidden {
+        border-bottom-color: transparent;
+        box-shadow: none;
+    }
+    #notm-pane-toggle-bar button.notm-pane-hidden:hover,
+    #notm-pane-toggle-bar button.notm-pane-hidden:focus,
+    #notm-pane-toggle-bar button.notm-pane-hidden:active {
+        border-bottom-color: transparent;
+        box-shadow: none;
     }
     #notm-left-sidebar,
     #notm-thread-pane,
@@ -19,8 +40,7 @@ pub fn css() -> &'static str {
         border-radius: 8px;
     }
     .notm-active-pane {
-        border-color: alpha(@theme_selected_bg_color, .55);
-        background-color: alpha(@theme_selected_bg_color, .055);
+        background-color: alpha(@theme_selected_bg_color, .035);
     }
     .notm-active-pane .notm-keyboard-cursor {
         box-shadow: inset 0 0 0 2px alpha(@theme_selected_bg_color, .85);
@@ -80,9 +100,12 @@ pub fn css() -> &'static str {
         padding: 10px;
         border: 1px solid alpha(currentColor, .18);
         border-radius: 8px;
-        background: alpha(currentColor, .06);
+        background-color: @theme_bg_color;
+        box-shadow: inset 0 0 0 9999px alpha(currentColor, .06);
     }
-    #notm-message-header .notm-message-header-badge {
+    #notm-message-header .notm-message-header-badge,
+    #notm-message-header:backdrop .notm-message-header-badge,
+    #notm-message-header .notm-message-header-badge:backdrop {
         padding: 2px 8px;
         border-radius: 999px;
         background: alpha(@theme_selected_bg_color, .16);
@@ -93,9 +116,18 @@ pub fn css() -> &'static str {
         font-size: 1.08em;
         font-weight: 800;
     }
-    #notm-message-header .notm-message-header-key {
+    #notm-message-header .notm-message-header-key,
+    #notm-message-header:backdrop .notm-message-header-key,
+    #notm-message-header .notm-message-header-key:backdrop {
         color: @theme_selected_bg_color;
         font-weight: 800;
+        opacity: 1;
+    }
+    #notm-message-header .notm-message-header-value,
+    #notm-message-header:backdrop .notm-message-header-value,
+    #notm-message-header .notm-message-header-value:backdrop {
+        color: @theme_fg_color;
+        opacity: .95;
     }
     #notm-command-palette {
         padding: 0;

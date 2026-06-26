@@ -118,6 +118,7 @@ fn launch_options(cfg: &config::AppConfig, app_config_path: Option<PathBuf>) -> 
         show_thread_dates: cfg.ui.show_thread_dates,
         show_thread_tags: cfg.ui.show_thread_tags,
         show_thread_preview: cfg.ui.show_thread_preview,
+        show_keybind_hints: cfg.ui.show_keybind_hints,
         html_mode: cfg.ui.html_mode.clone(),
         trusted_image_senders: cfg.ui.trusted_image_senders.clone(),
         hidden_tag_searches: cfg.ui.hidden_tag_searches.clone(),

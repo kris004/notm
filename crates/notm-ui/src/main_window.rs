@@ -95,6 +95,7 @@ pub struct LaunchOptions {
     pub show_thread_dates: bool,
     pub show_thread_tags: bool,
     pub show_thread_preview: bool,
+    pub show_keybind_hints: bool,
     pub html_mode: String,
     pub trusted_image_senders: Vec<String>,
     pub hidden_tag_searches: Vec<String>,
@@ -155,6 +156,7 @@ impl Default for LaunchOptions {
             show_thread_dates: true,
             show_thread_tags: true,
             show_thread_preview: true,
+            show_keybind_hints: true,
             html_mode: "sanitize_then_render_text_fallback".to_string(),
             trusted_image_senders: Vec::new(),
             hidden_tag_searches: Vec::new(),
@@ -224,10 +226,9 @@ struct Widgets {
     palette_button: gtk::Button,
     settings_button: gtk::Button,
     help_button: gtk::Button,
-    sidebar_toggle_button: gtk::ToggleButton,
-    thread_list_toggle_button: gtk::ToggleButton,
-    message_pane_toggle_button: gtk::ToggleButton,
-    pane_toggle_syncing: Rc<Cell<bool>>,
+    sidebar_toggle_button: gtk::Button,
+    thread_list_toggle_button: gtk::Button,
+    message_pane_toggle_button: gtk::Button,
     archive_button: gtk::Button,
     read_toggle_button: gtk::Button,
     flag_toggle_button: gtk::Button,
@@ -453,6 +454,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
         show_thread_dates: options.show_thread_dates,
         show_thread_tags: options.show_thread_tags,
         show_thread_preview: options.show_thread_preview,
+        show_keybind_hints: options.show_keybind_hints,
         trusted_image_senders: normalize_sender_list(&options.trusted_image_senders),
         compose_fields: ComposeFields {
             from: identity(&options)
@@ -1108,7 +1110,6 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
         sidebar_toggle_button: sidebar_toggle_button.clone(),
         thread_list_toggle_button: thread_list_toggle_button.clone(),
         message_pane_toggle_button: message_pane_toggle_button.clone(),
-        pane_toggle_syncing: Rc::new(Cell::new(false)),
         archive_button: archive_button.clone(),
         read_toggle_button: read_button.clone(),
         flag_toggle_button: flag_button.clone(),
@@ -1278,6 +1279,13 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
     restore_draft_if_present(&widgets, &state);
     refresh_draft_list(&widgets);
     window.present();
+    {
+        let w = widgets.clone();
+        let st = state.clone();
+        gtk::glib::idle_add_local_once(move || {
+            sync_pane_button_classes(&w, &st);
+        });
+    }
     widgets
         .status_label
         .set_text("Starting notm; loading mail…");
@@ -3658,37 +3666,24 @@ fn connect_pane_visibility_toggles(widgets: &Widgets, state: &SharedState) {
     {
         let w = widgets.clone();
         let st = state.clone();
-        widgets
-            .sidebar_toggle_button
-            .connect_toggled(move |button| {
-                if w.pane_toggle_syncing.get() {
-                    return;
-                }
-                set_pane_visibility_from_toggle(&w, &st, ActivePane::Sidebar, button.is_active());
-            });
+        widgets.sidebar_toggle_button.connect_clicked(move |_| {
+            toggle_pane_visibility(&w, &st, ActivePane::Sidebar);
+        });
     }
     {
         let w = widgets.clone();
         let st = state.clone();
-        widgets
-            .thread_list_toggle_button
-            .connect_toggled(move |button| {
-                if w.pane_toggle_syncing.get() {
-                    return;
-                }
-                set_pane_visibility_from_toggle(&w, &st, ActivePane::Threads, button.is_active());
-            });
+        widgets.thread_list_toggle_button.connect_clicked(move |_| {
+            toggle_pane_visibility(&w, &st, ActivePane::Threads);
+        });
     }
     {
         let w = widgets.clone();
         let st = state.clone();
         widgets
             .message_pane_toggle_button
-            .connect_toggled(move |button| {
-                if w.pane_toggle_syncing.get() {
-                    return;
-                }
-                set_pane_visibility_from_toggle(&w, &st, ActivePane::Message, button.is_active());
+            .connect_clicked(move |_| {
+                toggle_pane_visibility(&w, &st, ActivePane::Message);
             });
     }
 }
@@ -3702,10 +3697,16 @@ fn apply_initial_pane_visibility(options: &LaunchOptions, widgets: &Widgets, sta
     widgets.thread_pane.set_visible(list || !any_visible);
     widgets.message_pane.set_visible(message || !any_visible);
     ensure_active_pane_visible(widgets, state);
-    sync_pane_toggle_buttons(widgets);
+    sync_pane_button_classes(widgets, state);
 }
 
-fn set_pane_visibility_from_toggle(
+fn toggle_pane_visibility(widgets: &Widgets, state: &SharedState, pane: ActivePane) {
+    let visible = !pane_is_visible(widgets, pane);
+    set_pane_visibility_from_control(widgets, state, pane, visible);
+    focus_active_pane(widgets, state);
+}
+
+fn set_pane_visibility_from_control(
     widgets: &Widgets,
     state: &SharedState,
     pane: ActivePane,
@@ -3719,7 +3720,7 @@ fn set_pane_visibility_from_toggle(
         return;
     }
     set_pane_visibility(widgets, state, pane, visible);
-    sync_pane_toggle_buttons(widgets);
+    sync_pane_button_classes(widgets, state);
 }
 
 fn set_pane_visibility(widgets: &Widgets, state: &SharedState, pane: ActivePane, visible: bool) {
@@ -3743,17 +3744,36 @@ fn set_pane_visibility(widgets: &Widgets, state: &SharedState, pane: ActivePane,
 }
 
 fn sync_pane_toggle_buttons(widgets: &Widgets) {
-    widgets.pane_toggle_syncing.set(true);
-    widgets
-        .sidebar_toggle_button
-        .set_active(pane_is_visible(widgets, ActivePane::Sidebar));
-    widgets
-        .thread_list_toggle_button
-        .set_active(pane_is_visible(widgets, ActivePane::Threads));
-    widgets
-        .message_pane_toggle_button
-        .set_active(pane_is_visible(widgets, ActivePane::Message));
-    widgets.pane_toggle_syncing.set(false);
+    set_pane_button_visible_class(
+        &widgets.sidebar_toggle_button,
+        pane_is_visible(widgets, ActivePane::Sidebar),
+    );
+    set_pane_button_visible_class(
+        &widgets.thread_list_toggle_button,
+        pane_is_visible(widgets, ActivePane::Threads),
+    );
+    set_pane_button_visible_class(
+        &widgets.message_pane_toggle_button,
+        pane_is_visible(widgets, ActivePane::Message),
+    );
+}
+
+fn sync_pane_button_classes(widgets: &Widgets, state: &SharedState) {
+    sync_pane_toggle_buttons(widgets);
+    update_active_pane_visuals(widgets, state);
+}
+
+fn set_pane_button_visible_class<W>(widget: &W, visible: bool)
+where
+    W: IsA<gtk::Widget>,
+{
+    if visible {
+        widget.add_css_class("notm-pane-visible");
+        widget.remove_css_class("notm-pane-hidden");
+    } else {
+        widget.remove_css_class("notm-pane-visible");
+        widget.add_css_class("notm-pane-hidden");
+    }
 }
 
 fn ensure_active_pane_visible(widgets: &Widgets, state: &SharedState) {
@@ -4702,7 +4722,8 @@ fn clear_numeric_prefix(prefix: &Rc<RefCell<String>>) {
 }
 
 fn button_label(base: &str, binding: &str, state: &SharedState) -> String {
-    if state.borrow().input_mode == InputMode::Normal && !binding.is_empty() {
+    let state = state.borrow();
+    if state.show_keybind_hints && state.input_mode == InputMode::Normal && !binding.is_empty() {
         format!("{base} ({binding})")
     } else {
         base.to_string()
@@ -4928,18 +4949,15 @@ fn install_shortcuts(
         if ctrl && let Some(digit) = key_to_digit(key) {
             match digit {
                 1 => {
-                    w.sidebar_toggle_button
-                        .set_active(!w.sidebar_toggle_button.is_active());
+                    toggle_pane_visibility(&w, &st, ActivePane::Sidebar);
                     return gtk::glib::Propagation::Stop;
                 }
                 2 => {
-                    w.thread_list_toggle_button
-                        .set_active(!w.thread_list_toggle_button.is_active());
+                    toggle_pane_visibility(&w, &st, ActivePane::Threads);
                     return gtk::glib::Propagation::Stop;
                 }
                 3 => {
-                    w.message_pane_toggle_button
-                        .set_active(!w.message_pane_toggle_button.is_active());
+                    toggle_pane_visibility(&w, &st, ActivePane::Message);
                     return gtk::glib::Propagation::Stop;
                 }
                 _ => {}
@@ -12600,11 +12618,11 @@ fn button_flow(spacing: u32) -> gtk::FlowBox {
     flow
 }
 
-fn pane_toggle_button(icon_name: &str, widget_name: &str, tooltip: &str) -> gtk::ToggleButton {
-    let button = gtk::ToggleButton::new();
+fn pane_toggle_button(icon_name: &str, widget_name: &str, tooltip: &str) -> gtk::Button {
+    let button = gtk::Button::new();
     button.set_widget_name(widget_name);
     button.set_tooltip_text(Some(tooltip));
-    button.set_active(true);
+    button.add_css_class("notm-pane-visible");
     let icon = gtk::Image::from_icon_name(icon_name);
     icon.set_pixel_size(16);
     button.set_child(Some(&icon));
@@ -13739,6 +13757,12 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
         options.show_thread_preview,
         "Show message body previews in the thread list. Runtime command: :preview or :nopreview.",
     );
+    let show_keybind_hints = settings_check_row(
+        &form,
+        "Show keybind hints",
+        options.show_keybind_hints,
+        "Show shortcut hints in button labels, e.g. Archive (a). Relaunch required.",
+    );
     let show_sidebar = settings_check_row(
         &form,
         "Show sidebar at startup",
@@ -14043,6 +14067,7 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
                 show_thread_dates: show_thread_dates.is_active(),
                 show_thread_tags: show_thread_tags.is_active(),
                 show_thread_preview: show_thread_preview.is_active(),
+                show_keybind_hints: show_keybind_hints.is_active(),
                 show_sidebar: show_sidebar.is_active(),
                 show_message_list: show_message_list.is_active(),
                 show_message_view: show_message_view.is_active(),
@@ -14113,6 +14138,7 @@ struct SettingsValues {
     show_thread_dates: bool,
     show_thread_tags: bool,
     show_thread_preview: bool,
+    show_keybind_hints: bool,
     show_sidebar: bool,
     show_message_list: bool,
     show_message_view: bool,
@@ -14506,6 +14532,7 @@ fn persist_settings_values(options: &LaunchOptions, values: &SettingsValues) -> 
         "show_thread_preview",
         values.show_thread_preview,
     );
+    set_bool(root, "ui", "show_keybind_hints", values.show_keybind_hints);
     set_bool(root, "ui", "show_sidebar", values.show_sidebar);
     set_bool(root, "ui", "show_message_list", values.show_message_list);
     set_bool(root, "ui", "show_message_view", values.show_message_view);
@@ -14874,6 +14901,33 @@ mod tests {
         assert!(status.starts_with("Opened link externally: https://example.test/"));
         assert!(status.ends_with('…'));
         assert!(status.chars().count() < uri.chars().count());
+    }
+
+    #[test]
+    fn button_label_shows_keybind_hint_by_default_in_normal_mode() {
+        let state = Rc::new(RefCell::new(UiState::default()));
+
+        assert_eq!(button_label("Archive", "a", &state), "Archive (a)");
+    }
+
+    #[test]
+    fn button_label_hides_keybind_hint_when_setting_is_off() {
+        let state = Rc::new(RefCell::new(UiState {
+            show_keybind_hints: false,
+            ..UiState::default()
+        }));
+
+        assert_eq!(button_label("Archive", "a", &state), "Archive");
+    }
+
+    #[test]
+    fn button_label_hides_keybind_hint_outside_normal_mode() {
+        let state = Rc::new(RefCell::new(UiState {
+            input_mode: InputMode::Insert,
+            ..UiState::default()
+        }));
+
+        assert_eq!(button_label("Archive", "a", &state), "Archive");
     }
 
     #[test]
