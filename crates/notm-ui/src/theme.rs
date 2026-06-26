@@ -47,6 +47,11 @@ pub fn css() -> &'static str {
         border: 1px solid transparent;
         border-radius: 8px;
     }
+    #notm-left-sidebar .notm-keyboard-cursor,
+    #notm-left-sidebar-content .notm-keyboard-cursor {
+        box-shadow: inset 0 0 0 2px alpha(@theme_selected_bg_color, .85);
+        background-color: alpha(@theme_selected_bg_color, .12);
+    }
     #notm-thread-list row.notm-visual-selected,
     #notm-thread-list .notm-visual-selected,
     #notm-thread-list row.notm-multi-selected,
