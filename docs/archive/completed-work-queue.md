@@ -1,3 +1,7 @@
+# Historical completed work queue
+
+> Archived from the repository root during documentation cleanup. This file is historical context, not the current project plan.
+
 # notm remaining work queue
 
 This file is the compaction-safe tracker for finishing the remaining daily-driver gaps one at a time. Rule: finish a gap, run its quality gate, update PROGRESS.md and TEST_REPORT.md, then move to the next gap.

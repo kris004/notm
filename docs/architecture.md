@@ -6,7 +6,7 @@
 
 - `notm-notmuch`: generated FFI plus safe RAII wrappers over databases, queries, thread/message/tag/filename iterators, config, revision, indexing, and tag mutation.
 - `notm-mail`: RFC5322/MIME parsing, sanitized HTML-to-text fallback, attachment extraction, composition, reply/reply-all, inline forward, forward-as-attachment generation, and send transports.
-- `notm-ui`: direct gtk4-rs desktop UI, WebKitGTK visual HTML view, shortcuts, command palette, debug panel, automation socket, screenshot support, optional sent/draft persistence wiring.
+- `notm-ui`: direct gtk4-rs desktop UI, WebKitGTK visual HTML view, shortcuts, command palette, debug panel, developer test harness, screenshot support, optional sent/draft persistence wiring.
 - `notm-app`: CLI/config/logging/paths and app wiring.
 - `notm-test-support`: fixture Maildir/database creation, fake send helpers, UI driver helpers, screenshot helpers.
 

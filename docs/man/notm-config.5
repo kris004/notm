@@ -1,0 +1,223 @@
+.TH NOTM-CONFIG 5 "2026-06-26" "notm 0.1.0" "File Formats"
+.SH NAME
+notm-config \- configuration file for notm
+.SH SYNOPSIS
+.I ~/.config/notm/config.toml
+.SH DESCRIPTION
+.B notm
+uses TOML configuration.  If the file is absent, notm starts with safe defaults
+and tries to discover the user's Notmuch config from
+.I $XDG_CONFIG_HOME/notmuch/default/config
+or
+.IR ~/.notmuch-config .
+.PP
+An alternate file can be selected with
+.B --config
+for any subcommand.  For example:
+.nf
+notm --config path launch
+.fi
+.SH EXAMPLE
+.nf
+[notmuch]
+database_path = "/home/alice/Mail"
+default_query = "tag:inbox and not tag:trash and not tag:spam"
+excluded_tags = ["trash", "spam"]
+
+[identity]
+name = "Alice Example"
+primary_email = "alice@example.com"
+
+[send]
+command = "/usr/sbin/sendmail"
+args = ["-t", "-oi"]
+mode = "stdin_rfc5322"
+.fi
+.SH SECTIONS
+.SS [notmuch]
+.TP
+.B database_path
+Path to the Notmuch database/mail root.
+If unset, notm tries to read it from the Notmuch config.
+.TP
+.B config_path
+Path to a Notmuch config file.
+.TP
+.B profile
+Optional Notmuch profile name.
+.TP
+.B default_query
+Startup query.  The default is
+.BR "tag:inbox and not tag:trash and not tag:spam" .
+.TP
+.B excluded_tags
+Tags excluded from normal searches.  The default is:
+.nf
+["trash", "spam"]
+.fi
+.TP
+.B open_readwrite_only_for_mutations
+Keep normal search/view database opens read-only and open read-write only for
+mutations.  Defaults to true.
+.TP
+.B sync_maildir_flags_after_tag_change
+Ask libnotmuch to synchronize Maildir flags after tag changes when supported.
+Defaults to true.
+.SS [identity]
+.TP
+.B name
+Display name used when composing mail.
+.TP
+.B primary_email
+Primary sender address.
+.TP
+.B other_email
+Additional addresses used for identity matching.
+.SS [ui]
+.TP
+.B theme
+Theme preference.  The default is
+.BR system .
+.TP
+.B page_size
+Number of thread rows loaded per page.  The default is 100.
+.TP
+.B thread_preview_lines
+Preview lines shown in the thread list.  The default is 2.
+.TP
+.B show_thread_numbers
+Show thread row numbers.  Defaults to true.
+.TP
+.B show_thread_dates
+Show thread dates.  Defaults to true.
+.TP
+.B show_thread_tags
+Show thread tags.  Defaults to true.
+.TP
+.B show_thread_preview
+Show thread body previews.  Defaults to true.
+.TP
+.B show_keybind_hints
+Show shortcut hints on buttons.  Defaults to true.
+.TP
+.B remote_images
+Allow remote images globally in the visual HTML view.  Defaults to false.
+.TP
+.B trusted_image_senders
+Sender allow-list for remote images.
+.TP
+.B html_mode
+HTML rendering preference.  The default is
+.BR sanitize_then_render_text_fallback .
+.TP
+.B start_maximized
+Start the window maximized.  Defaults to false.
+.TP
+.B show_sidebar
+Initial sidebar visibility.  Defaults to true.
+.TP
+.B show_message_list
+Initial message-list visibility.  Defaults to true.
+.TP
+.B show_message_view
+Initial message-view visibility.  Defaults to true.
+.TP
+.B show_debug_panel
+Start with the debug panel visible.  Defaults to false.
+.TP
+.B custom_saved_searches
+Array of saved search objects with
+.B name
+and
+.B query
+fields.
+.TP
+.B hidden_tag_searches
+Tag-derived searches hidden from the sidebar.
+.SS [send]
+.TP
+.B enabled
+Enable sending UI.  Defaults to true.
+A real send requires a configured
+.B command
+that accepts the generated RFC5322 message.
+.TP
+.B transport
+Transport family.  Currently
+.B external
+is used.
+.TP
+.B command
+External send command.
+.TP
+.B args
+Arguments passed to the external send command.
+.TP
+.B mode
+One of
+.BR auto ,
+.BR stdin_rfc5322 ,
+.BR file_arg ,
+or
+.BR command_template .
+.TP
+.B working_dir
+Optional working directory for the send command.
+.TP
+.B env
+Environment variables for the send command.
+.TP
+.B timeout_seconds
+Send timeout.  Defaults to 120.
+.TP
+.B save_sent
+Save accepted sent mail to a local Maildir.  Defaults to false.
+.TP
+.B sent_maildir
+Sent Maildir path.  Defaults to
+.I Sent
+under the database path when sent saving is enabled.
+.TP
+.B sent_tags
+Tags applied to indexed sent mail.  Defaults to:
+.nf
+["sent"]
+.fi
+.TP
+.B index_sent_after_send
+Index the saved sent file through libnotmuch after a successful send.  Defaults
+to false.
+.SS [drafts]
+.TP
+.B save_maildir
+Save explicit drafts as local Maildir messages.  Defaults to true.
+.TP
+.B maildir
+Draft Maildir path.  Defaults to
+.I Drafts
+under the database path when Maildir drafts are enabled.
+.TP
+.B tags
+Tags applied to indexed draft messages.  Defaults to:
+.nf
+["draft"]
+.fi
+.TP
+.B index_after_save
+Index explicit draft saves through libnotmuch.  Defaults to true.
+.SS [sync]
+Sync is disabled by default.  Set
+.B enabled
+and the specific manual command settings only when notm should expose a manual
+Sync action.  Startup receive/index commands should remain disabled unless that
+behavior is intentionally desired.
+.SS [automation]
+The developer test harness is disabled by default.
+The historical
+.B [automation]
+section controls its local socket path, token, screenshot directory, and
+live-test gates.  See
+.BR notm-test-harness (7).
+.SH SEE ALSO
+.BR notm (1),
+.BR notm-test-harness (7)

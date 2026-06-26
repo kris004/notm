@@ -14,11 +14,19 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Launch {
-        #[arg(long)]
+        #[arg(long = "test-harness", alias = "automation")]
         automation: bool,
-        #[arg(long)]
+        #[arg(
+            long = "test-harness-socket",
+            alias = "automation-socket",
+            value_name = "SOCKET"
+        )]
         automation_socket: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(
+            long = "test-harness-token",
+            alias = "automation-token",
+            value_name = "TOKEN"
+        )]
         automation_token: Option<String>,
         #[arg(long)]
         fixture: bool,

@@ -11409,16 +11409,16 @@ fn setup_automation(
         },
         tx,
     ) {
-        state.borrow_mut().last_error = Some(format!("automation failed: {err}"));
+        state.borrow_mut().last_error = Some(format!("test harness failed: {err}"));
     } else {
         eprintln!(
-            "notm automation socket={} token={}",
+            "notm test harness socket={} token={}",
             socket.display(),
             token
         );
         widgets
             .status_label
-            .set_text(&format!("Automation: {}", socket.display()));
+            .set_text(&format!("Test harness: {}", socket.display()));
     }
     let opts = options.clone();
     let w = widgets.clone();
@@ -11449,7 +11449,7 @@ fn handle_automation_request(
                 .args
                 .get("name")
                 .and_then(|v| v.as_str())
-                .unwrap_or("automation.png");
+                .unwrap_or("test-harness.png");
             match screenshot::capture_screenshot(&options.screenshot_dir, name) {
                 Ok(path) => {
                     state.borrow_mut().screenshot_path = Some(path.clone());
@@ -11479,7 +11479,7 @@ fn handle_automation_request(
                 widgets,
                 state,
                 InputMode::Insert,
-                "Insert mode (automation focus)",
+                "Insert mode (test-harness focus)",
             );
             entry.grab_focus();
             if matches!(field, "to" | "cc" | "bcc") {
@@ -12302,7 +12302,7 @@ fn handle_automation_request(
         "get_logs" => {
             json!({"ok": true, "recent_error": state.borrow().last_error, "last_operation": state.borrow().last_operation})
         }
-        other => json!({"ok": false, "error": format!("unknown automation command: {other}")}),
+        other => json!({"ok": false, "error": format!("unknown test-harness command: {other}")}),
     };
     let _ = req.response.send(result);
 }
@@ -12613,7 +12613,7 @@ fn run_named_command(
 fn update_debug(widgets: &Widgets, state: &SharedState) {
     let s = state.borrow();
     let text = format!(
-        "query: {}\nselected_thread: {}\nselected_message: {}\ndatabase_path: {}\ndatabase_revision: {}\nlast_operation: {}\nlast_error: {}\nautomation: {}\nlast_send: {}\n",
+        "query: {}\nselected_thread: {}\nselected_message: {}\ndatabase_path: {}\ndatabase_revision: {}\nlast_operation: {}\nlast_error: {}\ntest_harness: {}\nlast_send: {}\n",
         s.current_query,
         s.selected_thread
             .as_ref()
@@ -14041,16 +14041,16 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
         "Shell command to update the local notmuch database, for example `notmuch new` or a wrapper.",
     );
 
-    settings_section(&form, "Automation");
+    settings_section(&form, "Developer test harness");
     settings_note(
         &form,
-        "Automation is for coding agents and tests to drive the actual notm UI and verify changes without clicking around or using separate GUI tools. It is not a Notmuch CLI replacement; it exercises notm itself. It is local, token-gated, and disabled by default.",
+        "The developer test harness lets coding agents and tests drive the actual notm UI without clicking around or using separate GUI tools. It is not mail automation, filtering, or a Notmuch CLI replacement. It is local, token-gated, and disabled by default.",
     );
     let automation_enabled = settings_check_row(
         &form,
-        "Enable automation",
+        "Enable test harness",
         options.automation_enabled,
-        "Start a local automation socket on launch.",
+        "Start the local test-harness socket on launch.",
     );
     let automation_socket = settings_entry_row(
         &form,
@@ -14062,14 +14062,14 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
         &form,
         "Token",
         options.automation_token.as_deref().unwrap_or_default(),
-        "Token required by automation clients.",
+        "Token required by test-harness clients.",
     );
     let screenshot_dir = settings_path_row(
         &widgets.window,
         &form,
         "Screenshots",
         &options.screenshot_dir.display().to_string(),
-        "Directory used by automation screenshots.",
+        "Directory used by test-harness screenshots.",
         SettingsPathKind::Directory,
     );
     let allow_live_send_test = settings_check_row(
@@ -14082,7 +14082,7 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
         &form,
         "Allow tag test",
         toml_bool(&existing, "automation", "allow_live_tag_test", false),
-        "Safety gate for explicit automation tests that intentionally mutate tags in the real mail database.",
+        "Safety gate for explicit test-harness checks that intentionally mutate tags in the real mail database.",
     );
 
     settings_note(

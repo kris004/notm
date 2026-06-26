@@ -41,7 +41,7 @@ pub fn spawn(config: AutomationConfig, tx: mpsc::Sender<AutomationRequest>) -> a
                     thread::sleep(Duration::from_millis(50));
                 }
                 Err(err) => {
-                    eprintln!("notm automation accept failed: {err}");
+                    eprintln!("notm test harness accept failed: {err}");
                     break;
                 }
             }
@@ -96,7 +96,7 @@ fn handle_client(
                 let _ = writeln!(
                     writer,
                     "{}",
-                    json!({"ok":false,"error":"automation command timed out"})
+                    json!({"ok":false,"error":"test harness command timed out"})
                 );
             }
         }

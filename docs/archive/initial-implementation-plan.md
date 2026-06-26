@@ -1,3 +1,7 @@
+# Historical initial implementation plan
+
+> Archived from the repository root during documentation cleanup. This file is historical context, not the current project plan.
+
 # notm implementation plan
 
 ## Architecture

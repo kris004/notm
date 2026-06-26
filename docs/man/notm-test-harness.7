@@ -1,0 +1,132 @@
+.TH NOTM-TEST-HARNESS 7 "2026-06-26" "notm 0.1.0" "Miscellaneous"
+.SH NAME
+notm-test-harness \- developer test harness for notm
+.SH DESCRIPTION
+The
+.B notm
+developer test harness is a local UI-driving test harness used for fixture
+testing, smoke
+tests, and agent-assisted validation.  It is not mail automation, filtering, or
+rules support.  It is disabled by default.  Normal desktop users should launch
+.B notm launch
+without the test harness.
+.PP
+Each request is one JSON line containing a
+.B token,
+.B command,
+and optional
+.B args
+object.  Commands run in the GTK main loop and operate on the real application
+state.
+.SH LAUNCH
+.nf
+notm launch \\
+  --test-harness \\
+  --test-harness-socket /tmp/notm.sock \\
+  --test-harness-token dev-token
+.fi
+.PP
+Fixture mode is preferred for UI test-harness runs that do not require a live
+mailbox:
+.PP
+.nf
+notm launch --fixture \\
+  --test-harness \\
+  --test-harness-socket /tmp/notm.sock \\
+  --test-harness-token dev-token
+.fi
+.SH REQUEST EXAMPLE
+.nf
+{"token":"dev-token","command":"run_search","args":{"query":"tag:inbox"}}
+.fi
+.SH COMMAND GROUPS
+.SS Health and state
+.BR health ,
+.BR app_state ,
+.BR get_logs ,
+.BR screenshot .
+.SS Search and navigation
+.BR focus_search ,
+.BR set_search_query ,
+.BR run_search ,
+.BR load_more_threads ,
+.BR scroll_thread_list_to_bottom ,
+.BR thread_page_info ,
+.BR thread_selection_view_state ,
+.BR thread_row_layout ,
+.BR thread_list_rows ,
+.BR select_saved_search ,
+.BR save_current_search ,
+.BR select_thread_by_index ,
+.BR select_relative_thread ,
+.BR select_thread_edge ,
+.BR open_selected_thread ,
+.BR select_message_by_index ,
+.BR thread_ui_details ,
+.BR toggle_multi_select_thread ,
+.BR clear_multi_selection .
+.SS Tags
+.BR archive_selected ,
+.BR mark_read_selected ,
+.BR mark_unread_selected ,
+.BR flag_selected ,
+.BR unflag_selected ,
+.BR trash_selected ,
+.BR spam_selected ,
+.BR tag_selected ,
+.BR add_tag_selected ,
+.BR remove_tag_selected ,
+.BR undo_last_tag ,
+.BR undo_tag_actions .
+.SS Compose and sending
+.BR open_compose ,
+.BR compose_set_from ,
+.BR compose_set_to ,
+.BR compose_set_cc ,
+.BR compose_set_bcc ,
+.BR compose_set_subject ,
+.BR compose_set_body ,
+.BR compose_add_attachment ,
+.BR compose_send .
+.SS Replies and forwards
+.BR reply_selected ,
+.BR reply_all_selected ,
+.BR forward_selected ,
+.BR forward_as_attachment_selected .
+.SS Message display and attachments
+.BR show_raw_source ,
+.BR show_full_headers ,
+.BR show_text_thread ,
+.BR show_visual_html ,
+.BR image_policy ,
+.BR load_images_once ,
+.BR trust_sender_images ,
+.BR toggle_quote_collapse ,
+.BR message_view_text ,
+.BR attachment_list_items ,
+.BR save_selected_attachment ,
+.BR open_selected_attachment .
+.SS UI and debugging
+.BR open_command_palette ,
+.BR command_completion ,
+.BR open_shortcuts ,
+.BR help_search ,
+.BR run_command ,
+.BR run_manual_sync ,
+.BR open_settings ,
+.BR save_settings ,
+.BR resize_window ,
+.BR pane_visibility ,
+.BR set_pane_visibility ,
+.BR toggle_debug_panel .
+.SH SAFETY
+Keep the socket local to the user session and use a token.  Prefer fixture data
+for test-harness runs.  Do not run receive/sync commands or live-send tests
+unless a user explicitly configured and requested that path.
+.SH FILES
+.TP
+.I artifacts/screenshots/
+Default screenshot output directory for test-harness screenshots.
+.SH SEE ALSO
+.BR notm (1),
+.BR notm-config (5)
