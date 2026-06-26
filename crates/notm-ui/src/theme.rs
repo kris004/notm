@@ -23,6 +23,14 @@ pub fn css() -> &'static str {
         background-color: alpha(@theme_selected_bg_color, .16);
         box-shadow: inset 0 0 0 1px alpha(@theme_selected_bg_color, .36);
     }
+    #notm-pane-toggle-bar button.notm-current-pane-button {
+        border-bottom-color: alpha(@theme_selected_bg_color, .92);
+    }
+    #notm-pane-toggle-bar button.notm-current-pane-button:hover,
+    #notm-pane-toggle-bar button.notm-current-pane-button:focus,
+    #notm-pane-toggle-bar button.notm-current-pane-button:active {
+        border-bottom-color: alpha(@theme_selected_bg_color, .95);
+    }
     #notm-pane-toggle-bar button.notm-pane-hidden {
         border-bottom-color: transparent;
         box-shadow: none;
@@ -38,13 +46,6 @@ pub fn css() -> &'static str {
     #notm-message-pane {
         border: 1px solid transparent;
         border-radius: 8px;
-    }
-    .notm-active-pane {
-        background-color: alpha(@theme_selected_bg_color, .035);
-    }
-    .notm-active-pane .notm-keyboard-cursor {
-        box-shadow: inset 0 0 0 2px alpha(@theme_selected_bg_color, .85);
-        background-color: alpha(@theme_selected_bg_color, .12);
     }
     #notm-thread-list row.notm-visual-selected,
     #notm-thread-list .notm-visual-selected,
@@ -101,15 +102,15 @@ pub fn css() -> &'static str {
         border: 1px solid alpha(currentColor, .18);
         border-radius: 8px;
         background-color: @theme_bg_color;
-        box-shadow: inset 0 0 0 9999px alpha(currentColor, .06);
     }
     #notm-message-header .notm-message-header-badge,
     #notm-message-header:backdrop .notm-message-header-badge,
     #notm-message-header .notm-message-header-badge:backdrop {
         padding: 2px 8px;
         border-radius: 999px;
-        background: alpha(@theme_selected_bg_color, .16);
-        color: @theme_selected_bg_color;
+        border: 1px solid alpha(currentColor, .16);
+        background: alpha(@theme_fg_color, .06);
+        color: @theme_fg_color;
         font-weight: 800;
     }
     #notm-message-header .notm-message-header-subject {
@@ -127,7 +128,7 @@ pub fn css() -> &'static str {
     #notm-message-header:backdrop .notm-message-header-value,
     #notm-message-header .notm-message-header-value:backdrop {
         color: @theme_fg_color;
-        opacity: .95;
+        opacity: 1;
     }
     #notm-command-palette {
         padding: 0;

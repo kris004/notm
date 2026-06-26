@@ -3181,7 +3181,10 @@ fn connect_search_debounce(options: &LaunchOptions, widgets: &Widgets, state: &S
         while let Ok(response) = rx.try_recv() {
             if response.generation == w.search_generation.get() {
                 match response.result {
-                    Ok(data) => apply_search_data(&poll_opts, &w, &st, data, true),
+                    Ok(data) => {
+                        let select_first = !widget_contains_focus(w.search_entry.upcast_ref());
+                        apply_search_data(&poll_opts, &w, &st, data, select_first);
+                    }
                     Err(err) => apply_search_error(&w, &st, err),
                 }
             } else {
@@ -3880,19 +3883,28 @@ fn default_content_split(paned: &gtk::Paned) -> i32 {
 
 fn update_active_pane_visuals(widgets: &Widgets, state: &SharedState) {
     let active = state.borrow().active_pane;
-    set_active_pane_class(&widgets.left_pane, active == ActivePane::Sidebar);
-    set_active_pane_class(&widgets.thread_pane, active == ActivePane::Threads);
-    set_active_pane_class(&widgets.message_pane, active == ActivePane::Message);
+    set_current_pane_button_class(
+        &widgets.sidebar_toggle_button,
+        active == ActivePane::Sidebar,
+    );
+    set_current_pane_button_class(
+        &widgets.thread_list_toggle_button,
+        active == ActivePane::Threads,
+    );
+    set_current_pane_button_class(
+        &widgets.message_pane_toggle_button,
+        active == ActivePane::Message,
+    );
 }
 
-fn set_active_pane_class<W>(widget: &W, active: bool)
+fn set_current_pane_button_class<W>(widget: &W, current: bool)
 where
     W: IsA<gtk::Widget>,
 {
-    if active {
-        widget.add_css_class("notm-active-pane");
+    if current {
+        widget.add_css_class("notm-current-pane-button");
     } else {
-        widget.remove_css_class("notm-active-pane");
+        widget.remove_css_class("notm-current-pane-button");
     }
 }
 
@@ -8883,6 +8895,7 @@ fn apply_search_data(
     let count = data.count;
     let offset = data.offset;
     let cached = data.cached;
+    let preserve_search_focus = widget_contains_focus(widgets.search_entry.upcast_ref());
     {
         let mut s = state.borrow_mut();
         s.current_query = query.clone();
@@ -8932,7 +8945,7 @@ fn apply_search_data(
         ));
     }
     update_thread_result_label(widgets, state);
-    if state.borrow().input_mode == InputMode::Normal {
+    if !preserve_search_focus && state.borrow().input_mode == InputMode::Normal {
         focus_active_pane(widgets, state);
     }
     update_debug(widgets, state);
@@ -9737,6 +9750,7 @@ fn select_thread_by_index(
         open_thread_by_index(options, widgets, state, index);
         return;
     }
+    let preserve_search_focus = widget_contains_focus(widgets.search_entry.upcast_ref());
 
     let result = (|| -> anyhow::Result<()> {
         let db = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
@@ -9760,7 +9774,7 @@ fn select_thread_by_index(
                 match open_selected_draft_message(widgets, state) {
                     Ok(()) => {
                         state.borrow_mut().active_pane = ActivePane::Threads;
-                        focus_active_pane(widgets, state);
+                        focus_after_thread_preview(widgets, state, preserve_search_focus);
                         widgets.status_label.set_text(&message_position_status(
                             state,
                             index,
@@ -9778,7 +9792,7 @@ fn select_thread_by_index(
                 set_active_draft(widgets, state, None);
                 show_preferred_selected_message_view(options, widgets, state);
                 state.borrow_mut().active_pane = ActivePane::Threads;
-                focus_active_pane(widgets, state);
+                focus_after_thread_preview(widgets, state, preserve_search_focus);
                 widgets
                     .status_label
                     .set_text(&message_position_status(state, index, "Selected"));
@@ -9794,13 +9808,21 @@ fn select_thread_by_index(
         }
     }
     scroll_thread_index_into_view(widgets, index);
-    focus_thread_list(widgets);
+    if !preserve_search_focus {
+        focus_thread_list(widgets);
+    }
     if state.borrow().visual_select_mode {
         update_visual_selection_to_cursor(widgets, state);
     }
     update_custom_tag_controls(widgets, state);
     update_message_action_buttons(options, widgets, state);
     update_debug(widgets, state);
+}
+
+fn focus_after_thread_preview(widgets: &Widgets, state: &SharedState, preserve_search_focus: bool) {
+    if !preserve_search_focus {
+        focus_active_pane(widgets, state);
+    }
 }
 
 fn open_thread_by_index(
@@ -11453,12 +11475,20 @@ fn handle_automation_request(
             json!({"ok": true, "field": field})
         }
         "entry_state" => {
+            let search_selection_bounds = widgets
+                .search_entry
+                .selection_bounds()
+                .map(|(start, end)| json!({"start": start, "end": end}));
             json!({
                 "ok": true,
                 "search": widgets.search_entry.text().to_string(),
+                "search_has_focus": widget_contains_focus(widgets.search_entry.upcast_ref()),
+                "search_selection_bounds": search_selection_bounds,
                 "custom_tag": widgets.custom_tag_entry.text().to_string(),
                 "tag_command": widgets.tag_command_entry.text().to_string(),
                 "compose_fields": compose_fields(widgets, state),
+                "input_mode": format!("{:?}", state.borrow().input_mode),
+                "active_pane": format!("{:?}", state.borrow().active_pane),
                 "search_suggestions_visible": widgets.search_suggestions_list.is_visible(),
                 "address_suggestions_visible": widgets.address_suggestions_list.is_visible(),
             })
@@ -11471,6 +11501,7 @@ fn handle_automation_request(
                 .unwrap_or_default();
             widgets.search_entry.set_text(query);
             state.borrow_mut().current_query = query.to_string();
+            widgets.search_entry.set_position(-1);
             json!({"ok": true, "current_query": query})
         }
         "run_search" => {
