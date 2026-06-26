@@ -3883,6 +3883,9 @@ fn default_content_split(paned: &gtk::Paned) -> i32 {
 
 fn update_active_pane_visuals(widgets: &Widgets, state: &SharedState) {
     let active = state.borrow().active_pane;
+    if active != ActivePane::Sidebar {
+        clear_keyboard_cursor(&widgets.left_pane.clone().upcast());
+    }
     set_current_pane_button_class(
         &widgets.sidebar_toggle_button,
         active == ActivePane::Sidebar,
@@ -4048,6 +4051,15 @@ fn mark_keyboard_cursor(targets: &[gtk::Widget], index: usize) {
     }
     if let Some(target) = targets.get(index) {
         target.add_css_class(KEYBOARD_CURSOR_CLASS);
+    }
+}
+
+fn clear_keyboard_cursor(widget: &gtk::Widget) {
+    widget.remove_css_class(KEYBOARD_CURSOR_CLASS);
+    let mut child = widget.first_child();
+    while let Some(child_widget) = child {
+        child = child_widget.next_sibling();
+        clear_keyboard_cursor(&child_widget);
     }
 }
 
@@ -9882,6 +9894,7 @@ fn open_thread_by_index(
         }
     }
     update_custom_tag_controls(widgets, state);
+    update_active_pane_visuals(widgets, state);
     update_debug(widgets, state);
 }
 
