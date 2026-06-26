@@ -403,6 +403,10 @@ const SIDEBAR_MIN_WIDTH: i32 = 136;
 const THREAD_LIST_MIN_WIDTH: i32 = 320;
 const COMPOSE_BODY_MIN_HEIGHT: i32 = 96;
 const COMPOSE_BODY_NATURAL_HEIGHT: i32 = 260;
+// GTK measures the message header at unbounded width during compact pane allocation.
+// Reserving multiple lines per metadata row can force the whole message pane taller
+// than the available window; full values stay available via selection and tooltip.
+const MESSAGE_HEADER_VALUE_LINES: i32 = 1;
 const KEYBOARD_CURSOR_CLASS: &str = "notm-keyboard-cursor";
 const STATUS_BAR_MAX_WIDTH_CHARS: i32 = 120;
 const HTML_LINK_STATUS_URI_MAX_CHARS: usize = 96;
@@ -7425,7 +7429,7 @@ fn append_message_header_field(grid: &gtk::Grid, row: &mut i32, key: &str, value
     value_label.set_xalign(0.0);
     value_label.set_wrap(true);
     value_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    value_label.set_lines(2);
+    value_label.set_lines(MESSAGE_HEADER_VALUE_LINES);
     value_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     value_label.set_max_width_chars(44);
     value_label.set_selectable(true);
@@ -14836,6 +14840,11 @@ fn table_entry<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_header_values_stay_single_line_for_compact_pane_height() {
+        assert_eq!(MESSAGE_HEADER_VALUE_LINES, 1);
+    }
 
     #[test]
     fn live_send_without_command_or_fixture_capture_fails() {
