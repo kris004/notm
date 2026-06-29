@@ -12,8 +12,7 @@ notm \- native GTK4 client for Notmuch mail stores
 is a desktop mail client for existing Notmuch mail stores.  It provides a
 three-pane GTK4 interface with saved searches, Notmuch query search, tag-based
 message actions, compose/reply/forward flows, local drafts, optional sanitized
-visual HTML, keyboard navigation, and an optional local developer test
-harness for tests.
+visual HTML, and keyboard navigation.
 .PP
 Normal search, view, tag, fixture indexing, and configured sent/draft indexing
 use
@@ -28,23 +27,28 @@ Read configuration from
 .I path
 instead of the default
 .IR ~/.config/notm/config.toml .
-.SH COMMANDS
+.SH NORMAL OPERATION
 .TP
 .B launch
-Start the GTK application.
-.TP
-.B launch --fixture
-Start the GTK application against a disposable fixture mailbox.
-.TP
-.B launch --test-harness --test-harness-socket PATH --test-harness-token TOKEN
-Start with the local developer test harness enabled.  This is for controlled
-local testing and agent-assisted validation, not normal desktop use.
+Start the GTK application for normal desktop mail use.
 .TP
 .B print-config
 Print the effective configuration as JSON after default discovery.
 .TP
 .B probe-send
-Probe the configured external send transport without sending mail.
+Probe the configured external send transport without sending mail.  This is a
+safe way to check send-command configuration.
+.SH TESTING AND DEBUGGING
+These commands and flags are for development, smoke testing, or agent-assisted
+validation.  They are not needed for normal mail use.
+.TP
+.B launch --fixture
+Start the GTK application against a disposable fixture mailbox.
+.TP
+.B launch --test-harness --test-harness-socket PATH --test-harness-token TOKEN
+Start with the local developer test harness enabled.  This lets tests drive the
+running GTK app through a local Unix socket.  See
+.BR notm-test-harness (7).
 .TP
 .B fixture-smoke
 Create a disposable fixture Notmuch database, run basic searches, and verify the
@@ -52,11 +56,12 @@ fake send transport contract.
 .TP
 .B live-readonly-smoke
 Open the configured Notmuch database read-only and run the configured default
-query.
+query.  This touches live user data only read-only.
 .TP
 .B live-self-send
 Send exactly one unique self-test message through the configured transport and
-wait briefly for it to appear in Notmuch.  This does not force sync.
+wait briefly for it to appear in Notmuch.  This sends real mail and does not
+force sync.
 .SH FILES
 .TP
 .I ~/.config/notm/config.toml

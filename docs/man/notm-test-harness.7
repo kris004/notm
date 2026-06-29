@@ -18,7 +18,16 @@ and optional
 .B args
 object.  Commands run in the GTK main loop and operate on the real application
 state.
-.SH LAUNCH
+.SH NORMAL OPERATION
+Normal desktop mail use does not require this harness.
+Start notm normally with:
+.PP
+.nf
+notm launch
+.fi
+.PP
+Use the harness only when developing, debugging, or running smoke tests.
+.SH TEST-HARNESS LAUNCH
 .nf
 notm launch \\
   --test-harness \\
@@ -35,11 +44,11 @@ notm launch --fixture \\
   --test-harness-socket /tmp/notm.sock \\
   --test-harness-token dev-token
 .fi
-.SH REQUEST EXAMPLE
+.SH TEST REQUEST EXAMPLE
 .nf
 {"token":"dev-token","command":"run_search","args":{"query":"tag:inbox"}}
 .fi
-.SH COMMAND GROUPS
+.SH TEST COMMAND GROUPS
 .SS Health and state
 .BR health ,
 .BR app_state ,

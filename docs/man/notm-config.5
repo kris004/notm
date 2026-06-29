@@ -33,7 +33,7 @@ command = "/usr/sbin/sendmail"
 args = ["-t", "-oi"]
 mode = "stdin_rfc5322"
 .fi
-.SH SECTIONS
+.SH NORMAL OPERATION SECTIONS
 .SS [notmuch]
 .TP
 .B database_path
@@ -211,12 +211,14 @@ Sync is disabled by default.  Set
 and the specific manual command settings only when notm should expose a manual
 Sync action.  Startup receive/index commands should remain disabled unless that
 behavior is intentionally desired.
+.SH TESTING AND DEBUGGING SECTIONS
 .SS [automation]
 The developer test harness is disabled by default.
 The historical
 .B [automation]
 section controls its local socket path, token, screenshot directory, and
-live-test gates.  See
+live-test gates.  This section is for development and smoke-test support, not
+normal mail operation.  See
 .BR notm-test-harness (7).
 .SH SEE ALSO
 .BR notm (1),
