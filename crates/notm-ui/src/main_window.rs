@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     rc::Rc,
-    sync::{Mutex, OnceLock, mpsc},
+    sync::{Arc, Mutex, OnceLock, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -45,6 +45,27 @@ pub struct SavedSearch {
     pub name: String,
     pub query: String,
 }
+
+#[derive(Debug, Clone)]
+pub struct RuntimeSettings {
+    page_size: usize,
+    excluded_tags: Vec<String>,
+    sync_maildir_flags_after_tag_change: bool,
+    remote_images: bool,
+}
+
+impl Default for RuntimeSettings {
+    fn default() -> Self {
+        Self {
+            page_size: 100,
+            excluded_tags: vec!["trash".to_string(), "spam".to_string()],
+            sync_maildir_flags_after_tag_change: true,
+            remote_images: false,
+        }
+    }
+}
+
+pub type RuntimeSettingsStore = Arc<Mutex<RuntimeSettings>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaunchOptions {
@@ -104,6 +125,9 @@ pub struct LaunchOptions {
     pub drafts_dir: Option<PathBuf>,
     pub app_config_path: Option<PathBuf>,
     pub custom_saved_searches: Vec<SavedSearch>,
+    pub open_message_id: Option<String>,
+    #[serde(skip)]
+    pub runtime_settings: RuntimeSettingsStore,
 }
 
 impl Default for LaunchOptions {
@@ -165,13 +189,19 @@ impl Default for LaunchOptions {
             drafts_dir: None,
             app_config_path: None,
             custom_saved_searches: Vec::new(),
+            open_message_id: None,
+            runtime_settings: Default::default(),
         }
     }
 }
 
 pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
+    sync_runtime_settings_from_launch_options(&options);
     let mut app_builder = gtk::Application::builder().application_id("dev.notm.Notm");
-    if options.automation_enabled {
+    // Targeted external launches must build their own window; a unique
+    // GtkApplication would only activate an already-running notm instance with
+    // that instance's original launch options.
+    if options.automation_enabled || options.open_message_id.is_some() {
         app_builder = app_builder.flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
     }
     let app = app_builder.build();
@@ -190,6 +220,49 @@ pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
     });
     app.run_with_args(&["notm"]);
     Ok(())
+}
+
+fn sync_runtime_settings_from_launch_options(options: &LaunchOptions) {
+    update_runtime_settings(
+        options,
+        RuntimeSettings {
+            page_size: options.page_size.max(1),
+            excluded_tags: options.excluded_tags.clone(),
+            sync_maildir_flags_after_tag_change: options.sync_maildir_flags_after_tag_change,
+            remote_images: options.remote_images,
+        },
+    );
+}
+
+fn runtime_settings(options: &LaunchOptions) -> RuntimeSettings {
+    options
+        .runtime_settings
+        .lock()
+        .expect("runtime settings lock")
+        .clone()
+}
+
+fn update_runtime_settings(options: &LaunchOptions, settings: RuntimeSettings) {
+    *options
+        .runtime_settings
+        .lock()
+        .expect("runtime settings lock") = settings;
+}
+
+fn runtime_page_size(options: &LaunchOptions) -> usize {
+    runtime_settings(options).page_size.max(1)
+}
+
+fn runtime_excluded_tags(options: &LaunchOptions) -> Vec<String> {
+    runtime_settings(options).excluded_tags
+}
+
+fn runtime_sync_maildir_flags_after_tag_change(options: &LaunchOptions) -> bool {
+    runtime_settings(options).sync_maildir_flags_after_tag_change
+}
+
+fn runtime_remote_images(options: &LaunchOptions) -> bool {
+    runtime_settings(options).remote_images
 }
 
 #[derive(Clone)]
@@ -447,7 +520,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
 
     let initial_state = UiState {
         current_query: options.default_query.clone(),
-        thread_page_size: options.page_size,
+        thread_page_size: runtime_page_size(&options),
         automation_enabled: options.automation_enabled,
         database_path: options
             .database_path
@@ -460,6 +533,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
         show_thread_preview: options.show_thread_preview,
         show_keybind_hints: options.show_keybind_hints,
         trusted_image_senders: normalize_sender_list(&options.trusted_image_senders),
+        pending_open_message_id: options.open_message_id.clone(),
         compose_fields: ComposeFields {
             from: identity(&options)
                 .map(|i| i.formatted())
@@ -929,7 +1003,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
     html_view.set_widget_name("notm-html-view");
     html_view.set_hexpand(true);
     html_view.set_vexpand(true);
-    configure_html_webview(&html_view, options.remote_images);
+    configure_html_webview(&html_view, runtime_remote_images(&options));
     let scrolled_html = gtk::ScrolledWindow::builder()
         .hexpand(true)
         .vexpand(true)
@@ -2436,13 +2510,13 @@ fn apply_custom_tag_from_entry(
         TagMutation {
             add: vec![tag],
             remove: Vec::new(),
-            sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+            sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
         }
     } else {
         TagMutation {
             add: Vec::new(),
             remove: vec![tag],
-            sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+            sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
         }
     };
     let applied = tag_selected(options, widgets, state, undo_state, mutation);
@@ -2474,7 +2548,7 @@ fn apply_notmuch_tag_command_text(
                 TagMutation {
                     add,
                     remove,
-                    sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+                    sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
             update_custom_tag_controls(widgets, state);
@@ -4436,7 +4510,7 @@ fn load_thread_page_containing_index(
 ) {
     let visual_anchor_index = visual_selection_anchor_index(widgets, state);
     let target_number = target_index + 1;
-    let page_size = options.page_size.max(1);
+    let page_size = runtime_page_size(options);
     let offset = (target_index / page_size) * page_size;
     let page_start = offset + 1;
     let page_end = offset + page_size;
@@ -5441,7 +5515,7 @@ fn install_shortcuts(
                 TagMutation {
                     add: vec![],
                     remove: vec!["inbox".to_string()],
-                    sync_maildir_flags: opts.sync_maildir_flags_after_tag_change,
+                    sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(&opts),
                 },
             );
             true
@@ -5481,7 +5555,7 @@ fn install_shortcuts(
                 TagMutation {
                     add: vec!["trash".to_string()],
                     remove: vec!["inbox".to_string(), "spam".to_string()],
-                    sync_maildir_flags: opts.sync_maildir_flags_after_tag_change,
+                    sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(&opts),
                 },
             );
             true
@@ -5495,7 +5569,7 @@ fn install_shortcuts(
                 TagMutation {
                     add: vec!["spam".to_string()],
                     remove: vec!["inbox".to_string(), "trash".to_string()],
-                    sync_maildir_flags: opts.sync_maildir_flags_after_tag_change,
+                    sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(&opts),
                 },
             );
             true
@@ -5563,7 +5637,7 @@ fn install_shortcuts(
             true
         } else if key == gtk::gdk::Key::comma {
             clear_numeric_prefix(&numeric_prefix);
-            show_settings(&w, &opts);
+            show_settings(&w, &st, &opts);
             true
         } else if key == gtk::gdk::Key::question {
             clear_numeric_prefix(&numeric_prefix);
@@ -6146,13 +6220,13 @@ fn toggle_unread_selected(
         TagMutation {
             add: vec![],
             remove: vec!["unread".to_string()],
-            sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+            sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
         }
     } else {
         TagMutation {
             add: vec!["unread".to_string()],
             remove: vec![],
-            sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+            sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
         }
     };
     tag_selected(options, widgets, state, undo_state, mutation);
@@ -6169,13 +6243,13 @@ fn toggle_flagged_selected(
         TagMutation {
             add: vec![],
             remove: vec!["flagged".to_string()],
-            sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+            sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
         }
     } else {
         TagMutation {
             add: vec!["flagged".to_string()],
             remove: vec![],
-            sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+            sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
         }
     };
     tag_selected(options, widgets, state, undo_state, mutation);
@@ -6215,7 +6289,7 @@ fn collect_address_suggestions(options: &LaunchOptions) -> anyhow::Result<Vec<St
         limit: 500,
         offset: 0,
         sort: SortOrder::NewestFirst,
-        excluded_tags: options.excluded_tags.clone(),
+        excluded_tags: runtime_excluded_tags(options),
     };
     let messages = db.search_messages("*", &opts)?;
     let mut addrs = Vec::new();
@@ -8183,7 +8257,7 @@ fn html_status_text(
 }
 
 fn selected_message_allows_images(options: &LaunchOptions, state: &SharedState) -> bool {
-    options.remote_images
+    runtime_remote_images(options)
         || selected_sender_email(state)
             .as_deref()
             .is_some_and(|sender| image_sender_is_trusted(state, sender))
@@ -8381,7 +8455,7 @@ fn html_view_state(
         "html_visible": visible_child == "html",
         "has_html": has_html,
         "html_bytes": html_len,
-        "global_remote_images_allowed": options.remote_images,
+        "global_remote_images_allowed": runtime_remote_images(options),
         "sender_email": sender_email,
         "sender_trusted": sender_trusted,
         "policy_allows_images": selected_message_allows_images(options, state),
@@ -8695,8 +8769,9 @@ fn connect_actions(
     palette_button.connect_clicked(move |_| show_command_palette(&opts, &w, &st, &undo));
 
     let w = widgets.clone();
+    let st = state.clone();
     let opts = options.clone();
-    settings_button.connect_clicked(move |_| show_settings(&w, &opts));
+    settings_button.connect_clicked(move |_| show_settings(&w, &st, &opts));
 
     let w = widgets.clone();
     help_button.connect_clicked(move |_| show_shortcuts_overlay(&w));
@@ -8726,7 +8801,7 @@ fn connect_tag_button(
         let mutation = TagMutation {
             add: add.clone(),
             remove: remove.clone(),
-            sync_maildir_flags: opts.sync_maildir_flags_after_tag_change,
+            sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(&opts),
         };
         tag_selected(&opts, &w, &st, &undo, mutation);
     });
@@ -8816,10 +8891,10 @@ fn execute_search_page(
     }
     let tags = db.all_tags();
     let opts = QueryOptions {
-        limit: options.page_size,
+        limit: runtime_page_size(options),
         offset,
         sort: SortOrder::NewestFirst,
-        excluded_tags: options.excluded_tags.clone(),
+        excluded_tags: runtime_excluded_tags(options),
     };
     let threads = db.search_threads(query, &opts)?;
     let count = db
@@ -8832,7 +8907,7 @@ fn execute_search_page(
         details,
         count,
         offset,
-        limit: options.page_size,
+        limit: runtime_page_size(options),
         tags,
         database_path: db_path,
         revision,
@@ -8947,6 +9022,38 @@ fn apply_search_data(
     }
     populate_thread_list(options, widgets, state);
     update_tag_searches(options, widgets, state);
+    let pending_open_message_id = { state.borrow().pending_open_message_id.clone() };
+    if let Some(message_id) = pending_open_message_id {
+        let has_loaded_threads = { !state.borrow().thread_list_items.is_empty() };
+        if has_loaded_threads && open_loaded_thread_at_message(options, widgets, state, &message_id)
+        {
+            state.borrow_mut().pending_open_message_id = None;
+            update_thread_result_label(widgets, state);
+            update_debug(widgets, state);
+            return;
+        }
+
+        let fallback_query = message_id_query(&message_id);
+        if query != fallback_query {
+            widgets.status_label.set_text(&format!(
+                "Message id not in loaded startup results: {message_id}; opening direct match"
+            ));
+            widgets.search_entry.set_text(&fallback_query);
+            run_search(options, widgets, state, &fallback_query);
+            return;
+        }
+
+        state.borrow_mut().pending_open_message_id = None;
+        widgets
+            .status_label
+            .set_text(&format!("Message id not found: {message_id}"));
+        refresh_thread_attachment_list(widgets, state);
+        update_message_menu(options, widgets, state);
+        update_thread_result_label(widgets, state);
+        update_debug(widgets, state);
+        return;
+    }
+
     let selected_first = select_first && !state.borrow().thread_list_items.is_empty();
     if selected_first {
         select_thread_index_clamped(options, widgets, state, 0);
@@ -9132,9 +9239,9 @@ fn search_cache_key(
         db_path,
         revision.uuid,
         revision.revision,
-        options.page_size,
+        runtime_page_size(options),
         offset,
-        options.excluded_tags.join(","),
+        runtime_excluded_tags(options).join(","),
         query
     )
 }
@@ -9841,6 +9948,90 @@ fn focus_after_thread_preview(widgets: &Widgets, state: &SharedState, preserve_s
     }
 }
 
+fn message_id_query(message_id: &str) -> String {
+    format!("id:{}", quote_notmuch_value(message_id))
+}
+
+fn open_loaded_thread_at_message(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    message_id: &str,
+) -> bool {
+    let threads = state.borrow().thread_list_items.clone();
+    for (index, thread) in threads.iter().enumerate() {
+        let result = (|| -> anyhow::Result<Option<usize>> {
+            let db = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
+            let messages = db.thread_messages(&thread.thread_id)?;
+            let Some(message_index) = messages
+                .iter()
+                .position(|message| message.message_id == message_id)
+            else {
+                return Ok(None);
+            };
+            {
+                let mut s = state.borrow_mut();
+                s.selected_thread = Some(thread.clone());
+                s.selected_message = messages.get(message_index).cloned();
+                s.messages = messages;
+                s.active_pane = ActivePane::Message;
+                s.last_operation = Some(format!("opened message {message_id}"));
+                s.last_error = None;
+            }
+            Ok(Some(message_index))
+        })();
+
+        match result {
+            Ok(Some(message_index)) => {
+                select_thread_index_in_list(widgets, index);
+                refresh_thread_attachment_list(widgets, state);
+                update_message_menu(options, widgets, state);
+                if selected_message_is_draft(options, state) {
+                    match open_selected_draft_message(widgets, state) {
+                        Ok(()) => widgets
+                            .status_label
+                            .set_text(&format!("Opened draft message {}", message_id)),
+                        Err(err) => {
+                            state.borrow_mut().last_error = Some(err.to_string());
+                            widgets
+                                .status_label
+                                .set_text(&format!("Open draft failed: {err}"));
+                        }
+                    }
+                } else {
+                    set_active_draft(widgets, state, None);
+                    show_preferred_selected_message_view(options, widgets, state);
+                    widgets.status_label.set_text(&format!(
+                        "Opened message {} ({}/{})",
+                        message_id,
+                        message_index + 1,
+                        state.borrow().messages.len()
+                    ));
+                }
+                scroll_thread_index_into_view(widgets, index);
+                update_custom_tag_controls(widgets, state);
+                update_active_pane_visuals(widgets, state);
+                update_message_action_buttons(options, widgets, state);
+                return true;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                state.borrow_mut().last_error = Some(err.to_string());
+                widgets
+                    .status_label
+                    .set_text(&format!("Open message failed: {err}"));
+                update_debug(widgets, state);
+                return false;
+            }
+        }
+    }
+
+    widgets.status_label.set_text(&format!(
+        "Message id not found in loaded results: {message_id}"
+    ));
+    false
+}
+
 fn open_thread_by_index(
     options: &LaunchOptions,
     widgets: &Widgets,
@@ -10074,7 +10265,7 @@ fn tag_selected(
                 limit: usize::MAX,
                 offset: 0,
                 sort: SortOrder::NewestFirst,
-                excluded_tags: options.excluded_tags.clone(),
+                excluded_tags: runtime_excluded_tags(options),
             };
             let report = db.apply_tags_to_thread_range(&query, &opts, start, end, &mutation)?;
             if report.changed_messages > 0 && report.revision_after > report.revision_before {
@@ -11768,7 +11959,7 @@ fn handle_automation_request(
                 TagMutation {
                     add: vec![],
                     remove: vec!["inbox".to_string()],
-                    sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+                    sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
             json!({"ok": true, "state": &*state.borrow()})
@@ -11782,7 +11973,7 @@ fn handle_automation_request(
                 TagMutation {
                     add: vec![],
                     remove: vec!["unread".to_string()],
-                    sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+                    sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
             json!({"ok": true, "state": &*state.borrow()})
@@ -11796,7 +11987,7 @@ fn handle_automation_request(
                 TagMutation {
                     add: vec!["unread".to_string()],
                     remove: vec![],
-                    sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+                    sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
             json!({"ok": true, "state": &*state.borrow()})
@@ -11810,7 +12001,7 @@ fn handle_automation_request(
                 TagMutation {
                     add: vec!["flagged".to_string()],
                     remove: vec![],
-                    sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+                    sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
             json!({"ok": true, "state": &*state.borrow()})
@@ -11824,7 +12015,7 @@ fn handle_automation_request(
                 TagMutation {
                     add: vec![],
                     remove: vec!["flagged".to_string()],
-                    sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+                    sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
             json!({"ok": true, "state": &*state.borrow()})
@@ -11838,7 +12029,7 @@ fn handle_automation_request(
                 TagMutation {
                     add: vec!["trash".to_string()],
                     remove: vec!["inbox".to_string(), "spam".to_string()],
-                    sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+                    sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
             json!({"ok": true, "state": &*state.borrow()})
@@ -11852,7 +12043,7 @@ fn handle_automation_request(
                 TagMutation {
                     add: vec!["spam".to_string()],
                     remove: vec!["inbox".to_string()],
-                    sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+                    sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
             json!({"ok": true, "state": &*state.borrow()})
@@ -11897,7 +12088,7 @@ fn handle_automation_request(
                 TagMutation {
                     add,
                     remove,
-                    sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+                    sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
             json!({"ok": true, "state": &*state.borrow()})
@@ -12226,7 +12417,7 @@ fn handle_automation_request(
             json!({"ok": true, "query": query, "results": help_search_results(query)})
         }
         "open_settings" => {
-            show_settings(widgets, options);
+            show_settings(widgets, state, options);
             json!({"ok": true})
         }
         "save_settings" => {
@@ -12240,7 +12431,7 @@ fn handle_automation_request(
                 .get("page_size")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize)
-                .unwrap_or(options.page_size);
+                .unwrap_or_else(|| runtime_page_size(options));
             let send_command = req
                 .args
                 .get("send_command")
@@ -12395,7 +12586,7 @@ fn run_named_command(
                 TagMutation {
                     add: vec![],
                     remove: vec!["inbox".to_string()],
-                    sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+                    sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
             json!({"ok": true, "state": &*state.borrow()})
@@ -12409,7 +12600,7 @@ fn run_named_command(
                 TagMutation {
                     add: vec![],
                     remove: vec!["unread".to_string()],
-                    sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+                    sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
             json!({"ok": true, "state": &*state.borrow()})
@@ -12423,7 +12614,7 @@ fn run_named_command(
                 TagMutation {
                     add: vec!["unread".to_string()],
                     remove: vec![],
-                    sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+                    sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
             json!({"ok": true, "state": &*state.borrow()})
@@ -12437,7 +12628,7 @@ fn run_named_command(
                 TagMutation {
                     add: vec!["flagged".to_string()],
                     remove: vec![],
-                    sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+                    sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
             json!({"ok": true, "state": &*state.borrow()})
@@ -12451,7 +12642,7 @@ fn run_named_command(
                 TagMutation {
                     add: vec![],
                     remove: vec!["flagged".to_string()],
-                    sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+                    sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
             json!({"ok": true, "state": &*state.borrow()})
@@ -12465,7 +12656,7 @@ fn run_named_command(
                 TagMutation {
                     add: vec!["trash".to_string()],
                     remove: vec!["inbox".to_string(), "spam".to_string()],
-                    sync_maildir_flags: options.sync_maildir_flags_after_tag_change,
+                    sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
             json!({"ok": true, "state": &*state.borrow()})
@@ -12586,7 +12777,7 @@ fn run_named_command(
             json!({"ok": true, "selected_thread": state.borrow().selected_thread})
         }
         "settings" | "open_settings" => {
-            show_settings(widgets, options);
+            show_settings(widgets, state, options);
             json!({"ok": true})
         }
         "shortcuts" | "show_shortcuts" => {
@@ -13646,7 +13837,7 @@ fn command_help_entries() -> &'static [HelpEntry] {
     ]
 }
 
-fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
+fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions) {
     let dialog = gtk::Dialog::builder()
         .title("notm settings")
         .transient_for(&widgets.window)
@@ -13657,6 +13848,11 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
     dialog.set_widget_name("notm-settings-dialog");
     let area = dialog.content_area();
     area.set_spacing(8);
+
+    let search = gtk::SearchEntry::new();
+    search.set_widget_name("notm-settings-search-entry");
+    search.set_placeholder_text(Some("Search settings"));
+    area.append(&search);
 
     let existing = read_settings_toml(options);
     let scrolled = gtk::ScrolledWindow::builder()
@@ -13716,7 +13912,7 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
     let excluded_tags = settings_entry_row(
         &form,
         "Excluded tags",
-        &join_string_list(&options.excluded_tags),
+        &join_string_list(&runtime_excluded_tags(options)),
         "Tags excluded from searches, comma separated.",
     );
     let open_readwrite_only_for_mutations = settings_check_row(
@@ -13733,7 +13929,7 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
     let sync_maildir_flags_after_tag_change = settings_check_row(
         &form,
         "Sync Maildir flags",
-        options.sync_maildir_flags_after_tag_change,
+        runtime_sync_maildir_flags_after_tag_change(options),
         "After changing tags like unread or flagged, also update Maildir filename flags so other mail tools see the same read/star state.",
     );
 
@@ -13772,7 +13968,7 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
     let page_size = settings_entry_row(
         &form,
         "Page size",
-        &options.page_size.to_string(),
+        &runtime_page_size(options).to_string(),
         "Number of threads loaded per search page.",
     );
     let thread_preview_lines = settings_entry_row(
@@ -13784,49 +13980,49 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
     let show_thread_numbers = settings_check_row(
         &form,
         "Show thread numbers",
-        options.show_thread_numbers,
+        state.borrow().show_thread_numbers,
         "Show message numbers in the thread list. Runtime command: :nu or :nonu.",
     );
     let show_thread_dates = settings_check_row(
         &form,
         "Show thread dates",
-        options.show_thread_dates,
+        state.borrow().show_thread_dates,
         "Show newest-message dates in the thread list. Runtime command: :date or :nodate.",
     );
     let show_thread_tags = settings_check_row(
         &form,
         "Show thread tags",
-        options.show_thread_tags,
+        state.borrow().show_thread_tags,
         "Show tags in the thread list metadata line. Runtime command: :tags or :notags.",
     );
     let show_thread_preview = settings_check_row(
         &form,
         "Show body preview",
-        options.show_thread_preview,
+        state.borrow().show_thread_preview,
         "Show message body previews in the thread list. Runtime command: :preview or :nopreview.",
     );
     let show_keybind_hints = settings_check_row(
         &form,
         "Show keybind hints",
-        options.show_keybind_hints,
-        "Show shortcut hints in button labels, e.g. Archive (a). Relaunch required.",
+        state.borrow().show_keybind_hints,
+        "Show shortcut hints in button labels, e.g. Archive (a).",
     );
     let show_sidebar = settings_check_row(
         &form,
         "Show sidebar at startup",
-        options.show_sidebar,
+        pane_is_visible(widgets, ActivePane::Sidebar),
         "Show the saved-search sidebar when notm starts. Runtime toggle: Ctrl+1.",
     );
     let show_message_list = settings_check_row(
         &form,
         "Show message list at startup",
-        options.show_message_list,
+        pane_is_visible(widgets, ActivePane::Threads),
         "Show the thread/message list when notm starts. Runtime toggle: Ctrl+2.",
     );
     let show_message_view = settings_check_row(
         &form,
         "Show message view at startup",
-        options.show_message_view,
+        pane_is_visible(widgets, ActivePane::Message),
         "Show the message reading pane when notm starts. Runtime toggle: Ctrl+3.",
     );
     let html_mode = settings_combo_row(
@@ -13839,7 +14035,11 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
             ),
             ("visual_html_preferred", "Visual HTML first when available"),
         ],
-        &options.html_mode,
+        if state.borrow().prefer_html_view {
+            "visual_html_preferred"
+        } else {
+            "sanitize_then_render_text_fallback"
+        },
         "Visual HTML is sanitized. Message scripts stay blocked; http/https/mailto links open externally.",
     );
     let start_maximized = settings_check_row(
@@ -13851,25 +14051,32 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
     let show_debug_panel = settings_check_row(
         &form,
         "Show debug panel",
-        options.show_debug_panel,
+        widgets.debug_view.is_visible(),
         "Show the debug text panel by default.",
     );
     let remote_images = settings_check_row(
         &form,
         "Load remote images",
-        options.remote_images,
+        runtime_remote_images(options),
         "If off, HTML mail starts with remote images blocked unless the sender is trusted.",
     );
     let trusted_image_senders = settings_entry_row(
         &form,
         "Trusted image senders",
-        &join_string_list(&options.trusted_image_senders),
+        &join_string_list(&state.borrow().trusted_image_senders),
         "Senders whose remote images may load by default, comma separated.",
     );
     let hidden_tag_searches = settings_entry_row(
         &form,
         "Hidden tag searches",
-        &join_string_list(&options.hidden_tag_searches),
+        &join_string_list(
+            &widgets
+                .hidden_tag_searches
+                .borrow()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
         "Tag search buttons hidden from the sidebar, comma separated.",
     );
 
@@ -14087,15 +14294,27 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
 
     settings_note(
         &form,
-        "Saving writes the app config file. Some changes require relaunch.",
+        "Apply updates this window where supported without writing the config file. Save writes the app config file and also applies the supported runtime changes. Data-source, identity, send, sync-command, startup, and test-harness changes require relaunch even after saving.",
     );
 
+    let filter_sections = Rc::new(RefCell::new(collect_settings_sections(&form)));
+    let sections_for_search = filter_sections.clone();
+    search.connect_search_changed(move |entry| {
+        apply_settings_search_filter(&sections_for_search, &entry.text());
+    });
+
+    dialog.add_button("Apply", gtk::ResponseType::Apply);
     dialog.add_button("Save", gtk::ResponseType::Accept);
     dialog.add_button("Close", gtk::ResponseType::Close);
     let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
     let status = widgets.status_label.clone();
     dialog.connect_response(move |d, response| {
-        if response == gtk::ResponseType::Accept {
+        if matches!(
+            response,
+            gtk::ResponseType::Apply | gtk::ResponseType::Accept
+        ) {
             let values = SettingsValues {
                 database_path: database_path.text().to_string(),
                 notmuch_config_path: notmuch_config_path.text().to_string(),
@@ -14109,7 +14328,10 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
                 primary_email: primary_email.text().to_string(),
                 other_email: other_email.text().to_string(),
                 theme: combo_active_id(&theme),
-                page_size: page_size.text().parse::<usize>().unwrap_or(opts.page_size),
+                page_size: page_size
+                    .text()
+                    .parse::<usize>()
+                    .unwrap_or_else(|_| runtime_page_size(&opts)),
                 thread_preview_lines: thread_preview_lines.text().parse::<usize>().unwrap_or(2),
                 show_thread_numbers: show_thread_numbers.is_active(),
                 show_thread_dates: show_thread_dates.is_active(),
@@ -14156,16 +14378,33 @@ fn show_settings(widgets: &Widgets, options: &LaunchOptions) {
                 allow_live_send_test: allow_live_send_test.is_active(),
                 allow_live_tag_test: allow_live_tag_test.is_active(),
             };
+
+            if response == gtk::ResponseType::Apply {
+                let search_reloaded = apply_runtime_settings_values(&opts, &w, &st, &values);
+                status.set_text(&settings_status_text(
+                    "Settings applied where possible",
+                    search_reloaded,
+                ));
+                return;
+            }
+
             match persist_settings_values(&opts, &values) {
                 Ok(()) => {
-                    status.set_text("Settings saved to app config; some changes require relaunch")
+                    let search_reloaded = apply_runtime_settings_values(&opts, &w, &st, &values);
+                    status.set_text(&settings_status_text(
+                        "Settings saved and applied where possible",
+                        search_reloaded,
+                    ));
+                    d.close();
                 }
                 Err(err) => status.set_text(&format!("Settings save failed: {err}")),
             }
+            return;
         }
         d.close();
     });
     dialog.present();
+    search.grab_focus();
 }
 
 struct SettingsValues {
@@ -14226,6 +14465,212 @@ struct SettingsValues {
     screenshot_dir: String,
     allow_live_send_test: bool,
     allow_live_tag_test: bool,
+}
+
+#[derive(Clone)]
+struct SettingsSectionFilter {
+    headers: Vec<gtk::Widget>,
+    haystack: String,
+    rows: Vec<(gtk::Widget, String)>,
+}
+
+fn collect_settings_sections(form: &gtk::Box) -> Vec<SettingsSectionFilter> {
+    let mut sections = Vec::new();
+    let mut current = None::<SettingsSectionFilter>;
+    let mut pending_headers = Vec::<gtk::Widget>::new();
+    let mut child = form.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if widget.clone().downcast::<gtk::Separator>().is_ok() {
+            if let Some(section) = current.take() {
+                sections.push(section);
+            }
+            pending_headers.push(widget);
+            continue;
+        }
+        if let Ok(label) = widget.clone().downcast::<gtk::Label>()
+            && label.has_css_class("notm-settings-section")
+        {
+            if let Some(section) = current.take() {
+                sections.push(section);
+            }
+            let mut headers = std::mem::take(&mut pending_headers);
+            let title = label.text().to_string();
+            headers.push(label.upcast::<gtk::Widget>());
+            current = Some(SettingsSectionFilter {
+                headers,
+                haystack: title.to_lowercase(),
+                rows: Vec::new(),
+            });
+            continue;
+        }
+        if let Some(section) = current.as_mut() {
+            let haystack = settings_widget_haystack(&widget);
+            section.rows.push((widget, haystack));
+        }
+    }
+    if let Some(section) = current {
+        sections.push(section);
+    }
+    sections
+}
+
+fn apply_settings_search_filter(sections: &Rc<RefCell<Vec<SettingsSectionFilter>>>, query: &str) {
+    let query = query.trim().to_lowercase();
+    for section in sections.borrow().iter() {
+        let section_matches = !query.is_empty() && section.haystack.contains(&query);
+        let mut any_visible = false;
+        for (row, haystack) in &section.rows {
+            let visible = query.is_empty() || section_matches || haystack.contains(&query);
+            row.set_visible(visible);
+            any_visible |= visible;
+        }
+        for header in &section.headers {
+            header.set_visible(query.is_empty() || section_matches || any_visible);
+        }
+    }
+}
+
+fn settings_widget_haystack(widget: &gtk::Widget) -> String {
+    let mut parts = Vec::new();
+    collect_settings_widget_text(widget, &mut parts);
+    parts.join(" ").to_lowercase()
+}
+
+fn collect_settings_widget_text(widget: &gtk::Widget, parts: &mut Vec<String>) {
+    if let Some(tooltip) = widget.tooltip_text()
+        && !tooltip.trim().is_empty()
+    {
+        parts.push(tooltip.to_string());
+    }
+    if let Ok(label) = widget.clone().downcast::<gtk::Label>() {
+        let text = label.text();
+        if !text.trim().is_empty() {
+            parts.push(text.to_string());
+        }
+    } else if let Ok(entry) = widget.clone().downcast::<gtk::Entry>() {
+        let text = entry.text();
+        if !text.trim().is_empty() {
+            parts.push(text.to_string());
+        }
+        if let Some(placeholder) = entry.placeholder_text()
+            && !placeholder.trim().is_empty()
+        {
+            parts.push(placeholder.to_string());
+        }
+    } else if let Ok(button) = widget.clone().downcast::<gtk::Button>() {
+        if let Some(label) = button.label()
+            && !label.trim().is_empty()
+        {
+            parts.push(label.to_string());
+        }
+    } else if let Ok(combo) = widget.clone().downcast::<gtk::ComboBoxText>()
+        && let Some(text) = combo.active_text()
+        && !text.trim().is_empty()
+    {
+        parts.push(text.to_string());
+    }
+    let mut child = widget.first_child();
+    while let Some(child_widget) = child {
+        child = child_widget.next_sibling();
+        collect_settings_widget_text(&child_widget, parts);
+    }
+}
+
+fn apply_runtime_settings_values(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    values: &SettingsValues,
+) -> bool {
+    let next_excluded_tags = parse_string_list(&values.excluded_tags);
+    let next_page_size = values.page_size.max(1);
+    let next_runtime = RuntimeSettings {
+        page_size: next_page_size,
+        excluded_tags: next_excluded_tags.clone(),
+        sync_maildir_flags_after_tag_change: values.sync_maildir_flags_after_tag_change,
+        remote_images: values.remote_images,
+    };
+    let previous_runtime = runtime_settings(options);
+    update_runtime_settings(options, next_runtime);
+
+    {
+        let mut s = state.borrow_mut();
+        s.thread_page_size = next_page_size;
+        s.show_thread_numbers = values.show_thread_numbers;
+        s.show_thread_dates = values.show_thread_dates;
+        s.show_thread_tags = values.show_thread_tags;
+        s.show_thread_preview = values.show_thread_preview;
+        s.show_keybind_hints = values.show_keybind_hints;
+        s.prefer_html_view = values.html_mode == "visual_html_preferred";
+        s.trusted_image_senders =
+            normalize_sender_list(&parse_string_list(&values.trusted_image_senders));
+    }
+    {
+        let hidden = parse_string_list(&values.hidden_tag_searches)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        *widgets.hidden_tag_searches.borrow_mut() = hidden;
+    }
+
+    apply_pane_visibility_values(
+        widgets,
+        state,
+        values.show_sidebar,
+        values.show_message_list,
+        values.show_message_view,
+    );
+    widgets.debug_view.set_visible(values.show_debug_panel);
+    populate_thread_list(options, widgets, state);
+    update_tag_searches(options, widgets, state);
+    update_thread_result_label(widgets, state);
+    update_button_binding_labels(widgets, state);
+    update_message_action_buttons(options, widgets, state);
+    if html_view_is_visible(widgets) {
+        let scroll = current_message_scroll_fraction(widgets);
+        show_visual_html_selected_message(options, widgets, state);
+        restore_message_scroll_fraction(widgets, scroll);
+    } else {
+        set_html_image_loading(&widgets.html_view, runtime_remote_images(options));
+    }
+
+    let search_settings_changed = previous_runtime.page_size != next_page_size
+        || previous_runtime.excluded_tags != next_excluded_tags;
+    if search_settings_changed {
+        let query = state.borrow().current_query.clone();
+        widgets.search_entry.set_text(&query);
+        run_search(options, widgets, state, &query);
+    }
+    sync_pane_button_classes(widgets, state);
+    update_active_pane_visuals(widgets, state);
+    update_debug(widgets, state);
+    search_settings_changed
+}
+
+fn settings_status_text(base: &str, search_reloaded: bool) -> String {
+    if search_reloaded {
+        format!("{base}; current search reloaded")
+    } else {
+        base.to_string()
+    }
+}
+
+fn apply_pane_visibility_values(
+    widgets: &Widgets,
+    state: &SharedState,
+    sidebar: bool,
+    message_list: bool,
+    message_view: bool,
+) {
+    let any_visible = sidebar || message_list || message_view;
+    widgets.left_pane.set_visible(sidebar || !any_visible);
+    widgets
+        .thread_pane
+        .set_visible(message_list || !any_visible);
+    widgets
+        .message_pane
+        .set_visible(message_view || !any_visible);
+    ensure_active_pane_visible(widgets, state);
 }
 
 fn settings_section(container: &gtk::Box, title: &str) {
@@ -14954,6 +15399,31 @@ mod tests {
         assert!(status.starts_with("Opened link externally: https://example.test/"));
         assert!(status.ends_with('…'));
         assert!(status.chars().count() < uri.chars().count());
+    }
+
+    #[test]
+    fn message_id_query_uses_notmuch_id_term() {
+        assert_eq!(message_id_query("abc@example.test"), "id:abc@example.test");
+    }
+
+    #[test]
+    fn message_id_query_quotes_special_values() {
+        assert_eq!(
+            message_id_query("abc+reply@example.test"),
+            "id:\"abc+reply@example.test\""
+        );
+    }
+
+    #[test]
+    fn settings_status_text_distinguishes_search_reload() {
+        assert_eq!(
+            settings_status_text("Settings applied where possible", false),
+            "Settings applied where possible"
+        );
+        assert_eq!(
+            settings_status_text("Settings saved and applied where possible", true),
+            "Settings saved and applied where possible; current search reloaded"
+        );
     }
 
     #[test]

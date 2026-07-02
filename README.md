@@ -77,6 +77,15 @@ make PREFIX=/usr DESTDIR=/tmp/pkgroot install
 notm launch
 ```
 
+To start with the normal startup search and select a specific Notmuch message,
+pass the id without angle brackets. If the message is not in the loaded startup
+page, `notm` falls back to a direct `id:` search so the requested message still
+opens:
+
+```sh
+notm launch --message-id abc@example.test
+```
+
 For development without installing first:
 
 ```sh

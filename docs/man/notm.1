@@ -32,6 +32,11 @@ instead of the default
 .B launch
 Start the GTK application for normal desktop mail use.
 .TP
+.BI "launch --message-id " MESSAGE_ID
+Start the GTK application with the normal startup search and select the specific
+Notmuch message id.  If the message is not in the loaded startup page, fall back
+to a direct id search.
+.TP
 .B print-config
 Print the effective configuration as JSON after default discovery.
 .TP

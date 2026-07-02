@@ -19,6 +19,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             automation_socket,
             automation_token,
             fixture,
+            message_id,
         } => {
             let cfg = config::load(cli.config)?;
             let fixture_guard = if fixture {
@@ -36,6 +37,9 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 options.draft_path = Some(fixture.root.join(".notm-fixture-draft.json"));
                 options.drafts_dir = Some(fixture.root.join(".notm-fixture-drafts"));
                 options.app_config_path = Some(fixture.root.join(".notm-fixture-config.toml"));
+            }
+            if let Some(message_id) = message_id {
+                apply_message_id_target(&mut options, &message_id)?;
             }
             if automation {
                 options.automation_enabled = true;
@@ -135,7 +139,28 @@ fn launch_options(cfg: &config::AppConfig, app_config_path: Option<PathBuf>) -> 
                 query: saved.query.clone(),
             })
             .collect(),
+        open_message_id: None,
+        runtime_settings: Default::default(),
     }
+}
+
+fn normalize_message_id(raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    let without_angles = trimmed
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+        .unwrap_or(trimmed)
+        .trim();
+    anyhow::ensure!(
+        !without_angles.is_empty(),
+        "--message-id requires a non-empty message id"
+    );
+    Ok(without_angles.to_string())
+}
+
+fn apply_message_id_target(options: &mut LaunchOptions, raw: &str) -> anyhow::Result<()> {
+    options.open_message_id = Some(normalize_message_id(raw)?);
+    Ok(())
 }
 
 fn open_config(cfg: &config::AppConfig) -> OpenConfig {
@@ -275,4 +300,30 @@ fn live_self_send(cfg: &config::AppConfig) -> anyhow::Result<()> {
         "send transport accepted the self-test, but it did not appear in Notmuch without forced sync: subject={subject}"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use notm_ui::LaunchOptions;
+
+    #[test]
+    fn normalize_message_id_accepts_rfc_angle_brackets() {
+        assert_eq!(
+            super::normalize_message_id(" <abc@example.test> ").unwrap(),
+            "abc@example.test"
+        );
+    }
+
+    #[test]
+    fn message_id_target_preserves_startup_query() {
+        let mut options = LaunchOptions {
+            default_query: "tag:inbox".to_string(),
+            ..LaunchOptions::default()
+        };
+
+        super::apply_message_id_target(&mut options, "<abc@example.test>").unwrap();
+
+        assert_eq!(options.default_query, "tag:inbox");
+        assert_eq!(options.open_message_id.as_deref(), Some("abc@example.test"));
+    }
 }
