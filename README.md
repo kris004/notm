@@ -1,7 +1,7 @@
 # notm
 
 `notm` is a native GTK4 desktop mail client for existing Notmuch mail
-stores. It gives a three-pane, keyboard-friendly desktop interface for people
+stores. It gives a column-based, keyboard-friendly desktop interface for people
 who already rely on Notmuch search and tags, while keeping mail storage and
 sync under your control.
 
@@ -118,7 +118,7 @@ mode = "stdin_rfc5322"
 
 Useful optional sections:
 
-- `[ui]`: page size, layout (`auto`, `three_pane`, or `stacked`), pane
+- `[ui]`: page size, layout (`auto`, `three_pane`/`columns`, or `stacked`), pane
   visibility, thread-list fields, HTML/image preferences, custom saved
   searches, hidden tag searches.
 - `[drafts]`: local Maildir draft location and tags.

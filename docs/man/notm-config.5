@@ -88,13 +88,17 @@ Preview lines shown in the thread list.  The default is 2.
 .B layout
 Window layout.  Supported values are
 .BR auto ,
-.BR three_pane ,
+.BR three_pane
+(or
+.BR columns ),
 and
 .BR stacked .
 .B auto
-uses the three-pane layout on wide windows and the stacked layout on narrower
-windows.  The stacked layout puts the sidebar and message list side by side
-above the message view.  Defaults to
+uses the side-by-side columns layout on wide windows and the stacked layout on
+narrower windows.  The canonical saved value for side-by-side columns is
+.BR three_pane .
+The stacked layout puts the sidebar and message list side by side above the
+message view.  Defaults to
 .BR auto .
 .TP
 .B show_thread_numbers
