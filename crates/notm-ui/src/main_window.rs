@@ -4310,7 +4310,10 @@ fn default_split_for_paned(widgets: &Widgets, paned: &gtk::Paned) -> i32 {
 }
 
 fn default_content_split(paned: &gtk::Paned) -> i32 {
-    let width = paned.width();
+    default_content_split_for_width(paned.width())
+}
+
+fn default_content_split_for_width(width: i32) -> i32 {
     if width <= 0 {
         return 560;
     }
@@ -15955,6 +15958,22 @@ mod tests {
                 ContentLayout::Stacked,
             ),
             ContentLayout::ThreePane
+        );
+    }
+
+    #[test]
+    fn default_content_split_preserves_thread_list_before_message_view() {
+        assert_eq!(
+            default_content_split_for_width(THREAD_LIST_MIN_WIDTH + MESSAGE_VIEW_MIN_WIDTH + 80),
+            THREAD_LIST_MIN_WIDTH + 20
+        );
+        assert_eq!(
+            default_content_split_for_width(THREAD_LIST_MIN_WIDTH + MESSAGE_VIEW_MIN_WIDTH - 40),
+            THREAD_LIST_MIN_WIDTH
+        );
+        assert_eq!(
+            default_content_split_for_width(THREAD_LIST_MIN_WIDTH - 20),
+            THREAD_LIST_MIN_WIDTH - 20
         );
     }
 
