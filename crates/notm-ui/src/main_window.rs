@@ -500,13 +500,23 @@ const THREAD_ROW_PREFIX: &str = "thread";
 const THREAD_STATUS_PREFIX: &str = "status";
 const AUTO_STACKED_BELOW_WIDTH: i32 = 1280;
 const AUTO_THREE_PANE_ABOVE_WIDTH: i32 = 1360;
+const MESSAGE_VIEW_MIN_WIDTH: i32 = 280;
 const STACKED_TOP_MIN_HEIGHT: i32 = 260;
 const STACKED_MESSAGE_MIN_HEIGHT: i32 = 280;
 
 fn parse_layout_preference(value: &str) -> LayoutPreference {
     match value.trim().replace('-', "_").to_lowercase().as_str() {
         "" | "auto" => LayoutPreference::Auto,
-        "three" | "three_pane" | "threepane" | "3pane" | "3_pane" => LayoutPreference::ThreePane,
+        "three"
+        | "three_pane"
+        | "threepane"
+        | "3pane"
+        | "3_pane"
+        | "column"
+        | "columns"
+        | "side_by_side"
+        | "sidebyside"
+        | "side_by_side_columns" => LayoutPreference::ThreePane,
         "stacked" | "stack" | "top" | "top_stack" | "list_above_message" | "sidebar_list_top" => {
             LayoutPreference::Stacked
         }
@@ -672,9 +682,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
     );
     let layout_toggle_button = gtk::Button::with_label("Layout");
     layout_toggle_button.set_widget_name("notm-layout-toggle-button");
-    layout_toggle_button.set_tooltip_text(Some(
-        "Switch between three-pane and stacked layouts (Ctrl+4)",
-    ));
+    layout_toggle_button
+        .set_tooltip_text(Some("Switch between columns and stacked layouts (Ctrl+4)"));
     for b in [
         &compose_button,
         &debug_button,
@@ -3984,10 +3993,12 @@ fn apply_content_layout(
             widgets
                 .outer_paned
                 .set_end_child(Some(&widgets.content_paned));
-            widgets.outer_paned.set_resize_start_child(false);
-            widgets.outer_paned.set_resize_end_child(true);
-            widgets.outer_paned.set_shrink_start_child(false);
+            configure_paned_allocation(&widgets.outer_paned, false, true, false, true);
             widgets.outer_paned.set_position(SIDEBAR_MIN_WIDTH);
+            // In the column layout, the message list is the read-from-left
+            // child of this split. Keep it at its requested width and let the
+            // message view absorb the narrow-window pressure first.
+            configure_paned_allocation(&widgets.content_paned, false, true, false, true);
             widgets
                 .content_paned
                 .set_position(default_content_split(&widgets.content_paned));
@@ -4011,9 +4022,11 @@ fn apply_content_layout(
             widgets
                 .outer_paned
                 .set_end_child(Some(&widgets.message_pane));
-            widgets.outer_paned.set_resize_start_child(false);
-            widgets.outer_paned.set_resize_end_child(true);
-            widgets.outer_paned.set_shrink_start_child(false);
+            configure_paned_allocation(&widgets.outer_paned, false, true, false, true);
+            // In the stacked layout, the sidebar is the read-from-left child
+            // of the top split. Match the column layout's sidebar policy so a
+            // narrow window clips the right side before it eats the sidebar.
+            configure_paned_allocation(&widgets.content_paned, false, true, false, true);
             widgets.content_paned.set_position(SIDEBAR_MIN_WIDTH);
             widgets
                 .outer_paned
@@ -4031,6 +4044,19 @@ fn apply_content_layout(
             .status_label
             .set_text(&format!("Layout: {}", content_layout_display_name(layout)));
     }
+}
+
+fn configure_paned_allocation(
+    paned: &gtk::Paned,
+    resize_start: bool,
+    resize_end: bool,
+    shrink_start: bool,
+    shrink_end: bool,
+) {
+    paned.set_resize_start_child(resize_start);
+    paned.set_resize_end_child(resize_end);
+    paned.set_shrink_start_child(shrink_start);
+    paned.set_shrink_end_child(shrink_end);
 }
 
 fn clear_paned_children(paned: &gtk::Paned) {
@@ -4203,6 +4229,14 @@ fn layout_state_json(widgets: &Widgets, state: &SharedState) -> serde_json::Valu
         },
         "outer_position": widgets.outer_paned.position(),
         "content_position": widgets.content_paned.position(),
+        "outer_resize_start": widgets.outer_paned.resizes_start_child(),
+        "outer_resize_end": widgets.outer_paned.resizes_end_child(),
+        "outer_shrink_start": widgets.outer_paned.shrinks_start_child(),
+        "outer_shrink_end": widgets.outer_paned.shrinks_end_child(),
+        "content_resize_start": widgets.content_paned.resizes_start_child(),
+        "content_resize_end": widgets.content_paned.resizes_end_child(),
+        "content_shrink_start": widgets.content_paned.shrinks_start_child(),
+        "content_shrink_end": widgets.content_paned.shrinks_end_child(),
     })
 }
 
@@ -4280,11 +4314,12 @@ fn default_content_split(paned: &gtk::Paned) -> i32 {
     if width <= 0 {
         return 560;
     }
-    let minimum_message_width = 280;
-    let maximum = (width - minimum_message_width).max(1);
-    (width / 2)
-        .max(THREAD_LIST_MIN_WIDTH.min(width))
-        .min(maximum)
+    let maximum = width - MESSAGE_VIEW_MIN_WIDTH;
+    if maximum >= THREAD_LIST_MIN_WIDTH {
+        (width / 2).max(THREAD_LIST_MIN_WIDTH).min(maximum)
+    } else {
+        THREAD_LIST_MIN_WIDTH.min(width.max(1))
+    }
 }
 
 fn default_stacked_top_split(paned: &gtk::Paned) -> i32 {
@@ -4323,14 +4358,14 @@ fn update_layout_toggle_button(widgets: &Widgets, state: &SharedState) {
 
 fn content_layout_display_name(layout: ContentLayout) -> &'static str {
     match layout {
-        ContentLayout::ThreePane => "three-pane",
+        ContentLayout::ThreePane => "side-by-side columns",
         ContentLayout::Stacked => "stacked top panes",
     }
 }
 
 fn content_layout_short_name(layout: ContentLayout) -> &'static str {
     match layout {
-        ContentLayout::ThreePane => "3-pane",
+        ContentLayout::ThreePane => "Columns",
         ContentLayout::Stacked => "Stacked",
     }
 }
@@ -13074,7 +13109,7 @@ fn run_named_command(
             set_layout_preference(options, widgets, state, LayoutPreference::Auto);
             json!({"ok": true, "layout": layout_state_json(widgets, state)})
         }
-        "layout_three_pane" | "three_pane" => {
+        "layout_columns" | "columns" | "layout_three_pane" | "three_pane" => {
             set_layout_preference(options, widgets, state, LayoutPreference::ThreePane);
             json!({"ok": true, "layout": layout_state_json(widgets, state)})
         }
@@ -13438,7 +13473,7 @@ fn command_name_candidates() -> &'static [&'static str] {
         "debug",
         "layout",
         "layout_auto",
-        "layout_three_pane",
+        "layout_columns",
         "layout_stacked",
         "settings",
         "shortcuts",
@@ -13822,7 +13857,7 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
         HelpEntry {
             section: "Pane navigation",
             key: "Ctrl+4",
-            description: "Switch between the three-pane and stacked layouts.",
+            description: "Switch between the columns and stacked layouts.",
         },
         HelpEntry {
             section: "Thread navigation",
@@ -14251,7 +14286,7 @@ fn command_help_entries() -> &'static [HelpEntry] {
         },
         HelpEntry {
             section: "Application commands",
-            key: ":layout / :layout_auto / :layout_stacked / :layout_three_pane",
+            key: ":layout / :layout_auto / :layout_columns / :layout_stacked",
             description: "Switch or select the window layout.",
         },
         HelpEntry {
@@ -14406,11 +14441,11 @@ fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions
         "Layout",
         &[
             ("auto", "Auto based on window width"),
-            ("three_pane", "Three pane"),
+            ("three_pane", "Side-by-side columns"),
             ("stacked", "Sidebar/list above message"),
         ],
         layout_preference_name(runtime_layout_preference(options)),
-        "Default window layout. Auto uses three-pane on wide windows and stacked layout on narrower windows.",
+        "Default window layout. Auto uses columns on wide windows and stacked layout on narrower windows.",
     );
     let thread_preview_lines = settings_entry_row(
         &form,
@@ -15884,6 +15919,14 @@ mod tests {
         assert_eq!(parse_layout_preference("auto"), LayoutPreference::Auto);
         assert_eq!(
             parse_layout_preference("three-pane"),
+            LayoutPreference::ThreePane
+        );
+        assert_eq!(
+            parse_layout_preference("columns"),
+            LayoutPreference::ThreePane
+        );
+        assert_eq!(
+            parse_layout_preference("side-by-side"),
             LayoutPreference::ThreePane
         );
         assert_eq!(
