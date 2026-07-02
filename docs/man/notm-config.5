@@ -85,6 +85,18 @@ Number of thread rows loaded per page.  The default is 100.
 .B thread_preview_lines
 Preview lines shown in the thread list.  The default is 2.
 .TP
+.B layout
+Window layout.  Supported values are
+.BR auto ,
+.BR three_pane ,
+and
+.BR stacked .
+.B auto
+uses the three-pane layout on wide windows and the stacked layout on narrower
+windows.  The stacked layout puts the sidebar and message list side by side
+above the message view.  Defaults to
+.BR auto .
+.TP
 .B show_thread_numbers
 Show thread row numbers.  Defaults to true.
 .TP

@@ -36,7 +36,10 @@ use webkit6::{
 
 use crate::{
     automation::{self, AutomationConfig, AutomationRequest},
-    model::{ActiveDraft, ActivePane, ComposeFields, InputMode, ThreadUiDetails, UiState},
+    model::{
+        ActiveDraft, ActivePane, ComposeFields, ContentLayout, InputMode, LayoutPreference,
+        ThreadUiDetails, UiState,
+    },
     screenshot,
 };
 
@@ -52,6 +55,7 @@ pub struct RuntimeSettings {
     excluded_tags: Vec<String>,
     sync_maildir_flags_after_tag_change: bool,
     remote_images: bool,
+    layout_preference: LayoutPreference,
 }
 
 impl Default for RuntimeSettings {
@@ -61,6 +65,7 @@ impl Default for RuntimeSettings {
             excluded_tags: vec!["trash".to_string(), "spam".to_string()],
             sync_maildir_flags_after_tag_change: true,
             remote_images: false,
+            layout_preference: LayoutPreference::Auto,
         }
     }
 }
@@ -117,6 +122,7 @@ pub struct LaunchOptions {
     pub show_thread_tags: bool,
     pub show_thread_preview: bool,
     pub show_keybind_hints: bool,
+    pub layout: String,
     pub html_mode: String,
     pub trusted_image_senders: Vec<String>,
     pub hidden_tag_searches: Vec<String>,
@@ -181,6 +187,7 @@ impl Default for LaunchOptions {
             show_thread_tags: true,
             show_thread_preview: true,
             show_keybind_hints: true,
+            layout: "auto".to_string(),
             html_mode: "sanitize_then_render_text_fallback".to_string(),
             trusted_image_senders: Vec::new(),
             hidden_tag_searches: Vec::new(),
@@ -230,6 +237,7 @@ fn sync_runtime_settings_from_launch_options(options: &LaunchOptions) {
             excluded_tags: options.excluded_tags.clone(),
             sync_maildir_flags_after_tag_change: options.sync_maildir_flags_after_tag_change,
             remote_images: options.remote_images,
+            layout_preference: parse_layout_preference(&options.layout),
         },
     );
 }
@@ -263,6 +271,10 @@ fn runtime_sync_maildir_flags_after_tag_change(options: &LaunchOptions) -> bool 
 
 fn runtime_remote_images(options: &LaunchOptions) -> bool {
     runtime_settings(options).remote_images
+}
+
+fn runtime_layout_preference(options: &LaunchOptions) -> LayoutPreference {
+    runtime_settings(options).layout_preference
 }
 
 #[derive(Clone)]
@@ -302,6 +314,7 @@ struct Widgets {
     sidebar_toggle_button: gtk::Button,
     thread_list_toggle_button: gtk::Button,
     message_pane_toggle_button: gtk::Button,
+    layout_toggle_button: gtk::Button,
     archive_button: gtk::Button,
     read_toggle_button: gtk::Button,
     flag_toggle_button: gtk::Button,
@@ -485,6 +498,62 @@ const STATUS_BAR_MAX_WIDTH_CHARS: i32 = 120;
 const HTML_LINK_STATUS_URI_MAX_CHARS: usize = 96;
 const THREAD_ROW_PREFIX: &str = "thread";
 const THREAD_STATUS_PREFIX: &str = "status";
+const AUTO_STACKED_BELOW_WIDTH: i32 = 1280;
+const AUTO_THREE_PANE_ABOVE_WIDTH: i32 = 1360;
+const STACKED_TOP_MIN_HEIGHT: i32 = 260;
+const STACKED_MESSAGE_MIN_HEIGHT: i32 = 280;
+
+fn parse_layout_preference(value: &str) -> LayoutPreference {
+    match value.trim().replace('-', "_").to_lowercase().as_str() {
+        "" | "auto" => LayoutPreference::Auto,
+        "three" | "three_pane" | "threepane" | "3pane" | "3_pane" => LayoutPreference::ThreePane,
+        "stacked" | "stack" | "top" | "top_stack" | "list_above_message" | "sidebar_list_top" => {
+            LayoutPreference::Stacked
+        }
+        _ => LayoutPreference::Auto,
+    }
+}
+
+fn layout_preference_name(layout: LayoutPreference) -> &'static str {
+    match layout {
+        LayoutPreference::Auto => "auto",
+        LayoutPreference::ThreePane => "three_pane",
+        LayoutPreference::Stacked => "stacked",
+    }
+}
+
+fn content_layout_name(layout: ContentLayout) -> &'static str {
+    match layout {
+        ContentLayout::ThreePane => "three_pane",
+        ContentLayout::Stacked => "stacked",
+    }
+}
+
+fn layout_for_preference(
+    preference: LayoutPreference,
+    width: i32,
+    height: i32,
+    current: ContentLayout,
+) -> ContentLayout {
+    match preference {
+        LayoutPreference::ThreePane => ContentLayout::ThreePane,
+        LayoutPreference::Stacked => ContentLayout::Stacked,
+        LayoutPreference::Auto => auto_content_layout(width, height, current),
+    }
+}
+
+fn auto_content_layout(width: i32, _height: i32, current: ContentLayout) -> ContentLayout {
+    if width <= 0 {
+        return current;
+    }
+    if width < AUTO_STACKED_BELOW_WIDTH {
+        ContentLayout::Stacked
+    } else if width > AUTO_THREE_PANE_ABOVE_WIDTH {
+        ContentLayout::ThreePane
+    } else {
+        current
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct ThreadListDisplay {
@@ -517,6 +586,9 @@ impl ThreadListDisplay {
 
 fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationWindow {
     install_css();
+    let layout_preference = runtime_layout_preference(&options);
+    let initial_layout =
+        layout_for_preference(layout_preference, 1500, 900, ContentLayout::ThreePane);
 
     let initial_state = UiState {
         current_query: options.default_query.clone(),
@@ -532,6 +604,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
         show_thread_tags: options.show_thread_tags,
         show_thread_preview: options.show_thread_preview,
         show_keybind_hints: options.show_keybind_hints,
+        layout_preference,
+        content_layout: initial_layout,
         trusted_image_senders: normalize_sender_list(&options.trusted_image_senders),
         pending_open_message_id: options.open_message_id.clone(),
         compose_fields: ComposeFields {
@@ -596,6 +670,11 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
         "notm-message-pane-toggle-button",
         "Show/hide message view (Ctrl+3)",
     );
+    let layout_toggle_button = gtk::Button::with_label("Layout");
+    layout_toggle_button.set_widget_name("notm-layout-toggle-button");
+    layout_toggle_button.set_tooltip_text(Some(
+        "Switch between three-pane and stacked layouts (Ctrl+4)",
+    ));
     for b in [
         &compose_button,
         &debug_button,
@@ -608,6 +687,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
     view_controls.append(&sidebar_toggle_button);
     view_controls.append(&thread_list_toggle_button);
     view_controls.append(&message_pane_toggle_button);
+    view_controls.append(&layout_toggle_button);
     top_bar.append(&toolbar);
     top_bar.append(&view_controls);
     root.append(&top_bar);
@@ -1119,17 +1199,15 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
     right.append(&debug_view);
 
     let content_paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+    content_paned.set_widget_name("notm-content-paned");
     content_paned.set_wide_handle(true);
-    content_paned.set_start_child(Some(&middle));
-    content_paned.set_end_child(Some(&right));
     content_paned.set_position(560);
     content_paned.set_hexpand(true);
     content_paned.set_vexpand(true);
 
     let outer_paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+    outer_paned.set_widget_name("notm-outer-paned");
     outer_paned.set_wide_handle(true);
-    outer_paned.set_start_child(Some(&sidebar_scrolled));
-    outer_paned.set_end_child(Some(&content_paned));
     outer_paned.set_resize_start_child(false);
     outer_paned.set_resize_end_child(true);
     outer_paned.set_shrink_start_child(false);
@@ -1188,6 +1266,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
         sidebar_toggle_button: sidebar_toggle_button.clone(),
         thread_list_toggle_button: thread_list_toggle_button.clone(),
         message_pane_toggle_button: message_pane_toggle_button.clone(),
+        layout_toggle_button: layout_toggle_button.clone(),
         archive_button: archive_button.clone(),
         read_toggle_button: read_button.clone(),
         flag_toggle_button: flag_button.clone(),
@@ -1271,6 +1350,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
             .clone()
             .unwrap_or_else(default_drafts_dir),
     };
+    apply_content_layout(&widgets, &state, initial_layout, false);
     apply_initial_pane_visibility(&options, &widgets, &state);
     update_active_pane_visuals(&widgets, &state);
     update_message_action_buttons(&options, &widgets, &state);
@@ -1328,7 +1408,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
         &help_button,
         &send_button,
     );
-    connect_pane_visibility_toggles(&widgets, &state);
+    connect_pane_visibility_toggles(&options, &widgets, &state);
+    connect_auto_layout(&widgets, &state);
     connect_compose_helpers(
         &options,
         &widgets,
@@ -1361,6 +1442,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
         let w = widgets.clone();
         let st = state.clone();
         gtk::glib::idle_add_local_once(move || {
+            apply_auto_layout_for_current_size(&w, &st);
             sync_pane_button_classes(&w, &st);
         });
     }
@@ -3741,7 +3823,11 @@ fn move_active_pane(widgets: &Widgets, state: &SharedState, delta: isize) {
     );
 }
 
-fn connect_pane_visibility_toggles(widgets: &Widgets, state: &SharedState) {
+fn connect_pane_visibility_toggles(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) {
     sync_pane_toggle_buttons(widgets);
 
     {
@@ -3767,6 +3853,31 @@ fn connect_pane_visibility_toggles(widgets: &Widgets, state: &SharedState) {
                 toggle_pane_visibility(&w, &st, ActivePane::Message);
             });
     }
+    {
+        let opts = options.clone();
+        let w = widgets.clone();
+        let st = state.clone();
+        widgets.layout_toggle_button.connect_clicked(move |_| {
+            toggle_layout_preference(&opts, &w, &st);
+        });
+    }
+}
+
+fn connect_auto_layout(widgets: &Widgets, state: &SharedState) {
+    let w = widgets.clone();
+    let st = state.clone();
+    let last_width = Rc::new(Cell::new(0));
+    let last_height = Rc::new(Cell::new(0));
+    gtk::glib::timeout_add_local(Duration::from_millis(300), move || {
+        let width = w.window.width();
+        let height = w.window.height();
+        if width != last_width.get() || height != last_height.get() {
+            last_width.set(width);
+            last_height.set(height);
+            apply_auto_layout_for_current_size(&w, &st);
+        }
+        gtk::glib::ControlFlow::Continue
+    });
 }
 
 fn apply_initial_pane_visibility(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -3779,6 +3890,152 @@ fn apply_initial_pane_visibility(options: &LaunchOptions, widgets: &Widgets, sta
     widgets.message_pane.set_visible(message || !any_visible);
     ensure_active_pane_visible(widgets, state);
     sync_pane_button_classes(widgets, state);
+}
+
+fn toggle_layout_preference(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    let next_layout = match state.borrow().content_layout {
+        ContentLayout::ThreePane => ContentLayout::Stacked,
+        ContentLayout::Stacked => ContentLayout::ThreePane,
+    };
+    let next_preference = match next_layout {
+        ContentLayout::ThreePane => LayoutPreference::ThreePane,
+        ContentLayout::Stacked => LayoutPreference::Stacked,
+    };
+    update_runtime_layout_preference(options, next_preference);
+    state.borrow_mut().layout_preference = next_preference;
+    apply_content_layout(widgets, state, next_layout, true);
+    focus_active_pane(widgets, state);
+}
+
+fn set_layout_preference(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    preference: LayoutPreference,
+) {
+    update_runtime_layout_preference(options, preference);
+    state.borrow_mut().layout_preference = preference;
+    apply_layout_preference_for_current_size(widgets, state, preference, true);
+}
+
+fn update_runtime_layout_preference(options: &LaunchOptions, preference: LayoutPreference) {
+    let mut settings = runtime_settings(options);
+    settings.layout_preference = preference;
+    update_runtime_settings(options, settings);
+}
+
+fn apply_auto_layout_for_current_size(widgets: &Widgets, state: &SharedState) {
+    let preference = state.borrow().layout_preference;
+    if preference == LayoutPreference::Auto {
+        apply_layout_preference_for_current_size(widgets, state, preference, false);
+    }
+}
+
+fn apply_layout_preference_for_current_size(
+    widgets: &Widgets,
+    state: &SharedState,
+    preference: LayoutPreference,
+    announce: bool,
+) {
+    let current = state.borrow().content_layout;
+    let next = layout_for_preference(
+        preference,
+        widgets.window.width(),
+        widgets.window.height(),
+        current,
+    );
+    apply_content_layout(widgets, state, next, announce);
+}
+
+fn apply_content_layout(
+    widgets: &Widgets,
+    state: &SharedState,
+    layout: ContentLayout,
+    announce: bool,
+) {
+    if state.borrow().content_layout == layout
+        && widgets.outer_paned.start_child().is_some()
+        && widgets.content_paned.start_child().is_some()
+    {
+        update_layout_toggle_button(widgets, state);
+        return;
+    }
+
+    clear_paned_children(&widgets.outer_paned);
+    clear_paned_children(&widgets.content_paned);
+
+    match layout {
+        ContentLayout::ThreePane => {
+            widgets
+                .outer_paned
+                .set_orientation(gtk::Orientation::Horizontal);
+            widgets
+                .content_paned
+                .set_orientation(gtk::Orientation::Horizontal);
+            widgets
+                .content_paned
+                .set_start_child(Some(&widgets.thread_pane));
+            widgets
+                .content_paned
+                .set_end_child(Some(&widgets.message_pane));
+            widgets
+                .outer_paned
+                .set_start_child(Some(&widgets.left_pane));
+            widgets
+                .outer_paned
+                .set_end_child(Some(&widgets.content_paned));
+            widgets.outer_paned.set_resize_start_child(false);
+            widgets.outer_paned.set_resize_end_child(true);
+            widgets.outer_paned.set_shrink_start_child(false);
+            widgets.outer_paned.set_position(SIDEBAR_MIN_WIDTH);
+            widgets
+                .content_paned
+                .set_position(default_content_split(&widgets.content_paned));
+        }
+        ContentLayout::Stacked => {
+            widgets
+                .outer_paned
+                .set_orientation(gtk::Orientation::Vertical);
+            widgets
+                .content_paned
+                .set_orientation(gtk::Orientation::Horizontal);
+            widgets
+                .content_paned
+                .set_start_child(Some(&widgets.left_pane));
+            widgets
+                .content_paned
+                .set_end_child(Some(&widgets.thread_pane));
+            widgets
+                .outer_paned
+                .set_start_child(Some(&widgets.content_paned));
+            widgets
+                .outer_paned
+                .set_end_child(Some(&widgets.message_pane));
+            widgets.outer_paned.set_resize_start_child(false);
+            widgets.outer_paned.set_resize_end_child(true);
+            widgets.outer_paned.set_shrink_start_child(false);
+            widgets.content_paned.set_position(SIDEBAR_MIN_WIDTH);
+            widgets
+                .outer_paned
+                .set_position(default_stacked_top_split(&widgets.outer_paned));
+        }
+    }
+
+    state.borrow_mut().content_layout = layout;
+    ensure_active_pane_visible(widgets, state);
+    sync_pane_button_classes(widgets, state);
+    update_layout_toggle_button(widgets, state);
+    update_debug(widgets, state);
+    if announce {
+        widgets
+            .status_label
+            .set_text(&format!("Layout: {}", content_layout_display_name(layout)));
+    }
+}
+
+fn clear_paned_children(paned: &gtk::Paned) {
+    paned.set_start_child(None::<&gtk::Widget>);
+    paned.set_end_child(None::<&gtk::Widget>);
 }
 
 fn toggle_pane_visibility(widgets: &Widgets, state: &SharedState, pane: ActivePane) {
@@ -3841,6 +4098,7 @@ fn sync_pane_toggle_buttons(widgets: &Widgets) {
 
 fn sync_pane_button_classes(widgets: &Widgets, state: &SharedState) {
     sync_pane_toggle_buttons(widgets);
+    update_layout_toggle_button(widgets, state);
     update_active_pane_visuals(widgets, state);
 }
 
@@ -3913,37 +4171,107 @@ fn parse_pane_name(name: &str) -> Option<ActivePane> {
     }
 }
 
-fn pane_visibility_json(widgets: &Widgets) -> serde_json::Value {
+fn pane_visibility_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
+    let state = state.borrow();
     json!({
         "ok": true,
         "sidebar": pane_is_visible(widgets, ActivePane::Sidebar),
         "message_list": pane_is_visible(widgets, ActivePane::Threads),
         "message_view": pane_is_visible(widgets, ActivePane::Message),
+        "layout_preference": layout_preference_name(state.layout_preference),
+        "layout": content_layout_name(state.content_layout),
+    })
+}
+
+fn layout_state_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
+    let state = state.borrow();
+    json!({
+        "ok": true,
+        "layout_preference": layout_preference_name(state.layout_preference),
+        "layout": content_layout_name(state.content_layout),
+        "window_width": widgets.window.width(),
+        "window_height": widgets.window.height(),
+        "outer_orientation": if widgets.outer_paned.orientation() == gtk::Orientation::Vertical {
+            "vertical"
+        } else {
+            "horizontal"
+        },
+        "content_orientation": if widgets.content_paned.orientation() == gtk::Orientation::Vertical {
+            "vertical"
+        } else {
+            "horizontal"
+        },
+        "outer_position": widgets.outer_paned.position(),
+        "content_position": widgets.content_paned.position(),
     })
 }
 
 fn restore_pane_position(widgets: &Widgets, pane: ActivePane) {
     match pane {
         ActivePane::Sidebar => {
-            if widgets.outer_paned.position() < SIDEBAR_MIN_WIDTH / 2 {
-                widgets.outer_paned.set_position(SIDEBAR_MIN_WIDTH);
+            let paned = sidebar_split_paned(widgets);
+            if paned.position() < SIDEBAR_MIN_WIDTH / 2 {
+                paned.set_position(SIDEBAR_MIN_WIDTH);
             }
         }
         ActivePane::Threads => {
-            if widgets.content_paned.position() < 80 {
-                widgets
-                    .content_paned
-                    .set_position(default_content_split(&widgets.content_paned));
+            let paned = thread_split_paned(widgets);
+            if paned.position() < 80 {
+                paned.set_position(default_split_for_paned(widgets, &paned));
             }
         }
         ActivePane::Message => {
-            let width = widgets.content_paned.width();
-            if width <= 0 || widgets.content_paned.position() >= width.saturating_sub(80) {
-                widgets
-                    .content_paned
-                    .set_position(default_content_split(&widgets.content_paned));
+            let paned = message_split_paned(widgets);
+            let extent = if state_layout_for_widgets(widgets) == ContentLayout::Stacked {
+                paned.height()
+            } else {
+                paned.width()
+            };
+            if extent <= 0 || paned.position() >= extent.saturating_sub(80) {
+                paned.set_position(default_split_for_paned(widgets, &paned));
             }
         }
+    }
+}
+
+fn state_layout_for_widgets(widgets: &Widgets) -> ContentLayout {
+    if widgets.outer_paned.orientation() == gtk::Orientation::Vertical {
+        ContentLayout::Stacked
+    } else {
+        ContentLayout::ThreePane
+    }
+}
+
+fn sidebar_split_paned(widgets: &Widgets) -> gtk::Paned {
+    if state_layout_for_widgets(widgets) == ContentLayout::Stacked {
+        widgets.content_paned.clone()
+    } else {
+        widgets.outer_paned.clone()
+    }
+}
+
+fn thread_split_paned(widgets: &Widgets) -> gtk::Paned {
+    widgets.content_paned.clone()
+}
+
+fn message_split_paned(widgets: &Widgets) -> gtk::Paned {
+    if state_layout_for_widgets(widgets) == ContentLayout::Stacked {
+        widgets.outer_paned.clone()
+    } else {
+        widgets.content_paned.clone()
+    }
+}
+
+fn default_split_for_paned(widgets: &Widgets, paned: &gtk::Paned) -> i32 {
+    if paned == &widgets.outer_paned && state_layout_for_widgets(widgets) == ContentLayout::Stacked
+    {
+        default_stacked_top_split(paned)
+    } else if paned == &widgets.content_paned
+        && state_layout_for_widgets(widgets) == ContentLayout::Stacked
+    {
+        SIDEBAR_MIN_WIDTH
+    } else {
+        default_content_split(paned)
     }
 }
 
@@ -3957,6 +4285,54 @@ fn default_content_split(paned: &gtk::Paned) -> i32 {
     (width / 2)
         .max(THREAD_LIST_MIN_WIDTH.min(width))
         .min(maximum)
+}
+
+fn default_stacked_top_split(paned: &gtk::Paned) -> i32 {
+    let height = paned.height();
+    if height <= 0 {
+        return 360;
+    }
+    let maximum = (height - STACKED_MESSAGE_MIN_HEIGHT).max(1);
+    (height / 2)
+        .max(STACKED_TOP_MIN_HEIGHT.min(height))
+        .min(maximum)
+}
+
+fn update_layout_toggle_button(widgets: &Widgets, state: &SharedState) {
+    let state = state.borrow();
+    let label = match state.layout_preference {
+        LayoutPreference::Auto => {
+            format!("Auto: {}", content_layout_short_name(state.content_layout))
+        }
+        LayoutPreference::ThreePane | LayoutPreference::Stacked => {
+            content_layout_short_name(state.content_layout).to_string()
+        }
+    };
+    widgets.layout_toggle_button.set_label(&label);
+    widgets.layout_toggle_button.set_tooltip_text(Some(&format!(
+        "Current layout: {}. Click to switch layout.",
+        content_layout_display_name(state.content_layout)
+    )));
+    widgets
+        .layout_toggle_button
+        .remove_css_class("notm-pane-hidden");
+    widgets
+        .layout_toggle_button
+        .add_css_class("notm-pane-visible");
+}
+
+fn content_layout_display_name(layout: ContentLayout) -> &'static str {
+    match layout {
+        ContentLayout::ThreePane => "three-pane",
+        ContentLayout::Stacked => "stacked top panes",
+    }
+}
+
+fn content_layout_short_name(layout: ContentLayout) -> &'static str {
+    match layout {
+        ContentLayout::ThreePane => "3-pane",
+        ContentLayout::Stacked => "Stacked",
+    }
 }
 
 fn update_active_pane_visuals(widgets: &Widgets, state: &SharedState) {
@@ -4855,6 +5231,7 @@ fn update_button_binding_labels(widgets: &Widgets, state: &SharedState) {
     set_button_label(&widgets.palette_button, "Commands", "Ctrl+K", state);
     set_button_label(&widgets.settings_button, "Settings", ",", state);
     set_button_label(&widgets.help_button, "Help", "?", state);
+    update_layout_toggle_button(widgets, state);
     set_button_label(&widgets.search_button, "Search", "/", state);
     set_button_label(&widgets.load_more_button, "Load more", "Ctrl+f", state);
     set_button_label(&widgets.archive_button, "Archive", "a", state);
@@ -5060,6 +5437,10 @@ fn install_shortcuts(
                 }
                 3 => {
                     toggle_pane_visibility(&w, &st, ActivePane::Message);
+                    return gtk::glib::Propagation::Stop;
+                }
+                4 => {
+                    toggle_layout_preference(&opts, &w, &st);
                     return gtk::glib::Propagation::Stop;
                 }
                 _ => {}
@@ -11799,7 +12180,8 @@ fn handle_automation_request(
             widgets.window.set_default_size(width, height);
             widgets.window.present();
             spin_main_context_for(Duration::from_millis(250));
-            json!({"ok": true, "width": widgets.window.width(), "height": widgets.window.height()})
+            apply_auto_layout_for_current_size(widgets, state);
+            json!({"ok": true, "width": widgets.window.width(), "height": widgets.window.height(), "layout": layout_state_json(widgets, state)})
         }
         "select_saved_search" => {
             let name = req
@@ -11874,7 +12256,23 @@ fn handle_automation_request(
                 Err(err) => json!({"ok": false, "error": err.to_string()}),
             }
         }
-        "pane_visibility" => pane_visibility_json(widgets),
+        "pane_visibility" => pane_visibility_json(widgets, state),
+        "layout_state" => layout_state_json(widgets, state),
+        "toggle_layout" => {
+            toggle_layout_preference(options, widgets, state);
+            json!({"ok": true, "layout": layout_state_json(widgets, state)})
+        }
+        "set_layout" => {
+            let layout = req
+                .args
+                .get("layout")
+                .or_else(|| req.args.get("mode"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("auto");
+            let preference = parse_layout_preference(layout);
+            set_layout_preference(options, widgets, state, preference);
+            json!({"ok": true, "layout": layout_state_json(widgets, state)})
+        }
         "set_pane_visibility" => {
             let pane = req
                 .args
@@ -11892,12 +12290,12 @@ fn handle_automation_request(
                         && pane_is_visible(widgets, pane)
                         && visible_panes(widgets).len() <= 1 =>
                 {
-                    json!({"ok": false, "error": "at least one pane must stay visible", "visibility": pane_visibility_json(widgets)})
+                    json!({"ok": false, "error": "at least one pane must stay visible", "visibility": pane_visibility_json(widgets, state)})
                 }
                 Some(pane) => {
                     set_pane_visibility(widgets, state, pane, visible);
                     sync_pane_toggle_buttons(widgets);
-                    json!({"ok": true, "visibility": pane_visibility_json(widgets)})
+                    json!({"ok": true, "visibility": pane_visibility_json(widgets, state)})
                 }
                 None => json!({"ok": false, "error": format!("unknown pane: {pane}")}),
             }
@@ -12668,6 +13066,22 @@ fn run_named_command(
             update_debug(widgets, state);
             json!({"ok": true, "debug_visible": widgets.debug_view.is_visible()})
         }
+        "layout" | "toggle_layout" => {
+            toggle_layout_preference(options, widgets, state);
+            json!({"ok": true, "layout": layout_state_json(widgets, state)})
+        }
+        "layout_auto" | "auto_layout" => {
+            set_layout_preference(options, widgets, state, LayoutPreference::Auto);
+            json!({"ok": true, "layout": layout_state_json(widgets, state)})
+        }
+        "layout_three_pane" | "three_pane" => {
+            set_layout_preference(options, widgets, state, LayoutPreference::ThreePane);
+            json!({"ok": true, "layout": layout_state_json(widgets, state)})
+        }
+        "layout_stacked" | "stacked_layout" => {
+            set_layout_preference(options, widgets, state, LayoutPreference::Stacked);
+            json!({"ok": true, "layout": layout_state_json(widgets, state)})
+        }
         "raw_source" | "open_raw_source" => {
             show_raw_source(options, widgets, state);
             json!({"ok": state.borrow().last_error.is_none(), "last_error": state.borrow().last_error})
@@ -12804,7 +13218,7 @@ fn run_named_command(
 fn update_debug(widgets: &Widgets, state: &SharedState) {
     let s = state.borrow();
     let text = format!(
-        "query: {}\nselected_thread: {}\nselected_message: {}\ndatabase_path: {}\ndatabase_revision: {}\nlast_operation: {}\nlast_error: {}\ntest_harness: {}\nlast_send: {}\n",
+        "query: {}\nselected_thread: {}\nselected_message: {}\nlayout: {} ({})\ndatabase_path: {}\ndatabase_revision: {}\nlast_operation: {}\nlast_error: {}\ntest_harness: {}\nlast_send: {}\n",
         s.current_query,
         s.selected_thread
             .as_ref()
@@ -12814,6 +13228,8 @@ fn update_debug(widgets: &Widgets, state: &SharedState) {
             .as_ref()
             .map(|m| m.message_id.as_str())
             .unwrap_or(""),
+        content_layout_name(s.content_layout),
+        layout_preference_name(s.layout_preference),
         s.database_path.as_deref().unwrap_or(""),
         s.database_revision
             .as_ref()
@@ -13020,6 +13436,10 @@ fn command_name_candidates() -> &'static [&'static str] {
         "sync",
         "manual_sync",
         "debug",
+        "layout",
+        "layout_auto",
+        "layout_three_pane",
+        "layout_stacked",
         "settings",
         "shortcuts",
         "help",
@@ -13398,6 +13818,11 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
             section: "Pane navigation",
             key: "Ctrl+1 / Ctrl+2 / Ctrl+3",
             description: "Show or hide the sidebar, message list, or message view.",
+        },
+        HelpEntry {
+            section: "Pane navigation",
+            key: "Ctrl+4",
+            description: "Switch between the three-pane and stacked layouts.",
         },
         HelpEntry {
             section: "Thread navigation",
@@ -13826,6 +14251,11 @@ fn command_help_entries() -> &'static [HelpEntry] {
         },
         HelpEntry {
             section: "Application commands",
+            key: ":layout / :layout_auto / :layout_stacked / :layout_three_pane",
+            description: "Switch or select the window layout.",
+        },
+        HelpEntry {
+            section: "Application commands",
             key: ":settings",
             description: "Open Settings.",
         },
@@ -13970,6 +14400,17 @@ fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions
         "Page size",
         &runtime_page_size(options).to_string(),
         "Number of threads loaded per search page.",
+    );
+    let layout = settings_combo_row(
+        &form,
+        "Layout",
+        &[
+            ("auto", "Auto based on window width"),
+            ("three_pane", "Three pane"),
+            ("stacked", "Sidebar/list above message"),
+        ],
+        layout_preference_name(runtime_layout_preference(options)),
+        "Default window layout. Auto uses three-pane on wide windows and stacked layout on narrower windows.",
     );
     let thread_preview_lines = settings_entry_row(
         &form,
@@ -14294,7 +14735,7 @@ fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions
 
     settings_note(
         &form,
-        "Apply updates this window where supported without writing the config file. Save writes the app config file and also applies the supported runtime changes. Data-source, identity, send, sync-command, startup, and test-harness changes require relaunch even after saving.",
+        "Apply updates this window where supported without writing the config file. Save writes the app config file and also applies the supported runtime changes. Layout, display, pane, HTML image, page-size, excluded-tag, and tag-sync changes apply to this window where possible. Data-source, identity, send, sync-command, startup, and test-harness changes require relaunch even after saving.",
     );
 
     let filter_sections = Rc::new(RefCell::new(collect_settings_sections(&form)));
@@ -14338,6 +14779,7 @@ fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions
                 show_thread_tags: show_thread_tags.is_active(),
                 show_thread_preview: show_thread_preview.is_active(),
                 show_keybind_hints: show_keybind_hints.is_active(),
+                layout: combo_active_id(&layout),
                 show_sidebar: show_sidebar.is_active(),
                 show_message_list: show_message_list.is_active(),
                 show_message_view: show_message_view.is_active(),
@@ -14426,6 +14868,7 @@ struct SettingsValues {
     show_thread_tags: bool,
     show_thread_preview: bool,
     show_keybind_hints: bool,
+    layout: String,
     show_sidebar: bool,
     show_message_list: bool,
     show_message_view: bool,
@@ -14585,11 +15028,13 @@ fn apply_runtime_settings_values(
 ) -> bool {
     let next_excluded_tags = parse_string_list(&values.excluded_tags);
     let next_page_size = values.page_size.max(1);
+    let next_layout_preference = parse_layout_preference(&values.layout);
     let next_runtime = RuntimeSettings {
         page_size: next_page_size,
         excluded_tags: next_excluded_tags.clone(),
         sync_maildir_flags_after_tag_change: values.sync_maildir_flags_after_tag_change,
         remote_images: values.remote_images,
+        layout_preference: next_layout_preference,
     };
     let previous_runtime = runtime_settings(options);
     update_runtime_settings(options, next_runtime);
@@ -14602,6 +15047,7 @@ fn apply_runtime_settings_values(
         s.show_thread_tags = values.show_thread_tags;
         s.show_thread_preview = values.show_thread_preview;
         s.show_keybind_hints = values.show_keybind_hints;
+        s.layout_preference = next_layout_preference;
         s.prefer_html_view = values.html_mode == "visual_html_preferred";
         s.trusted_image_senders =
             normalize_sender_list(&parse_string_list(&values.trusted_image_senders));
@@ -14620,6 +15066,7 @@ fn apply_runtime_settings_values(
         values.show_message_list,
         values.show_message_view,
     );
+    apply_layout_preference_for_current_size(widgets, state, next_layout_preference, false);
     widgets.debug_view.set_visible(values.show_debug_panel);
     populate_thread_list(options, widgets, state);
     update_tag_searches(options, widgets, state);
@@ -15026,6 +15473,12 @@ fn persist_settings_values(options: &LaunchOptions, values: &SettingsValues) -> 
         values.show_thread_preview,
     );
     set_bool(root, "ui", "show_keybind_hints", values.show_keybind_hints);
+    set_string(
+        root,
+        "ui",
+        "layout",
+        layout_preference_name(parse_layout_preference(&values.layout)),
+    );
     set_bool(root, "ui", "show_sidebar", values.show_sidebar);
     set_bool(root, "ui", "show_message_list", values.show_message_list);
     set_bool(root, "ui", "show_message_view", values.show_message_view);
@@ -15423,6 +15876,42 @@ mod tests {
         assert_eq!(
             settings_status_text("Settings saved and applied where possible", true),
             "Settings saved and applied where possible; current search reloaded"
+        );
+    }
+
+    #[test]
+    fn layout_preference_parses_config_values() {
+        assert_eq!(parse_layout_preference("auto"), LayoutPreference::Auto);
+        assert_eq!(
+            parse_layout_preference("three-pane"),
+            LayoutPreference::ThreePane
+        );
+        assert_eq!(
+            parse_layout_preference("stacked"),
+            LayoutPreference::Stacked
+        );
+        assert_eq!(parse_layout_preference("unknown"), LayoutPreference::Auto);
+    }
+
+    #[test]
+    fn auto_layout_uses_width_thresholds() {
+        assert_eq!(
+            layout_for_preference(
+                LayoutPreference::Auto,
+                AUTO_STACKED_BELOW_WIDTH - 1,
+                900,
+                ContentLayout::ThreePane,
+            ),
+            ContentLayout::Stacked
+        );
+        assert_eq!(
+            layout_for_preference(
+                LayoutPreference::Auto,
+                AUTO_THREE_PANE_ABOVE_WIDTH + 1,
+                900,
+                ContentLayout::Stacked,
+            ),
+            ContentLayout::ThreePane
         );
     }
 

@@ -118,8 +118,9 @@ mode = "stdin_rfc5322"
 
 Useful optional sections:
 
-- `[ui]`: page size, pane visibility, thread-list fields, HTML/image preferences,
-  custom saved searches, hidden tag searches.
+- `[ui]`: page size, layout (`auto`, `three_pane`, or `stacked`), pane
+  visibility, thread-list fields, HTML/image preferences, custom saved
+  searches, hidden tag searches.
 - `[drafts]`: local Maildir draft location and tags.
 - `[send]`: external send command, timeout, sent-mail persistence, and sent
   indexing.

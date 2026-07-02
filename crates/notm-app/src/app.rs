@@ -123,6 +123,7 @@ fn launch_options(cfg: &config::AppConfig, app_config_path: Option<PathBuf>) -> 
         show_thread_tags: cfg.ui.show_thread_tags,
         show_thread_preview: cfg.ui.show_thread_preview,
         show_keybind_hints: cfg.ui.show_keybind_hints,
+        layout: cfg.ui.layout.clone(),
         html_mode: cfg.ui.html_mode.clone(),
         trusted_image_senders: cfg.ui.trusted_image_senders.clone(),
         hidden_tag_searches: cfg.ui.hidden_tag_searches.clone(),
@@ -325,5 +326,15 @@ mod tests {
 
         assert_eq!(options.default_query, "tag:inbox");
         assert_eq!(options.open_message_id.as_deref(), Some("abc@example.test"));
+    }
+
+    #[test]
+    fn launch_options_passes_layout_preference() {
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.ui.layout = "stacked".to_string();
+
+        let options = super::launch_options(&cfg, None);
+
+        assert_eq!(options.layout, "stacked");
     }
 }

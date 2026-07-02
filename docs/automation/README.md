@@ -90,8 +90,9 @@ Implemented test-harness commands include:
 - UI/debug: `open_command_palette`, `command_completion`, `open_shortcuts`,
   `show_shortcuts`, `help_search`, `run_command`, `run_manual_sync`,
   `open_settings`, `save_settings`, `resize_window`, `pane_visibility`,
-  `set_pane_visibility`, `toggle_debug_panel`, custom saved-search commands,
-  and custom tag-editor commands
+  `set_pane_visibility`, `layout_state`, `set_layout`, `toggle_layout`,
+  `toggle_debug_panel`, custom saved-search commands, and custom tag-editor
+  commands
 
 The `screenshot` command writes to `artifacts/screenshots/` by default. The app
 tries desktop screenshot tools when native capture is unavailable and reports

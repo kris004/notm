@@ -43,6 +43,8 @@ pub struct UiState {
     pub show_thread_tags: bool,
     pub show_thread_preview: bool,
     pub show_keybind_hints: bool,
+    pub layout_preference: LayoutPreference,
+    pub content_layout: ContentLayout,
     pub visual_select_mode: bool,
     pub visual_select_anchor: Option<usize>,
     pub visual_select_cursor: Option<usize>,
@@ -88,6 +90,8 @@ impl Default for UiState {
             show_thread_tags: true,
             show_thread_preview: true,
             show_keybind_hints: true,
+            layout_preference: LayoutPreference::Auto,
+            content_layout: ContentLayout::ThreePane,
             visual_select_mode: false,
             visual_select_anchor: None,
             visual_select_cursor: None,
@@ -117,6 +121,23 @@ pub enum ActivePane {
     Sidebar,
     Threads,
     Message,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutPreference {
+    #[default]
+    Auto,
+    ThreePane,
+    Stacked,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentLayout {
+    #[default]
+    ThreePane,
+    Stacked,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

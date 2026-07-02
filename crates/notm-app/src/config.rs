@@ -70,6 +70,8 @@ pub struct UiConfig {
     pub page_size: usize,
     #[serde(default = "default_thread_preview_lines")]
     pub thread_preview_lines: usize,
+    #[serde(default = "default_layout")]
+    pub layout: String,
     #[serde(default = "default_true")]
     pub show_thread_numbers: bool,
     #[serde(default = "default_true")]
@@ -114,6 +116,7 @@ impl Default for UiConfig {
             theme: "system".to_string(),
             page_size: 100,
             thread_preview_lines: 2,
+            layout: "auto".to_string(),
             show_thread_numbers: true,
             show_thread_dates: true,
             show_thread_tags: true,
@@ -338,6 +341,10 @@ fn default_thread_preview_lines() -> usize {
     2
 }
 
+fn default_layout() -> String {
+    "auto".to_string()
+}
+
 fn default_html_mode() -> String {
     "sanitize_then_render_text_fallback".to_string()
 }
@@ -368,4 +375,24 @@ fn default_sync_label() -> String {
 
 fn default_screenshot_dir() -> PathBuf {
     PathBuf::from("artifacts/screenshots")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppConfig;
+
+    #[test]
+    fn ui_layout_defaults_to_auto() {
+        let config: AppConfig = toml::from_str("").expect("empty config should deserialize");
+
+        assert_eq!(config.ui.layout, "auto");
+    }
+
+    #[test]
+    fn ui_layout_can_select_stacked() {
+        let config: AppConfig =
+            toml::from_str("[ui]\nlayout = \"stacked\"\n").expect("layout config");
+
+        assert_eq!(config.ui.layout, "stacked");
+    }
 }
