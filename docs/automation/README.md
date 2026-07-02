@@ -94,6 +94,9 @@ Implemented test-harness commands include:
   `toggle_debug_panel`, custom saved-search commands, and custom tag-editor
   commands
 
+`set_layout` accepts `auto`, `columns` (with `three_pane` kept as a
+compatibility spelling), and `stacked`.
+
 The `screenshot` command writes to `artifacts/screenshots/` by default. The app
 tries desktop screenshot tools when native capture is unavailable and reports
 errors instead of faking screenshots.
