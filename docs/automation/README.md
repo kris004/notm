@@ -95,7 +95,8 @@ Implemented test-harness commands include:
   commands
 
 `set_layout` accepts `auto`, `columns` (with `three_pane` kept as a
-compatibility spelling), and `stacked`.
+compatibility spelling), and `stacked`. `toggle_layout` cycles through columns,
+stacked, and auto.
 
 The `screenshot` command writes to `artifacts/screenshots/` by default. The app
 tries desktop screenshot tools when native capture is unavailable and reports

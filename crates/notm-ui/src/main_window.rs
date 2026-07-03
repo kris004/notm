@@ -683,7 +683,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
     let layout_toggle_button = gtk::Button::with_label("Layout");
     layout_toggle_button.set_widget_name("notm-layout-toggle-button");
     layout_toggle_button
-        .set_tooltip_text(Some("Switch between columns and stacked layouts (Ctrl+4)"));
+        .set_tooltip_text(Some("Cycle auto, columns, and stacked layouts (Ctrl+4)"));
     for b in [
         &compose_button,
         &debug_button,
@@ -3902,18 +3902,17 @@ fn apply_initial_pane_visibility(options: &LaunchOptions, widgets: &Widgets, sta
 }
 
 fn toggle_layout_preference(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
-    let next_layout = match state.borrow().content_layout {
-        ContentLayout::ThreePane => ContentLayout::Stacked,
-        ContentLayout::Stacked => ContentLayout::ThreePane,
-    };
-    let next_preference = match next_layout {
-        ContentLayout::ThreePane => LayoutPreference::ThreePane,
-        ContentLayout::Stacked => LayoutPreference::Stacked,
-    };
-    update_runtime_layout_preference(options, next_preference);
-    state.borrow_mut().layout_preference = next_preference;
-    apply_content_layout(widgets, state, next_layout, true);
+    let next_preference = next_layout_preference(state.borrow().layout_preference);
+    set_layout_preference(options, widgets, state, next_preference);
     focus_active_pane(widgets, state);
+}
+
+fn next_layout_preference(current: LayoutPreference) -> LayoutPreference {
+    match current {
+        LayoutPreference::ThreePane => LayoutPreference::Stacked,
+        LayoutPreference::Stacked => LayoutPreference::Auto,
+        LayoutPreference::Auto => LayoutPreference::ThreePane,
+    }
 }
 
 fn set_layout_preference(
@@ -3967,6 +3966,13 @@ fn apply_content_layout(
         && widgets.content_paned.start_child().is_some()
     {
         update_layout_toggle_button(widgets, state);
+        update_debug(widgets, state);
+        if announce {
+            widgets.status_label.set_text(&layout_status_text(
+                state.borrow().layout_preference,
+                layout,
+            ));
+        }
         return;
     }
 
@@ -4040,9 +4046,19 @@ fn apply_content_layout(
     update_layout_toggle_button(widgets, state);
     update_debug(widgets, state);
     if announce {
-        widgets
-            .status_label
-            .set_text(&format!("Layout: {}", content_layout_display_name(layout)));
+        widgets.status_label.set_text(&layout_status_text(
+            state.borrow().layout_preference,
+            layout,
+        ));
+    }
+}
+
+fn layout_status_text(preference: LayoutPreference, layout: ContentLayout) -> String {
+    match preference {
+        LayoutPreference::Auto => format!("Layout: auto ({})", content_layout_display_name(layout)),
+        LayoutPreference::ThreePane | LayoutPreference::Stacked => {
+            format!("Layout: {}", content_layout_display_name(layout))
+        }
     }
 }
 
@@ -4348,7 +4364,7 @@ fn update_layout_toggle_button(widgets: &Widgets, state: &SharedState) {
     };
     widgets.layout_toggle_button.set_label(&label);
     widgets.layout_toggle_button.set_tooltip_text(Some(&format!(
-        "Current layout: {}. Click to switch layout.",
+        "Current layout: {}. Click to cycle auto, columns, and stacked.",
         content_layout_display_name(state.content_layout)
     )));
     widgets
@@ -13860,7 +13876,7 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
         HelpEntry {
             section: "Pane navigation",
             key: "Ctrl+4",
-            description: "Switch between the columns and stacked layouts.",
+            description: "Cycle among auto, columns, and stacked layouts.",
         },
         HelpEntry {
             section: "Thread navigation",
@@ -15958,6 +15974,34 @@ mod tests {
                 ContentLayout::Stacked,
             ),
             ContentLayout::ThreePane
+        );
+    }
+
+    #[test]
+    fn layout_toggle_cycles_through_explicit_and_auto_preferences() {
+        assert_eq!(
+            next_layout_preference(LayoutPreference::ThreePane),
+            LayoutPreference::Stacked
+        );
+        assert_eq!(
+            next_layout_preference(LayoutPreference::Stacked),
+            LayoutPreference::Auto
+        );
+        assert_eq!(
+            next_layout_preference(LayoutPreference::Auto),
+            LayoutPreference::ThreePane
+        );
+    }
+
+    #[test]
+    fn layout_status_names_auto_when_preference_does_not_change_visible_layout() {
+        assert_eq!(
+            layout_status_text(LayoutPreference::Auto, ContentLayout::ThreePane),
+            "Layout: auto (side-by-side columns)"
+        );
+        assert_eq!(
+            layout_status_text(LayoutPreference::Stacked, ContentLayout::Stacked),
+            "Layout: stacked top panes"
         );
     }
 
