@@ -24,7 +24,9 @@ use notm_mail::{
     html_sanitize::sanitize_html,
     mime::{extract_attachments_from_file, parse_file},
 };
-use notm_notmuch::{Database, DatabaseMode, OpenConfig, QueryOptions, SortOrder, TagMutation};
+use notm_notmuch::{
+    Database, DatabaseMode, MessageTagMutation, OpenConfig, QueryOptions, SortOrder, TagMutation,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sourceview5::{Buffer as SourceBuffer, View as SourceView, VimIMContext};
@@ -428,12 +430,20 @@ struct SearchCompletionSession {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UndoTagAction {
-    query: String,
-    mutation: TagMutation,
+    mutations: Vec<MessageTagMutation>,
+    sync_maildir_flags: bool,
     label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UndoTagHistory {
+    version: u8,
+    actions: Vec<UndoTagAction>,
+}
+
+const UNDO_TAG_HISTORY_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MessageViewKind {
@@ -2894,6 +2904,7 @@ fn tag_query_for_thread_ids(thread_ids: &BTreeSet<String>) -> String {
         .join(" or ")
 }
 
+#[cfg(test)]
 fn thread_ids_from_tag_query(query: &str) -> BTreeSet<String> {
     query
         .split_whitespace()
@@ -10700,7 +10711,9 @@ fn load_undo_tag_actions() -> Vec<UndoTagAction> {
     let path = default_undo_history_path();
     std::fs::read_to_string(path)
         .ok()
-        .and_then(|text| serde_json::from_str::<Vec<UndoTagAction>>(&text).ok())
+        .and_then(|text| serde_json::from_str::<UndoTagHistory>(&text).ok())
+        .filter(|history| history.version == UNDO_TAG_HISTORY_VERSION)
+        .map(|history| history.actions)
         .unwrap_or_default()
 }
 
@@ -10709,7 +10722,11 @@ fn persist_undo_tag_actions(actions: &[UndoTagAction]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, serde_json::to_string_pretty(actions)?)?;
+    let history = UndoTagHistory {
+        version: UNDO_TAG_HISTORY_VERSION,
+        actions: actions.to_vec(),
+    };
+    std::fs::write(path, serde_json::to_string_pretty(&history)?)?;
     Ok(())
 }
 
@@ -10825,21 +10842,16 @@ fn tag_selected(
                 excluded_tags: runtime_excluded_tags(options),
             };
             let report = db.apply_tags_to_thread_range(&query, &opts, start, end, &mutation)?;
-            if report.changed_messages > 0 && report.revision_after > report.revision_before {
-                let undo_query = format!(
-                    "lastmod:{}..{}",
-                    report.revision_before.saturating_add(1),
-                    report.revision_after
-                );
+            if !report.changes.is_empty() {
                 push_undo_tag_action(
                     undo_state,
                     UndoTagAction {
-                        query: undo_query,
-                        mutation: TagMutation {
-                            add: mutation.remove.clone(),
-                            remove: mutation.add.clone(),
-                            sync_maildir_flags: mutation.sync_maildir_flags,
-                        },
+                        mutations: report
+                            .changes
+                            .iter()
+                            .map(|change| change.inverse())
+                            .collect(),
+                        sync_maildir_flags: mutation.sync_maildir_flags,
                         label: tag_undo_label(&mutation, target_count, report.changed_messages),
                         detail: Some(undo_detail_for_visual_range(&query, start, end)),
                     },
@@ -10906,16 +10918,16 @@ fn tag_selected_threads(
     let result = (|| -> anyhow::Result<usize> {
         let db = Database::open(&open_config(options), DatabaseMode::ReadWrite)?;
         let report = db.apply_tags_to_query(&query, &mutation)?;
-        if report.changed_messages > 0 {
+        if !report.changes.is_empty() {
             push_undo_tag_action(
                 undo_state,
                 UndoTagAction {
-                    query: query.clone(),
-                    mutation: TagMutation {
-                        add: mutation.remove.clone(),
-                        remove: mutation.add.clone(),
-                        sync_maildir_flags: mutation.sync_maildir_flags,
-                    },
+                    mutations: report
+                        .changes
+                        .iter()
+                        .map(|change| change.inverse())
+                        .collect(),
+                    sync_maildir_flags: mutation.sync_maildir_flags,
                     label: tag_undo_label(&mutation, target_count, report.changed_messages),
                     detail: undo_detail,
                 },
@@ -11145,27 +11157,18 @@ fn undo_tag_action(
     undo_state: &UndoState,
     action: UndoTagAction,
 ) {
-    let query = action.query.clone();
-    let mutation = action.mutation.clone();
+    let mutations = action.mutations.clone();
     let result = (|| -> anyhow::Result<()> {
         let db = Database::open(&open_config(options), DatabaseMode::ReadWrite)?;
-        db.apply_tags_to_query(&query, &mutation)?;
+        db.apply_tags_to_messages(&mutations, action.sync_maildir_flags)?;
         state.borrow_mut().last_operation = Some(format!("undid tag operation: {}", action.label));
         Ok(())
     })();
     match result {
         Ok(()) => {
             set_undo_tag_available(widgets, !undo_state.borrow().is_empty());
-            let target_thread_ids = thread_ids_from_tag_query(&query);
-            if !target_thread_ids.is_empty() {
-                apply_local_tag_mutation(widgets, state, &mutation, &target_thread_ids);
-                update_message_header(widgets, state);
-                update_custom_tag_controls(widgets, state);
-                update_message_action_buttons(options, widgets, state);
-            } else {
-                let current = state.borrow().current_query.clone();
-                run_search(options, widgets, state, &current);
-            }
+            let current = state.borrow().current_query.clone();
+            run_search(options, widgets, state, &current);
             widgets
                 .status_label
                 .set_text(&format!("Undid tag operation: {}", action.label));

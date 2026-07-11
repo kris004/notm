@@ -21,11 +21,36 @@ pub struct TagMutation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageTagMutation {
+    pub message_id: String,
+    pub add: Vec<String>,
+    pub remove: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppliedTagChange {
+    pub message_id: String,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+impl AppliedTagChange {
+    pub fn inverse(&self) -> MessageTagMutation {
+        MessageTagMutation {
+            message_id: self.message_id.clone(),
+            add: self.removed.clone(),
+            remove: self.added.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TagOperationReport {
     pub query: String,
     pub changed_messages: usize,
     pub added: Vec<String>,
     pub removed: Vec<String>,
+    pub changes: Vec<AppliedTagChange>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -40,4 +65,5 @@ pub struct ThreadRangeTagReport {
     pub revision_uuid: String,
     pub added: Vec<String>,
     pub removed: Vec<String>,
+    pub changes: Vec<AppliedTagChange>,
 }

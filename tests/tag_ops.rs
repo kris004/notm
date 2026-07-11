@@ -1,5 +1,5 @@
-use notm_notmuch::{QueryOptions, SortOrder, TagMutation};
-use std::path::Path;
+use notm_notmuch::{MessageSummary, QueryOptions, SortOrder, TagMutation};
+use std::{collections::BTreeMap, path::Path};
 
 #[test]
 fn applies_and_undoes_tag_operations_without_cli() -> anyhow::Result<()> {
@@ -34,6 +34,80 @@ fn applies_and_undoes_tag_operations_without_cli() -> anyhow::Result<()> {
     let restored = db.count_messages("subject:\"Unread inbox message\" and tag:inbox", &options)?;
     assert_eq!(restored, 1);
     Ok(())
+}
+
+#[test]
+fn per_message_tag_deltas_round_trip_mixed_thread_exactly() -> anyhow::Result<()> {
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let db = fixture.open_readwrite()?;
+    let options = QueryOptions {
+        limit: usize::MAX,
+        offset: 0,
+        sort: SortOrder::OldestFirst,
+        excluded_tags: Vec::new(),
+    };
+    let matching = db.search_messages("subject:\"Three message thread\"", &options)?;
+    let thread_id = matching
+        .first()
+        .map(|message| message.thread_id.clone())
+        .expect("fixture thread");
+    let query = format!("thread:{thread_id}");
+    let before = tags_by_message_id(db.search_messages(&query, &options)?);
+    assert_eq!(before.len(), 3, "fixture should contain a 3-message thread");
+
+    let report = db.apply_tags_to_query(
+        &query,
+        &TagMutation {
+            add: vec!["inbox".to_string()],
+            remove: vec!["unread".to_string()],
+            sync_maildir_flags: false,
+        },
+    )?;
+
+    assert_eq!(report.changed_messages, 2);
+    assert_eq!(report.changes.len(), 2);
+    assert!(
+        report
+            .changes
+            .iter()
+            .any(|change| { change.added == ["inbox"] && change.removed.is_empty() })
+    );
+    assert!(
+        report
+            .changes
+            .iter()
+            .any(|change| { change.added.is_empty() && change.removed == ["unread"] })
+    );
+
+    let inverses = report
+        .changes
+        .iter()
+        .map(|change| change.inverse())
+        .collect::<Vec<_>>();
+    db.apply_tags_to_messages(&inverses, false)?;
+
+    let restored = tags_by_message_id(db.search_messages(&query, &options)?);
+    assert_eq!(restored, before);
+
+    let noop = db.apply_tags_to_query(
+        &query,
+        &TagMutation {
+            add: Vec::new(),
+            remove: vec!["not-present".to_string()],
+            sync_maildir_flags: false,
+        },
+    )?;
+    assert_eq!(noop.changed_messages, 0);
+    assert!(noop.changes.is_empty());
+
+    Ok(())
+}
+
+fn tags_by_message_id(messages: Vec<MessageSummary>) -> BTreeMap<String, Vec<String>> {
+    messages
+        .into_iter()
+        .map(|message| (message.message_id, message.tags))
+        .collect()
 }
 
 #[test]

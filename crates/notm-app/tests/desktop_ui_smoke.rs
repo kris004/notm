@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -45,7 +46,8 @@ impl FixtureApp {
         let config_home = work_dir.join("config");
         let cache_home = work_dir.join("cache");
         let data_home = work_dir.join("data");
-        for directory in [&home, &config_home, &cache_home, &data_home] {
+        let state_home = work_dir.join("state");
+        for directory in [&home, &config_home, &cache_home, &data_home, &state_home] {
             fs::create_dir_all(directory)
                 .with_context(|| format!("creating test directory {}", directory.display()))?;
         }
@@ -76,6 +78,7 @@ impl FixtureApp {
             .env("XDG_CONFIG_HOME", config_home)
             .env("XDG_CACHE_HOME", cache_home)
             .env("XDG_DATA_HOME", data_home)
+            .env("XDG_STATE_HOME", state_home)
             .env("GSETTINGS_BACKEND", "memory")
             .env("NO_AT_BRIDGE", "1")
             .env("GTK_USE_PORTAL", "0")
@@ -338,6 +341,124 @@ fn timed_out_send_reports_failure_and_leaves_desktop_responsive() -> anyhow::Res
     );
 
     Ok(())
+}
+
+#[test]
+fn fixture_tag_undo_restores_each_messages_original_tags() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP fixture_tag_undo_restores_each_messages_original_tags: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running exact tag undo UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-tag-undo-ui-{run_id}"));
+    let legacy_path = work_dir.join("state/notm/tag-undo.json");
+    fs::create_dir_all(legacy_path.parent().expect("legacy undo parent"))?;
+    fs::write(
+        &legacy_path,
+        r#"[{"query":"*","mutation":{"add":[],"remove":["inbox"],"sync_maildir_flags":false},"label":"legacy"}]"#,
+    )?;
+
+    let token = format!("notm-tag-undo-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+
+    let legacy = driver.command("undo_tag_actions", json!({}))?;
+    ensure!(
+        json_array_at(&legacy, &["actions"])?.is_empty(),
+        "unsafe legacy undo entries were not invalidated: {legacy}"
+    );
+
+    let query = "subject:\"Three message thread\"";
+    select_first_thread(&mut driver, query)?;
+    let before = message_tags(&driver.command("app_state", json!({}))?)?;
+    ensure!(
+        before.len() == 3,
+        "expected fixture thread messages: {before:?}"
+    );
+
+    let tagged = driver.command(
+        "tag_selected",
+        json!({"add": ["inbox"], "remove": ["unread"]}),
+    )?;
+    assert_eq!(
+        tagged["state"]["last_error"],
+        Value::Null,
+        "tag operation failed: {tagged}"
+    );
+    let actions = driver.command("undo_tag_actions", json!({}))?;
+    let actions = json_array_at(&actions, &["actions"])?;
+    ensure!(
+        actions.len() == 1,
+        "expected one exact undo entry: {actions:?}"
+    );
+    let mutations = json_array_at(&actions[0], &["mutations"])?;
+    ensure!(
+        mutations.len() == 2,
+        "mixed thread should record only two changed messages: {mutations:?}"
+    );
+    ensure!(
+        actions[0].get("query").is_none(),
+        "undo entry still targets a mutable query: {}",
+        actions[0]
+    );
+
+    let undone = driver.command("undo_last_tag", json!({}))?;
+    assert_eq!(
+        undone["state"]["last_error"],
+        Value::Null,
+        "undo operation failed: {undone}"
+    );
+    let actions = driver.command("undo_tag_actions", json!({}))?;
+    ensure!(
+        json_array_at(&actions, &["actions"])?.is_empty(),
+        "undo history was not consumed: {actions}"
+    );
+
+    select_first_thread(&mut driver, query)?;
+    let restored = message_tags(&driver.command("app_state", json!({}))?)?;
+    assert_eq!(restored, before);
+
+    Ok(())
+}
+
+fn select_first_thread(driver: &mut UiDriver, query: &str) -> anyhow::Result<()> {
+    let search = driver.command("run_search", json!({"query": query}))?;
+    let rows = json_array_at(&search, &["state", "thread_list_items"])?;
+    ensure!(rows.len() == 1, "expected one fixture thread: {search}");
+    let selected = driver.command("select_thread_by_index", json!({"index": 0}))?;
+    assert_eq!(
+        selected["ok"], true,
+        "could not select fixture thread: {selected}"
+    );
+    Ok(())
+}
+
+fn message_tags(state: &Value) -> anyhow::Result<BTreeMap<String, BTreeSet<String>>> {
+    json_array_at(state, &["state", "messages"])?
+        .iter()
+        .map(|message| {
+            let message_id = message["message_id"]
+                .as_str()
+                .with_context(|| format!("message has no id: {message}"))?
+                .to_string();
+            let tags = message["tags"]
+                .as_array()
+                .with_context(|| format!("message has no tags: {message}"))?
+                .iter()
+                .map(|tag| {
+                    tag.as_str()
+                        .map(ToOwned::to_owned)
+                        .with_context(|| format!("tag is not a string: {tag}"))
+                })
+                .collect::<anyhow::Result<BTreeSet<_>>>()?;
+            Ok((message_id, tags))
+        })
+        .collect()
 }
 
 #[cfg(unix)]

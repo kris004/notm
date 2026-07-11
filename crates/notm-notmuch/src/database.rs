@@ -1,4 +1,4 @@
-use std::{ffi::CString, os::raw::c_char, path::Path, ptr::NonNull};
+use std::{collections::BTreeSet, ffi::CString, os::raw::c_char, path::Path, ptr::NonNull};
 
 use serde::{Deserialize, Serialize};
 
@@ -6,7 +6,10 @@ use crate::{
     Error, Result, ThreadSummary,
     error::{check, check_index},
     ffi,
-    message::{MessageSummary, TagMutation, TagOperationReport, ThreadRangeTagReport},
+    message::{
+        AppliedTagChange, MessageSummary, MessageTagMutation, TagMutation, TagOperationReport,
+        ThreadRangeTagReport,
+    },
     query::{QueryOptions, SortOrder},
     safe::{cstr_to_string, path_to_cstring, take_malloc_string},
     tags::validate_tag,
@@ -305,14 +308,16 @@ impl Database {
         check(status, self.status_string())?;
         let begin = unsafe { ffi::notmuch_database_begin_atomic(self.ptr.as_ptr()) };
         check(begin, self.status_string())?;
-        let mut changed = 0usize;
+        let mut changes = Vec::new();
         let result: Result<()> = (|| {
             while unsafe { ffi::notmuch_messages_valid(messages) } != 0 {
                 let message = unsafe { ffi::notmuch_messages_get(messages) };
                 if !message.is_null() {
-                    mutate_message(message, mutation, &self.status_string())?;
-                    changed += 1;
+                    let change = mutate_message(message, mutation, &self.status_string());
                     unsafe { ffi::notmuch_message_destroy(message) };
+                    if let Some(change) = change? {
+                        changes.push(change);
+                    }
                 }
                 unsafe { ffi::notmuch_messages_move_to_next(messages) };
             }
@@ -329,10 +334,62 @@ impl Database {
         result?;
         Ok(TagOperationReport {
             query: query.to_string(),
-            changed_messages: changed,
+            changed_messages: changes.len(),
             added: mutation.add.clone(),
             removed: mutation.remove.clone(),
+            changes,
         })
+    }
+
+    pub fn apply_tags_to_messages(
+        &self,
+        mutations: &[MessageTagMutation],
+        sync_maildir_flags: bool,
+    ) -> Result<Vec<AppliedTagChange>> {
+        let mut prepared = Vec::with_capacity(mutations.len());
+        for mutation in mutations {
+            for tag in mutation.add.iter().chain(mutation.remove.iter()) {
+                validate_tag(tag)?;
+            }
+            prepared.push((
+                CString::new(mutation.message_id.as_str())?,
+                TagMutation {
+                    add: mutation.add.clone(),
+                    remove: mutation.remove.clone(),
+                    sync_maildir_flags,
+                },
+            ));
+        }
+
+        let begin = unsafe { ffi::notmuch_database_begin_atomic(self.ptr.as_ptr()) };
+        check(begin, self.status_string())?;
+        let mut changes = Vec::new();
+        let result: Result<()> = (|| {
+            for (message_id, mutation) in &prepared {
+                let mut message = std::ptr::null_mut();
+                let status = unsafe {
+                    ffi::notmuch_database_find_message(
+                        self.ptr.as_ptr(),
+                        message_id.as_ptr(),
+                        &mut message,
+                    )
+                };
+                check(status, self.status_string())?;
+                if message.is_null() {
+                    continue;
+                }
+                let change = mutate_message(message, mutation, &self.status_string());
+                unsafe { ffi::notmuch_message_destroy(message) };
+                if let Some(change) = change? {
+                    changes.push(change);
+                }
+            }
+            Ok(())
+        })();
+        let end = unsafe { ffi::notmuch_database_end_atomic(self.ptr.as_ptr()) };
+        check(end, self.status_string())?;
+        result?;
+        Ok(changes)
     }
 
     pub fn apply_tags_to_thread_range(
@@ -355,7 +412,7 @@ impl Database {
         check(begin, self.status_string())?;
         let mut index = 0usize;
         let mut changed_threads = 0usize;
-        let mut changed_messages = 0usize;
+        let mut changes = Vec::new();
         let result: Result<()> = (|| {
             while unsafe { ffi::notmuch_threads_valid(threads) } != 0 {
                 let thread = unsafe { ffi::notmuch_threads_get(threads) };
@@ -365,7 +422,7 @@ impl Database {
                             thread,
                             mutation,
                             &self.status_string(),
-                            &mut changed_messages,
+                            &mut changes,
                         )?;
                         if thread_changed {
                             changed_threads += 1;
@@ -398,12 +455,13 @@ impl Database {
             start,
             end,
             changed_threads,
-            changed_messages,
+            changed_messages: changes.len(),
             revision_before: revision_before.revision,
             revision_after: revision_after.revision,
             revision_uuid: revision_after.uuid,
             added: mutation.add.clone(),
             removed: mutation.remove.clone(),
+            changes,
         })
     }
 
@@ -546,17 +604,19 @@ fn mutate_thread_messages(
     thread: *mut ffi::notmuch_thread_t,
     mutation: &TagMutation,
     detail: &str,
-    changed_messages: &mut usize,
+    changes: &mut Vec<AppliedTagChange>,
 ) -> Result<bool> {
     let messages = unsafe { ffi::notmuch_thread_get_messages(thread) };
     let mut changed = false;
     while unsafe { ffi::notmuch_messages_valid(messages) } != 0 {
         let message = unsafe { ffi::notmuch_messages_get(messages) };
         if !message.is_null() {
-            mutate_message(message, mutation, detail)?;
-            *changed_messages += 1;
-            changed = true;
+            let change = mutate_message(message, mutation, detail);
             unsafe { ffi::notmuch_message_destroy(message) };
+            if let Some(change) = change? {
+                changes.push(change);
+                changed = true;
+            }
         }
         unsafe { ffi::notmuch_messages_move_to_next(messages) };
     }
@@ -594,12 +654,18 @@ fn mutate_message(
     message: *mut ffi::notmuch_message_t,
     mutation: &TagMutation,
     detail: &str,
-) -> Result<()> {
+) -> Result<Option<AppliedTagChange>> {
+    let message_id = unsafe { cstr_to_string(ffi::notmuch_message_get_message_id(message)) };
+    let current_tags = unsafe { collect_tags(ffi::notmuch_message_get_tags(message)) };
+    let Some((effective, change)) = effective_tag_change(&message_id, &current_tags, mutation)
+    else {
+        return Ok(None);
+    };
     check(
         unsafe { ffi::notmuch_message_freeze(message) },
         detail.to_string(),
     )?;
-    for tag in &mutation.remove {
+    for tag in &effective.remove {
         let tag = CString::new(tag.as_str())?;
         if let Err(err) = check(
             unsafe { ffi::notmuch_message_remove_tag(message, tag.as_ptr()) },
@@ -609,7 +675,7 @@ fn mutate_message(
             return Err(err);
         }
     }
-    for tag in &mutation.add {
+    for tag in &effective.add {
         let tag = CString::new(tag.as_str())?;
         if let Err(err) = check(
             unsafe { ffi::notmuch_message_add_tag(message, tag.as_ptr()) },
@@ -619,7 +685,7 @@ fn mutate_message(
             return Err(err);
         }
     }
-    if mutation.sync_maildir_flags
+    if effective.sync_maildir_flags
         && let Err(err) = check(
             unsafe { ffi::notmuch_message_tags_to_maildir_flags(message) },
             detail.to_string(),
@@ -631,5 +697,85 @@ fn mutate_message(
     check(
         unsafe { ffi::notmuch_message_thaw(message) },
         detail.to_string(),
-    )
+    )?;
+    Ok(Some(change))
+}
+
+fn effective_tag_change(
+    message_id: &str,
+    current_tags: &[String],
+    mutation: &TagMutation,
+) -> Option<(TagMutation, AppliedTagChange)> {
+    let before = current_tags.iter().cloned().collect::<BTreeSet<_>>();
+    let mut after = before.clone();
+    for tag in &mutation.remove {
+        after.remove(tag);
+    }
+    for tag in &mutation.add {
+        after.insert(tag.clone());
+    }
+    let added = after.difference(&before).cloned().collect::<Vec<_>>();
+    let removed = before.difference(&after).cloned().collect::<Vec<_>>();
+    if added.is_empty() && removed.is_empty() {
+        return None;
+    }
+    Some((
+        TagMutation {
+            add: added.clone(),
+            remove: removed.clone(),
+            sync_maildir_flags: mutation.sync_maildir_flags,
+        },
+        AppliedTagChange {
+            message_id: message_id.to_string(),
+            added,
+            removed,
+        },
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_tag_change_records_only_net_per_message_delta() {
+        let mutation = TagMutation {
+            add: vec!["inbox".to_string(), "project".to_string()],
+            remove: vec!["unread".to_string(), "missing".to_string()],
+            sync_maildir_flags: true,
+        };
+
+        let (effective, change) = effective_tag_change(
+            "message@example.test",
+            &["inbox".to_string(), "unread".to_string()],
+            &mutation,
+        )
+        .expect("net change");
+
+        assert_eq!(effective.add, ["project"]);
+        assert_eq!(effective.remove, ["unread"]);
+        assert!(effective.sync_maildir_flags);
+        assert_eq!(change.added, ["project"]);
+        assert_eq!(change.removed, ["unread"]);
+        assert_eq!(change.inverse().add, ["unread"]);
+        assert_eq!(change.inverse().remove, ["project"]);
+    }
+
+    #[test]
+    fn effective_tag_change_respects_remove_then_add_for_overlapping_tags() {
+        let mutation = TagMutation {
+            add: vec!["inbox".to_string()],
+            remove: vec!["inbox".to_string()],
+            sync_maildir_flags: false,
+        };
+
+        assert!(
+            effective_tag_change("present@example.test", &["inbox".to_string()], &mutation,)
+                .is_none()
+        );
+        let (_, change) = effective_tag_change("absent@example.test", &[], &mutation)
+            .expect("remove then add leaves an absent tag added");
+        assert_eq!(change.added, ["inbox"]);
+        assert!(change.removed.is_empty());
+    }
 }
