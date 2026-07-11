@@ -94,6 +94,11 @@ Implemented test-harness commands include:
   `toggle_debug_panel`, custom saved-search commands, and custom tag-editor
   commands
 
+`focus_search` and `focus_compose_field` move GTK focus without forcing Insert
+mode. Tests that exercise keyboard editing should send the same `/`, `i`, or
+Enter transition that a user would use instead of relying on the harness to
+change modes implicitly.
+
 `set_layout` accepts `auto`, `columns` (with `three_pane` kept as a
 compatibility spelling), and `stacked`. `toggle_layout` cycles through columns,
 stacked, and auto.

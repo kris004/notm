@@ -295,6 +295,7 @@ struct Widgets {
     search_entry: gtk::Entry,
     search_button: gtk::Button,
     search_generation: Rc<Cell<u64>>,
+    input_mode_generation: Rc<Cell<u64>>,
     search_suggestions_list: gtk::ListBox,
     search_completion: Rc<RefCell<Option<SearchCompletionSession>>>,
     hidden_tag_searches: HiddenTagSearchStore,
@@ -1256,6 +1257,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
         search_entry,
         search_button: search_button.clone(),
         search_generation,
+        input_mode_generation: Rc::new(Cell::new(0)),
         search_suggestions_list,
         search_completion,
         hidden_tag_searches,
@@ -3725,10 +3727,21 @@ fn quote_notmuch_value(value: &str) -> String {
 }
 
 fn set_input_mode(widgets: &Widgets, state: &SharedState, mode: InputMode, status: &str) {
-    state.borrow_mut().input_mode = mode;
+    let changed = apply_input_mode(&mut state.borrow_mut(), mode);
+    if changed {
+        widgets
+            .input_mode_generation
+            .set(widgets.input_mode_generation.get().wrapping_add(1));
+    }
     update_button_binding_labels(widgets, state);
     update_active_pane_visuals(widgets, state);
     widgets.status_label.set_text(status);
+}
+
+fn apply_input_mode(state: &mut UiState, mode: InputMode) -> bool {
+    let changed = state.input_mode != mode;
+    state.input_mode = mode;
+    changed
 }
 
 fn enter_normal_mode(widgets: &Widgets, state: &SharedState) {
@@ -5423,11 +5436,85 @@ where
             return;
         };
         state.active_pane = pane;
+        let normal_mode = state.input_mode == InputMode::Normal;
         drop(state);
         update_button_binding_labels(&w, &st);
         update_active_pane_visuals(&w, &st);
+        if normal_mode {
+            w.status_label
+                .set_text("Normal mode: press Enter or i to edit this field");
+        }
     });
     widget.add_controller(focus);
+}
+
+fn main_text_entry_has_focus(widgets: &Widgets) -> bool {
+    [
+        &widgets.saved_name_entry,
+        &widgets.saved_query_entry,
+        &widgets.custom_tag_entry,
+        &widgets.tag_command_entry,
+        &widgets.search_entry,
+        &widgets.compose_from,
+        &widgets.compose_to,
+        &widgets.compose_cc,
+        &widgets.compose_bcc,
+        &widgets.compose_subject,
+    ]
+    .into_iter()
+    .any(|entry| widget_contains_focus(entry.upcast_ref()))
+}
+
+fn normal_text_focus_blocks_key(key: gtk::gdk::Key) -> bool {
+    key_to_digit(key).is_none()
+        && key.to_unicode().is_some()
+        && !matches!(
+            key,
+            gtk::gdk::Key::h
+                | gtk::gdk::Key::H
+                | gtk::gdk::Key::j
+                | gtk::gdk::Key::k
+                | gtk::gdk::Key::l
+                | gtk::gdk::Key::L
+                | gtk::gdk::Key::g
+                | gtk::gdk::Key::G
+                | gtk::gdk::Key::i
+                | gtk::gdk::Key::slash
+                | gtk::gdk::Key::colon
+                | gtk::gdk::Key::comma
+                | gtk::gdk::Key::question
+        )
+}
+
+fn normal_text_focus_starts_insert(key: gtk::gdk::Key, mods: gtk::gdk::ModifierType) -> bool {
+    let ctrl = mods.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+    let alt = mods.contains(gtk::gdk::ModifierType::ALT_MASK);
+    let super_key = mods.contains(gtk::gdk::ModifierType::SUPER_MASK);
+    if alt || super_key {
+        return false;
+    }
+    if ctrl {
+        matches!(
+            key,
+            gtk::gdk::Key::a
+                | gtk::gdk::Key::c
+                | gtk::gdk::Key::v
+                | gtk::gdk::Key::x
+                | gtk::gdk::Key::y
+                | gtk::gdk::Key::z
+                | gtk::gdk::Key::Z
+        )
+    } else {
+        matches!(
+            key,
+            gtk::gdk::Key::BackSpace
+                | gtk::gdk::Key::Delete
+                | gtk::gdk::Key::Left
+                | gtk::gdk::Key::Right
+                | gtk::gdk::Key::Home
+                | gtk::gdk::Key::End
+        )
+    }
 }
 
 fn connect_compose_body_focus<W>(widget: &W, widgets: &Widgets, state: &SharedState)
@@ -5442,12 +5529,13 @@ where
             return;
         };
         state.active_pane = ActivePane::Message;
-        state.input_mode = InputMode::Insert;
         drop(state);
-        update_button_binding_labels(&w, &st);
-        update_active_pane_visuals(&w, &st);
-        w.status_label
-            .set_text("Vim composer: Esc leaves insert/visual, Esc again exits to notm");
+        set_input_mode(
+            &w,
+            &st,
+            InputMode::Insert,
+            "Vim composer: Esc leaves insert/visual, Esc again exits to notm",
+        );
     });
     widget.add_controller(focus);
 }
@@ -5468,6 +5556,14 @@ fn install_shortcuts(
     let saved_for_capture = saved_store.clone();
     capture_controller.connect_key_pressed(move |_, key, _, mods| {
         let ctrl = mods.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+        let normal_mode = st.borrow().input_mode == InputMode::Normal;
+        if normal_mode
+            && main_text_entry_has_focus(&w)
+            && normal_text_focus_starts_insert(key, mods)
+        {
+            set_input_mode(&w, &st, InputMode::Insert, "Insert mode (Esc for normal)");
+            return gtk::glib::Propagation::Proceed;
+        }
         if ctrl && (key == gtk::gdk::Key::k || key == gtk::gdk::Key::K) {
             show_command_palette(&opts, &w, &st, &undo);
             return gtk::glib::Propagation::Stop;
@@ -5588,6 +5684,9 @@ fn install_shortcuts(
             return gtk::glib::Propagation::Stop;
         }
         if key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter {
+            if main_text_entry_has_focus(&w) {
+                return gtk::glib::Propagation::Proceed;
+            }
             match st.borrow().active_pane {
                 ActivePane::Threads => {
                     let idx = selected_thread_index(&w).unwrap_or(0);
@@ -5631,13 +5730,47 @@ fn install_shortcuts(
         pending_undo.clone(),
         undo.clone(),
     );
+    let observed_input_mode_generation = Cell::new(w.input_mode_generation.get());
     controller.connect_key_pressed(move |_, key, _, mods| {
+        let cancel_pending_sequences = || {
+            *pending_go.borrow_mut() = false;
+            *pending_custom_search.borrow_mut() = false;
+            *pending_response.borrow_mut() = false;
+            *pending_view.borrow_mut() = false;
+            *pending_copy.borrow_mut() = false;
+            *pending_tag.borrow_mut() = false;
+            *pending_undo.borrow_mut() = false;
+            clear_numeric_prefix(&numeric_prefix);
+            w.response_menu_button.popdown();
+            w.view_menu_button.popdown();
+            w.copy_menu_button.popdown();
+            w.tag_menu_button.popdown();
+            w.undo_tag_button.popdown();
+        };
+        let input_mode_generation = w.input_mode_generation.get();
+        if observed_input_mode_generation.get() != input_mode_generation {
+            cancel_pending_sequences();
+            observed_input_mode_generation.set(input_mode_generation);
+        }
         let ctrl = mods.contains(gtk::gdk::ModifierType::CONTROL_MASK);
         if ctrl {
             return gtk::glib::Propagation::Proceed;
         }
         if st.borrow().input_mode == InputMode::Insert {
             return gtk::glib::Propagation::Proceed;
+        }
+        if (key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter)
+            && main_text_entry_has_focus(&w)
+        {
+            cancel_pending_sequences();
+            set_input_mode(&w, &st, InputMode::Insert, "Insert mode (Esc for normal)");
+            return gtk::glib::Propagation::Stop;
+        }
+        if main_text_entry_has_focus(&w) && normal_text_focus_blocks_key(key) {
+            cancel_pending_sequences();
+            w.status_label
+                .set_text("Normal mode: press Enter or i to edit this field");
+            return gtk::glib::Propagation::Stop;
         }
         if key == gtk::gdk::Key::space && st.borrow().active_pane == ActivePane::Threads {
             clear_numeric_prefix(&numeric_prefix);
@@ -5655,18 +5788,7 @@ fn install_shortcuts(
             return gtk::glib::Propagation::Stop;
         }
         if key == gtk::gdk::Key::Escape {
-            *pending_go.borrow_mut() = false;
-            *pending_custom_search.borrow_mut() = false;
-            *pending_response.borrow_mut() = false;
-            *pending_view.borrow_mut() = false;
-            *pending_copy.borrow_mut() = false;
-            *pending_tag.borrow_mut() = false;
-            *pending_undo.borrow_mut() = false;
-            w.response_menu_button.popdown();
-            w.view_menu_button.popdown();
-            w.copy_menu_button.popdown();
-            w.tag_menu_button.popdown();
-            w.undo_tag_button.popdown();
+            cancel_pending_sequences();
             if st.borrow().visual_select_mode {
                 clear_visual_selection(&w, &st);
             } else if !st.borrow().multi_selected_threads.is_empty() {
@@ -12101,12 +12223,6 @@ fn handle_automation_request(
                 "subject" => &widgets.compose_subject,
                 _ => &widgets.compose_to,
             };
-            set_input_mode(
-                widgets,
-                state,
-                InputMode::Insert,
-                "Insert mode (test-harness focus)",
-            );
             entry.grab_focus();
             if matches!(field, "to" | "cc" | "bcc") {
                 set_active_address_entry(widgets, entry);
@@ -16046,6 +16162,50 @@ mod tests {
         }));
 
         assert_eq!(button_label("Archive", "a", &state), "Archive");
+    }
+
+    #[test]
+    fn input_mode_transition_reports_only_real_changes() {
+        let mut state = UiState::default();
+
+        assert!(apply_input_mode(&mut state, InputMode::Insert));
+        assert_eq!(state.input_mode, InputMode::Insert);
+        assert!(!apply_input_mode(&mut state, InputMode::Insert));
+        assert!(apply_input_mode(&mut state, InputMode::Normal));
+        assert_eq!(state.input_mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn normal_text_focus_blocks_mail_actions_but_keeps_modal_navigation() {
+        for key in [gtk::gdk::Key::a, gtk::gdk::Key::t, gtk::gdk::Key::s] {
+            assert!(normal_text_focus_blocks_key(key));
+        }
+        for key in [
+            gtk::gdk::Key::h,
+            gtk::gdk::Key::j,
+            gtk::gdk::Key::k,
+            gtk::gdk::Key::l,
+            gtk::gdk::Key::i,
+            gtk::gdk::Key::slash,
+        ] {
+            assert!(!normal_text_focus_blocks_key(key));
+        }
+    }
+
+    #[test]
+    fn text_editing_keys_enter_insert_mode_before_reaching_an_entry() {
+        let ctrl = gtk::gdk::ModifierType::CONTROL_MASK;
+
+        assert!(normal_text_focus_starts_insert(gtk::gdk::Key::v, ctrl));
+        assert!(normal_text_focus_starts_insert(
+            gtk::gdk::Key::BackSpace,
+            gtk::gdk::ModifierType::empty(),
+        ));
+        assert!(!normal_text_focus_starts_insert(gtk::gdk::Key::k, ctrl));
+        assert!(!normal_text_focus_starts_insert(
+            gtk::gdk::Key::j,
+            gtk::gdk::ModifierType::empty(),
+        ));
     }
 
     #[test]

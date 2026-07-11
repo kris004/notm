@@ -56,6 +56,14 @@ fixture/live path after the change and confirm the symptom is gone. Rust compile
 Clippy, and unit tests are still useful, but they do not replace a runtime smoke
 check for UI warnings or behavior regressions.
 
+The focused-text shortcut regression has a self-contained headless Sway check.
+It requires `dbus-run-session`, `sway`, `swaymsg`, and `wtype`:
+
+```sh
+CARGO_HOME=$PWD/.cargo-home cargo build -p notm-app
+python3 -B tests/ui_text_focus_smoke.py --binary target/debug/notm
+```
+
 Test-harness reports and screenshots are local validation artifacts under
 `artifacts/`; they are ignored by git except for `artifacts/logs/.gitkeep`. Keep
 long progress reports out of the root README and archive completed planning notes
