@@ -6,7 +6,6 @@ use std::{
 use chrono::{Duration, Utc};
 use notm_notmuch::{Database, DatabaseMode, OpenConfig};
 use tempfile::TempDir;
-use uuid::Uuid;
 
 pub struct FixtureDatabase {
     _temp: TempDir,
@@ -86,7 +85,7 @@ struct FixtureMessage {
 
 fn fixture_messages() -> Vec<FixtureMessage> {
     let now = Utc::now();
-    let thread_id = Uuid::new_v4();
+    let thread_id = "three-message";
     vec![
         msg(
             "unread inbox message",

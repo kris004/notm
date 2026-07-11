@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const TEST_HARNESS_APPLICATION_ID_ENV: &str = "NOTM_TEST_HARNESS_APPLICATION_ID";
 
 struct FixtureApp {
     child: Child,
@@ -21,9 +22,34 @@ struct FixtureApp {
     work_dir: PathBuf,
 }
 
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 impl FixtureApp {
     fn spawn(work_dir: PathBuf, token: &str) -> anyhow::Result<Self> {
-        Self::spawn_inner(work_dir, token, None)
+        Self::spawn_inner(work_dir, token, None, None, None)
+    }
+
+    fn spawn_with_message_id(
+        work_dir: PathBuf,
+        token: &str,
+        message_id: &str,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(work_dir, token, None, Some(message_id), None)
+    }
+
+    fn spawn_with_application_id(
+        work_dir: PathBuf,
+        token: &str,
+        application_id: &str,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(work_dir, token, None, None, Some(application_id))
     }
 
     #[cfg(unix)]
@@ -32,15 +58,17 @@ impl FixtureApp {
         token: &str,
         config_path: &std::path::Path,
     ) -> anyhow::Result<Self> {
-        Self::spawn_inner(work_dir, token, Some(config_path))
+        Self::spawn_inner(work_dir, token, Some(config_path), None, None)
     }
 
     fn spawn_inner(
         work_dir: PathBuf,
         token: &str,
         config_path: Option<&std::path::Path>,
+        message_id: Option<&str>,
+        application_id: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let socket_path = work_dir.join("test-harness.sock");
+        let socket_path = work_dir.join("h.sock");
         let log_path = work_dir.join("notm.log");
         let home = work_dir.join("home");
         let config_home = work_dir.join("config");
@@ -71,9 +99,17 @@ impl FixtureApp {
                 "--test-harness-socket",
             ]);
         }
-        let child = command
+        command
             .arg(&socket_path)
-            .args(["--test-harness-token", token])
+            .args(["--test-harness-token", token]);
+        if let Some(message_id) = message_id {
+            command.args(["--message-id", message_id]);
+        }
+        command.env_remove(TEST_HARNESS_APPLICATION_ID_ENV);
+        if let Some(application_id) = application_id {
+            command.env(TEST_HARNESS_APPLICATION_ID_ENV, application_id);
+        }
+        let child = command
             .env("HOME", home)
             .env("XDG_CONFIG_HOME", config_home)
             .env("XDG_CACHE_HOME", cache_home)
@@ -125,6 +161,74 @@ impl FixtureApp {
     fn logs(&self) -> String {
         fs::read_to_string(&self.log_path)
             .unwrap_or_else(|err| format!("could not read app log: {err}"))
+    }
+
+    fn request_message_id(
+        &self,
+        token: &str,
+        application_id: &str,
+        message_id: &str,
+    ) -> anyhow::Result<()> {
+        let secondary = self.work_dir.join("secondary");
+        let home = secondary.join("home");
+        let config_home = secondary.join("config");
+        let cache_home = secondary.join("cache");
+        let data_home = secondary.join("data");
+        let state_home = secondary.join("state");
+        for directory in [&home, &config_home, &cache_home, &data_home, &state_home] {
+            fs::create_dir_all(directory)
+                .with_context(|| format!("creating test directory {}", directory.display()))?;
+        }
+        let log_path = secondary.join("notm.log");
+        let log = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&log_path)
+            .with_context(|| format!("creating app log {}", log_path.display()))?;
+        let socket_path = secondary.join("h.sock");
+        let child = Command::new(env!("CARGO_BIN_EXE_notm"))
+            .args([
+                "launch",
+                "--fixture",
+                "--test-harness",
+                "--test-harness-socket",
+            ])
+            .arg(&socket_path)
+            .args(["--test-harness-token", token, "--message-id", message_id])
+            .env(TEST_HARNESS_APPLICATION_ID_ENV, application_id)
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", config_home)
+            .env("XDG_CACHE_HOME", cache_home)
+            .env("XDG_DATA_HOME", data_home)
+            .env("XDG_STATE_HOME", state_home)
+            .env("GSETTINGS_BACKEND", "memory")
+            .env("NO_AT_BRIDGE", "1")
+            .env("GTK_USE_PORTAL", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone()?))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .context("launching the secondary fixture app")?;
+        let mut child = ChildGuard(child);
+
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            if let Some(status) = child.0.try_wait()? {
+                ensure!(
+                    status.success(),
+                    "secondary message-id request failed with {status}\n{}",
+                    fs::read_to_string(&log_path).unwrap_or_default()
+                );
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "secondary message-id request did not exit within {STARTUP_TIMEOUT:?}\n{}",
+                    fs::read_to_string(&log_path).unwrap_or_default()
+                );
+            }
+            thread::sleep(STARTUP_POLL_INTERVAL);
+        }
     }
 }
 
@@ -243,6 +347,116 @@ fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
         "fixture composer dropped Bcc recipients from its send submission:\n{captured}"
     );
 
+    Ok(())
+}
+
+#[test]
+fn fixture_cold_message_id_launch_preserves_target_and_startup_query() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP fixture_cold_message_id_launch_preserves_target_and_startup_query: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running cold message-id desktop UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-message-id-ui-{run_id}"));
+    let token = format!("notm-message-id-ui-{run_id}");
+    let target = "thread-root-three-message@fixture.test";
+    let mut app = FixtureApp::spawn_with_message_id(work_dir, &token, target)?;
+    let mut driver = app.connect(&token)?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let state = loop {
+        let response = driver.command("app_state", json!({}))?;
+        if response["state"]["selected_message"]["message_id"] == target
+            && response["state"]["pending_open_message_id"].is_null()
+        {
+            break response;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "cold message-id launch did not select {target}: {response}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+
+    assert_eq!(
+        state["state"]["current_query"], "tag:inbox",
+        "cold target replaced the startup query instead of selecting within it: {state}"
+    );
+    assert_eq!(
+        state["state"]["active_pane"], "Message",
+        "cold target did not focus the message pane: {state}"
+    );
+    assert_target_message_rendered(&mut driver)?;
+
+    Ok(())
+}
+
+#[test]
+fn fixture_existing_instance_message_id_request_reaches_primary() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP fixture_existing_instance_message_id_request_reaches_primary: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running existing-instance message-id desktop UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-message-id-remote-ui-{run_id}"));
+    let token = format!("notm-message-id-remote-ui-{run_id}");
+    let application_id = format!("dev.notm.Notm.Test.r{}", run_id.replace('-', ""));
+    let target = "thread-root-three-message@fixture.test";
+    let mut app = FixtureApp::spawn_with_application_id(work_dir, &token, &application_id)?;
+    let mut driver = app.connect(&token)?;
+    let initial = driver.command("app_state", json!({}))?;
+    assert_ne!(
+        initial["state"]["selected_message"]["message_id"], target,
+        "primary fixture unexpectedly started on the remote target: {initial}"
+    );
+
+    app.request_message_id(&token, &application_id, target)?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let state = loop {
+        let response = driver.command("app_state", json!({}))?;
+        if response["state"]["selected_message"]["message_id"] == target
+            && response["state"]["pending_open_message_id"].is_null()
+        {
+            break response;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "primary instance did not receive message-id request for {target}: {response}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+
+    assert_eq!(state["state"]["active_pane"], "Message", "{state}");
+    assert_eq!(state["state"]["current_query"], "tag:inbox", "{state}");
+    assert_target_message_rendered(&mut driver)?;
+
+    Ok(())
+}
+
+fn assert_target_message_rendered(driver: &mut UiDriver) -> anyhow::Result<()> {
+    let rendered = driver.command("message_view_text", json!({}))?;
+    let text = rendered["text"]
+        .as_str()
+        .with_context(|| format!("message view response has no text: {rendered}"))?;
+    ensure!(
+        text.contains("Thread root body."),
+        "message view did not render the targeted root message: {rendered}"
+    );
+    ensure!(
+        !text.contains("Reply two body with quote."),
+        "message view rendered the thread's last message instead of the target: {rendered}"
+    );
     Ok(())
 }
 

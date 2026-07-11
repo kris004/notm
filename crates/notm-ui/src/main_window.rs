@@ -12,6 +12,7 @@ use std::{
 };
 
 use chrono::Utc;
+use gtk::glib::variant::{StaticVariantType, ToVariant};
 use gtk::prelude::*;
 use gtk4 as gtk;
 use notm_mail::{
@@ -45,6 +46,12 @@ use crate::{
     },
     screenshot,
 };
+
+const NORMAL_APPLICATION_ID: &str = "dev.notm.Notm";
+const TEST_HARNESS_APPLICATION_ID_NAMESPACE: &str = "dev.notm.Notm.Test.";
+const TEST_HARNESS_APPLICATION_ID_PREFIX: &str = "dev.notm.Notm.Test.t";
+const TEST_HARNESS_APPLICATION_ID_ENV: &str = "NOTM_TEST_HARNESS_APPLICATION_ID";
+const OPEN_MESSAGE_ID_ACTION: &str = "open-message-id";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedSearch {
@@ -207,29 +214,121 @@ impl Default for LaunchOptions {
 
 pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
     sync_runtime_settings_from_launch_options(&options);
-    let mut app_builder = gtk::Application::builder().application_id("dev.notm.Notm");
-    // Targeted external launches must build their own window; a unique
-    // GtkApplication would only activate an already-running notm instance with
-    // that instance's original launch options.
-    if options.automation_enabled || options.open_message_id.is_some() {
-        app_builder = app_builder.flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
-    }
+    let app_builder = gtk::Application::builder()
+        .application_id(application_id_for_launch(&options)?)
+        .flags(application_flags_for_launch(&options));
     let app = app_builder.build();
-    let main_window = Rc::new(RefCell::new(None::<gtk::ApplicationWindow>));
+    let main_window = Rc::new(RefCell::new(None::<MainWindowHandle>));
+
+    add_open_message_id_action(&app, &options, &main_window);
+    let activate_options = options.clone();
+    let activate_main_window = main_window.clone();
     app.connect_activate(move |app| {
-        if !options.automation_enabled
-            && let Some(window) = main_window.borrow().as_ref()
-        {
-            window.present();
-            return;
-        }
-        let window = build_ui(app, options.clone());
-        if !options.automation_enabled {
-            *main_window.borrow_mut() = Some(window);
-        }
+        open_or_present_main_window(app, &activate_options, &activate_main_window, None);
     });
+
+    if let Some(message_id) = &options.open_message_id {
+        app.register(gtk::gio::Cancellable::NONE)?;
+        if app.is_remote() {
+            anyhow::ensure!(
+                app.has_action(OPEN_MESSAGE_ID_ACTION),
+                "the running notm instance does not support message-id routing; restart it and \
+                 try again"
+            );
+            app.activate_action(OPEN_MESSAGE_ID_ACTION, Some(&message_id.to_variant()));
+            let connection = app
+                .dbus_connection()
+                .ok_or_else(|| anyhow::anyhow!("remote notm instance has no D-Bus connection"))?;
+            connection.flush_sync(gtk::gio::Cancellable::NONE)?;
+            return Ok(());
+        }
+    }
+
     app.run_with_args(&["notm"]);
     Ok(())
+}
+
+fn application_id_for_launch(options: &LaunchOptions) -> anyhow::Result<String> {
+    if options.automation_enabled {
+        if let Some(application_id) = std::env::var_os(TEST_HARNESS_APPLICATION_ID_ENV) {
+            let application_id = application_id.into_string().map_err(|_| {
+                anyhow::anyhow!("{TEST_HARNESS_APPLICATION_ID_ENV} must be valid UTF-8")
+            })?;
+            anyhow::ensure!(
+                application_id.starts_with(TEST_HARNESS_APPLICATION_ID_NAMESPACE),
+                "{TEST_HARNESS_APPLICATION_ID_ENV} must use the test-harness namespace \
+                 {TEST_HARNESS_APPLICATION_ID_NAMESPACE}"
+            );
+            anyhow::ensure!(
+                gtk::gio::Application::id_is_valid(&application_id),
+                "{TEST_HARNESS_APPLICATION_ID_ENV} is not a valid application ID"
+            );
+            return Ok(application_id);
+        }
+        Ok(format!(
+            "{}{}",
+            TEST_HARNESS_APPLICATION_ID_PREFIX,
+            Uuid::new_v4().simple()
+        ))
+    } else {
+        Ok(NORMAL_APPLICATION_ID.to_string())
+    }
+}
+
+fn application_flags_for_launch(_options: &LaunchOptions) -> gtk::gio::ApplicationFlags {
+    gtk::gio::ApplicationFlags::empty()
+}
+
+fn add_open_message_id_action(
+    app: &gtk::Application,
+    options: &LaunchOptions,
+    main_window: &Rc<RefCell<Option<MainWindowHandle>>>,
+) {
+    let action =
+        gtk::gio::SimpleAction::new(OPEN_MESSAGE_ID_ACTION, Some(&String::static_variant_type()));
+    let action_app = app.clone();
+    let action_options = options.clone();
+    let action_main_window = main_window.clone();
+    action.connect_activate(move |_, parameter| {
+        let Some(message_id) = parameter.and_then(|value| value.get::<String>()) else {
+            return;
+        };
+        open_or_present_main_window(
+            &action_app,
+            &action_options,
+            &action_main_window,
+            Some(message_id),
+        );
+    });
+    app.add_action(&action);
+}
+
+fn resolved_new_window_message_id(
+    requested_message_id: Option<String>,
+    launch_message_id: Option<&str>,
+) -> Option<String> {
+    requested_message_id.or_else(|| launch_message_id.map(ToOwned::to_owned))
+}
+
+fn open_or_present_main_window(
+    app: &gtk::Application,
+    options: &LaunchOptions,
+    main_window: &Rc<RefCell<Option<MainWindowHandle>>>,
+    open_message_id: Option<String>,
+) {
+    if let Some(handle) = main_window.borrow().as_ref().cloned() {
+        if let Some(message_id) = open_message_id {
+            open_message_id_request(options, &handle.widgets, &handle.state, &message_id);
+        }
+        handle.window.present();
+        return;
+    }
+
+    let mut launch_options = options.clone();
+    launch_options.open_message_id =
+        resolved_new_window_message_id(open_message_id, options.open_message_id.as_deref());
+    let handle = build_ui(app, launch_options);
+    *main_window.borrow_mut() = Some(handle);
 }
 
 fn sync_runtime_settings_from_launch_options(options: &LaunchOptions) {
@@ -401,6 +500,13 @@ type SharedState = Rc<RefCell<UiState>>;
 type UndoState = Rc<RefCell<Vec<UndoTagAction>>>;
 type SavedSearchStore = Rc<RefCell<Vec<SavedSearch>>>;
 type HiddenTagSearchStore = Rc<RefCell<BTreeSet<String>>>;
+
+#[derive(Clone)]
+struct MainWindowHandle {
+    window: gtk::ApplicationWindow,
+    widgets: Widgets,
+    state: SharedState,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecipientField {
@@ -606,7 +712,7 @@ impl ThreadListDisplay {
     }
 }
 
-fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationWindow {
+fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle {
     install_css();
     let layout_preference = runtime_layout_preference(&options);
     let initial_layout =
@@ -1494,7 +1600,11 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> gtk::ApplicationW
         });
     }
     update_debug(&widgets, &state);
-    window
+    MainWindowHandle {
+        window,
+        widgets,
+        state,
+    }
 }
 
 fn built_in_saved_searches() -> Vec<SavedSearch> {
@@ -6488,6 +6598,16 @@ fn select_thread_index_in_list(widgets: &Widgets, index: usize) {
     focus_thread_list(widgets);
 }
 
+fn select_thread_index_for_open_message(widgets: &Widgets, index: usize) {
+    if index >= widgets.thread_model.n_items() as usize {
+        return;
+    }
+    widgets.thread_selection_refreshing.set(true);
+    widgets.thread_selection.set_selected(index as u32);
+    widgets.thread_selection_refreshing.set(false);
+    scroll_thread_index_into_view(widgets, index);
+}
+
 fn scroll_thread_index_into_view(widgets: &Widgets, index: usize) {
     if index >= widgets.thread_model.n_items() as usize {
         return;
@@ -10519,6 +10639,24 @@ fn message_id_query(message_id: &str) -> String {
     format!("id:{}", quote_notmuch_value(message_id))
 }
 
+fn open_message_id_request(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    message_id: &str,
+) {
+    state.borrow_mut().pending_open_message_id = Some(message_id.to_string());
+    if open_loaded_thread_at_message(options, widgets, state, message_id) {
+        state.borrow_mut().pending_open_message_id = None;
+        update_thread_result_label(widgets, state);
+        update_debug(widgets, state);
+        return;
+    }
+
+    widgets.search_entry.set_text(&options.default_query);
+    run_search(options, widgets, state, &options.default_query);
+}
+
 fn open_loaded_thread_at_message(
     options: &LaunchOptions,
     widgets: &Widgets,
@@ -10550,7 +10688,7 @@ fn open_loaded_thread_at_message(
 
         match result {
             Ok(Some(message_index)) => {
-                select_thread_index_in_list(widgets, index);
+                select_thread_index_for_open_message(widgets, index);
                 refresh_thread_attachment_list(widgets, state);
                 update_message_menu(options, widgets, state);
                 if selected_message_is_draft(options, state) {
@@ -10579,6 +10717,7 @@ fn open_loaded_thread_at_message(
                 update_custom_tag_controls(widgets, state);
                 update_active_pane_visuals(widgets, state);
                 update_message_action_buttons(options, widgets, state);
+                focus_active_pane(widgets, state);
                 return true;
             }
             Ok(None) => {}
@@ -16024,6 +16163,69 @@ mod tests {
         assert!(status.starts_with("Opened link externally: https://example.test/"));
         assert!(status.ends_with('…'));
         assert!(status.chars().count() < uri.chars().count());
+    }
+
+    #[test]
+    fn normal_launch_uses_stable_single_instance_application_id() {
+        let options = LaunchOptions::default();
+
+        assert_eq!(
+            application_id_for_launch(&options).expect("application ID"),
+            NORMAL_APPLICATION_ID
+        );
+        assert!(application_flags_for_launch(&options).is_empty());
+        assert!(
+            !application_flags_for_launch(&options)
+                .contains(gtk::gio::ApplicationFlags::NON_UNIQUE)
+        );
+    }
+
+    #[test]
+    fn test_harness_launch_uses_per_process_valid_application_id() {
+        let options = LaunchOptions {
+            automation_enabled: true,
+            ..LaunchOptions::default()
+        };
+        let app_id = application_id_for_launch(&options).expect("application ID");
+
+        assert_ne!(app_id, NORMAL_APPLICATION_ID);
+        assert!(app_id.starts_with(TEST_HARNESS_APPLICATION_ID_PREFIX));
+        assert!(gtk::gio::Application::id_is_valid(&app_id));
+        assert!(application_flags_for_launch(&options).is_empty());
+    }
+
+    #[test]
+    fn message_id_launch_keeps_stable_single_instance_application_id() {
+        let options = LaunchOptions {
+            open_message_id: Some("abc@example.test".to_string()),
+            ..LaunchOptions::default()
+        };
+
+        assert_eq!(
+            application_id_for_launch(&options).expect("application ID"),
+            NORMAL_APPLICATION_ID
+        );
+        assert!(application_flags_for_launch(&options).is_empty());
+        assert!(
+            !application_flags_for_launch(&options)
+                .contains(gtk::gio::ApplicationFlags::NON_UNIQUE)
+        );
+    }
+
+    #[test]
+    fn new_window_message_id_prefers_request_and_preserves_cold_launch_target() {
+        assert_eq!(
+            resolved_new_window_message_id(None, Some("cold@example.test")),
+            Some("cold@example.test".to_string())
+        );
+        assert_eq!(
+            resolved_new_window_message_id(
+                Some("request@example.test".to_string()),
+                Some("cold@example.test")
+            ),
+            Some("request@example.test".to_string())
+        );
+        assert_eq!(resolved_new_window_message_id(None, None), None);
     }
 
     #[test]
