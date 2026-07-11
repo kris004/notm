@@ -152,7 +152,21 @@ fn sanitize_header(value: &str) -> String {
 }
 
 fn normalize_body(body: &str) -> String {
-    body.replace('\n', "\r\n")
+    let mut normalized = String::with_capacity(body.len());
+    let mut chars = body.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    let _ = chars.next();
+                }
+                normalized.push_str("\r\n");
+            }
+            '\n' => normalized.push_str("\r\n"),
+            _ => normalized.push(ch),
+        }
+    }
+    normalized
 }
 
 fn plain_text_to_html_fragment(body: &str) -> String {
@@ -212,5 +226,38 @@ mod tests {
         let rendered = render_message(&test_message());
 
         assert!(!rendered.contains("\r\nBcc:"));
+    }
+
+    #[test]
+    fn normalizes_all_body_line_endings_to_crlf() {
+        for (case, input, expected) in [
+            ("lf", "first\nsecond\n", "first\r\nsecond\r\n"),
+            ("crlf", "first\r\nsecond\r\n", "first\r\nsecond\r\n"),
+            ("cr", "first\rsecond\r", "first\r\nsecond\r\n"),
+            (
+                "mixed",
+                "first\r\nsecond\nthird\rfourth",
+                "first\r\nsecond\r\nthird\r\nfourth",
+            ),
+        ] {
+            let normalized = normalize_body(input);
+            assert_eq!(normalized, expected, "unexpected {case} normalization");
+            assert_eq!(
+                normalize_body(&normalized),
+                normalized,
+                "{case} normalization was not idempotent"
+            );
+        }
+    }
+
+    #[test]
+    fn rendered_plain_body_does_not_double_existing_crlf() {
+        let mut message = test_message();
+        message.body = "first\r\nsecond".to_string();
+
+        let rendered = render_message(&message);
+
+        assert!(rendered.ends_with("\r\n\r\nfirst\r\nsecond"));
+        assert!(!rendered.contains("\r\r\n"));
     }
 }
