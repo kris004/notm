@@ -33,7 +33,14 @@ pub enum Command {
         #[arg(long, value_name = "MESSAGE_ID")]
         message_id: Option<String>,
     },
-    PrintConfig,
+    #[command(about = "Print effective configuration as JSON with secrets redacted by default")]
+    PrintConfig {
+        #[arg(
+            long,
+            help = "Show unredacted secret values (unsafe for logs or shared output)"
+        )]
+        show_secrets: bool,
+    },
     ProbeSend,
     FixtureSmoke,
     LiveReadonlySmoke,

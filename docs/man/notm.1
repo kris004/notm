@@ -38,7 +38,14 @@ Notmuch message id.  If the message is not in the loaded startup page, fall back
 to a direct id search.
 .TP
 .B print-config
-Print the effective configuration as JSON after default discovery.
+Print the effective configuration as JSON after default discovery.  The test
+harness token, send environment values and arguments, and configured sync
+commands are redacted by default.
+.TP
+.B print-config --show-secrets
+Print the effective configuration with secret-bearing values unredacted for
+backward compatibility.  This is unsafe for logs or shared output; use it only
+for deliberate private local inspection.
 .TP
 .B probe-send
 Probe the configured external send transport without sending mail.  This is a

@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths;
 
+const REDACTED_VALUE: &str = "[REDACTED]";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
@@ -20,6 +22,30 @@ pub struct AppConfig {
     pub sync: SyncConfig,
     #[serde(default)]
     pub automation: AutomationConfig,
+}
+
+impl AppConfig {
+    pub(crate) fn redacted_for_display(&self) -> Self {
+        let mut redacted = self.clone();
+
+        if redacted.automation.token.is_some() {
+            redacted.automation.token = Some(REDACTED_VALUE.to_string());
+        }
+        for value in redacted.send.env.values_mut() {
+            *value = REDACTED_VALUE.to_string();
+        }
+        for argument in &mut redacted.send.args {
+            *argument = REDACTED_VALUE.to_string();
+        }
+        if !redacted.sync.notmuch_database_update_command.is_empty() {
+            redacted.sync.notmuch_database_update_command = REDACTED_VALUE.to_string();
+        }
+        if !redacted.sync.external_receive_command.is_empty() {
+            redacted.sync.external_receive_command = REDACTED_VALUE.to_string();
+        }
+
+        redacted
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,7 +405,79 @@ fn default_screenshot_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::AppConfig;
+    use super::{AppConfig, REDACTED_VALUE};
+
+    #[test]
+    fn display_redaction_replaces_secret_bearing_values_without_changing_shape() {
+        let mut config = AppConfig::default();
+        config.automation.token = Some("test-harness-secret".to_string());
+        config
+            .send
+            .env
+            .insert("ACCESS_TOKEN".to_string(), "environment-secret".to_string());
+        config
+            .send
+            .env
+            .insert("EMPTY_VALUE".to_string(), String::new());
+        config.send.args = vec!["--password".to_string(), "argument-secret".to_string()];
+        config.sync.external_receive_command = "receive --token sync-secret".to_string();
+        config.sync.notmuch_database_update_command = "index --key update-secret".to_string();
+
+        let redacted = config.redacted_for_display();
+
+        assert_eq!(redacted.automation.token.as_deref(), Some(REDACTED_VALUE));
+        assert_eq!(redacted.send.env.len(), 2);
+        assert!(
+            redacted
+                .send
+                .env
+                .values()
+                .all(|value| value == REDACTED_VALUE)
+        );
+        assert_eq!(redacted.send.args.len(), 2);
+        assert!(
+            redacted
+                .send
+                .args
+                .iter()
+                .all(|argument| argument == REDACTED_VALUE)
+        );
+        assert_eq!(redacted.sync.external_receive_command, REDACTED_VALUE);
+        assert_eq!(
+            redacted.sync.notmuch_database_update_command,
+            REDACTED_VALUE
+        );
+
+        assert_eq!(
+            config.automation.token.as_deref(),
+            Some("test-harness-secret")
+        );
+        assert_eq!(
+            config.send.env.get("ACCESS_TOKEN").map(String::as_str),
+            Some("environment-secret")
+        );
+        assert_eq!(config.send.args[1], "argument-secret");
+        assert!(config.sync.external_receive_command.contains("sync-secret"));
+        assert!(
+            config
+                .sync
+                .notmuch_database_update_command
+                .contains("update-secret")
+        );
+    }
+
+    #[test]
+    fn display_redaction_preserves_absent_and_empty_sensitive_fields() {
+        let config = AppConfig::default();
+
+        let redacted = config.redacted_for_display();
+
+        assert_eq!(redacted.automation.token, None);
+        assert!(redacted.send.env.is_empty());
+        assert!(redacted.send.args.is_empty());
+        assert!(redacted.sync.external_receive_command.is_empty());
+        assert!(redacted.sync.notmuch_database_update_command.is_empty());
+    }
 
     #[test]
     fn ui_layout_defaults_to_auto() {

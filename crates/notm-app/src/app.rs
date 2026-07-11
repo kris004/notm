@@ -48,9 +48,14 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             }
             notm_ui::launch(options)
         }
-        Command::PrintConfig => {
+        Command::PrintConfig { show_secrets } => {
             let cfg = config::load(cli.config)?;
-            println!("{}", serde_json::to_string_pretty(&cfg)?);
+            let printable = if show_secrets {
+                cfg
+            } else {
+                cfg.redacted_for_display()
+            };
+            println!("{}", serde_json::to_string_pretty(&printable)?);
             Ok(())
         }
         Command::ProbeSend => {

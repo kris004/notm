@@ -128,8 +128,11 @@ Useful optional sections:
   you want `notm` to expose a Sync button.
 
 Run `notm print-config` to see the effective configuration after default
-discovery. See `notm-config(5)` and [docs/send-transport.md](docs/send-transport.md)
-for details.
+discovery. Secret-bearing values are redacted by default. The explicit
+`notm print-config --show-secrets` compatibility mode reveals them; use it only
+for private local inspection because terminal output may be logged or shared.
+See `notm-config(5)` and [docs/send-transport.md](docs/send-transport.md) for
+details.
 
 ## Keyboard basics
 
