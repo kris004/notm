@@ -1,8 +1,28 @@
+use std::{ffi::OsStr, process::Command};
+
 #[test]
-fn live_readonly_smoke_is_explicitly_gated() {
-    if std::env::var_os("NOTM_RUN_LIVE_TESTS").is_none() {
-        eprintln!(
-            "skipping live readonly smoke in cargo test; run `cargo run -p notm-app -- live-readonly-smoke`"
-        );
-    }
+#[ignore = "live DB: set NOTM_RUN_LIVE_TESTS=1 and run this test with --ignored --exact"]
+fn live_readonly_smoke_runs_real_command() {
+    assert!(
+        std::env::var_os("NOTM_RUN_LIVE_TESTS").as_deref() == Some(OsStr::new("1")),
+        "refusing to access the live Notmuch database: set NOTM_RUN_LIVE_TESTS=1 explicitly"
+    );
+
+    let status = Command::new(env!("CARGO"))
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args([
+            "run",
+            "--quiet",
+            "-p",
+            "notm-app",
+            "--",
+            "live-readonly-smoke",
+        ])
+        .status()
+        .expect("failed to start Cargo for the live readonly smoke");
+
+    assert!(
+        status.success(),
+        "`notm live-readonly-smoke` failed with {status}"
+    );
 }
