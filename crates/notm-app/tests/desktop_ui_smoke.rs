@@ -350,6 +350,150 @@ fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn validated_config_launches_and_invalid_layout_requests_are_rejected() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP validated_config_launches_and_invalid_layout_requests_are_rejected: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running validated-config desktop UI smoke with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-valid-config-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+             \n[ui]\npage_size = 1\nlayout = \"columns\"\nhtml_mode = \"visual_html_preferred\"\n\
+             \n[send]\ntransport = \"external\"\nmode = \"auto\"\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+        ),
+    )?;
+
+    let token = format!("notm-valid-config-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    let health = driver.command("health", json!({}))?;
+    assert_eq!(health["ok"], true, "validated app was unhealthy: {health}");
+
+    let page = driver.command("thread_page_info", json!({}))?;
+    assert_eq!(
+        page["page_size"], 1,
+        "configured page size was ignored: {page}"
+    );
+    let before = driver.command("layout_state", json!({}))?;
+    assert_eq!(
+        before["layout_preference"], "three_pane",
+        "documented columns alias was not applied: {before}"
+    );
+
+    let rejected = driver.command("set_layout", json!({"layout": "diagonal"}))?;
+    assert_eq!(
+        rejected["ok"], false,
+        "invalid harness layout unexpectedly succeeded: {rejected}"
+    );
+    ensure!(
+        rejected["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("unknown layout")),
+        "invalid harness layout returned an unclear error: {rejected}"
+    );
+    let after = driver.command("layout_state", json!({}))?;
+    assert_eq!(
+        after["layout_preference"], before["layout_preference"],
+        "invalid harness layout changed the active preference: before={before}, after={after}"
+    );
+
+    let blank_layout = driver.command("set_layout", json!({"layout": ""}))?;
+    assert_eq!(
+        blank_layout["ok"], true,
+        "legacy blank layout was not treated as auto: {blank_layout}"
+    );
+    assert_eq!(
+        blank_layout["layout"]["layout_preference"], "auto",
+        "legacy blank layout did not select auto: {blank_layout}"
+    );
+
+    let original_config = fs::read_to_string(&config_path)?;
+    let rejected_page_size = driver.command("save_settings", json!({"page_size": 0}))?;
+    assert_eq!(
+        rejected_page_size["ok"], false,
+        "zero page size unexpectedly persisted: {rejected_page_size}"
+    );
+    ensure!(
+        rejected_page_size["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("page size must be greater than zero")),
+        "zero page size returned an unclear error: {rejected_page_size}"
+    );
+    assert_eq!(
+        fs::read_to_string(&config_path)?,
+        original_config,
+        "rejected page size still modified the configuration"
+    );
+
+    let saved = driver.command("save_settings", json!({"page_size": 2}))?;
+    assert_eq!(saved["ok"], true, "valid settings were not saved: {saved}");
+    let persisted = fs::read_to_string(&config_path)?.parse::<toml::Value>()?;
+    assert_eq!(persisted["ui"]["page_size"].as_integer(), Some(2));
+    assert_eq!(
+        persisted["notmuch"]["open_readwrite_only_for_mutations"].as_bool(),
+        Some(true),
+        "settings save did not enforce the read-only Notmuch invariant: {persisted}"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn invalid_config_exits_before_exposing_the_desktop_harness() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP invalid_config_exits_before_exposing_the_desktop_harness: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running invalid-config desktop UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-invalid-config-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let config_path = work_dir.join("notm.toml");
+    fs::write(&config_path, "[ui]\nlayout = \"diagonal\"\n")?;
+
+    let token = format!("notm-invalid-config-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
+    let startup_error = match app.connect(&token) {
+        Ok(_) => anyhow::bail!("invalid config exposed the desktop harness"),
+        Err(error) => error,
+    };
+    let logs = app.logs();
+    ensure!(
+        startup_error.to_string().contains("exited during startup"),
+        "invalid config failed for an unexpected reason: {startup_error:#}"
+    );
+    ensure!(
+        logs.contains(&config_path.display().to_string()) && logs.contains("ui.layout"),
+        "invalid config error did not include its path and field:\n{logs}"
+    );
+    ensure!(
+        !app.socket_path.exists(),
+        "invalid config exposed a desktop harness socket"
+    );
+
+    Ok(())
+}
+
 #[test]
 fn fixture_cold_message_id_launch_preserves_target_and_startup_query() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment() else {

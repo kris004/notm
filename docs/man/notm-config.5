@@ -17,6 +17,14 @@ for any subcommand.  For example:
 .nf
 notm --config path launch
 .fi
+.PP
+.B --config
+requires the selected file to exist; only an absent default configuration file
+falls back to built-in defaults.
+.PP
+Configuration is validated before a command or desktop window starts.  Unknown
+sections and keys are errors rather than being silently ignored.  Errors name
+the configuration file and the invalid key or value.
 .SH EXAMPLE
 .nf
 [notmuch]
@@ -58,7 +66,7 @@ Tags excluded from normal searches.  The default is:
 .TP
 .B open_readwrite_only_for_mutations
 Keep normal search/view database opens read-only and open read-write only for
-mutations.  Defaults to true.
+mutations.  Defaults to true and must remain true; false is not supported.
 .TP
 .B sync_maildir_flags_after_tag_change
 Ask libnotmuch to synchronize Maildir flags after tag changes when supported.
@@ -80,7 +88,7 @@ Theme preference.  The default is
 .BR system .
 .TP
 .B page_size
-Number of thread rows loaded per page.  The default is 100.
+Positive number of thread rows loaded per page.  The default is 100.
 .TP
 .B thread_preview_lines
 Preview lines shown in the thread list.  The default is 2.
@@ -123,7 +131,11 @@ Allow remote images globally in the visual HTML view.  Defaults to false.
 Sender allow-list for remote images.
 .TP
 .B html_mode
-HTML rendering preference.  The default is
+HTML rendering preference.  Supported values are
+.B sanitize_then_render_text_fallback
+and
+.BR visual_html_preferred .
+The default is
 .BR sanitize_then_render_text_fallback .
 .TP
 .B start_maximized
@@ -161,13 +173,19 @@ that accepts the generated RFC5322 message.
 .B transport
 Transport family.  Currently
 .B external
-is used.
+is the only supported value.
 .TP
 .B command
 External send command.
 .TP
 .B args
-Arguments passed to the external send command.
+Arguments passed to the external send command.  When
+.B mode
+is
+.BR command_template ,
+at least one argument must contain the
+.B {file}
+placeholder.
 .TP
 .B mode
 One of
@@ -236,6 +254,15 @@ section controls its local socket path, token, screenshot directory, and
 live-test gates.  This section is for development and smoke-test support, not
 normal mail operation.  See
 .BR notm-test-harness (7).
+.SH LEGACY KEYS
+The obsolete keys
+.BR ui.confirm_destructive_tag_actions ,
+.BR send.one_live_self_test_per_run ,
+and
+.B sync.show_manual_sync_button
+are accepted for compatibility but ignored and omitted from printed
+configuration.  They can be removed from existing files.  Other unknown keys
+are errors.
 .SH SEE ALSO
 .BR notm (1),
 .BR notm-test-harness (7)

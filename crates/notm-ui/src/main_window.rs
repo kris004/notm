@@ -623,8 +623,12 @@ const STACKED_TOP_MIN_HEIGHT: i32 = 260;
 const STACKED_MESSAGE_MIN_HEIGHT: i32 = 280;
 
 fn parse_layout_preference(value: &str) -> LayoutPreference {
+    try_parse_layout_preference(value).unwrap_or(LayoutPreference::Auto)
+}
+
+fn try_parse_layout_preference(value: &str) -> Option<LayoutPreference> {
     match value.trim().replace('-', "_").to_lowercase().as_str() {
-        "" | "auto" => LayoutPreference::Auto,
+        "" | "auto" => Some(LayoutPreference::Auto),
         "three"
         | "three_pane"
         | "threepane"
@@ -634,11 +638,11 @@ fn parse_layout_preference(value: &str) -> LayoutPreference {
         | "columns"
         | "side_by_side"
         | "sidebyside"
-        | "side_by_side_columns" => LayoutPreference::ThreePane,
+        | "side_by_side_columns" => Some(LayoutPreference::ThreePane),
         "stacked" | "stack" | "top" | "top_stack" | "list_above_message" | "sidebar_list_top" => {
-            LayoutPreference::Stacked
+            Some(LayoutPreference::Stacked)
         }
-        _ => LayoutPreference::Auto,
+        _ => None,
     }
 }
 
@@ -12580,9 +12584,19 @@ fn handle_automation_request(
                 .or_else(|| req.args.get("mode"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("auto");
-            let preference = parse_layout_preference(layout);
-            set_layout_preference(options, widgets, state, preference);
-            json!({"ok": true, "layout": layout_state_json(widgets, state)})
+            match try_parse_layout_preference(layout) {
+                Some(preference) => {
+                    set_layout_preference(options, widgets, state, preference);
+                    json!({"ok": true, "layout": layout_state_json(widgets, state)})
+                }
+                None => json!({
+                    "ok": false,
+                    "error": format!(
+                        "unknown layout {layout:?}; expected auto, columns, three_pane, or stacked"
+                    ),
+                    "layout": layout_state_json(widgets, state),
+                }),
+            }
         }
         "set_pane_visibility" => {
             let pane = req
@@ -14656,16 +14670,11 @@ fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions
         &join_string_list(&runtime_excluded_tags(options)),
         "Tags excluded from searches, comma separated.",
     );
-    let open_readwrite_only_for_mutations = settings_check_row(
+    settings_readonly_row(
         &form,
         "Keep searches read-only",
-        toml_bool(
-            &existing,
-            "notmuch",
-            "open_readwrite_only_for_mutations",
-            true,
-        ),
-        "Searches and message viewing open the database read-only. Notm switches to read/write only for actions that change tags or index saved sent/draft files. Leave this on.",
+        "Always on (required)",
+        "Searches and message viewing always open the database read-only. Notm switches to read/write only for actions that change tags or index saved sent/draft files.",
     );
     let sync_maildir_flags_after_tag_change = settings_check_row(
         &form,
@@ -14710,8 +14719,9 @@ fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions
         &form,
         "Page size",
         &runtime_page_size(options).to_string(),
-        "Number of threads loaded per search page.",
+        "Positive number of threads loaded per search page.",
     );
+    page_size.set_input_purpose(gtk::InputPurpose::Digits);
     let layout = settings_combo_row(
         &form,
         "Layout",
@@ -15067,23 +15077,27 @@ fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions
             response,
             gtk::ResponseType::Apply | gtk::ResponseType::Accept
         ) {
+            let page_size_value = match parse_settings_page_size(&page_size.text()) {
+                Ok(value) => value,
+                Err(err) => {
+                    status.set_text(&format!("Settings validation failed: {err}"));
+                    page_size.grab_focus();
+                    return;
+                }
+            };
             let values = SettingsValues {
                 database_path: database_path.text().to_string(),
                 notmuch_config_path: notmuch_config_path.text().to_string(),
                 notmuch_profile: notmuch_profile.text().to_string(),
                 default_query: default_query.text().to_string(),
                 excluded_tags: excluded_tags.text().to_string(),
-                open_readwrite_only_for_mutations: open_readwrite_only_for_mutations.is_active(),
                 sync_maildir_flags_after_tag_change: sync_maildir_flags_after_tag_change
                     .is_active(),
                 identity_name: identity_name.text().to_string(),
                 primary_email: primary_email.text().to_string(),
                 other_email: other_email.text().to_string(),
                 theme: combo_active_id(&theme),
-                page_size: page_size
-                    .text()
-                    .parse::<usize>()
-                    .unwrap_or_else(|_| runtime_page_size(&opts)),
+                page_size: page_size_value,
                 thread_preview_lines: thread_preview_lines.text().parse::<usize>().unwrap_or(2),
                 show_thread_numbers: show_thread_numbers.is_active(),
                 show_thread_dates: show_thread_dates.is_active(),
@@ -15166,7 +15180,6 @@ struct SettingsValues {
     notmuch_profile: String,
     default_query: String,
     excluded_tags: String,
-    open_readwrite_only_for_mutations: bool,
     sync_maildir_flags_after_tag_change: bool,
     identity_name: String,
     primary_email: String,
@@ -15683,6 +15696,31 @@ fn join_string_list(values: &[String]) -> String {
     values.join(", ")
 }
 
+fn parse_settings_page_size(value: &str) -> anyhow::Result<usize> {
+    let page_size = value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("page size must be a positive whole number"))?;
+    validate_page_size(page_size)
+}
+
+fn validate_page_size(page_size: usize) -> anyhow::Result<usize> {
+    anyhow::ensure!(page_size > 0, "page size must be greater than zero");
+    anyhow::ensure!(
+        i64::try_from(page_size).is_ok(),
+        "page size is too large to store in configuration"
+    );
+    Ok(page_size)
+}
+
+fn validate_send_settings(mode: &str, args: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        mode != "command_template" || args.iter().any(|arg| arg.contains("{file}")),
+        "send arguments must include {{file}} when send mode is command_template"
+    );
+    Ok(())
+}
+
 fn parse_string_list(value: &str) -> Vec<String> {
     value
         .split([',', '\n'])
@@ -15720,6 +15758,9 @@ fn transport_mode_name(mode: &TransportMode) -> String {
 }
 
 fn persist_settings_values(options: &LaunchOptions, values: &SettingsValues) -> anyhow::Result<()> {
+    let page_size = validate_page_size(values.page_size)?;
+    let send_args = parse_string_list(&values.send_args);
+    validate_send_settings(&values.send_mode, &send_args)?;
     let Some(path) = &options.app_config_path else {
         anyhow::bail!("app config path is not configured");
     };
@@ -15739,12 +15780,7 @@ fn persist_settings_values(options: &LaunchOptions, values: &SettingsValues) -> 
         "excluded_tags",
         parse_string_list(&values.excluded_tags),
     );
-    set_bool(
-        root,
-        "notmuch",
-        "open_readwrite_only_for_mutations",
-        values.open_readwrite_only_for_mutations,
-    );
+    persist_read_only_notmuch_invariant(root);
     set_bool(
         root,
         "notmuch",
@@ -15762,7 +15798,7 @@ fn persist_settings_values(options: &LaunchOptions, values: &SettingsValues) -> 
     );
 
     set_string(root, "ui", "theme", &values.theme);
-    set_int(root, "ui", "page_size", values.page_size as i64);
+    set_int(root, "ui", "page_size", page_size as i64);
     set_int(
         root,
         "ui",
@@ -15813,7 +15849,7 @@ fn persist_settings_values(options: &LaunchOptions, values: &SettingsValues) -> 
     set_bool(root, "send", "enabled", values.send_enabled);
     set_string(root, "send", "transport", &values.send_transport);
     set_optional_string(root, "send", "command", &values.send_command);
-    set_string_array(root, "send", "args", parse_string_list(&values.send_args));
+    set_string_array(root, "send", "args", send_args);
     set_string(root, "send", "mode", &values.send_mode);
     set_optional_string(root, "send", "working_dir", &values.send_working_dir);
     set_string_map(root, "send", "env", parse_env_map(&values.send_env));
@@ -15955,6 +15991,10 @@ fn set_bool(root: &mut toml::map::Map<String, toml::Value>, section: &str, key: 
     table_entry(root, section).insert(key.to_string(), toml::Value::Boolean(value));
 }
 
+fn persist_read_only_notmuch_invariant(root: &mut toml::map::Map<String, toml::Value>) {
+    set_bool(root, "notmuch", "open_readwrite_only_for_mutations", true);
+}
+
 fn set_int(root: &mut toml::map::Map<String, toml::Value>, section: &str, key: &str, value: i64) {
     table_entry(root, section).insert(key.to_string(), toml::Value::Integer(value));
 }
@@ -15998,6 +16038,7 @@ fn persist_basic_settings(
     page_size: usize,
     send_command: &str,
 ) -> anyhow::Result<()> {
+    let page_size = validate_page_size(page_size)?;
     let Some(path) = &options.app_config_path else {
         return Ok(());
     };
@@ -16016,6 +16057,7 @@ fn persist_basic_settings(
         "default_query".to_string(),
         toml::Value::String(default_query.to_string()),
     );
+    persist_read_only_notmuch_invariant(root);
     table_entry(root, "ui").insert(
         "page_size".to_string(),
         toml::Value::Integer(page_size as i64),
@@ -16254,7 +16296,66 @@ mod tests {
     }
 
     #[test]
+    fn settings_page_size_requires_a_positive_whole_number() {
+        assert_eq!(parse_settings_page_size(" 25 ").unwrap(), 25);
+        assert!(
+            parse_settings_page_size("0")
+                .unwrap_err()
+                .to_string()
+                .contains("greater than zero")
+        );
+        assert!(
+            parse_settings_page_size("many")
+                .unwrap_err()
+                .to_string()
+                .contains("positive whole number")
+        );
+        #[cfg(target_pointer_width = "64")]
+        assert!(
+            validate_page_size((i64::MAX as usize) + 1)
+                .unwrap_err()
+                .to_string()
+                .contains("too large")
+        );
+    }
+
+    #[test]
+    fn settings_command_template_requires_a_file_argument() {
+        assert!(
+            validate_send_settings("command_template", &["--message".to_string()])
+                .unwrap_err()
+                .to_string()
+                .contains("{file}")
+        );
+        validate_send_settings("command_template", &["--message={file}".to_string()])
+            .expect("command template should accept a file placeholder");
+        validate_send_settings("auto", &[]).expect("other send modes do not need a placeholder");
+    }
+
+    #[test]
+    fn settings_persistence_forces_the_read_only_notmuch_invariant() {
+        let mut root = toml::map::Map::new();
+        set_bool(
+            &mut root,
+            "notmuch",
+            "open_readwrite_only_for_mutations",
+            false,
+        );
+
+        persist_read_only_notmuch_invariant(&mut root);
+
+        assert_eq!(
+            root["notmuch"]["open_readwrite_only_for_mutations"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn layout_preference_parses_config_values() {
+        assert_eq!(
+            try_parse_layout_preference(""),
+            Some(LayoutPreference::Auto)
+        );
         assert_eq!(parse_layout_preference("auto"), LayoutPreference::Auto);
         assert_eq!(
             parse_layout_preference("three-pane"),
@@ -16273,6 +16374,7 @@ mod tests {
             LayoutPreference::Stacked
         );
         assert_eq!(parse_layout_preference("unknown"), LayoutPreference::Auto);
+        assert_eq!(try_parse_layout_preference("unknown"), None);
     }
 
     #[test]
