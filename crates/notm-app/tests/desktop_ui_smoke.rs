@@ -246,6 +246,83 @@ fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn fixture_attachment_save_keeps_existing_files() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP fixture_attachment_save_keeps_existing_files: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running attachment no-clobber UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-attachment-ui-{run_id}"));
+    let downloads = work_dir.join("downloads");
+    fs::create_dir_all(&downloads)?;
+    let original_path = downloads.join("note.txt");
+    fs::write(&original_path, b"keep this file")?;
+
+    let token = format!("notm-attachment-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+    select_first_thread(&mut driver, "subject:\"Attachment message\"")?;
+
+    let listed = driver.command("attachment_list_items", json!({}))?;
+    let attachments = json_array_at(&listed, &["attachments"])?;
+    ensure!(
+        attachments.len() == 1 && attachments[0]["filename"] == "note.txt",
+        "fixture attachment was not available in the UI: {listed}"
+    );
+
+    let first = driver.command(
+        "save_selected_attachment",
+        json!({"index": 0, "dir": downloads}),
+    )?;
+    assert_eq!(first["ok"], true, "first attachment save failed: {first}");
+    let first_path = first["path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("first save returned no path: {first}"))?;
+    assert_eq!(first_path, downloads.join("note (1).txt"));
+    assert_eq!(fs::read(&original_path)?, b"keep this file");
+    ensure!(
+        String::from_utf8_lossy(&fs::read(&first_path)?).contains("attached text"),
+        "first saved file did not contain fixture attachment bytes"
+    );
+
+    let second = driver.command(
+        "save_selected_attachment",
+        json!({"index": 0, "dir": downloads}),
+    )?;
+    assert_eq!(
+        second["ok"], true,
+        "second attachment save failed: {second}"
+    );
+    let second_path = second["path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("second save returned no path: {second}"))?;
+    assert_eq!(second_path, downloads.join("note (2).txt"));
+    assert_eq!(fs::read(&original_path)?, b"keep this file");
+    ensure!(
+        String::from_utf8_lossy(&fs::read(&second_path)?).contains("attached text"),
+        "second saved file did not contain fixture attachment bytes"
+    );
+
+    let logs = driver.command("get_logs", json!({}))?;
+    let last_operation = logs["last_operation"]
+        .as_str()
+        .with_context(|| format!("attachment save was not logged: {logs}"))?;
+    ensure!(
+        last_operation.contains(&second_path.display().to_string()),
+        "attachment log did not report the collision-free path: {logs}"
+    );
+
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn timed_out_send_reports_failure_and_leaves_desktop_responsive() -> anyhow::Result<()> {

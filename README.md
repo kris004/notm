@@ -21,7 +21,8 @@ GPL-family `libnotmuch`.
   for large mailboxes.
 - Message pane with safe text rendering by default, optional sanitized visual
   HTML, full headers, raw source, MIME tree details, quote collapse, attachment
-  list, and copy/open/save attachment actions.
+  list, and copy/open/save attachment actions. Saving a same-name attachment
+  creates a numbered copy instead of replacing the existing file.
 - Tag-first message actions: archive, trash, spam, read/unread, flagged/unflagged,
   custom tag edits, and undo for recent tag changes.
 - Compose, reply, reply-all, inline forward, forward-as-attachment, address

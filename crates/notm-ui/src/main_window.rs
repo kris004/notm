@@ -18,6 +18,7 @@ use notm_mail::{
     ComposedMessage, ExternalCommandTransport, FakeSendTransport, ReplyKind, SendTransport,
     TransportMode,
     address::{dedupe_addresses, format_address, parse_address_list},
+    attachments::save_attachment_without_overwrite,
     build_reply,
     compose::{AttachmentInput, Identity},
     forward::{build_attachment_forward, build_inline_forward},
@@ -7669,9 +7670,8 @@ fn save_selected_attachment(
     let target_dir = dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("artifacts/attachments"));
-    std::fs::create_dir_all(&target_dir)?;
-    let path = target_dir.join(safe_filename(&attachment.filename));
-    std::fs::write(&path, &attachment.bytes)?;
+    let path =
+        save_attachment_without_overwrite(&target_dir, &attachment.filename, &attachment.bytes)?;
     widgets
         .status_label
         .set_text(&format!("Attachment saved to {}", path.display()));
@@ -7872,9 +7872,8 @@ fn save_thread_attachment(
     let target_dir = dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("artifacts/attachments"));
-    std::fs::create_dir_all(&target_dir)?;
-    let path = target_dir.join(safe_filename(&attachment.filename));
-    std::fs::write(&path, &attachment.bytes)?;
+    let path =
+        save_attachment_without_overwrite(&target_dir, &attachment.filename, &attachment.bytes)?;
     widgets
         .status_label
         .set_text(&format!("Attachment saved to {}", path.display()));
