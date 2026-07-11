@@ -683,6 +683,114 @@ fn fixture_attachment_save_keeps_existing_files() -> anyhow::Result<()> {
 
 #[cfg(unix)]
 #[test]
+fn external_file_arg_send_reports_existing_sent_copy() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP external_file_arg_send_reports_existing_sent_copy: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running external sent-copy desktop UI smoke with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-sent-copy-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let helper = work_dir.join("send-helper");
+    let helper_message_path = work_dir.join("helper-message-path");
+    fs::write(
+        &helper,
+        "#!/bin/sh\nprintf '%s' \"$2\" > \"$1\"\ntest -s \"$2\"\n",
+    )?;
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755))?;
+    let sent_maildir = work_dir.join("Sent");
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+             \n[identity]\nname = \"Fixture Sender\"\nprimary_email = \"sender@example.test\"\n\
+             \n[send]\nenabled = true\ntransport = \"external\"\ncommand = {}\nargs = [{}]\nmode = \"file_arg\"\ntimeout_seconds = 5\nsave_sent = true\nsent_maildir = {}\nindex_sent_after_send = false\n\
+             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+            toml_path(&helper),
+            toml_path(&helper_message_path),
+            toml_path(&sent_maildir),
+        ),
+    )?;
+
+    let token = format!("notm-sent-copy-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    let health = driver.command("health", json!({}))?;
+    assert_eq!(health["ok"], true, "unhealthy configured app: {health}");
+
+    let open_compose = driver.command("open_compose", json!({}))?;
+    assert_eq!(
+        open_compose["ok"], true,
+        "configured composer did not open: {open_compose}"
+    );
+    for (command, value) in [
+        ("compose_set_from", "Fixture Sender <sender@example.test>"),
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Durable sent-copy desktop smoke"),
+        ("compose_set_body", "Durable sent-copy body"),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(
+            response["ok"], true,
+            "configured composer command {command} failed: {response}"
+        );
+    }
+
+    let send = driver.command("compose_send", json!({}))?;
+    assert_eq!(
+        send["last_send_report"]["accepted"], true,
+        "external file-argument send was not accepted: {send}"
+    );
+    let reported_path = send["last_send_report"]["captured_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("sent-copy send did not report a durable path: {send}"))?;
+    ensure!(
+        reported_path.starts_with(&sent_maildir) && reported_path.is_file(),
+        "reported sent copy is not an existing file under {}: {}",
+        sent_maildir.display(),
+        reported_path.display()
+    );
+
+    let temporary_path = PathBuf::from(
+        fs::read_to_string(&helper_message_path)
+            .with_context(|| format!("reading helper path {}", helper_message_path.display()))?,
+    );
+    ensure!(
+        temporary_path != reported_path,
+        "send report exposed the helper temporary file: {}",
+        reported_path.display()
+    );
+    ensure!(
+        !temporary_path.exists(),
+        "helper temporary file still exists after send: {}",
+        temporary_path.display()
+    );
+
+    let sent = fs::read_to_string(&reported_path)
+        .with_context(|| format!("reading durable sent copy {}", reported_path.display()))?;
+    ensure!(
+        sent.contains("\r\nSubject: Durable sent-copy desktop smoke\r\n")
+            && sent.contains("\r\n\r\nDurable sent-copy body"),
+        "durable sent copy did not contain the composed RFC5322 message:\n{sent}"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn timed_out_send_reports_failure_and_leaves_desktop_responsive() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 

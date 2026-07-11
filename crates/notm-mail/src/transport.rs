@@ -217,7 +217,7 @@ impl ExternalCommandTransport {
             self.timeout,
         )
         .await?;
-        Ok(report_from_output(output, None))
+        Ok(report_from_output(output))
     }
 
     async fn send_file_arg(&self, message: ComposedMessage) -> anyhow::Result<SendReport> {
@@ -231,7 +231,7 @@ impl ExternalCommandTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let output = run_command_with_timeout(command, None, self.timeout).await?;
-        Ok(report_from_output(output, Some(path.display().to_string())))
+        Ok(report_from_output(output))
     }
 
     async fn send_template(&self, message: ComposedMessage) -> anyhow::Result<SendReport> {
@@ -254,7 +254,7 @@ impl ExternalCommandTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let output = run_command_with_timeout(command, None, self.timeout).await?;
-        Ok(report_from_output(output, Some(path.display().to_string())))
+        Ok(report_from_output(output))
     }
 
     fn base_command(&self) -> Command {
@@ -394,13 +394,15 @@ async fn terminate_and_reap(child: &mut Child, _child_id: Option<u32>) -> io::Re
     child.wait().await.map(|_| ())
 }
 
-fn report_from_output(output: Output, captured_path: Option<String>) -> SendReport {
+fn report_from_output(output: Output) -> SendReport {
     SendReport {
         accepted: output.status.success(),
         exit_status: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        captured_path,
+        // External transports do not own a durable capture. File-based modes
+        // delete their transport-only temporary message before returning.
+        captured_path: None,
     }
 }
 
@@ -415,6 +417,27 @@ mod tests {
             "Subject".to_string(),
             body.into(),
         )
+    }
+
+    #[tokio::test]
+    async fn fake_transport_reports_existing_durable_capture_path() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let transport = FakeSendTransport {
+            capture_dir: temp.path().join("capture"),
+        };
+
+        let report = transport
+            .send(test_message("Body"))
+            .await
+            .expect("fake transport should capture message");
+
+        let path = report
+            .captured_path
+            .expect("fake transport should report its durable capture");
+        assert!(
+            Path::new(&path).is_file(),
+            "reported fake capture should still exist: {path}"
+        );
     }
 
     #[cfg(unix)]
@@ -542,6 +565,100 @@ mod tests {
         assert_eq!(report.exit_status, Some(7));
         assert_eq!(report.stdout, "helper stdout");
         assert_eq!(report.stderr, "helper stderr");
+        assert_eq!(report.captured_path, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_arg_does_not_report_deleted_temporary_message() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let helper = temp.path().join("send-helper");
+        let observed_path = temp.path().join("observed-path");
+        let copied_message = temp.path().join("copied-message.eml");
+        write_executable_script(
+            &helper,
+            "#!/bin/sh\nprintf '%s' \"$3\" > \"$1\"\ncat \"$3\" > \"$2\"\nprintf 'file helper stdout'\n",
+        );
+        let transport = ExternalCommandTransport {
+            command: helper,
+            args: vec![
+                observed_path.display().to_string(),
+                copied_message.display().to_string(),
+            ],
+            mode: TransportMode::FileArg,
+            working_dir: None,
+            env: BTreeMap::new(),
+            timeout: Duration::from_secs(3),
+        };
+
+        let report = transport
+            .send(test_message("File argument body"))
+            .await
+            .expect("file-argument helper should complete");
+
+        assert!(report.accepted);
+        assert_eq!(report.stdout, "file helper stdout");
+        assert_eq!(
+            report.captured_path, None,
+            "the report must not expose the deleted transport temporary file"
+        );
+        let ephemeral_path =
+            std::fs::read_to_string(observed_path).expect("read helper-observed message path");
+        assert!(
+            !Path::new(&ephemeral_path).exists(),
+            "transport temporary message should be removed after send: {ephemeral_path}"
+        );
+        let copied = std::fs::read_to_string(copied_message)
+            .expect("helper should receive and copy the temporary message");
+        assert!(copied.contains("Subject: Subject"));
+        assert!(copied.contains("\r\n\r\nFile argument body"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_template_does_not_report_deleted_temporary_message() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let helper = temp.path().join("send-helper");
+        let observed_path = temp.path().join("observed-path");
+        let copied_message = temp.path().join("copied-message.eml");
+        write_executable_script(
+            &helper,
+            "#!/bin/sh\nprintf '%s' \"$1\" > \"$2\"\ncat \"$1\" > \"$3\"\nprintf 'template helper stdout'\n",
+        );
+        let transport = ExternalCommandTransport {
+            command: helper,
+            args: vec![
+                "{file}".to_string(),
+                observed_path.display().to_string(),
+                copied_message.display().to_string(),
+            ],
+            mode: TransportMode::CommandTemplate,
+            working_dir: None,
+            env: BTreeMap::new(),
+            timeout: Duration::from_secs(3),
+        };
+
+        let report = transport
+            .send(test_message("Template body"))
+            .await
+            .expect("command-template helper should complete");
+
+        assert!(report.accepted);
+        assert_eq!(report.stdout, "template helper stdout");
+        assert_eq!(
+            report.captured_path, None,
+            "the report must not expose the deleted transport temporary file"
+        );
+        let ephemeral_path =
+            std::fs::read_to_string(observed_path).expect("read helper-observed message path");
+        assert!(
+            !Path::new(&ephemeral_path).exists(),
+            "transport temporary message should be removed after send: {ephemeral_path}"
+        );
+        let copied = std::fs::read_to_string(copied_message)
+            .expect("helper should receive and copy the temporary message");
+        assert!(copied.contains("Subject: Subject"));
+        assert!(copied.contains("\r\n\r\nTemplate body"));
     }
 
     #[cfg(unix)]
