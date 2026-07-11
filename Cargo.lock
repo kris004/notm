@@ -1209,6 +1209,7 @@ dependencies = [
  "chrono",
  "email_address",
  "html2text",
+ "libc",
  "mailparse",
  "regex",
  "serde",

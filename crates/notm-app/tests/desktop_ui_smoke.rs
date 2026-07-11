@@ -22,6 +22,23 @@ struct FixtureApp {
 
 impl FixtureApp {
     fn spawn(work_dir: PathBuf, token: &str) -> anyhow::Result<Self> {
+        Self::spawn_inner(work_dir, token, None)
+    }
+
+    #[cfg(unix)]
+    fn spawn_with_config(
+        work_dir: PathBuf,
+        token: &str,
+        config_path: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(work_dir, token, Some(config_path))
+    }
+
+    fn spawn_inner(
+        work_dir: PathBuf,
+        token: &str,
+        config_path: Option<&std::path::Path>,
+    ) -> anyhow::Result<Self> {
         let socket_path = work_dir.join("test-harness.sock");
         let log_path = work_dir.join("notm.log");
         let home = work_dir.join("home");
@@ -37,13 +54,22 @@ impl FixtureApp {
             .write(true)
             .open(&log_path)
             .with_context(|| format!("creating app log {}", log_path.display()))?;
-        let child = Command::new(env!("CARGO_BIN_EXE_notm"))
-            .args([
+        let mut command = Command::new(env!("CARGO_BIN_EXE_notm"));
+        if let Some(config_path) = config_path {
+            command.arg("--config").arg(config_path).args([
+                "launch",
+                "--test-harness",
+                "--test-harness-socket",
+            ]);
+        } else {
+            command.args([
                 "launch",
                 "--fixture",
                 "--test-harness",
                 "--test-harness-socket",
-            ])
+            ]);
+        }
+        let child = command
             .arg(&socket_path)
             .args(["--test-harness-token", token])
             .env("HOME", home)
@@ -215,6 +241,108 @@ fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn timed_out_send_reports_failure_and_leaves_desktop_responsive() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP timed_out_send_reports_failure_and_leaves_desktop_responsive: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running send-timeout desktop UI smoke with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-send-timeout-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let helper = work_dir.join("send-helper");
+    let survived_marker = work_dir.join("descendant-survived");
+    fs::write(
+        &helper,
+        "#!/bin/sh\n(\n  sleep 2\n  printf 'survived\\n' > \"$1\"\n) &\nwait\n",
+    )?;
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755))?;
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+             \n[identity]\nname = \"Fixture Sender\"\nprimary_email = \"sender@example.test\"\n\
+             \n[send]\nenabled = true\ncommand = {}\nargs = [{}]\nmode = \"stdin_rfc5322\"\ntimeout_seconds = 1\nsave_sent = false\n\
+             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+            toml_path(&helper),
+            toml_path(&survived_marker),
+        ),
+    )?;
+
+    let token = format!("notm-send-timeout-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    let health = driver.command("health", json!({}))?;
+    assert_eq!(health["ok"], true, "unhealthy configured app: {health}");
+
+    let open_compose = driver.command("open_compose", json!({}))?;
+    assert_eq!(
+        open_compose["ok"], true,
+        "configured composer did not open: {open_compose}"
+    );
+    for (command, value) in [
+        ("compose_set_from", "Fixture Sender <sender@example.test>"),
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Timeout desktop smoke"),
+        ("compose_set_body", "Timeout desktop smoke body"),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(
+            response["ok"], true,
+            "configured composer command {command} failed: {response}"
+        );
+    }
+
+    let send = driver.command("compose_send", json!({}))?;
+    ensure!(
+        send["last_send_report"].is_null(),
+        "timed-out send unexpectedly produced a report: {send}"
+    );
+    let last_error = send["last_error"]
+        .as_str()
+        .with_context(|| format!("timed-out send did not report an error: {send}"))?;
+    ensure!(
+        last_error.contains("send command timed out after 1s"),
+        "unexpected timed-out send error: {last_error}"
+    );
+
+    let state = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        state["state"]["compose_fields"]["subject"], "Timeout desktop smoke",
+        "failed send cleared the composer: {state}"
+    );
+    let health = driver.command("health", json!({}))?;
+    assert_eq!(
+        health["ok"], true,
+        "desktop did not recover after send timeout: {health}"
+    );
+
+    thread::sleep(Duration::from_secs(2));
+    ensure!(
+        !survived_marker.exists(),
+        "send helper descendant survived after the UI reported a timeout"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn toml_path(path: &std::path::Path) -> String {
+    toml::Value::String(path.display().to_string()).to_string()
 }
 
 fn gtk_display_environment() -> Option<String> {

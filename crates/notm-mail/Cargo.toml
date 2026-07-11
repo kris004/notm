@@ -12,6 +12,7 @@ base64.workspace = true
 chrono.workspace = true
 email_address.workspace = true
 html2text.workspace = true
+libc.workspace = true
 mailparse.workspace = true
 regex.workspace = true
 serde.workspace = true
