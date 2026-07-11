@@ -59,6 +59,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             let report = rt.block_on(transport.probe())?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+            anyhow::ensure!(report.ok, "send transport probe failed");
             Ok(())
         }
         Command::FixtureSmoke => fixture_smoke(),

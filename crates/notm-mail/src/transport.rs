@@ -1,4 +1,11 @@
-use std::{collections::BTreeMap, path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    collections::BTreeMap,
+    env,
+    ffi::OsStr,
+    path::{Component, Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
@@ -85,13 +92,6 @@ impl SendTransport for ExternalCommandTransport {
 
     async fn probe(&self) -> anyhow::Result<ProbeReport> {
         let mut details = Vec::new();
-        if !self.command.exists() {
-            return Ok(ProbeReport {
-                ok: false,
-                details: vec![format!("command not found: {}", self.command.display())],
-            });
-        }
-        details.push(format!("command exists: {}", self.command.display()));
         if let Some(dir) = &self.working_dir {
             if dir.is_dir() {
                 details.push(format!("working directory exists: {}", dir.display()));
@@ -101,6 +101,34 @@ impl SendTransport for ExternalCommandTransport {
                     details: vec![format!("working directory missing: {}", dir.display())],
                 });
             }
+        }
+        let search_path = self
+            .env
+            .get("PATH")
+            .map(|path| path.into())
+            .or_else(|| env::var_os("PATH"));
+        let Some(resolved_command) = resolve_executable(
+            &self.command,
+            self.working_dir.as_deref(),
+            search_path.as_deref(),
+        ) else {
+            details.push(format!("command not found: {}", self.command.display()));
+            return Ok(ProbeReport { ok: false, details });
+        };
+        if is_bare_command(&self.command) {
+            details.push(format!(
+                "command resolved through PATH: {} -> {}",
+                self.command.display(),
+                resolved_command.display()
+            ));
+        } else if resolved_command == self.command {
+            details.push(format!("command exists: {}", self.command.display()));
+        } else {
+            details.push(format!(
+                "command resolved from working directory: {} -> {}",
+                self.command.display(),
+                resolved_command.display()
+            ));
         }
         Ok(ProbeReport { ok: true, details })
     }
@@ -116,6 +144,56 @@ impl SendTransport for ExternalCommandTransport {
             TransportMode::CommandTemplate => self.send_template(message).await,
             TransportMode::Auto => unreachable!(),
         }
+    }
+}
+
+fn resolve_executable(
+    command: &Path,
+    working_dir: Option<&Path>,
+    search_path: Option<&OsStr>,
+) -> Option<PathBuf> {
+    if !is_bare_command(command) {
+        let candidate = resolve_from_working_dir(command, working_dir);
+        return is_executable_file(&candidate).then_some(candidate);
+    }
+
+    env::split_paths(search_path?)
+        .map(|directory| resolve_from_working_dir(&directory.join(command), working_dir))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+fn is_bare_command(command: &Path) -> bool {
+    let mut components = command.components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+fn resolve_from_working_dir(path: &Path, working_dir: Option<&Path>) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(working_dir) = working_dir {
+        working_dir.join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 
@@ -195,6 +273,75 @@ fn report_from_output(output: std::process::Output, captured_path: Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_executable_bare_name_from_supplied_search_path() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir(&bin_dir).expect("create bin directory");
+        let helper = bin_dir.join("send-helper");
+        fs::write(&helper, "#!/bin/sh\nexit 0\n").expect("write helper");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755))
+            .expect("make helper executable");
+        let search_path = env::join_paths([&bin_dir]).expect("construct search path");
+
+        assert_eq!(
+            resolve_executable(Path::new("send-helper"), None, Some(&search_path)),
+            Some(helper)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_resolves_relative_command_from_working_directory() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let helper = temp.path().join("send-helper");
+        fs::write(&helper, "#!/bin/sh\nexit 0\n").expect("write helper");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755))
+            .expect("make helper executable");
+        let transport = ExternalCommandTransport {
+            command: PathBuf::from("./send-helper"),
+            args: Vec::new(),
+            mode: TransportMode::StdinRfc5322,
+            working_dir: Some(temp.path().to_path_buf()),
+            env: BTreeMap::new(),
+            timeout: Duration::from_secs(1),
+        };
+
+        let report = transport.probe().await.expect("probe relative helper");
+
+        assert!(report.ok, "relative helper should resolve: {report:?}");
+        assert!(
+            report
+                .details
+                .iter()
+                .any(|detail| detail.contains("resolved from working directory")),
+            "probe should explain relative-command resolution: {report:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_non_executable_file_on_search_path() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let helper = temp.path().join("send-helper");
+        fs::write(&helper, "#!/bin/sh\nexit 0\n").expect("write helper");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o644))
+            .expect("leave helper non-executable");
+        let search_path = env::join_paths([temp.path()]).expect("construct search path");
+
+        assert_eq!(
+            resolve_executable(Path::new("send-helper"), None, Some(&search_path)),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn command_template_requires_file_placeholder() {
