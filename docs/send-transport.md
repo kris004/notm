@@ -22,6 +22,11 @@ Transport mode behavior:
 
 Any helper-specific flags must be set explicitly in config. notm does not inspect helper scripts or add implicit arguments.
 
+When the composer has Bcc recipients, notm includes a `Bcc` field in the
+submitted RFC5322 message so a header-reading helper can add those recipients to
+the delivery envelope. The helper must remove that field before final delivery;
+the sendmail-style `-t` configuration in the README follows this contract.
+
 Optional post-send persistence is explicit:
 
 ```toml

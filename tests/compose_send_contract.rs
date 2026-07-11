@@ -24,6 +24,32 @@ async fn fake_transport_captures_valid_rfc5322() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn fake_transport_captures_bcc_recipients_for_submission() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let transport = FakeSendTransport {
+        capture_dir: dir.path().to_path_buf(),
+    };
+    let mut message = ComposedMessage::new(
+        "Sender <sender@example.test>".into(),
+        vec!["Visible <visible@example.test>".into()],
+        "Bcc contract".into(),
+        "Contract body".into(),
+    );
+    message.bcc = vec![
+        "Hidden <hidden@example.test>".into(),
+        "second@example.test".into(),
+    ];
+
+    let report = transport.send(message).await?;
+
+    assert!(report.accepted);
+    let path = report.captured_path.expect("captured path");
+    let raw = std::fs::read_to_string(path)?;
+    assert!(raw.contains("\r\nBcc: Hidden <hidden@example.test>, second@example.test\r\n"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn fake_transport_preserves_attachment_part() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let transport = FakeSendTransport {

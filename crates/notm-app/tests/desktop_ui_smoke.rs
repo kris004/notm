@@ -177,6 +177,43 @@ fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
         "page metadata reported no loaded fixture rows: {page}"
     );
 
+    let open_compose = driver.command("open_compose", json!({}))?;
+    assert_eq!(
+        open_compose["ok"], true,
+        "fixture composer did not open: {open_compose}"
+    );
+    for (command, value) in [
+        ("compose_set_from", "Fixture Sender <sender@example.test>"),
+        ("compose_set_to", "Visible <visible@example.test>"),
+        (
+            "compose_set_bcc",
+            "Hidden <hidden@example.test>, second@example.test",
+        ),
+        ("compose_set_subject", "Bcc desktop smoke"),
+        ("compose_set_body", "Desktop smoke body"),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(
+            response["ok"], true,
+            "fixture composer command {command} failed: {response}"
+        );
+    }
+
+    let send = driver.command("compose_send", json!({}))?;
+    assert_eq!(
+        send["last_send_report"]["accepted"], true,
+        "fixture composer send was not accepted: {send}"
+    );
+    let captured_path = send["last_send_report"]["captured_path"]
+        .as_str()
+        .with_context(|| format!("fixture send did not report a capture path: {send}"))?;
+    let captured = fs::read_to_string(captured_path)
+        .with_context(|| format!("reading fixture send capture {captured_path}"))?;
+    ensure!(
+        captured.contains("\r\nBcc: Hidden <hidden@example.test>, second@example.test\r\n"),
+        "fixture composer dropped Bcc recipients from its send submission:\n{captured}"
+    );
+
     Ok(())
 }
 

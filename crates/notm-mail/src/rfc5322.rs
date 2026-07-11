@@ -35,6 +35,9 @@ pub fn render_message(message: &ComposedMessage) -> String {
     if !message.cc.is_empty() {
         out.push_str(&format!("Cc: {}\r\n", message.cc.join(", ")));
     }
+    if !message.bcc.is_empty() {
+        out.push_str(&format!("Bcc: {}\r\n", message.bcc.join(", ")));
+    }
     out.push_str(&format!(
         "Subject: {}\r\n",
         sanitize_header(&message.subject)
@@ -171,4 +174,43 @@ fn escape_html(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_message() -> ComposedMessage {
+        ComposedMessage::new(
+            "Sender <sender@example.test>".to_string(),
+            vec!["Visible <visible@example.test>".to_string()],
+            "Bcc contract".to_string(),
+            "Body".to_string(),
+        )
+    }
+
+    #[test]
+    fn rendered_message_includes_bcc_recipients_for_submission() {
+        let mut message = test_message();
+        message.bcc = vec![
+            "Hidden <hidden@example.test>".to_string(),
+            "second@example.test".to_string(),
+        ];
+
+        let rendered = render_message(&message);
+
+        assert_eq!(
+            rendered
+                .matches("Bcc: Hidden <hidden@example.test>, second@example.test\r\n")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn rendered_message_omits_empty_bcc_header() {
+        let rendered = render_message(&test_message());
+
+        assert!(!rendered.contains("\r\nBcc:"));
+    }
 }
