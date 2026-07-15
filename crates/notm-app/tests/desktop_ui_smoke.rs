@@ -350,6 +350,87 @@ fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn fixture_compose_attachment_headers_are_safe_and_round_trip() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP fixture_compose_attachment_headers_are_safe_and_round_trip: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running attachment-header desktop UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-attachment-header-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let unsafe_filename = "résumé \"final\" \\ draft\r\nX-Injected-Filename: yes.txt";
+    let safe_filename = unsafe_filename.replace(['\r', '\n'], " ");
+    let attachment_path = work_dir.join(unsafe_filename);
+    fs::write(&attachment_path, b"attachment header smoke")?;
+
+    let token = format!("notm-attachment-header-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+    let open_compose = driver.command("open_compose", json!({}))?;
+    assert_eq!(
+        open_compose["ok"], true,
+        "fixture composer did not open: {open_compose}"
+    );
+    for (command, value) in [
+        ("compose_set_from", "Fixture Sender <sender@example.test>"),
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Attachment header desktop smoke"),
+        ("compose_set_body", "Attachment header desktop smoke body"),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(
+            response["ok"], true,
+            "fixture composer command {command} failed: {response}"
+        );
+    }
+    let add_attachment =
+        driver.command("compose_add_attachment", json!({"path": attachment_path}))?;
+    assert_eq!(
+        add_attachment["ok"], true,
+        "fixture attachment was not added: {add_attachment}"
+    );
+
+    let send = driver.command("compose_send", json!({}))?;
+    assert_eq!(
+        send["last_send_report"]["accepted"], true,
+        "fixture composer send was not accepted: {send}"
+    );
+    let captured_path = send["last_send_report"]["captured_path"]
+        .as_str()
+        .with_context(|| format!("fixture send did not report a capture path: {send}"))?;
+    let captured = fs::read(captured_path)
+        .with_context(|| format!("reading fixture send capture {captured_path}"))?;
+    let captured_text = String::from_utf8_lossy(&captured);
+    ensure!(
+        !captured_text.contains("\r\nX-Injected-Filename:"),
+        "attachment filename injected an RFC5322 header:\n{captured_text}"
+    );
+    let encoded_filename =
+        "r%C3%A9sum%C3%A9%20%22final%22%20%5C%20draft%20%20X-Injected-Filename%3A%20yes.txt";
+    ensure!(
+        captured_text.contains(&format!("name*=utf-8''{encoded_filename}\r\n"))
+            && captured_text.contains(&format!("filename*=utf-8''{encoded_filename}\r\n")),
+        "attachment filename was not rendered as safe RFC 2231 parameters:\n{captured_text}"
+    );
+
+    let attachments = notm_mail::mime::extract_attachments(&captured)?;
+    ensure!(
+        attachments.len() == 1
+            && attachments[0].filename == safe_filename
+            && attachments[0].content_type == "text/plain"
+            && attachments[0].bytes == b"attachment header smoke",
+        "captured attachment did not round-trip through the UI send path: {attachments:?}"
+    );
+
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn validated_config_launches_and_invalid_layout_requests_are_rejected() -> anyhow::Result<()> {
