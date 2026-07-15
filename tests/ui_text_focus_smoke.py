@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise text-field keyboard safety in a private headless Sway session.
+"""Exercise text-field and tag-editor keyboard safety in headless Sway.
 
 This is an explicit UI smoke test rather than a Cargo test.  It drives the real
 GTK window with ``wtype`` while the developer test harness is used only to set
@@ -26,6 +26,8 @@ from typing import Any, Callable
 TARGET_MESSAGE_ID = "unicode@fixture.test"
 TARGET_QUERY = 'subject:"Unicode"'
 TARGET_TAGS = ["inbox", "unread"]
+SINGLE_TAG = "ui-single-tag-smoke"
+MULTI_TAG = "ui-multi-tag-smoke"
 TOKEN = "notm-ui-text-focus-smoke"
 
 
@@ -146,22 +148,35 @@ class Harness:
         return self.request("entry_state")
 
 
-def run_wtype(environment: dict[str, str], *arguments: str) -> None:
-    command = ["wtype", *arguments]
-    result = subprocess.run(
-        command,
-        env=environment,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=10,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise SmokeFailure(
-            f"{' '.join(command)} failed with exit {result.returncode}: "
-            f"{result.stderr.strip() or result.stdout.strip()}"
+class WtypeDriver:
+    """Keep each virtual keyboard connected so the headless seat stays active."""
+
+    def __init__(self, environment: dict[str, str]) -> None:
+        self.environment = environment
+        self.sessions: list[subprocess.Popen[str]] = []
+
+    def send(self, *arguments: str) -> None:
+        command = ["wtype", *arguments, "-s", "600000"]
+        process = subprocess.Popen(
+            command,
+            env=self.environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
         )
+        self.sessions.append(process)
+        time.sleep(0.05)
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise SmokeFailure(
+                f"{' '.join(command)} failed with exit {process.returncode}: "
+                f"{stderr.strip() or stdout.strip()}"
+            )
+
+    def close(self) -> None:
+        for process in reversed(self.sessions):
+            terminate_process_group(process)
 
 
 def focus_app_window(environment: dict[str, str], app_pid: int) -> dict[str, Any]:
@@ -305,12 +320,91 @@ def assert_message_tags(message: dict[str, Any], phase: str) -> None:
         )
 
 
-def exercise_ui(environment: dict[str, str], harness: Harness, app_pid: int) -> None:
+def wait_for_target_tag(harness: Harness, tag: str, present: bool) -> dict[str, Any]:
+    def expected_state() -> dict[str, Any] | None:
+        message = selected_target(harness.state())
+        if message is None:
+            return None
+        tags = message.get("tags", [])
+        return message if isinstance(tags, list) and ((tag in tags) == present) else None
+
+    expectation = "gain" if present else "lose"
+    return wait_until(
+        f"fixture message {TARGET_MESSAGE_ID!r} to {expectation} tag {tag!r}",
+        expected_state,
+        timeout=5,
+    )
+
+
+def wait_for_tag_editor(
+    harness: Harness,
+    *,
+    phase: str,
+    mode: str,
+    single_visible: bool,
+    multiple_visible: bool,
+    focused_field: str | None = None,
+    menu_visible: bool | None = None,
+) -> dict[str, Any]:
+    last_entry: dict[str, Any] = {}
+
+    def expected_state() -> dict[str, Any] | None:
+        entry = harness.entry_state()
+        last_entry.clear()
+        last_entry.update(entry)
+        matches = (
+            entry.get("input_mode") == mode
+            and entry.get("single_tag_editor_visible") is single_visible
+            and entry.get("tag_command_editor_visible") is multiple_visible
+        )
+        if focused_field is not None:
+            matches = matches and entry.get(f"{focused_field}_has_focus") is True
+        if menu_visible is not None:
+            matches = matches and entry.get("tag_menu_visible") is menu_visible
+        return entry if matches else None
+
+    try:
+        return wait_until(f"{phase} tag editor state", expected_state, timeout=5)
+    except SmokeFailure as error:
+        raise SmokeFailure(f"{error}; last entry state: {last_entry!r}") from error
+
+
+def focus_selected_thread(harness: Harness) -> None:
+    """Move GTK focus off any text entry without changing the selection."""
+    response = harness.request("select_relative_thread", {"delta": 0})
+    state_value = response.get("state")
+    if not isinstance(state_value, dict) or selected_target(state_value) is None:
+        raise SmokeFailure(f"could not focus the selected fixture thread: {response!r}")
+
+
+def wait_for_tag_menu(harness: Harness) -> None:
+    last_entry: dict[str, Any] = {}
+
+    def menu_visible() -> dict[str, Any] | None:
+        entry = harness.entry_state()
+        last_entry.clear()
+        last_entry.update(entry)
+        return (
+            entry
+            if entry.get("input_mode") == "Normal"
+            and entry.get("tag_menu_visible") is True
+            else None
+        )
+
+    try:
+        wait_until("T tag choice menu", menu_visible, timeout=5)
+    except SmokeFailure as error:
+        raise SmokeFailure(f"{error}; last entry state: {last_entry!r}") from error
+
+
+def exercise_ui(
+    environment: dict[str, str], driver: WtypeDriver, harness: Harness, app_pid: int
+) -> None:
     print("[ui-text-focus] fixture app and test harness are ready", flush=True)
     assert_target_tags_unchanged(harness, "fixture baseline")
 
     # Programmatic focus is also used by normal-mode pane traversal.  Exercise
-    # the complete modal path in one virtual-keyboard session: destructive
+    # the complete modal path in one virtual-keyboard sequence: destructive
     # a/t/s keys must be suppressed in Normal, a pending `g` sequence must not
     # survive Return into Insert, and text must reach the Entry only in Insert.
     harness.request("set_search_query", {"query": ""})
@@ -328,8 +422,7 @@ def exercise_ui(environment: dict[str, str], harness: Harness, app_pid: int) -> 
     if normal_entry.get("search") != "":
         raise SmokeFailure(f"search entry was not cleared: {normal_entry!r}")
     focus_app_window(environment, app_pid)
-    run_wtype(
-        environment,
+    driver.send(
         "-d",
         "20",
         "ats",
@@ -371,6 +464,184 @@ def exercise_ui(environment: dict[str, str], harness: Harness, app_pid: int) -> 
     assert_target_tags_unchanged(harness, "focused search key sequence")
     print(
         "[ui-text-focus] Normal actions were suppressed and Insert typing was safe",
+        flush=True,
+    )
+
+
+def exercise_tag_editor(
+    environment: dict[str, str], driver: WtypeDriver, harness: Harness, app_pid: int
+) -> None:
+    load_target(harness)
+    focus_selected_thread(harness)
+    focus_app_window(environment, app_pid)
+    driver.send(
+        # An unrelated second key closes the choice without opening an editor.
+        "-M",
+        "shift",
+        "-k",
+        "t",
+        "-m",
+        "shift",
+        "-s",
+        "800",
+        "-k",
+        "x",
+        "-s",
+        "1200",
+        # Add and then remove one tag through the explicit single-tag editor.
+        "-M",
+        "shift",
+        "-k",
+        "t",
+        "-m",
+        "shift",
+        "-s",
+        "800",
+        "-k",
+        "t",
+        "-s",
+        "1200",
+        "-d",
+        "20",
+        SINGLE_TAG,
+        "-k",
+        "Return",
+        "-s",
+        "1500",
+        "-k",
+        "Return",
+        "-s",
+        "1500",
+        "-k",
+        "Escape",
+        "-s",
+        "1200",
+        # Add and remove one tag through two explicit multi-tag editor opens.
+        "-M",
+        "shift",
+        "-k",
+        "t",
+        "-m",
+        "shift",
+        "-s",
+        "800",
+        "-k",
+        "m",
+        "-s",
+        "1200",
+        "-d",
+        "20",
+        f"+{MULTI_TAG}",
+        "-k",
+        "Return",
+        "-s",
+        "1500",
+        "-M",
+        "shift",
+        "-k",
+        "t",
+        "-m",
+        "shift",
+        "-s",
+        "800",
+        "-k",
+        "m",
+        "-s",
+        "1200",
+        "-k",
+        "minus",
+        "-d",
+        "20",
+        MULTI_TAG,
+        "-k",
+        "Return",
+    )
+
+    # A failed second key must cancel the pending T sequence without opening an
+    # editor, changing mode, or applying a tag.
+    wait_for_tag_menu(harness)
+    wait_for_tag_editor(
+        harness,
+        phase="unrelated T x",
+        mode="Normal",
+        single_visible=False,
+        multiple_visible=False,
+        menu_visible=False,
+    )
+    assert_target_tags_unchanged(harness, "unrelated T sequence")
+
+    # T t opens the explicit add/remove editor.  Enter adds an absent tag,
+    # updates the action to Remove, and a second Enter removes it again.
+    single = wait_for_tag_editor(
+        harness,
+        phase="T t open",
+        mode="Insert",
+        single_visible=True,
+        multiple_visible=False,
+        focused_field="custom_tag",
+    )
+    if single.get("single_tag_apply_label") != "Add tag":
+        raise SmokeFailure(f"single-tag editor did not start as Add: {single!r}")
+    wait_for_target_tag(harness, SINGLE_TAG, True)
+
+    def remove_action_ready() -> dict[str, Any] | None:
+        entry = harness.entry_state()
+        return (
+            entry
+            if entry.get("single_tag_apply_label") == "Remove tag"
+            and entry.get("single_tag_editor_visible") is True
+            and entry.get("input_mode") == "Insert"
+            else None
+        )
+
+    wait_until("single-tag action to switch to Remove", remove_action_ready)
+    wait_for_target_tag(harness, SINGLE_TAG, False)
+    wait_for_tag_editor(
+        harness,
+        phase="single-tag Escape",
+        mode="Normal",
+        single_visible=False,
+        multiple_visible=False,
+    )
+
+    # T m opens the separate multi-change editor.  Apply one tag, then reopen
+    # the same explicit flow and remove it so the fixture finishes unchanged.
+    wait_for_tag_editor(
+        harness,
+        phase="T m add open",
+        mode="Insert",
+        single_visible=False,
+        multiple_visible=True,
+        focused_field="tag_command",
+    )
+    wait_for_target_tag(harness, MULTI_TAG, True)
+    wait_for_tag_editor(
+        harness,
+        phase="T m add apply",
+        mode="Normal",
+        single_visible=False,
+        multiple_visible=False,
+    )
+
+    wait_for_tag_editor(
+        harness,
+        phase="T m remove open",
+        mode="Insert",
+        single_visible=False,
+        multiple_visible=True,
+        focused_field="tag_command",
+    )
+    wait_for_target_tag(harness, MULTI_TAG, False)
+    wait_for_tag_editor(
+        harness,
+        phase="T m remove apply",
+        mode="Normal",
+        single_visible=False,
+        multiple_visible=False,
+    )
+    assert_target_tags_unchanged(harness, "completed tag editor flows")
+    print(
+        "[ui-tag-editor] T x was safe and explicit T t/T m flows passed",
         flush=True,
     )
 
@@ -432,6 +703,7 @@ def run_inside_dbus(args: argparse.Namespace) -> int:
 
     sway_process: subprocess.Popen[Any] | None = None
     app_process: subprocess.Popen[Any] | None = None
+    driver: WtypeDriver | None = None
     try:
         with sway_log.open("wb") as sway_output:
             sway_process = subprocess.Popen(
@@ -497,7 +769,9 @@ def run_inside_dbus(args: argparse.Namespace) -> int:
 
         wait_until("fixture test harness health", harness_ready, timeout=30)
         focus_app_window(environment, app_process.pid)
-        exercise_ui(environment, harness, app_process.pid)
+        driver = WtypeDriver(environment)
+        exercise_ui(environment, driver, harness, app_process.pid)
+        exercise_tag_editor(environment, driver, harness, app_process.pid)
         print("[ui-text-focus] PASS", flush=True)
         return 0
     except BaseException as error:
@@ -506,6 +780,8 @@ def run_inside_dbus(args: argparse.Namespace) -> int:
         print(f"--- sway log ({sway_log}) ---\n{log_tail(sway_log)}", file=sys.stderr)
         return 1
     finally:
+        if driver is not None:
+            driver.close()
         terminate_process_group(app_process)
         terminate_process_group(sway_process)
 

@@ -433,11 +433,15 @@ struct Widgets {
     trash_button: gtk::Button,
     spam_button: gtk::Button,
     tag_command_entry: gtk::Entry,
+    tag_command_button: gtk::Button,
     tag_command_apply_button: gtk::Button,
     tag_menu_button: gtk::MenuButton,
     tag_menu_box: gtk::Box,
-    add_custom_tag_button: gtk::Button,
-    remove_custom_tag_button: gtk::Button,
+    single_tag_button: gtk::Button,
+    single_tag_editor_box: gtk::Box,
+    single_tag_action_label: gtk::Label,
+    single_tag_apply_button: gtk::Button,
+    tag_command_editor_box: gtk::Box,
     undo_tag_button: gtk::MenuButton,
     undo_menu_box: gtk::Box,
     undo_last_tag_button: gtk::Button,
@@ -995,34 +999,52 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle 
     tag_menu_box.set_margin_end(6);
     tag_menu_box.set_margin_top(6);
     tag_menu_box.set_margin_bottom(6);
-    let single_tag_label = gtk::Label::new(Some("Single tag"));
-    single_tag_label.set_xalign(0.0);
-    single_tag_label.add_css_class("dim-label");
-    tag_menu_box.append(&single_tag_label);
+    let tag_choice_label = gtk::Label::new(Some("Choose tag action"));
+    tag_choice_label.set_xalign(0.0);
+    tag_choice_label.add_css_class("dim-label");
+    tag_menu_box.append(&tag_choice_label);
+    let single_tag_button = gtk::Button::with_label("Add/remove tag");
+    single_tag_button.set_widget_name("notm-single-tag-mode-button");
+    single_tag_button.set_hexpand(true);
+    single_tag_button.set_halign(gtk::Align::Fill);
+    let tag_command_button = gtk::Button::with_label("Tag multiple");
+    tag_command_button.set_widget_name("notm-tag-command-mode-button");
+    tag_command_button.set_hexpand(true);
+    tag_command_button.set_halign(gtk::Align::Fill);
+    tag_menu_box.append(&single_tag_button);
+    tag_menu_box.append(&tag_command_button);
+    let single_tag_editor_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    single_tag_editor_box.set_widget_name("notm-single-tag-editor");
+    single_tag_editor_box.set_visible(false);
+    let single_tag_action_label = gtk::Label::new(Some("Add/remove tag"));
+    single_tag_action_label.set_xalign(0.0);
+    single_tag_action_label.add_css_class("dim-label");
     let custom_tag_entry = entry_with_placeholder("tag");
     custom_tag_entry.set_widget_name("notm-custom-tag-entry");
     custom_tag_entry.set_width_chars(18);
     custom_tag_entry.set_hexpand(true);
-    let tag_button_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    tag_button_row.set_hexpand(true);
-    tag_button_row.set_homogeneous(true);
-    let add_tag_button = gtk::Button::with_label("Add tag");
-    add_tag_button.set_widget_name("notm-add-custom-tag-button");
-    add_tag_button.set_hexpand(true);
-    add_tag_button.set_halign(gtk::Align::Fill);
-    let remove_tag_button = gtk::Button::with_label("Remove tag");
-    remove_tag_button.set_widget_name("notm-remove-custom-tag-button");
-    remove_tag_button.set_hexpand(true);
-    remove_tag_button.set_halign(gtk::Align::Fill);
-    remove_tag_button.set_visible(false);
-    tag_button_row.append(&add_tag_button);
-    tag_button_row.append(&remove_tag_button);
-    tag_menu_box.append(&custom_tag_entry);
-    tag_menu_box.append(&tag_button_row);
-    let multi_tag_label = gtk::Label::new(Some("Multiple tag changes"));
+    let single_tag_apply_button = gtk::Button::with_label("Apply");
+    single_tag_apply_button.set_widget_name("notm-apply-single-tag-button");
+    single_tag_apply_button.add_css_class("suggested-action");
+    single_tag_apply_button.set_size_request(120, -1);
+    let single_tag_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    single_tag_row.set_hexpand(true);
+    single_tag_row.append(&custom_tag_entry);
+    single_tag_row.append(&single_tag_apply_button);
+    single_tag_editor_box.append(&single_tag_action_label);
+    single_tag_editor_box.append(&single_tag_row);
+    let tag_command_editor_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    tag_command_editor_box.set_widget_name("notm-tag-command-editor");
+    tag_command_editor_box.set_visible(false);
+    let multi_tag_label = gtk::Label::new(Some("Tag multiple"));
     multi_tag_label.set_xalign(0.0);
     multi_tag_label.add_css_class("dim-label");
-    tag_menu_box.append(&multi_tag_label);
+    let multi_tag_help = gtk::Label::new(Some(
+        "Syntax: +tag adds, -tag removes. Example: -inbox +books +flagged",
+    ));
+    multi_tag_help.set_xalign(0.0);
+    multi_tag_help.set_wrap(true);
+    multi_tag_help.add_css_class("dim-label");
     let tag_command_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     tag_command_row.set_widget_name("notm-tag-command-row");
     tag_command_row.set_hexpand(true);
@@ -1031,9 +1053,13 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle 
     tag_command_entry.set_hexpand(true);
     let tag_command_apply_button = gtk::Button::with_label("Apply");
     tag_command_apply_button.set_widget_name("notm-run-tag-command-button");
+    tag_command_apply_button.add_css_class("suggested-action");
+    tag_command_apply_button.set_size_request(120, -1);
     tag_command_row.append(&tag_command_entry);
     tag_command_row.append(&tag_command_apply_button);
-    tag_menu_box.append(&tag_command_row);
+    tag_command_editor_box.append(&multi_tag_label);
+    tag_command_editor_box.append(&multi_tag_help);
+    tag_command_editor_box.append(&tag_command_row);
     for b in [
         &archive_button,
         &read_button,
@@ -1058,6 +1084,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle 
     action_outer.append(&action_row);
     action_outer.append(&undo_row);
     controls_box.append(&action_outer);
+    controls_box.append(&single_tag_editor_box);
+    controls_box.append(&tag_command_editor_box);
 
     let thread_model = gtk::StringList::new(&[]);
     let thread_selection = gtk::SingleSelection::new(Some(thread_model.clone()));
@@ -1435,11 +1463,15 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle 
         trash_button: trash_button.clone(),
         spam_button: spam_button.clone(),
         tag_command_entry: tag_command_entry.clone(),
+        tag_command_button: tag_command_button.clone(),
         tag_command_apply_button: tag_command_apply_button.clone(),
         tag_menu_button: tag_menu_button.clone(),
         tag_menu_box: tag_menu_box.clone(),
-        add_custom_tag_button: add_tag_button.clone(),
-        remove_custom_tag_button: remove_tag_button.clone(),
+        single_tag_button: single_tag_button.clone(),
+        single_tag_editor_box: single_tag_editor_box.clone(),
+        single_tag_action_label: single_tag_action_label.clone(),
+        single_tag_apply_button: single_tag_apply_button.clone(),
+        tag_command_editor_box: tag_command_editor_box.clone(),
         undo_tag_button: undo_button.clone(),
         undo_menu_box: undo_menu_box.clone(),
         undo_last_tag_button: undo_last_button.clone(),
@@ -1526,14 +1558,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle 
         &saved_search_store,
         &save_search_button,
     );
-    connect_custom_tag_editor(
-        &options,
-        &widgets,
-        &state,
-        &undo_state,
-        &add_tag_button,
-        &remove_tag_button,
-    );
+    connect_custom_tag_editor(&options, &widgets, &state, &undo_state, &single_tag_button);
     connect_notmuch_tag_command_editor(&options, &widgets, &state, &undo_state);
     if let Some(sync_button) = manual_sync_button {
         let opts = options.clone();
@@ -2664,25 +2689,21 @@ fn connect_custom_tag_editor(
     widgets: &Widgets,
     state: &SharedState,
     undo_state: &UndoState,
-    add_tag_button: &gtk::Button,
-    remove_tag_button: &gtk::Button,
+    single_tag_button: &gtk::Button,
 ) {
-    let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
-    let undo = undo_state.clone();
-    add_tag_button.connect_clicked(move |_| {
-        if apply_custom_tag_from_entry(&opts, &w, &st, &undo, true) {
-            close_custom_tag_editor(&w, &st);
-        }
+    single_tag_button.connect_clicked(move |_| {
+        open_custom_tag_editor(&w, &st);
     });
 
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
     let undo = undo_state.clone();
-    widgets.custom_tag_entry.connect_activate(move |_| {
-        if apply_custom_tag_from_entry_auto(&opts, &w, &st, &undo) {
+    widgets.single_tag_apply_button.connect_clicked(move |_| {
+        let add = !custom_tag_can_remove(&w, &st);
+        if apply_custom_tag_from_entry(&opts, &w, &st, &undo, add) {
             prepare_custom_tag_entry_for_next(&w, &st);
         }
     });
@@ -2691,9 +2712,10 @@ fn connect_custom_tag_editor(
     let w = widgets.clone();
     let st = state.clone();
     let undo = undo_state.clone();
-    remove_tag_button.connect_clicked(move |_| {
-        if apply_custom_tag_from_entry(&opts, &w, &st, &undo, false) {
-            close_custom_tag_editor(&w, &st);
+    widgets.custom_tag_entry.connect_activate(move |_| {
+        let add = !custom_tag_can_remove(&w, &st);
+        if apply_custom_tag_from_entry(&opts, &w, &st, &undo, add) {
+            prepare_custom_tag_entry_for_next(&w, &st);
         }
     });
 
@@ -2716,27 +2738,29 @@ fn connect_custom_tag_editor(
     });
     widgets.custom_tag_entry.add_controller(controller);
 
+    widgets.custom_tag_entry.connect_map(|entry| {
+        entry.grab_focus();
+        entry.select_region(0, -1);
+    });
+
     if let Some(popover) = widgets.tag_menu_button.popover() {
         let w = widgets.clone();
         let st = state.clone();
         popover.connect_closed(move |_| {
-            if tag_editor_insert_mode_active(&w, &st) {
-                enter_normal_mode(&w, &st);
+            if st.borrow().input_mode != InputMode::Insert {
+                return;
+            }
+            if w.single_tag_editor_box.is_visible() {
+                w.custom_tag_entry.grab_focus();
+                w.custom_tag_entry.select_region(0, -1);
+            } else if w.tag_command_editor_box.is_visible() {
+                w.tag_command_entry.grab_focus();
+                w.tag_command_entry.select_region(0, -1);
             }
         });
     }
 
     update_custom_tag_controls(widgets, state);
-}
-
-fn apply_custom_tag_from_entry_auto(
-    options: &LaunchOptions,
-    widgets: &Widgets,
-    state: &SharedState,
-    undo_state: &UndoState,
-) -> bool {
-    let add = !custom_tag_can_remove(widgets, state);
-    apply_custom_tag_from_entry(options, widgets, state, undo_state, add)
 }
 
 fn apply_custom_tag_from_entry(
@@ -2863,6 +2887,12 @@ fn connect_notmuch_tag_command_editor(
     state: &SharedState,
     undo_state: &UndoState,
 ) {
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets.tag_command_button.connect_clicked(move |_| {
+        open_notmuch_tag_command_editor(&w, &st);
+    });
+
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
@@ -2897,34 +2927,110 @@ fn connect_notmuch_tag_command_editor(
         gtk::glib::Propagation::Proceed
     });
     widgets.tag_command_entry.add_controller(controller);
+    widgets.tag_command_entry.connect_map(|entry| {
+        entry.grab_focus();
+        entry.select_region(0, -1);
+    });
 }
 
 fn open_notmuch_tag_command_editor(widgets: &Widgets, state: &SharedState) {
-    widgets.tag_menu_button.popup();
+    widgets.single_tag_editor_box.set_visible(false);
+    widgets.tag_menu_button.popdown();
     set_input_mode(
         widgets,
         state,
         InputMode::Insert,
-        "Insert mode: tag command (Esc for normal)",
+        "Insert mode: tag multiple (+tag/-tag, Esc for normal)",
     );
+    widgets.tag_command_editor_box.set_visible(true);
     widgets.tag_command_entry.grab_focus();
     widgets.tag_command_entry.select_region(0, -1);
 }
 
-fn close_notmuch_tag_command_editor(widgets: &Widgets, state: &SharedState) {
-    if let Some(popover) = widgets.tag_menu_button.popover() {
-        popover.popdown();
+fn show_tag_sequence_menu(widgets: &Widgets) {
+    close_tag_editors(widgets);
+    widgets.tag_menu_button.popup();
+}
+
+fn handle_tag_sequence_key(widgets: &Widgets, state: &SharedState, key: gtk::gdk::Key) -> bool {
+    match tag_sequence_key_action(key) {
+        Some(TagSequenceKeyAction::SingleTag) => {
+            open_custom_tag_editor(widgets, state);
+            true
+        }
+        Some(TagSequenceKeyAction::TagCommand) => {
+            open_notmuch_tag_command_editor(widgets, state);
+            true
+        }
+        None => false,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TagSequenceKeyAction {
+    SingleTag,
+    TagCommand,
+}
+
+fn tag_sequence_key_action(key: gtk::gdk::Key) -> Option<TagSequenceKeyAction> {
+    if key == gtk::gdk::Key::t {
+        Some(TagSequenceKeyAction::SingleTag)
+    } else if key == gtk::gdk::Key::m {
+        Some(TagSequenceKeyAction::TagCommand)
+    } else {
+        None
+    }
+}
+
+fn is_tag_sequence_prefix(key: gtk::gdk::Key, mods: gtk::gdk::ModifierType) -> bool {
+    key == gtk::gdk::Key::T
+        || (key == gtk::gdk::Key::t && mods.contains(gtk::gdk::ModifierType::SHIFT_MASK))
+}
+
+fn is_tag_menu_navigation_key(key: gtk::gdk::Key) -> bool {
+    matches!(
+        key,
+        gtk::gdk::Key::j
+            | gtk::gdk::Key::k
+            | gtk::gdk::Key::Up
+            | gtk::gdk::Key::Down
+            | gtk::gdk::Key::Left
+            | gtk::gdk::Key::Right
+            | gtk::gdk::Key::Home
+            | gtk::gdk::Key::End
+            | gtk::gdk::Key::Tab
+            | gtk::gdk::Key::ISO_Left_Tab
+            | gtk::gdk::Key::Return
+            | gtk::gdk::Key::KP_Enter
+            | gtk::gdk::Key::space
+    )
+}
+
+fn close_notmuch_tag_command_editor(widgets: &Widgets, state: &SharedState) {
+    close_tag_editors(widgets);
     enter_normal_mode(widgets, state);
+}
+
+fn close_tag_editors(widgets: &Widgets) {
+    widgets.single_tag_editor_box.set_visible(false);
+    widgets.tag_command_editor_box.set_visible(false);
 }
 
 fn update_custom_tag_controls(widgets: &Widgets, state: &SharedState) {
     let has_tag = !widgets.custom_tag_entry.text().trim().is_empty();
     let can_remove = custom_tag_can_remove(widgets, state);
-    widgets.add_custom_tag_button.set_visible(!can_remove);
-    widgets.remove_custom_tag_button.set_visible(can_remove);
-    widgets.add_custom_tag_button.set_sensitive(has_tag);
-    widgets.remove_custom_tag_button.set_sensitive(has_tag);
+    widgets.single_tag_action_label.set_text(if !has_tag {
+        "Add/remove tag: type a tag"
+    } else if can_remove {
+        "Add/remove tag: this will remove an existing tag"
+    } else {
+        "Add/remove tag: this will add a tag"
+    });
+    widgets.custom_tag_entry.set_placeholder_text(Some("tag"));
+    widgets
+        .single_tag_apply_button
+        .set_label(if can_remove { "Remove tag" } else { "Add tag" });
+    widgets.single_tag_apply_button.set_sensitive(has_tag);
 }
 
 fn custom_tag_can_remove(widgets: &Widgets, state: &SharedState) -> bool {
@@ -2936,21 +3042,24 @@ fn custom_tag_can_remove(widgets: &Widgets, state: &SharedState) -> bool {
 }
 
 fn open_custom_tag_editor(widgets: &Widgets, state: &SharedState) {
+    widgets.tag_command_editor_box.set_visible(false);
+    widgets.tag_menu_button.popdown();
     update_custom_tag_controls(widgets, state);
-    widgets.tag_menu_button.popup();
     set_input_mode(
         widgets,
         state,
         InputMode::Insert,
-        "Insert mode: tag (Esc for normal)",
+        "Insert mode: single tag (Esc for normal)",
     );
+    widgets.single_tag_editor_box.set_visible(true);
     widgets.custom_tag_entry.grab_focus();
     widgets.custom_tag_entry.select_region(0, -1);
 }
 
 fn prepare_custom_tag_entry_for_next(widgets: &Widgets, state: &SharedState) {
+    widgets.tag_command_editor_box.set_visible(false);
+    widgets.single_tag_editor_box.set_visible(true);
     update_custom_tag_controls(widgets, state);
-    widgets.tag_menu_button.popup();
     set_input_mode(
         widgets,
         state,
@@ -3066,18 +3175,20 @@ fn tag_target_status_label(count: usize) -> String {
 }
 
 fn close_custom_tag_editor(widgets: &Widgets, state: &SharedState) {
+    let was_active = tag_editor_insert_mode_active(widgets, state);
     if let Some(popover) = widgets.tag_menu_button.popover() {
         popover.popdown();
     }
-    if tag_editor_insert_mode_active(widgets, state) {
+    close_tag_editors(widgets);
+    if was_active {
         enter_normal_mode(widgets, state);
     }
 }
 
 fn tag_editor_insert_mode_active(widgets: &Widgets, state: &SharedState) -> bool {
     state.borrow().input_mode == InputMode::Insert
-        && (widgets.status_label.text().starts_with("Insert mode: tag")
-            || widgets.status_label.text().starts_with("Tag applied;"))
+        && (widgets.single_tag_editor_box.is_visible()
+            || widgets.tag_command_editor_box.is_visible())
 }
 
 fn widget_token(value: &str) -> String {
@@ -5462,14 +5573,11 @@ fn update_button_binding_labels(widgets: &Widgets, state: &SharedState) {
     set_button_label(&widgets.trash_button, "Trash", "t", state);
     set_button_label(&widgets.spam_button, "Spam", "s", state);
     set_menu_button_label(&widgets.tag_menu_button, "Tag…", "T", state);
-    set_button_label(&widgets.add_custom_tag_button, "Add tag", "T t", state);
-    set_button_label(
-        &widgets.remove_custom_tag_button,
-        "Remove tag",
-        "T t",
-        state,
-    );
-    set_button_label(&widgets.tag_command_apply_button, "Apply", "T m", state);
+    set_button_label(&widgets.single_tag_button, "Add/remove tag", "T t", state);
+    set_button_label(&widgets.tag_command_button, "Tag multiple", "T m", state);
+    widgets
+        .tag_command_apply_button
+        .set_label(&button_label("Apply", "", state));
     set_menu_button_label(&widgets.undo_tag_button, "Undo", "z", state);
     set_button_label(&widgets.undo_last_tag_button, "Undo last", "z z", state);
     set_button_label(&widgets.undo_list_tag_button, "Undo multiple", "z m", state);
@@ -6052,16 +6160,10 @@ fn install_shortcuts(
         if *pending_tag.borrow() {
             *pending_tag.borrow_mut() = false;
             clear_numeric_prefix(&numeric_prefix);
-            let handled = if key == gtk::gdk::Key::t {
-                open_custom_tag_editor(&w, &st);
-                true
-            } else if key == gtk::gdk::Key::m {
-                open_notmuch_tag_command_editor(&w, &st);
-                true
-            } else {
+            let handled = handle_tag_sequence_key(&w, &st, key);
+            if !handled {
                 w.tag_menu_button.popdown();
-                false
-            };
+            }
             return if handled {
                 gtk::glib::Propagation::Stop
             } else {
@@ -6237,12 +6339,12 @@ fn install_shortcuts(
             clear_numeric_prefix(&numeric_prefix);
             toggle_flagged_selected(&opts, &w, &st, &undo);
             true
-        } else if key == gtk::gdk::Key::T {
+        } else if is_tag_sequence_prefix(key, mods) {
             clear_numeric_prefix(&numeric_prefix);
             *pending_tag.borrow_mut() = true;
-            w.tag_menu_button.popup();
+            show_tag_sequence_menu(&w);
             w.status_label
-                .set_text("Tag: t single tag, m multiple tag changes");
+                .set_text("Tag: t add/remove tag, m tag multiple");
             true
         } else if key == gtk::gdk::Key::r {
             clear_numeric_prefix(&numeric_prefix);
@@ -6497,20 +6599,17 @@ fn connect_dropdown_sequence_keys(
         if st.borrow().input_mode == InputMode::Insert {
             return gtk::glib::Propagation::Proceed;
         }
-        let handled = if key == gtk::gdk::Key::t {
-            open_custom_tag_editor(&w, &st);
-            true
-        } else if key == gtk::gdk::Key::m {
-            open_notmuch_tag_command_editor(&w, &st);
-            true
-        } else {
-            false
-        };
+        if is_tag_menu_navigation_key(key) {
+            return gtk::glib::Propagation::Proceed;
+        }
+        let handled = handle_tag_sequence_key(&w, &st, key);
         if handled {
             *pending.borrow_mut() = false;
             gtk::glib::Propagation::Stop
         } else {
-            gtk::glib::Propagation::Proceed
+            *pending.borrow_mut() = false;
+            w.tag_menu_button.popdown();
+            gtk::glib::Propagation::Stop
         }
     });
     widgets.tag_menu_box.add_controller(controller);
@@ -12777,7 +12876,22 @@ fn handle_automation_request(
                 "search_has_focus": widget_contains_focus(widgets.search_entry.upcast_ref()),
                 "search_selection_bounds": search_selection_bounds,
                 "custom_tag": widgets.custom_tag_entry.text().to_string(),
+                "custom_tag_has_focus": widget_contains_focus(widgets.custom_tag_entry.upcast_ref()),
                 "tag_command": widgets.tag_command_entry.text().to_string(),
+                "tag_command_has_focus": widget_contains_focus(widgets.tag_command_entry.upcast_ref()),
+                "status": widgets.status_label.text().to_string(),
+                "tag_menu_visible": widgets
+                    .tag_menu_button
+                    .popover()
+                    .is_some_and(|popover| popover.is_visible()),
+                "single_tag_editor_visible": widgets.single_tag_editor_box.is_visible(),
+                "tag_command_editor_visible": widgets.tag_command_editor_box.is_visible(),
+                "single_tag_action": widgets.single_tag_action_label.text().to_string(),
+                "single_tag_apply_label": widgets
+                    .single_tag_apply_button
+                    .label()
+                    .unwrap_or_default()
+                    .to_string(),
                 "compose_fields": compose_fields(widgets, state),
                 "input_mode": format!("{:?}", state.borrow().input_mode),
                 "active_pane": format!("{:?}", state.borrow().active_pane),
@@ -14711,12 +14825,12 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
         HelpEntry {
             section: "Thread actions",
             key: "T t",
-            description: "Add or remove one tag on selected message(s).",
+            description: "Open an add/remove tag input that uses the selected message(s) to choose add or remove.",
         },
         HelpEntry {
             section: "Thread actions",
             key: "T m",
-            description: "Apply multiple tag changes, for example -inbox +books.",
+            description: "Open a tag-multiple input, for example -inbox +books.",
         },
         HelpEntry {
             section: "Thread actions",
@@ -17247,6 +17361,50 @@ mod tests {
             gtk::gdk::Key::j,
             gtk::gdk::ModifierType::empty(),
         ));
+    }
+
+    #[test]
+    fn tag_sequence_requires_an_explicit_editor_choice() {
+        assert!(is_tag_sequence_prefix(
+            gtk::gdk::Key::T,
+            gtk::gdk::ModifierType::empty()
+        ));
+        assert!(is_tag_sequence_prefix(
+            gtk::gdk::Key::t,
+            gtk::gdk::ModifierType::SHIFT_MASK
+        ));
+        assert!(!is_tag_sequence_prefix(
+            gtk::gdk::Key::t,
+            gtk::gdk::ModifierType::empty()
+        ));
+        for key in [
+            gtk::gdk::Key::j,
+            gtk::gdk::Key::k,
+            gtk::gdk::Key::Tab,
+            gtk::gdk::Key::Return,
+            gtk::gdk::Key::space,
+        ] {
+            assert!(is_tag_menu_navigation_key(key));
+        }
+        assert!(!is_tag_menu_navigation_key(gtk::gdk::Key::x));
+        assert_eq!(
+            tag_sequence_key_action(gtk::gdk::Key::t),
+            Some(TagSequenceKeyAction::SingleTag)
+        );
+        assert_eq!(
+            tag_sequence_key_action(gtk::gdk::Key::m),
+            Some(TagSequenceKeyAction::TagCommand)
+        );
+        for key in [
+            gtk::gdk::Key::i,
+            gtk::gdk::Key::a,
+            gtk::gdk::Key::r,
+            gtk::gdk::Key::s,
+            gtk::gdk::Key::j,
+            gtk::gdk::Key::k,
+        ] {
+            assert_eq!(tag_sequence_key_action(key), None);
+        }
     }
 
     #[test]
