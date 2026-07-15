@@ -1262,6 +1262,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sourceview5",
+ "tempfile",
  "tokio",
  "toml 0.8.23",
  "tracing",

@@ -668,6 +668,139 @@ fn live_harness_denies_ungated_mutations_and_reports_reply_noops() -> anyhow::Re
 
 #[cfg(unix)]
 #[test]
+fn default_draft_recovery_migrates_clears_and_reports_autosave_failures() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP default_draft_recovery_migrates_clears_and_reports_autosave_failures: no \
+             DISPLAY or WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running durable draft recovery desktop UI smoke with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-draft-recovery-ui-{run_id}"));
+    let legacy_path = work_dir.join("cache/notm/draft.json");
+    let recovery_path = work_dir.join("state/notm/draft.json");
+    fs::create_dir_all(legacy_path.parent().expect("legacy draft parent"))?;
+    fs::write(
+        &legacy_path,
+        serde_json::to_vec_pretty(&json!({
+            "from": "Fixture User <fixture@example.test>",
+            "to": "recipient@example.test",
+            "cc": "",
+            "bcc": "",
+            "subject": "Recovered legacy draft",
+            "body": "Recovery body"
+        }))?,
+    )?;
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+             \n[identity]\nname = \"Fixture User\"\nprimary_email = \"fixture@example.test\"\n\
+             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+        ),
+    )?;
+
+    let token = format!("notm-draft-recovery-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    let recovered = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        recovered["state"]["compose_fields"]["subject"], "Recovered legacy draft",
+        "legacy cache draft was not recovered: {recovered}"
+    );
+    assert_eq!(
+        recovered["state"]["compose_fields"]["body"], "Recovery body",
+        "legacy cache draft body was not recovered: {recovered}"
+    );
+    ensure!(
+        recovery_path.is_file() && !legacy_path.exists(),
+        "legacy draft was not moved from {} to {}",
+        legacy_path.display(),
+        recovery_path.display()
+    );
+
+    for (command, value) in [("compose_set_body", ""), ("compose_set_subject", "")] {
+        let cleared = driver.command(command, json!({"value": value}))?;
+        assert_eq!(cleared["ok"], true, "composer clear failed: {cleared}");
+    }
+    ensure!(
+        recovery_path.is_file(),
+        "recovery draft disappeared while recipient content remained"
+    );
+    let cleared = driver.command("compose_set_to", json!({"value": ""}))?;
+    assert_eq!(
+        cleared["ok"], true,
+        "final composer clear failed: {cleared}"
+    );
+    ensure!(
+        !recovery_path.exists() && !legacy_path.exists(),
+        "empty composer left stale recovery state"
+    );
+
+    fs::create_dir(&recovery_path)?;
+    let failed = driver.command(
+        "compose_set_subject",
+        json!({"value": "Autosave failure must be visible"}),
+    )?;
+    assert_eq!(failed["ok"], true, "composer update failed: {failed}");
+    let failed_state = driver.command("app_state", json!({}))?;
+    let last_error = failed_state["state"]["last_error"]
+        .as_str()
+        .with_context(|| format!("autosave failure was not recorded: {failed_state}"))?;
+    ensure!(
+        last_error.starts_with("Draft autosave failed:"),
+        "unexpected autosave error: {last_error}"
+    );
+    let view = driver.command("html_view_state", json!({}))?;
+    ensure!(
+        view["status_text"]
+            .as_str()
+            .is_some_and(|status| status.starts_with("Draft autosave failed:")),
+        "autosave failure was not shown in the desktop status: {view}"
+    );
+    let state_entries = fs::read_dir(recovery_path.parent().expect("recovery draft parent"))?
+        .collect::<Result<Vec<_>, _>>()?;
+    ensure!(
+        state_entries.len() == 1 && state_entries[0].path() == recovery_path,
+        "failed atomic autosave left temporary files: {state_entries:?}"
+    );
+    fs::remove_dir(&recovery_path)?;
+    let recovered_autosave = driver.command(
+        "compose_set_subject",
+        json!({"value": "Autosave recovered"}),
+    )?;
+    assert_eq!(
+        recovered_autosave["ok"], true,
+        "composer did not recover after transient autosave failure: {recovered_autosave}"
+    );
+    let recovered_state = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        recovered_state["state"]["last_error"],
+        Value::Null,
+        "successful autosave left a stale failure: {recovered_state}"
+    );
+    let recovered_view = driver.command("html_view_state", json!({}))?;
+    assert_eq!(
+        recovered_view["status_text"], "Draft autosave recovered",
+        "successful autosave did not clear the visible failure: {recovered_view}"
+    );
+    ensure!(
+        recovery_path.is_file(),
+        "recovered autosave did not recreate persistent draft state"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn validated_config_launches_and_invalid_layout_requests_are_rejected() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment() else {
         eprintln!(

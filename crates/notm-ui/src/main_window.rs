@@ -3,6 +3,9 @@
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
+    ffi::OsStr,
+    fs::OpenOptions,
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
     rc::Rc,
@@ -478,6 +481,7 @@ struct Widgets {
     attachment_items: Rc<RefCell<Vec<ThreadAttachmentItem>>>,
     tag_search_box: gtk::Box,
     draft_path: PathBuf,
+    legacy_draft_path: Option<PathBuf>,
     debug_view: gtk::TextView,
     status_label: gtk::Label,
     compose_from: gtk::Entry,
@@ -500,6 +504,7 @@ struct Widgets {
     address_completion: Rc<RefCell<Option<AddressCompletionSession>>>,
     draft_list: gtk::ListBox,
     drafts_dir: PathBuf,
+    legacy_drafts_dir: Option<PathBuf>,
 }
 
 type SharedState = Rc<RefCell<UiState>>;
@@ -1368,6 +1373,24 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle 
     connect_html_navigation_policy(&html_view, &status_label);
     connect_html_hover_status(&html_view, &status_label);
 
+    let draft_path = options
+        .draft_path
+        .clone()
+        .unwrap_or_else(default_draft_path);
+    let legacy_draft_path = options
+        .draft_path
+        .is_none()
+        .then(legacy_default_draft_path)
+        .filter(|legacy_path| legacy_path != &draft_path);
+    let drafts_dir = options
+        .drafts_dir
+        .clone()
+        .unwrap_or_else(default_drafts_dir);
+    let legacy_drafts_dir = options
+        .drafts_dir
+        .is_none()
+        .then(legacy_default_drafts_dir)
+        .filter(|legacy_dir| legacy_dir != &drafts_dir);
     let widgets = Widgets {
         window: window.clone(),
         overlay: overlay.clone(),
@@ -1459,10 +1482,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle 
         attachment_list,
         attachment_items: Rc::new(RefCell::new(Vec::new())),
         tag_search_box,
-        draft_path: options
-            .draft_path
-            .clone()
-            .unwrap_or_else(default_draft_path),
+        draft_path,
+        legacy_draft_path,
         debug_view,
         status_label,
         compose_from,
@@ -1484,10 +1505,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle 
         active_address_field,
         address_completion,
         draft_list,
-        drafts_dir: options
-            .drafts_dir
-            .clone()
-            .unwrap_or_else(default_drafts_dir),
+        drafts_dir,
+        legacy_drafts_dir,
     };
     apply_content_layout(&widgets, &state, initial_layout, false);
     apply_initial_pane_visibility(&options, &widgets, &state);
@@ -1575,6 +1594,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle 
     }
 
     restore_draft_if_present(&widgets, &state);
+    migrate_legacy_named_drafts_from_ui(&widgets, &state);
     refresh_draft_list(&widgets);
     window.present();
     {
@@ -3212,7 +3232,7 @@ fn connect_compose_helpers(
             .as_ref()
             .is_some_and(|draft| compose_fields(&w, &st) != draft.saved_fields);
         clear_draft_widgets(&opts, &w, &st);
-        match clear_draft_file(&w.draft_path) {
+        match clear_recovery_draft_files(&w.draft_path, w.legacy_draft_path.as_deref()) {
             Ok(()) => {
                 let status = match (active_draft.is_some(), has_unsaved_changes) {
                     (true, true) => "Draft changes discarded",
@@ -6313,8 +6333,12 @@ fn install_shortcuts(
         } else if key == gtk::gdk::Key::x && compose_view_is_visible(&w) {
             clear_numeric_prefix(&numeric_prefix);
             clear_draft_widgets(&opts, &w, &st);
-            let _ = clear_draft_file(&w.draft_path);
-            w.status_label.set_text("Composer closed");
+            match clear_recovery_draft_files(&w.draft_path, w.legacy_draft_path.as_deref()) {
+                Ok(()) => w.status_label.set_text("Composer closed"),
+                Err(err) => {
+                    report_draft_persistence_error(&w, &st, "Draft clear failed", &err)
+                }
+            }
             true
         } else if key == gtk::gdk::Key::D && compose_view_is_visible(&w) {
             clear_numeric_prefix(&numeric_prefix);
@@ -7327,10 +7351,56 @@ fn autosave_draft_from_widgets(widgets: &Widgets, state: &SharedState) {
     let fields = compose_fields(widgets, state);
     state.borrow_mut().compose_fields = fields.clone();
     update_attachment_label(widgets, &fields.attachments);
-    if fields_has_content(&fields) {
-        let _ = save_draft_fields(&widgets.draft_path, &fields);
-    }
+    persist_recovery_draft_from_ui(widgets, state, &fields);
     update_draft_action_buttons(widgets, state);
+}
+
+fn persist_recovery_draft_from_ui(
+    widgets: &Widgets,
+    state: &SharedState,
+    fields: &ComposeFields,
+) -> bool {
+    match persist_recovery_draft(
+        &widgets.draft_path,
+        widgets.legacy_draft_path.as_deref(),
+        fields,
+    ) {
+        Ok(()) => {
+            let mut state = state.borrow_mut();
+            if clear_transient_autosave_error(&mut state.last_error) {
+                widgets.status_label.set_text("Draft autosave recovered");
+            }
+            true
+        }
+        Err(err) => {
+            report_draft_persistence_error(widgets, state, "Draft autosave failed", &err);
+            false
+        }
+    }
+}
+
+fn report_draft_persistence_error(
+    widgets: &Widgets,
+    state: &SharedState,
+    action: &str,
+    err: &anyhow::Error,
+) {
+    let message = format!("{action}: {err}");
+    state.borrow_mut().last_error = Some(message.clone());
+    widgets.status_label.set_text(&message);
+    update_debug(widgets, state);
+}
+
+fn clear_transient_autosave_error(last_error: &mut Option<String>) -> bool {
+    if last_error
+        .as_deref()
+        .is_some_and(|error| error.starts_with("Draft autosave failed:"))
+    {
+        *last_error = None;
+        true
+    } else {
+        false
+    }
 }
 
 fn update_draft_action_buttons(widgets: &Widgets, state: &SharedState) {
@@ -7359,28 +7429,121 @@ fn fields_has_content(fields: &ComposeFields) -> bool {
         || !fields.attachments.is_empty()
 }
 
-fn default_draft_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
+fn xdg_home_path(
+    configured_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+    home_suffix: &str,
+    fallback: &str,
+) -> PathBuf {
+    configured_home
+        .filter(|path| !path.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .unwrap_or_else(|| PathBuf::from("target/notm-cache"));
-    base.join("notm/draft.json")
+        .or_else(|| {
+            home.filter(|path| !path.is_empty())
+                .map(|path| PathBuf::from(path).join(home_suffix))
+        })
+        .unwrap_or_else(|| PathBuf::from(fallback))
+}
+
+fn default_state_home() -> PathBuf {
+    let configured_home = std::env::var_os("XDG_STATE_HOME");
+    let home = std::env::var_os("HOME");
+    xdg_home_path(
+        configured_home.as_deref(),
+        home.as_deref(),
+        ".local/state",
+        "target/notm-state",
+    )
+}
+
+fn legacy_default_cache_home() -> PathBuf {
+    let configured_home = std::env::var_os("XDG_CACHE_HOME");
+    let home = std::env::var_os("HOME");
+    xdg_home_path(
+        configured_home.as_deref(),
+        home.as_deref(),
+        ".cache",
+        "target/notm-cache",
+    )
+}
+
+fn compose_state_path(state_home: &Path, relative_path: &str) -> PathBuf {
+    state_home.join("notm").join(relative_path)
+}
+
+fn default_draft_path() -> PathBuf {
+    compose_state_path(&default_state_home(), "draft.json")
+}
+
+fn legacy_default_draft_path() -> PathBuf {
+    legacy_default_cache_home().join("notm/draft.json")
+}
+
+fn legacy_default_drafts_dir() -> PathBuf {
+    legacy_default_cache_home().join("notm/drafts")
 }
 
 fn default_drafts_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .unwrap_or_else(|| PathBuf::from("target/notm-cache"));
-    base.join("notm/drafts")
+    compose_state_path(&default_state_home(), "drafts")
 }
 
 fn save_draft_fields(path: &Path, fields: &ComposeFields) -> anyhow::Result<PathBuf> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, serde_json::to_vec_pretty(fields)?)?;
+    atomic_write(path, &serde_json::to_vec_pretty(fields)?)?;
     Ok(path.to_path_buf())
+}
+
+fn persist_recovery_draft(
+    path: &Path,
+    legacy_path: Option<&Path>,
+    fields: &ComposeFields,
+) -> anyhow::Result<()> {
+    if fields_has_content(fields) {
+        save_draft_fields(path, fields)?;
+        if let Some(legacy_path) = legacy_path {
+            remove_file_if_present(legacy_path)?;
+        }
+    } else {
+        clear_recovery_draft_files(path, legacy_path)?;
+    }
+    Ok(())
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    atomic_write_with_sync(path, bytes, false)
+}
+
+fn atomic_write_durable(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    atomic_write_with_sync(path, bytes, true)
+}
+
+fn atomic_write_with_sync(path: &Path, bytes: &[u8], sync_to_disk: bool) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let filename = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("notm-state");
+    let temporary_path = parent.join(format!(".{filename}.{}.tmp", Uuid::new_v4()));
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut temporary = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)?;
+        temporary.write_all(bytes)?;
+        if sync_to_disk {
+            temporary.sync_all()?;
+        }
+        drop(temporary);
+        std::fs::rename(&temporary_path, path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    write_result.map_err(|err| anyhow::anyhow!("writing {} atomically: {err}", path.display()))
 }
 
 fn save_named_draft_fields(dir: &Path, fields: &ComposeFields) -> anyhow::Result<PathBuf> {
@@ -7394,7 +7557,7 @@ fn save_named_draft_fields(dir: &Path, fields: &ComposeFields) -> anyhow::Result
         slug.chars().take(32).collect()
     };
     let path = dir.join(format!("{stamp}-{slug}-{}.json", Uuid::new_v4()));
-    std::fs::write(&path, serde_json::to_vec_pretty(fields)?)?;
+    atomic_write_durable(&path, &serde_json::to_vec_pretty(fields)?)?;
     Ok(path)
 }
 
@@ -7488,7 +7651,13 @@ fn delete_active_draft_from_ui(options: &LaunchOptions, widgets: &Widgets, state
     match delete_draft_source(options, &draft) {
         Ok(()) => {
             clear_draft_widgets(options, widgets, state);
-            let _ = clear_draft_file(&widgets.draft_path);
+            if let Err(err) = clear_recovery_draft_files(
+                &widgets.draft_path,
+                widgets.legacy_draft_path.as_deref(),
+            ) {
+                report_draft_persistence_error(widgets, state, "Draft recovery clear failed", &err);
+                return;
+            }
             let current = state.borrow().current_query.clone();
             run_search(options, widgets, state, &current);
             widgets
@@ -7511,26 +7680,88 @@ fn delete_active_draft_from_ui(options: &LaunchOptions, widgets: &Widgets, state
     }
 }
 
-fn list_named_drafts(dir: &Path) -> Vec<(PathBuf, ComposeFields)> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+fn migrate_legacy_named_drafts(dir: &Path, legacy_dir: &Path) -> anyhow::Result<usize> {
+    let entries = match std::fs::read_dir(legacy_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err.into()),
     };
-    let mut drafts = entries
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
+    let mut migrated = 0;
+    for entry in entries {
+        let entry = entry?;
+        let legacy_path = entry.path();
+        if legacy_path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = std::fs::read(&legacy_path)?;
+        std::fs::create_dir_all(dir)?;
+        let filename = entry.file_name();
+        let mut destination = dir.join(&filename);
+        if destination.exists() {
+            if std::fs::read(&destination)? == bytes {
+                remove_file_if_present(&legacy_path)?;
+                continue;
+            }
+            destination = dir.join(format!(
+                "legacy-{}-{}",
+                Uuid::new_v4(),
+                filename.to_string_lossy()
+            ));
+        }
+        atomic_write_durable(&destination, &bytes)?;
+        remove_file_if_present(&legacy_path)?;
+        migrated += 1;
+    }
+    Ok(migrated)
+}
+
+fn migrate_legacy_named_drafts_from_ui(widgets: &Widgets, state: &SharedState) {
+    let Some(legacy_dir) = widgets.legacy_drafts_dir.as_deref() else {
+        return;
+    };
+    match migrate_legacy_named_drafts(&widgets.drafts_dir, legacy_dir) {
+        Ok(0) => {}
+        Ok(count) => {
+            let message = format!("Migrated {count} legacy named draft(s) to persistent state");
+            state.borrow_mut().last_operation = Some(message.clone());
+            widgets.status_label.set_text(&message);
+        }
+        Err(err) => {
+            report_draft_persistence_error(widgets, state, "Named draft migration failed", &err)
+        }
+    }
+}
+
+fn list_named_drafts(dir: &Path, legacy_dir: Option<&Path>) -> Vec<(PathBuf, ComposeFields)> {
+    let mut drafts: Vec<(Option<std::time::SystemTime>, PathBuf, ComposeFields)> = Vec::new();
+    for dir in std::iter::once(dir).chain(legacy_dir) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                return None;
+                continue;
             }
-            let fields =
-                serde_json::from_slice::<ComposeFields>(&std::fs::read(&path).ok()?).ok()?;
+            let Some(fields) = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<ComposeFields>(&bytes).ok())
+            else {
+                continue;
+            };
+            let duplicate = drafts.iter().any(|(_, existing_path, existing_fields)| {
+                existing_path.file_name() == path.file_name() && existing_fields == &fields
+            });
+            if duplicate {
+                continue;
+            }
             let modified = entry
                 .metadata()
                 .and_then(|metadata| metadata.modified())
                 .ok();
-            Some((modified, path, fields))
-        })
-        .collect::<Vec<_>>();
+            drafts.push((modified, path, fields));
+        }
+    }
     drafts.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     drafts
         .into_iter()
@@ -7542,9 +7773,10 @@ fn refresh_draft_list(widgets: &Widgets) {
     while let Some(child) = widgets.draft_list.first_child() {
         widgets.draft_list.remove(&child);
     }
-    for (index, (path, fields)) in list_named_drafts(&widgets.drafts_dir)
-        .into_iter()
-        .enumerate()
+    for (index, (path, fields)) in
+        list_named_drafts(&widgets.drafts_dir, widgets.legacy_drafts_dir.as_deref())
+            .into_iter()
+            .enumerate()
     {
         let row = gtk::ListBoxRow::new();
         row.set_widget_name(&format!("notm-draft-row-{index}"));
@@ -7580,7 +7812,7 @@ fn selected_named_draft(widgets: &Widgets) -> anyhow::Result<(PathBuf, ComposeFi
         .selected_row()
         .map(|row| row.index() as usize)
         .unwrap_or(0);
-    list_named_drafts(&widgets.drafts_dir)
+    list_named_drafts(&widgets.drafts_dir, widgets.legacy_drafts_dir.as_deref())
         .into_iter()
         .nth(index)
         .ok_or_else(|| anyhow::anyhow!("no selected draft"))
@@ -7610,26 +7842,96 @@ fn delete_selected_named_draft(widgets: &Widgets) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn migrate_legacy_recovery_draft(path: &Path, legacy_path: &Path) -> anyhow::Result<bool> {
+    if path.exists() || !legacy_path.exists() {
+        return Ok(false);
+    }
+    let bytes = std::fs::read(legacy_path)?;
+    atomic_write_durable(path, &bytes)?;
+    remove_file_if_present(legacy_path)?;
+    Ok(true)
+}
+
 fn restore_draft_if_present(widgets: &Widgets, state: &SharedState) {
-    let path = &widgets.draft_path;
-    let Ok(bytes) = std::fs::read(path) else {
+    let migration = widgets
+        .legacy_draft_path
+        .as_deref()
+        .map(|legacy_path| migrate_legacy_recovery_draft(&widgets.draft_path, legacy_path))
+        .transpose();
+    let (migrated, migration_error) = match migration {
+        Ok(migrated) => (migrated.unwrap_or(false), None),
+        Err(err) => (false, Some(err)),
+    };
+    let source_path = if widgets.draft_path.exists() {
+        Some(widgets.draft_path.as_path())
+    } else {
+        widgets
+            .legacy_draft_path
+            .as_deref()
+            .filter(|legacy_path| legacy_path.exists())
+    };
+    let Some(source_path) = source_path else {
+        if let Some(err) = migration_error {
+            report_draft_persistence_error(widgets, state, "Draft recovery migration failed", &err);
+        }
         return;
     };
-    let Ok(fields) = serde_json::from_slice::<ComposeFields>(&bytes) else {
-        return;
+    let fields = match std::fs::read(source_path)
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| serde_json::from_slice::<ComposeFields>(&bytes).map_err(Into::into))
+    {
+        Ok(fields) => fields,
+        Err(err) => {
+            report_draft_persistence_error(widgets, state, "Draft recovery failed", &err);
+            return;
+        }
     };
-    if fields_has_content(&fields) {
-        apply_compose_fields(widgets, state, fields);
-        show_compose_view(widgets);
+    if !fields_has_content(&fields) {
+        if let Err(err) =
+            clear_recovery_draft_files(&widgets.draft_path, widgets.legacy_draft_path.as_deref())
+        {
+            report_draft_persistence_error(widgets, state, "Draft recovery clear failed", &err);
+        }
+        return;
+    }
+    apply_compose_fields(widgets, state, fields);
+    show_compose_view(widgets);
+    if let Some(err) = migration_error {
+        report_draft_persistence_error(
+            widgets,
+            state,
+            "Recovered draft, but legacy migration failed",
+            &err,
+        );
+    } else if migrated {
+        widgets.status_label.set_text(&format!(
+            "Recovered draft from {} (migrated from legacy cache)",
+            widgets.draft_path.display()
+        ));
+    } else {
         widgets
             .status_label
-            .set_text(&format!("Recovered draft from {}", path.display()));
+            .set_text(&format!("Recovered draft from {}", source_path.display()));
     }
 }
 
-fn clear_draft_file(path: &Path) -> anyhow::Result<()> {
-    if path.exists() {
-        std::fs::remove_file(path)?;
+fn remove_file_if_present(path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(anyhow::anyhow!("removing {}: {err}", path.display())),
+    }
+}
+
+fn clear_recovery_draft_files(path: &Path, legacy_path: Option<&Path>) -> anyhow::Result<()> {
+    let mut errors = Vec::new();
+    for path in std::iter::once(path).chain(legacy_path) {
+        if let Err(err) = remove_file_if_present(path) {
+            errors.push(format!("{}: {err}", path.display()));
+        }
+    }
+    if !errors.is_empty() {
+        anyhow::bail!("could not remove recovery draft: {}", errors.join("; "));
     }
     Ok(())
 }
@@ -7671,7 +7973,8 @@ fn apply_compose_fields(widgets: &Widgets, state: &SharedState, fields: ComposeF
     widgets.compose_body.buffer().set_text(&fields.body);
     move_compose_cursor_to_start(widgets);
     update_attachment_label(widgets, &fields.attachments);
-    state.borrow_mut().compose_fields = fields;
+    state.borrow_mut().compose_fields = fields.clone();
+    persist_recovery_draft_from_ui(widgets, state, &fields);
     update_draft_action_buttons(widgets, state);
 }
 
@@ -7698,9 +8001,11 @@ fn add_attachment_path(widgets: &Widgets, state: &SharedState, path: PathBuf) {
     }
     update_attachment_label(widgets, &fields.attachments);
     state.borrow_mut().compose_fields = fields.clone();
-    let _ = save_draft_fields(&widgets.draft_path, &fields);
+    let saved = persist_recovery_draft_from_ui(widgets, state, &fields);
     update_draft_action_buttons(widgets, state);
-    widgets.status_label.set_text("Attachment added to draft");
+    if saved {
+        widgets.status_label.set_text("Attachment added to draft");
+    }
 }
 
 fn update_attachment_label(widgets: &Widgets, attachments: &[String]) {
@@ -12076,9 +12381,10 @@ fn fill_composer(widgets: &Widgets, state: &SharedState, message: ComposedMessag
     }
     {
         let mut state = state.borrow_mut();
-        state.compose_fields = fields;
+        state.compose_fields = fields.clone();
         state.active_pane = ActivePane::Message;
     }
+    persist_recovery_draft_from_ui(widgets, state, &fields);
     if state.borrow().input_mode == InputMode::Insert {
         widgets.compose_to.grab_focus();
     } else {
@@ -12090,7 +12396,7 @@ fn cache_composer_attachments(attachments: &[AttachmentInput]) -> anyhow::Result
     if attachments.is_empty() {
         return Ok(Vec::new());
     }
-    let dir = default_attachment_cache_dir();
+    let dir = default_compose_attachment_dir();
     std::fs::create_dir_all(&dir)?;
     attachments
         .iter()
@@ -12105,18 +12411,14 @@ fn cache_composer_attachments(attachments: &[AttachmentInput]) -> anyhow::Result
                 Uuid::new_v4(),
                 safe_filename(&attachment.filename)
             ));
-            std::fs::write(&path, &attachment.bytes)?;
+            atomic_write_durable(&path, &attachment.bytes)?;
             Ok(path.display().to_string())
         })
         .collect()
 }
 
-fn default_attachment_cache_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .unwrap_or_else(|| PathBuf::from("target/notm-cache"));
-    base.join("notm/compose-attachments")
+fn default_compose_attachment_dir() -> PathBuf {
+    compose_state_path(&default_state_home(), "compose-attachments")
 }
 
 fn send_compose(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -12187,7 +12489,17 @@ fn send_compose(options: &LaunchOptions, widgets: &Widgets, state: &SharedState)
                         .status_label
                         .set_text(&format!("Send accepted; draft delete failed: {err}"));
                 }
-                let _ = clear_draft_file(&widgets.draft_path);
+                if let Err(err) = clear_recovery_draft_files(
+                    &widgets.draft_path,
+                    widgets.legacy_draft_path.as_deref(),
+                ) {
+                    report_draft_persistence_error(
+                        widgets,
+                        state,
+                        "Send accepted; draft recovery clear failed",
+                        &err,
+                    );
+                }
                 clear_draft_widgets(options, widgets, state);
             }
         }
@@ -13005,10 +13317,11 @@ fn handle_automation_request(
             Err(err) => json!({"ok": false, "error": err.to_string()}),
         },
         "list_drafts" => {
-            let drafts = list_named_drafts(&widgets.drafts_dir)
-                .into_iter()
-                .map(|(path, fields)| json!({"path": path, "fields": fields}))
-                .collect::<Vec<_>>();
+            let drafts =
+                list_named_drafts(&widgets.drafts_dir, widgets.legacy_drafts_dir.as_deref())
+                    .into_iter()
+                    .map(|(path, fields)| json!({"path": path, "fields": fields}))
+                    .collect::<Vec<_>>();
             json!({"ok": true, "drafts": drafts})
         }
         "select_draft_by_index" => {
@@ -13038,7 +13351,10 @@ fn handle_automation_request(
         }
         "clear_draft" => {
             clear_draft_widgets(options, widgets, state);
-            match clear_draft_file(&widgets.draft_path) {
+            match clear_recovery_draft_files(
+                &widgets.draft_path,
+                widgets.legacy_draft_path.as_deref(),
+            ) {
                 Ok(()) => json!({"ok": true, "compose_fields": state.borrow().compose_fields}),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),
             }
@@ -16440,6 +16756,156 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn compose_persistence_paths_use_the_xdg_state_layout() {
+        let state_home = xdg_home_path(
+            Some(OsStr::new("/tmp/notm-xdg-state")),
+            Some(OsStr::new("/tmp/notm-home")),
+            ".local/state",
+            "target/notm-state",
+        );
+        assert_eq!(state_home, PathBuf::from("/tmp/notm-xdg-state"));
+        assert_eq!(
+            compose_state_path(&state_home, "draft.json"),
+            PathBuf::from("/tmp/notm-xdg-state/notm/draft.json")
+        );
+        assert_eq!(
+            compose_state_path(&state_home, "drafts"),
+            PathBuf::from("/tmp/notm-xdg-state/notm/drafts")
+        );
+        assert_eq!(
+            compose_state_path(&state_home, "compose-attachments"),
+            PathBuf::from("/tmp/notm-xdg-state/notm/compose-attachments")
+        );
+        assert_eq!(
+            xdg_home_path(
+                Some(OsStr::new("")),
+                Some(OsStr::new("/tmp/notm-home")),
+                ".local/state",
+                "target/notm-state",
+            ),
+            PathBuf::from("/tmp/notm-home/.local/state")
+        );
+    }
+
+    #[test]
+    fn atomic_state_write_replaces_complete_file_without_temporary_artifacts() {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let path = directory.path().join("draft.json");
+        atomic_write(&path, b"old draft").expect("write initial draft");
+        atomic_write_durable(&path, b"complete replacement").expect("replace durable draft");
+
+        assert_eq!(
+            std::fs::read(&path).expect("read replaced draft"),
+            b"complete replacement"
+        );
+        let entries = std::fs::read_dir(directory.path())
+            .expect("list state directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read state entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path(), path);
+    }
+
+    #[test]
+    fn legacy_cache_recovery_is_migrated_without_changing_its_contents() {
+        let directory = tempfile::tempdir().expect("temporary draft directory");
+        let current = directory.path().join("state/notm/draft.json");
+        let legacy = directory.path().join("cache/notm/draft.json");
+        std::fs::create_dir_all(legacy.parent().expect("legacy parent"))
+            .expect("create legacy directory");
+        let bytes = br#"{"from":"Me","to":"you@example.test","cc":"","bcc":"","subject":"Legacy","body":"Body"}"#;
+        std::fs::write(&legacy, bytes).expect("write legacy draft");
+
+        assert!(migrate_legacy_recovery_draft(&current, &legacy).expect("migrate legacy draft"));
+        assert_eq!(std::fs::read(&current).expect("read migrated draft"), bytes);
+        assert!(!legacy.exists());
+        assert!(
+            !migrate_legacy_recovery_draft(&current, &legacy).expect("repeat migration is a no-op")
+        );
+    }
+
+    #[test]
+    fn empty_composer_removes_current_and_legacy_recovery_files() {
+        let directory = tempfile::tempdir().expect("temporary draft directory");
+        let current = directory.path().join("state/notm/draft.json");
+        let legacy = directory.path().join("cache/notm/draft.json");
+        let fields = ComposeFields {
+            subject: "Still editing".to_string(),
+            ..ComposeFields::default()
+        };
+        persist_recovery_draft(&current, Some(&legacy), &fields)
+            .expect("write current recovery draft");
+        std::fs::create_dir_all(legacy.parent().expect("legacy parent"))
+            .expect("create legacy directory");
+        std::fs::write(&legacy, b"legacy").expect("write stale legacy draft");
+
+        persist_recovery_draft(&current, Some(&legacy), &ComposeFields::default())
+            .expect("clear recovery drafts");
+
+        assert!(!current.exists());
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn named_drafts_migrate_from_cache_and_duplicate_fallback_rows_are_hidden() {
+        let directory = tempfile::tempdir().expect("temporary named draft directory");
+        let current = directory.path().join("state/notm/drafts");
+        let legacy = directory.path().join("cache/notm/drafts");
+        let existing = ComposeFields {
+            subject: "Existing".to_string(),
+            ..ComposeFields::default()
+        };
+        let legacy_only = ComposeFields {
+            subject: "Legacy only".to_string(),
+            ..ComposeFields::default()
+        };
+        std::fs::create_dir_all(&current).expect("create current drafts directory");
+        std::fs::create_dir_all(&legacy).expect("create legacy drafts directory");
+        let existing_bytes = serde_json::to_vec_pretty(&existing).expect("serialize draft");
+        std::fs::write(current.join("existing.json"), &existing_bytes)
+            .expect("write current draft");
+        std::fs::write(legacy.join("existing.json"), &existing_bytes)
+            .expect("write duplicate legacy draft");
+        std::fs::write(
+            legacy.join("legacy.json"),
+            serde_json::to_vec_pretty(&legacy_only).expect("serialize legacy draft"),
+        )
+        .expect("write legacy draft");
+
+        assert_eq!(
+            migrate_legacy_named_drafts(&current, &legacy).expect("migrate named drafts"),
+            1
+        );
+        assert!(!legacy.join("existing.json").exists());
+        assert!(!legacy.join("legacy.json").exists());
+        let migrated = list_named_drafts(&current, Some(&legacy));
+        assert_eq!(migrated.len(), 2);
+        assert!(
+            migrated
+                .iter()
+                .any(|(_, fields)| fields.subject == "Legacy only")
+        );
+
+        std::fs::write(
+            legacy.join("legacy.json"),
+            serde_json::to_vec_pretty(&legacy_only).expect("serialize fallback draft"),
+        )
+        .expect("write duplicate fallback draft");
+        assert_eq!(list_named_drafts(&current, Some(&legacy)).len(), 2);
+    }
+
+    #[test]
+    fn successful_autosave_clears_only_transient_autosave_errors() {
+        let mut last_error = Some("Draft autosave failed: temporary error".to_string());
+        assert!(clear_transient_autosave_error(&mut last_error));
+        assert_eq!(last_error, None);
+
+        let mut last_error = Some("Send failed: permanent error".to_string());
+        assert!(!clear_transient_autosave_error(&mut last_error));
+        assert_eq!(last_error.as_deref(), Some("Send failed: permanent error"));
     }
 
     #[test]
