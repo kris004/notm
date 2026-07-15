@@ -509,6 +509,8 @@ struct Widgets {
     draft_list: gtk::ListBox,
     drafts_dir: PathBuf,
     legacy_drafts_dir: Option<PathBuf>,
+    standalone_windows: Rc<RefCell<Vec<Rc<StandaloneMessageWindow>>>>,
+    standalone_next_id: Rc<Cell<u64>>,
 }
 
 type SharedState = Rc<RefCell<UiState>>;
@@ -573,6 +575,96 @@ enum MessageViewKind {
     Html,
     Headers,
     Raw,
+}
+
+#[derive(Debug, Clone)]
+struct StandaloneMessageState {
+    messages: Vec<notm_notmuch::MessageSummary>,
+    selected_index: usize,
+    view: MessageViewKind,
+    collapse_quotes: bool,
+    image_policy: ImagePolicy,
+}
+
+struct StandaloneMessageWindow {
+    id: u64,
+    window: gtk::ApplicationWindow,
+    response_menu_button: gtk::MenuButton,
+    response_menu_box: gtk::Box,
+    reply_button: gtk::Button,
+    reply_all_button: gtk::Button,
+    forward_button: gtk::Button,
+    forward_attachment_button: gtk::Button,
+    message_menu_button: gtk::MenuButton,
+    message_menu_box: gtk::Box,
+    view_menu_button: gtk::MenuButton,
+    view_menu_box: gtk::Box,
+    view_text_button: gtk::Button,
+    view_html_button: gtk::Button,
+    view_headers_button: gtk::Button,
+    view_raw_button: gtk::Button,
+    html_policy_row: gtk::Box,
+    html_policy_label: gtk::Label,
+    image_policy_button: gtk::Button,
+    collapse_quotes_button: gtk::Button,
+    message_header_box: gtk::Box,
+    message_stack: gtk::Stack,
+    text_view: gtk::TextView,
+    text_scrolled: gtk::ScrolledWindow,
+    html_view: webkit6::WebView,
+    status_label: gtk::Label,
+    copy_menu_button: gtk::MenuButton,
+    copy_menu_box: gtk::Box,
+    copy_message_id_button: gtk::Button,
+    copy_thread_id_button: gtk::Button,
+    copy_from_email_button: gtk::Button,
+    copy_to_email_button: gtk::Button,
+    copy_cc_email_button: gtk::Button,
+    copy_subject_button: gtk::Button,
+    state: RefCell<StandaloneMessageState>,
+}
+
+#[derive(Clone)]
+struct StandaloneShortcutState {
+    pending_go: Rc<Cell<bool>>,
+    pending_response: Rc<Cell<bool>>,
+    pending_view: Rc<Cell<bool>>,
+    pending_copy: Rc<Cell<bool>>,
+}
+
+impl StandaloneShortcutState {
+    fn new() -> Self {
+        Self {
+            pending_go: Rc::new(Cell::new(false)),
+            pending_response: Rc::new(Cell::new(false)),
+            pending_view: Rc::new(Cell::new(false)),
+            pending_copy: Rc::new(Cell::new(false)),
+        }
+    }
+
+    fn clear(&self) {
+        self.pending_go.set(false);
+        self.pending_response.set(false);
+        self.pending_view.set(false);
+        self.pending_copy.set(false);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StandaloneResponseAction {
+    Reply(ReplyKind),
+    Forward,
+    ForwardAttachment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StandaloneCopyField {
+    MessageId,
+    ThreadId,
+    From,
+    To,
+    Cc,
+    Subject,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1539,6 +1631,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle 
         draft_list,
         drafts_dir,
         legacy_drafts_dir,
+        standalone_windows: Rc::new(RefCell::new(Vec::new())),
+        standalone_next_id: Rc::new(Cell::new(1)),
     };
     apply_content_layout(&widgets, &state, initial_layout, false);
     apply_initial_pane_visibility(&options, &widgets, &state);
@@ -4392,6 +4486,7 @@ fn set_pane_visibility(widgets: &Widgets, state: &SharedState, pane: ActivePane,
         ensure_active_pane_visible(widgets, state);
     }
     update_active_pane_visuals(widgets, state);
+    update_button_binding_labels(widgets, state);
     widgets.status_label.set_text(&format!(
         "{} {}",
         pane_display_name(pane),
@@ -4937,8 +5032,21 @@ fn vim_scroll_to_edge(widgets: &Widgets, state: &SharedState, bottom: bool) {
 }
 
 fn scroll_html_view_lines(widgets: &Widgets, lines: f64) {
-    evaluate_html_scroll_script(
-        widgets,
+    scroll_web_view_lines(&widgets.html_view, &widgets.status_label, lines);
+}
+
+fn scroll_html_view_pages(widgets: &Widgets, pages: f64) {
+    scroll_web_view_pages(&widgets.html_view, &widgets.status_label, pages);
+}
+
+fn scroll_html_view_to_edge(widgets: &Widgets, bottom: bool) {
+    scroll_web_view_to_edge(&widgets.html_view, &widgets.status_label, bottom);
+}
+
+fn scroll_web_view_lines(view: &webkit6::WebView, status_label: &gtk::Label, lines: f64) {
+    evaluate_web_view_scroll_script(
+        view,
+        status_label,
         &format!(
             "const e = document.scrollingElement || document.documentElement || document.body; \
              e.scrollBy(0, {}); \
@@ -4948,9 +5056,10 @@ fn scroll_html_view_lines(widgets: &Widgets, lines: f64) {
     );
 }
 
-fn scroll_html_view_pages(widgets: &Widgets, pages: f64) {
-    evaluate_html_scroll_script(
-        widgets,
+fn scroll_web_view_pages(view: &webkit6::WebView, status_label: &gtk::Label, pages: f64) {
+    evaluate_web_view_scroll_script(
+        view,
+        status_label,
         &format!(
             "const e = document.scrollingElement || document.documentElement || document.body; \
              e.scrollBy(0, Math.round(window.innerHeight * {})); \
@@ -4960,10 +5069,11 @@ fn scroll_html_view_pages(widgets: &Widgets, pages: f64) {
     );
 }
 
-fn scroll_html_view_to_edge(widgets: &Widgets, bottom: bool) {
+fn scroll_web_view_to_edge(view: &webkit6::WebView, status_label: &gtk::Label, bottom: bool) {
     let target = if bottom { "e.scrollHeight" } else { "0" };
-    evaluate_html_scroll_script(
-        widgets,
+    evaluate_web_view_scroll_script(
+        view,
+        status_label,
         &format!(
             "const e = document.scrollingElement || document.documentElement || document.body; \
              e.scrollTo(0, {target}); \
@@ -5051,9 +5161,13 @@ fn restore_html_scroll_fraction(widgets: &Widgets, fraction: f64) {
     });
 }
 
-fn evaluate_html_scroll_script(widgets: &Widgets, script: &str) {
-    let status = widgets.status_label.clone();
-    widgets.html_view.evaluate_javascript(
+fn evaluate_web_view_scroll_script(
+    view: &webkit6::WebView,
+    status_label: &gtk::Label,
+    script: &str,
+) {
+    let status = status_label.clone();
+    view.evaluate_javascript(
         script,
         Some("notm-scroll"),
         Some("notm://scroll"),
@@ -5556,7 +5670,16 @@ fn set_menu_button_label(widget: &gtk::MenuButton, base: &str, binding: &str, st
     widget.set_label(&button_label(base, binding, state));
 }
 
+fn message_pane_shortcuts_available(widgets: &Widgets) -> bool {
+    pane_is_visible(widgets, ActivePane::Message)
+}
+
+fn visible_binding(visible: bool, binding: &'static str) -> &'static str {
+    if visible { binding } else { "" }
+}
+
 fn update_button_binding_labels(widgets: &Widgets, state: &SharedState) {
+    let message_bindings = message_pane_shortcuts_available(widgets);
     set_button_label(&widgets.compose_button, "Compose", "c", state);
     set_button_label(&widgets.debug_button, "Debug", "d", state);
     set_button_label(&widgets.palette_button, "Commands", "Ctrl+K", state);
@@ -5581,51 +5704,121 @@ fn update_button_binding_labels(widgets: &Widgets, state: &SharedState) {
     set_menu_button_label(&widgets.undo_tag_button, "Undo", "z", state);
     set_button_label(&widgets.undo_last_tag_button, "Undo last", "z z", state);
     set_button_label(&widgets.undo_list_tag_button, "Undo multiple", "z m", state);
-    set_menu_button_label(&widgets.response_menu_button, "Respond", "r", state);
-    set_button_label(&widgets.reply_button, "Reply", "r r", state);
-    set_button_label(&widgets.reply_all_button, "Reply all", "r a", state);
-    set_button_label(&widgets.forward_button, "Forward", "r f", state);
+    set_menu_button_label(
+        &widgets.response_menu_button,
+        "Respond",
+        visible_binding(message_bindings, "r"),
+        state,
+    );
+    set_button_label(
+        &widgets.reply_button,
+        "Reply",
+        visible_binding(message_bindings, "r r"),
+        state,
+    );
+    set_button_label(
+        &widgets.reply_all_button,
+        "Reply all",
+        visible_binding(message_bindings, "r a"),
+        state,
+    );
+    set_button_label(
+        &widgets.forward_button,
+        "Forward",
+        visible_binding(message_bindings, "r f"),
+        state,
+    );
     set_button_label(
         &widgets.forward_attachment_button,
         "Forward attached",
-        "r A",
+        visible_binding(message_bindings, "r A"),
         state,
     );
-    set_menu_button_label(&widgets.view_menu_button, "View", "V", state);
-    set_button_label(&widgets.view_text_button, "Text", "V t", state);
-    set_button_label(&widgets.view_html_button, "Visual HTML", "V v", state);
-    set_button_label(&widgets.view_headers_button, "Full headers", "V h", state);
-    set_button_label(&widgets.view_raw_button, "Raw source", "V r", state);
+    set_menu_button_label(
+        &widgets.view_menu_button,
+        "View",
+        visible_binding(message_bindings, "V"),
+        state,
+    );
+    set_button_label(
+        &widgets.view_text_button,
+        "Text",
+        visible_binding(message_bindings, "V t"),
+        state,
+    );
+    set_button_label(
+        &widgets.view_html_button,
+        "Visual HTML",
+        visible_binding(message_bindings, "V v"),
+        state,
+    );
+    set_button_label(
+        &widgets.view_headers_button,
+        "Full headers",
+        visible_binding(message_bindings, "V h"),
+        state,
+    );
+    set_button_label(
+        &widgets.view_raw_button,
+        "Raw source",
+        visible_binding(message_bindings, "V r"),
+        state,
+    );
     set_button_label(
         &widgets.collapse_quotes_button,
         "Collapse quotes",
-        "q",
+        visible_binding(message_bindings, "q"),
         state,
     );
-    set_menu_button_label(&widgets.copy_menu_button, "Copy", "y", state);
+    set_menu_button_label(
+        &widgets.copy_menu_button,
+        "Copy",
+        visible_binding(message_bindings, "y"),
+        state,
+    );
     set_button_label(
         &widgets.copy_message_id_button,
         "Copy message id",
-        "y m",
+        visible_binding(message_bindings, "y m"),
         state,
     );
     set_button_label(
         &widgets.copy_thread_id_button,
         "Copy thread id",
-        "y t",
+        visible_binding(message_bindings, "y t"),
         state,
     );
     set_button_label(
         &widgets.copy_from_email_button,
         "Copy from email",
-        "y f",
+        visible_binding(message_bindings, "y f"),
         state,
     );
-    set_button_label(&widgets.copy_to_email_button, "Copy to email", "y o", state);
-    set_button_label(&widgets.copy_cc_email_button, "Copy cc email", "y c", state);
-    set_button_label(&widgets.copy_subject_button, "Copy subject", "y s", state);
+    set_button_label(
+        &widgets.copy_to_email_button,
+        "Copy to email",
+        visible_binding(message_bindings, "y o"),
+        state,
+    );
+    set_button_label(
+        &widgets.copy_cc_email_button,
+        "Copy cc email",
+        visible_binding(message_bindings, "y c"),
+        state,
+    );
+    set_button_label(
+        &widgets.copy_subject_button,
+        "Copy subject",
+        visible_binding(message_bindings, "y s"),
+        state,
+    );
     let image_base = strip_binding_suffix(&widgets.image_policy_button.label().unwrap_or_default());
-    set_button_label(&widgets.image_policy_button, &image_base, "I", state);
+    set_button_label(
+        &widgets.image_policy_button,
+        &image_base,
+        visible_binding(message_bindings, "I"),
+        state,
+    );
     set_button_label(
         &widgets.add_attachment_button,
         "Add attachment…",
@@ -6071,6 +6264,11 @@ fn install_shortcuts(
             };
         }
         if *pending_response.borrow() {
+            if !message_pane_shortcuts_available(&w) {
+                *pending_response.borrow_mut() = false;
+                w.response_menu_button.popdown();
+                return gtk::glib::Propagation::Proceed;
+            }
             *pending_response.borrow_mut() = false;
             w.response_menu_button.popdown();
             clear_numeric_prefix(&numeric_prefix);
@@ -6096,6 +6294,11 @@ fn install_shortcuts(
             };
         }
         if *pending_view.borrow() {
+            if !message_pane_shortcuts_available(&w) {
+                *pending_view.borrow_mut() = false;
+                w.view_menu_button.popdown();
+                return gtk::glib::Propagation::Proceed;
+            }
             *pending_view.borrow_mut() = false;
             w.view_menu_button.popdown();
             clear_numeric_prefix(&numeric_prefix);
@@ -6127,6 +6330,11 @@ fn install_shortcuts(
             };
         }
         if *pending_copy.borrow() {
+            if !message_pane_shortcuts_available(&w) {
+                *pending_copy.borrow_mut() = false;
+                w.copy_menu_button.popdown();
+                return gtk::glib::Propagation::Proceed;
+            }
             *pending_copy.borrow_mut() = false;
             w.copy_menu_button.popdown();
             clear_numeric_prefix(&numeric_prefix);
@@ -6346,7 +6554,7 @@ fn install_shortcuts(
             w.status_label
                 .set_text("Tag: t add/remove tag, m tag multiple");
             true
-        } else if key == gtk::gdk::Key::r {
+        } else if key == gtk::gdk::Key::r && message_pane_shortcuts_available(&w) {
             clear_numeric_prefix(&numeric_prefix);
             *pending_response.borrow_mut() = true;
             w.response_menu_button.popup();
@@ -6400,25 +6608,25 @@ fn install_shortcuts(
             } else {
                 false
             }
-        } else if key == gtk::gdk::Key::V {
+        } else if key == gtk::gdk::Key::V && message_pane_shortcuts_available(&w) {
             clear_numeric_prefix(&numeric_prefix);
             *pending_view.borrow_mut() = true;
             w.view_menu_button.popup();
             w.status_label
                 .set_text("View: t text, v visual HTML, h headers, r raw source");
             true
-        } else if key == gtk::gdk::Key::q {
+        } else if key == gtk::gdk::Key::q && message_pane_shortcuts_available(&w) {
             clear_numeric_prefix(&numeric_prefix);
             toggle_quote_collapse(&opts, &w, &st);
             true
-        } else if key == gtk::gdk::Key::y {
+        } else if key == gtk::gdk::Key::y && message_pane_shortcuts_available(&w) {
             clear_numeric_prefix(&numeric_prefix);
             *pending_copy.borrow_mut() = true;
             w.copy_menu_button.popup();
             w.status_label
                 .set_text("Copy: m message id, t thread id, f from, o to, c cc, s subject");
             true
-        } else if key == gtk::gdk::Key::I {
+        } else if key == gtk::gdk::Key::I && message_pane_shortcuts_available(&w) {
             clear_numeric_prefix(&numeric_prefix);
             activate_image_policy_button(&opts, &w, &st);
             true
@@ -6490,6 +6698,11 @@ fn connect_dropdown_sequence_keys(
     let st = state.clone();
     let pending = pending_response.clone();
     controller.connect_key_pressed(move |_, key, _, _| {
+        if !message_pane_shortcuts_available(&w) {
+            *pending.borrow_mut() = false;
+            w.response_menu_button.popdown();
+            return gtk::glib::Propagation::Proceed;
+        }
         let handled = if key == gtk::gdk::Key::r {
             reply_selected(&opts, &w, &st, ReplyKind::Sender);
             true
@@ -6522,6 +6735,11 @@ fn connect_dropdown_sequence_keys(
     let st = state.clone();
     let pending = pending_view.clone();
     controller.connect_key_pressed(move |_, key, _, _| {
+        if !message_pane_shortcuts_available(&w) {
+            *pending.borrow_mut() = false;
+            w.view_menu_button.popdown();
+            return gtk::glib::Propagation::Proceed;
+        }
         let handled = if key == gtk::gdk::Key::t {
             let scroll = current_message_scroll_fraction(&w);
             st.borrow_mut().prefer_html_view = false;
@@ -6559,6 +6777,11 @@ fn connect_dropdown_sequence_keys(
     let st = state.clone();
     let pending = pending_copy;
     controller.connect_key_pressed(move |_, key, _, _| {
+        if !message_pane_shortcuts_available(&w) {
+            *pending.borrow_mut() = false;
+            w.copy_menu_button.popdown();
+            return gtk::glib::Propagation::Proceed;
+        }
         let handled = if key == gtk::gdk::Key::m {
             copy_selected_message_id(&w, &st);
             true
@@ -8508,13 +8731,20 @@ fn render_selected_message_text(widgets: &Widgets, state: &SharedState) -> anyho
         .selected_message
         .clone()
         .ok_or_else(|| anyhow::anyhow!("no selected message"))?;
+    render_message_text(&message, widgets.quote_collapse.get())
+}
+
+fn render_message_text(
+    message: &notm_notmuch::MessageSummary,
+    collapse_quotes: bool,
+) -> anyhow::Result<String> {
     let mut rendered = String::new();
     if let Some(path) = message.filenames.first() {
         match parse_file(path) {
             Ok(parsed) => {
                 rendered.push_str(&render_body_with_quote_collapse(
                     &parsed.safe_body,
-                    widgets.quote_collapse.get(),
+                    collapse_quotes,
                 ));
                 if !parsed.decode_warnings.is_empty() {
                     if !rendered.is_empty() {
@@ -8821,13 +9051,25 @@ fn compose_view_is_visible(widgets: &Widgets) -> bool {
 }
 
 fn html_view_images_allowed(widgets: &Widgets) -> bool {
-    WebViewExt::settings(&widgets.html_view)
+    webkit_view_images_allowed(&widgets.html_view)
+}
+
+fn webkit_view_images_allowed(view: &webkit6::WebView) -> bool {
+    WebViewExt::settings(view)
         .map(|settings| settings.is_auto_load_images())
         .unwrap_or(false)
 }
 
 fn selected_message_has_html(state: &SharedState) -> bool {
-    selected_message_filename(state)
+    state
+        .borrow()
+        .selected_message
+        .as_ref()
+        .is_some_and(message_has_html)
+}
+
+fn message_has_html(message: &notm_notmuch::MessageSummary) -> bool {
+    message_filename(message)
         .and_then(parse_file)
         .ok()
         .and_then(|parsed| parsed.html_body)
@@ -9007,6 +9249,14 @@ fn selected_message_filename(state: &SharedState) -> anyhow::Result<String> {
         .as_ref()
         .and_then(|message| message.filenames.first().cloned())
         .ok_or_else(|| anyhow::anyhow!("selected message has no file"))
+}
+
+fn message_filename(message: &notm_notmuch::MessageSummary) -> anyhow::Result<String> {
+    message
+        .filenames
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("message has no file"))
 }
 
 fn selected_message_is_draft(options: &LaunchOptions, state: &SharedState) -> bool {
@@ -9265,7 +9515,7 @@ fn navigation_decision_uri(decision: &webkit6::PolicyDecision) -> Option<String>
     request.uri().map(|uri| uri.to_string())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImagePolicy {
     Config,
     Once,
@@ -9286,33 +9536,13 @@ fn show_visual_html_with_image_policy(
     state: &SharedState,
     image_policy: ImagePolicy,
 ) {
-    let result = (|| -> anyhow::Result<(String, String, bool, Option<String>, usize)> {
-        let sender = selected_sender_email(state);
-        if matches!(image_policy, ImagePolicy::TrustSender) {
-            let sender = sender
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("selected message sender could not be parsed"))?;
-            trust_image_sender(options, state, &sender)?;
-        }
-        let allow_remote_images = match image_policy {
-            ImagePolicy::Config => selected_message_allows_images(options, state),
-            ImagePolicy::Once | ImagePolicy::TrustSender => true,
-        };
-        let filename = selected_message_filename(state)?;
-        let parsed = parse_file(filename)?;
-        let decode_warning_count = parsed.decode_warnings.len();
-        let html = parsed
-            .html_body
-            .ok_or_else(|| anyhow::anyhow!("selected message has no HTML body"))?;
-        let sanitized = sanitize_html_for_visual(&html, allow_remote_images);
-        Ok((
-            visual_html_document(&sanitized),
-            html,
-            allow_remote_images,
-            sender,
-            decode_warning_count,
-        ))
-    })();
+    let result = {
+        let message = state.borrow().selected_message.clone();
+        (|| -> anyhow::Result<(String, String, bool, Option<String>, usize)> {
+            let message = message.ok_or_else(|| anyhow::anyhow!("no selected message"))?;
+            render_visual_html_for_message(options, state, &message, image_policy)
+        })()
+    };
     match result {
         Ok((document, original_html, allow_remote_images, sender, decode_warning_count)) => {
             set_html_image_loading(&widgets.html_view, allow_remote_images);
@@ -9349,6 +9579,39 @@ fn show_visual_html_with_image_policy(
     }
     update_message_action_buttons(options, widgets, state);
     update_debug(widgets, state);
+}
+
+fn render_visual_html_for_message(
+    options: &LaunchOptions,
+    state: &SharedState,
+    message: &notm_notmuch::MessageSummary,
+    image_policy: ImagePolicy,
+) -> anyhow::Result<(String, String, bool, Option<String>, usize)> {
+    let sender = message_sender_email(message);
+    if matches!(image_policy, ImagePolicy::TrustSender) {
+        let sender = sender
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("selected message sender could not be parsed"))?;
+        trust_image_sender(options, state, &sender)?;
+    }
+    let allow_remote_images = match image_policy {
+        ImagePolicy::Config => message_allows_images(options, state, message),
+        ImagePolicy::Once | ImagePolicy::TrustSender => true,
+    };
+    let filename = message_filename(message)?;
+    let parsed = parse_file(filename)?;
+    let decode_warning_count = parsed.decode_warnings.len();
+    let html = parsed
+        .html_body
+        .ok_or_else(|| anyhow::anyhow!("selected message has no HTML body"))?;
+    let sanitized = sanitize_html_for_visual(&html, allow_remote_images);
+    Ok((
+        visual_html_document(&sanitized),
+        html,
+        allow_remote_images,
+        sender,
+        decode_warning_count,
+    ))
 }
 
 fn set_html_image_loading(view: &webkit6::WebView, allow_remote_images: bool) {
@@ -9390,10 +9653,11 @@ fn html_status_text(
 }
 
 fn selected_message_allows_images(options: &LaunchOptions, state: &SharedState) -> bool {
-    runtime_remote_images(options)
-        || selected_sender_email(state)
-            .as_deref()
-            .is_some_and(|sender| image_sender_is_trusted(state, sender))
+    state
+        .borrow()
+        .selected_message
+        .as_ref()
+        .is_some_and(|message| message_allows_images(options, state, message))
 }
 
 fn selected_sender_email(state: &SharedState) -> Option<String> {
@@ -9401,7 +9665,22 @@ fn selected_sender_email(state: &SharedState) -> Option<String> {
         .borrow()
         .selected_message
         .as_ref()
-        .and_then(|message| sender_email_from_header(&message.from))
+        .and_then(message_sender_email)
+}
+
+fn message_allows_images(
+    options: &LaunchOptions,
+    state: &SharedState,
+    message: &notm_notmuch::MessageSummary,
+) -> bool {
+    runtime_remote_images(options)
+        || message_sender_email(message)
+            .as_deref()
+            .is_some_and(|sender| image_sender_is_trusted(state, sender))
+}
+
+fn message_sender_email(message: &notm_notmuch::MessageSummary) -> Option<String> {
+    sender_email_from_header(&message.from)
 }
 
 fn sender_email_from_header(value: &str) -> Option<String> {
@@ -11197,25 +11476,50 @@ fn open_thread_by_index(
     let Some(thread) = state.borrow().thread_list_items.get(index).cloned() else {
         return;
     };
-    let result = (|| -> anyhow::Result<()> {
+    let destination = thread_open_destination(pane_is_visible(widgets, ActivePane::Message));
+    let result = (|| -> anyhow::Result<(Vec<notm_notmuch::MessageSummary>, usize)> {
         let db = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
         let messages = db.thread_messages(&thread.thread_id)?;
+        let selected_index = messages.len().saturating_sub(1);
         {
             let mut s = state.borrow_mut();
             s.selected_thread = Some(thread.clone());
             s.selected_message = messages.last().cloned();
-            s.messages = messages;
-            s.active_pane = ActivePane::Message;
+            s.messages = messages.clone();
+            s.active_pane = match destination {
+                ThreadOpenDestination::InlinePane => ActivePane::Message,
+                ThreadOpenDestination::StandaloneWindow => ActivePane::Threads,
+            };
             s.last_operation = Some(format!("opened thread {}", thread.thread_id));
             s.last_error = None;
         }
-        Ok(())
+        Ok((messages, selected_index))
     })();
     match result {
-        Ok(()) => {
+        Ok((messages, selected_index)) => {
             refresh_thread_attachment_list(widgets, state);
             update_message_menu(options, widgets, state);
-            if selected_message_is_draft(options, state) {
+            if destination == ThreadOpenDestination::StandaloneWindow {
+                match open_standalone_message_window(
+                    options,
+                    widgets,
+                    state,
+                    messages,
+                    selected_index,
+                ) {
+                    Ok(()) => widgets.status_label.set_text(&message_position_status(
+                        state,
+                        index,
+                        "Opened in new window",
+                    )),
+                    Err(err) => {
+                        state.borrow_mut().last_error = Some(err.to_string());
+                        widgets
+                            .status_label
+                            .set_text(&format!("Open message window failed: {err}"));
+                    }
+                }
+            } else if selected_message_is_draft(options, state) {
                 match open_selected_draft_message(widgets, state) {
                     Ok(()) => widgets.status_label.set_text(&message_position_status(
                         state,
@@ -11247,6 +11551,1236 @@ fn open_thread_by_index(
     update_custom_tag_controls(widgets, state);
     update_active_pane_visuals(widgets, state);
     update_debug(widgets, state);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadOpenDestination {
+    InlinePane,
+    StandaloneWindow,
+}
+
+fn thread_open_destination(message_pane_visible: bool) -> ThreadOpenDestination {
+    if message_pane_visible {
+        ThreadOpenDestination::InlinePane
+    } else {
+        ThreadOpenDestination::StandaloneWindow
+    }
+}
+
+fn open_standalone_message_window(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    messages: Vec<notm_notmuch::MessageSummary>,
+    selected_index: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(!messages.is_empty(), "thread has no messages");
+    let selected_index = selected_index.min(messages.len() - 1);
+    let message = messages[selected_index].clone();
+    let app = widgets
+        .window
+        .application()
+        .ok_or_else(|| anyhow::anyhow!("main window is not attached to an application"))?;
+    let id = widgets.standalone_next_id.get();
+    widgets
+        .standalone_next_id
+        .set(id.checked_add(1).unwrap_or(1));
+    let window = gtk::ApplicationWindow::builder()
+        .application(&app)
+        .title(standalone_message_window_title(&message))
+        .default_width(900)
+        .default_height(760)
+        .build();
+    window.set_widget_name("notm-message-window");
+
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    root.set_margin_start(10);
+    root.set_margin_end(10);
+    root.set_margin_top(10);
+    root.set_margin_bottom(10);
+
+    let action_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    action_row.set_widget_name("notm-message-window-actions");
+    action_row.set_halign(gtk::Align::Start);
+
+    let (response_menu_button, response_menu_box) =
+        menu_button_with_box("Respond", "notm-message-window-response-menu-button", state);
+    let reply_button = gtk::Button::with_label("Reply");
+    reply_button.set_widget_name("notm-message-window-reply-button");
+    let reply_all_button = gtk::Button::with_label("Reply all");
+    reply_all_button.set_widget_name("notm-message-window-reply-all-button");
+    let forward_button = gtk::Button::with_label("Forward");
+    forward_button.set_widget_name("notm-message-window-forward-button");
+    let forward_attachment_button = gtk::Button::with_label("Forward attached");
+    forward_attachment_button.set_widget_name("notm-message-window-forward-attachment-button");
+    for button in [
+        &reply_button,
+        &reply_all_button,
+        &forward_button,
+        &forward_attachment_button,
+    ] {
+        response_menu_box.append(button);
+    }
+
+    let (message_menu_button, message_menu_box) =
+        menu_button_with_box("Message", "notm-message-window-message-menu-button", state);
+    let (view_menu_button, view_menu_box) =
+        menu_button_with_box("View", "notm-message-window-view-menu-button", state);
+    let view_text_button = gtk::Button::with_label("Text");
+    view_text_button.set_widget_name("notm-message-window-view-text-button");
+    let view_html_button = gtk::Button::with_label("Visual HTML");
+    view_html_button.set_widget_name("notm-message-window-view-html-button");
+    let view_headers_button = gtk::Button::with_label("Full headers");
+    view_headers_button.set_widget_name("notm-message-window-view-headers-button");
+    let view_raw_button = gtk::Button::with_label("Raw source");
+    view_raw_button.set_widget_name("notm-message-window-view-raw-button");
+    for button in [
+        &view_text_button,
+        &view_html_button,
+        &view_headers_button,
+        &view_raw_button,
+    ] {
+        view_menu_box.append(button);
+    }
+    let collapse_quotes_button = gtk::Button::with_label("Collapse quotes");
+    collapse_quotes_button.set_widget_name("notm-message-window-collapse-quotes-button");
+
+    let (copy_menu_button, copy_menu_box) =
+        menu_button_with_box("Copy", "notm-message-window-copy-menu-button", state);
+    let copy_message_id_button = gtk::Button::with_label("Copy message id");
+    copy_message_id_button.set_widget_name("notm-message-window-copy-message-id-button");
+    let copy_thread_id_button = gtk::Button::with_label("Copy thread id");
+    copy_thread_id_button.set_widget_name("notm-message-window-copy-thread-id-button");
+    let copy_from_email_button = gtk::Button::with_label("Copy from email");
+    copy_from_email_button.set_widget_name("notm-message-window-copy-from-email-button");
+    let copy_to_email_button = gtk::Button::with_label("Copy to email");
+    copy_to_email_button.set_widget_name("notm-message-window-copy-to-email-button");
+    let copy_cc_email_button = gtk::Button::with_label("Copy cc email");
+    copy_cc_email_button.set_widget_name("notm-message-window-copy-cc-email-button");
+    let copy_subject_button = gtk::Button::with_label("Copy subject");
+    copy_subject_button.set_widget_name("notm-message-window-copy-subject-button");
+    for button in [
+        &copy_message_id_button,
+        &copy_thread_id_button,
+        &copy_from_email_button,
+        &copy_to_email_button,
+        &copy_cc_email_button,
+        &copy_subject_button,
+    ] {
+        copy_menu_box.append(button);
+    }
+
+    action_row.append(&response_menu_button);
+    action_row.append(&message_menu_button);
+    action_row.append(&view_menu_button);
+    action_row.append(&collapse_quotes_button);
+    action_row.append(&copy_menu_button);
+    root.append(&action_row);
+
+    let image_policy_button = gtk::Button::with_label("Load images once");
+    image_policy_button.set_widget_name("notm-message-window-image-policy-button");
+    let html_policy_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    html_policy_row.set_widget_name("notm-message-window-html-policy-row");
+    html_policy_row.set_visible(false);
+    let html_policy_label = gtk::Label::new(None);
+    html_policy_label.set_xalign(0.0);
+    html_policy_label.set_wrap(true);
+    html_policy_label.set_hexpand(true);
+    html_policy_label.add_css_class("dim-label");
+    image_policy_button.set_halign(gtk::Align::End);
+    html_policy_row.append(&html_policy_label);
+    html_policy_row.append(&image_policy_button);
+    root.append(&html_policy_row);
+
+    let message_header_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    message_header_box.set_widget_name("notm-message-window-header");
+    root.append(&message_header_box);
+
+    let text_view = gtk::TextView::new();
+    text_view.set_widget_name("notm-message-window-text");
+    text_view.set_editable(false);
+    text_view.set_cursor_visible(false);
+    text_view.set_wrap_mode(gtk::WrapMode::WordChar);
+    let text_scrolled = gtk::ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .child(&text_view)
+        .build();
+
+    let status_label = gtk::Label::new(Some("Ready"));
+    configure_status_label(&status_label);
+    let html_view = webkit6::WebView::new();
+    html_view.set_widget_name("notm-message-window-html");
+    html_view.set_hexpand(true);
+    html_view.set_vexpand(true);
+    configure_html_webview(&html_view, runtime_remote_images(options));
+    connect_html_navigation_policy(&html_view, &status_label);
+    connect_html_hover_status(&html_view, &status_label);
+    let html_scrolled = gtk::ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .child(&html_view)
+        .build();
+
+    let message_stack = gtk::Stack::new();
+    message_stack.set_widget_name("notm-message-window-stack");
+    message_stack.set_hexpand(true);
+    message_stack.set_vexpand(true);
+    message_stack.set_hhomogeneous(false);
+    message_stack.set_vhomogeneous(false);
+    message_stack.add_named(&text_scrolled, Some("text"));
+    message_stack.add_named(&html_scrolled, Some("html"));
+    message_stack.set_visible_child_name("text");
+    root.append(&message_stack);
+    root.append(&status_label);
+    window.set_child(Some(&root));
+
+    let initial_view = if state.borrow().prefer_html_view && message_has_html(&message) {
+        MessageViewKind::Html
+    } else {
+        MessageViewKind::Text
+    };
+    let standalone = Rc::new(StandaloneMessageWindow {
+        id,
+        window: window.clone(),
+        response_menu_button,
+        response_menu_box,
+        reply_button,
+        reply_all_button,
+        forward_button,
+        forward_attachment_button,
+        message_menu_button,
+        message_menu_box,
+        view_menu_button,
+        view_menu_box,
+        view_text_button,
+        view_html_button,
+        view_headers_button,
+        view_raw_button,
+        html_policy_row,
+        html_policy_label,
+        image_policy_button,
+        collapse_quotes_button,
+        message_header_box,
+        message_stack,
+        text_view,
+        text_scrolled,
+        html_view,
+        status_label,
+        copy_menu_button,
+        copy_menu_box,
+        copy_message_id_button,
+        copy_thread_id_button,
+        copy_from_email_button,
+        copy_to_email_button,
+        copy_cc_email_button,
+        copy_subject_button,
+        state: RefCell::new(StandaloneMessageState {
+            messages,
+            selected_index,
+            view: initial_view,
+            collapse_quotes: widgets.quote_collapse.get(),
+            image_policy: ImagePolicy::Config,
+        }),
+    });
+
+    widgets
+        .standalone_windows
+        .borrow_mut()
+        .push(standalone.clone());
+    let windows = widgets.standalone_windows.clone();
+    window.connect_close_request(move |_| {
+        windows
+            .borrow_mut()
+            .retain(|standalone| standalone.id != id);
+        gtk::glib::Propagation::Proceed
+    });
+    connect_standalone_message_window_actions(options, widgets, state, &standalone);
+    connect_standalone_message_window_shortcuts(options, widgets, state, &standalone);
+    populate_standalone_message_menu(options, state, &standalone);
+    show_standalone_message_view(options, state, &standalone, initial_view);
+    window.present();
+    Ok(())
+}
+
+fn connect_standalone_message_window_actions(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    standalone: &Rc<StandaloneMessageWindow>,
+) {
+    for (button, action) in [
+        (
+            &standalone.reply_button,
+            StandaloneResponseAction::Reply(ReplyKind::Sender),
+        ),
+        (
+            &standalone.reply_all_button,
+            StandaloneResponseAction::Reply(ReplyKind::All),
+        ),
+        (
+            &standalone.forward_button,
+            StandaloneResponseAction::Forward,
+        ),
+        (
+            &standalone.forward_attachment_button,
+            StandaloneResponseAction::ForwardAttachment,
+        ),
+    ] {
+        let opts = options.clone();
+        let w = widgets.clone();
+        let st = state.clone();
+        let standalone = Rc::downgrade(standalone);
+        button.connect_clicked(move |_| {
+            if let Some(standalone) = standalone.upgrade() {
+                run_standalone_response_action(&opts, &w, &st, &standalone, action);
+                standalone.response_menu_button.popdown();
+            }
+        });
+    }
+
+    for (button, view) in [
+        (&standalone.view_text_button, MessageViewKind::Text),
+        (&standalone.view_html_button, MessageViewKind::Html),
+        (&standalone.view_headers_button, MessageViewKind::Headers),
+        (&standalone.view_raw_button, MessageViewKind::Raw),
+    ] {
+        let opts = options.clone();
+        let st = state.clone();
+        let standalone = Rc::downgrade(standalone);
+        button.connect_clicked(move |_| {
+            if let Some(standalone) = standalone.upgrade() {
+                show_standalone_message_view(&opts, &st, &standalone, view);
+                standalone.view_menu_button.popdown();
+            }
+        });
+    }
+
+    let opts = options.clone();
+    let st = state.clone();
+    let standalone_weak = Rc::downgrade(standalone);
+    standalone.image_policy_button.connect_clicked(move |_| {
+        if let Some(standalone) = standalone_weak.upgrade() {
+            activate_standalone_image_policy_button(&opts, &st, &standalone);
+        }
+    });
+
+    let opts = options.clone();
+    let st = state.clone();
+    let standalone_weak = Rc::downgrade(standalone);
+    standalone.collapse_quotes_button.connect_clicked(move |_| {
+        if let Some(standalone) = standalone_weak.upgrade() {
+            toggle_standalone_quote_collapse(&opts, &st, &standalone);
+        }
+    });
+
+    for (button, field) in [
+        (
+            &standalone.copy_message_id_button,
+            StandaloneCopyField::MessageId,
+        ),
+        (
+            &standalone.copy_thread_id_button,
+            StandaloneCopyField::ThreadId,
+        ),
+        (
+            &standalone.copy_from_email_button,
+            StandaloneCopyField::From,
+        ),
+        (&standalone.copy_to_email_button, StandaloneCopyField::To),
+        (&standalone.copy_cc_email_button, StandaloneCopyField::Cc),
+        (
+            &standalone.copy_subject_button,
+            StandaloneCopyField::Subject,
+        ),
+    ] {
+        let standalone = Rc::downgrade(standalone);
+        button.connect_clicked(move |_| {
+            if let Some(standalone) = standalone.upgrade() {
+                copy_standalone_message_field(&standalone, field);
+                standalone.copy_menu_button.popdown();
+            }
+        });
+    }
+}
+
+fn update_standalone_button_binding_labels(
+    standalone: &StandaloneMessageWindow,
+    state: &SharedState,
+) {
+    set_menu_button_label(&standalone.response_menu_button, "Respond", "r", state);
+    set_button_label(&standalone.reply_button, "Reply", "r r", state);
+    set_button_label(&standalone.reply_all_button, "Reply all", "r a", state);
+    set_button_label(&standalone.forward_button, "Forward", "r f", state);
+    set_button_label(
+        &standalone.forward_attachment_button,
+        "Forward attached",
+        "r A",
+        state,
+    );
+    set_menu_button_label(&standalone.view_menu_button, "View", "V", state);
+    set_button_label(&standalone.view_text_button, "Text", "V t", state);
+    set_button_label(&standalone.view_html_button, "Visual HTML", "V v", state);
+    set_button_label(
+        &standalone.view_headers_button,
+        "Full headers",
+        "V h",
+        state,
+    );
+    set_button_label(&standalone.view_raw_button, "Raw source", "V r", state);
+    set_button_label(
+        &standalone.collapse_quotes_button,
+        "Collapse quotes",
+        "q",
+        state,
+    );
+    set_menu_button_label(&standalone.copy_menu_button, "Copy", "y", state);
+    set_button_label(
+        &standalone.copy_message_id_button,
+        "Copy message id",
+        "y m",
+        state,
+    );
+    set_button_label(
+        &standalone.copy_thread_id_button,
+        "Copy thread id",
+        "y t",
+        state,
+    );
+    set_button_label(
+        &standalone.copy_from_email_button,
+        "Copy from email",
+        "y f",
+        state,
+    );
+    set_button_label(
+        &standalone.copy_to_email_button,
+        "Copy to email",
+        "y o",
+        state,
+    );
+    set_button_label(
+        &standalone.copy_cc_email_button,
+        "Copy cc email",
+        "y c",
+        state,
+    );
+    set_button_label(
+        &standalone.copy_subject_button,
+        "Copy subject",
+        "y s",
+        state,
+    );
+    let image_base =
+        strip_binding_suffix(&standalone.image_policy_button.label().unwrap_or_default());
+    set_button_label(&standalone.image_policy_button, &image_base, "I", state);
+}
+
+fn connect_standalone_message_window_shortcuts(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    standalone: &Rc<StandaloneMessageWindow>,
+) {
+    let shortcuts = StandaloneShortcutState::new();
+    connect_standalone_dropdown_sequence_keys(options, widgets, state, standalone, &shortcuts);
+    standalone.window.add_controller(standalone_key_controller(
+        options, widgets, state, standalone, &shortcuts,
+    ));
+}
+
+fn standalone_key_controller(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    standalone: &Rc<StandaloneMessageWindow>,
+    shortcuts: &StandaloneShortcutState,
+) -> gtk::EventControllerKey {
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let standalone = Rc::downgrade(standalone);
+    let shortcuts = shortcuts.clone();
+    controller.connect_key_pressed(move |_, key, _, mods| {
+        let Some(standalone) = standalone.upgrade() else {
+            return gtk::glib::Propagation::Proceed;
+        };
+        let ctrl = mods.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+        if ctrl && (key == gtk::gdk::Key::d || key == gtk::gdk::Key::D) {
+            scroll_standalone_message_pages(&standalone, 0.5);
+            return gtk::glib::Propagation::Stop;
+        }
+        if ctrl && (key == gtk::gdk::Key::u || key == gtk::gdk::Key::U) {
+            scroll_standalone_message_pages(&standalone, -0.5);
+            return gtk::glib::Propagation::Stop;
+        }
+        if ctrl && (key == gtk::gdk::Key::f || key == gtk::gdk::Key::F) {
+            scroll_standalone_message_pages(&standalone, 1.0);
+            return gtk::glib::Propagation::Stop;
+        }
+        if ctrl && (key == gtk::gdk::Key::b || key == gtk::gdk::Key::B) {
+            scroll_standalone_message_pages(&standalone, -1.0);
+            return gtk::glib::Propagation::Stop;
+        }
+        if ctrl {
+            return gtk::glib::Propagation::Proceed;
+        }
+        if key == gtk::gdk::Key::Escape {
+            shortcuts.clear();
+            popdown_standalone_shortcut_menus(&standalone);
+            standalone.status_label.set_text("Normal mode");
+            return gtk::glib::Propagation::Stop;
+        }
+        if shortcuts.pending_response.get() {
+            shortcuts.pending_response.set(false);
+            standalone.response_menu_button.popdown();
+            return propagation_for_handled(run_standalone_response_key(
+                &opts,
+                &w,
+                &st,
+                &standalone,
+                key,
+            ));
+        }
+        if shortcuts.pending_view.get() {
+            shortcuts.pending_view.set(false);
+            standalone.view_menu_button.popdown();
+            return propagation_for_handled(run_standalone_view_key(&opts, &st, &standalone, key));
+        }
+        if shortcuts.pending_copy.get() {
+            shortcuts.pending_copy.set(false);
+            standalone.copy_menu_button.popdown();
+            return propagation_for_handled(run_standalone_copy_key(&standalone, key));
+        }
+        if shortcuts.pending_go.get() {
+            shortcuts.pending_go.set(false);
+            return propagation_for_handled(if key == gtk::gdk::Key::g {
+                scroll_standalone_message_to_edge(&standalone, false);
+                true
+            } else {
+                false
+            });
+        }
+        let handled = if key == gtk::gdk::Key::j || key == gtk::gdk::Key::Down {
+            scroll_standalone_message_lines(&standalone, 1.0);
+            true
+        } else if key == gtk::gdk::Key::k || key == gtk::gdk::Key::Up {
+            scroll_standalone_message_lines(&standalone, -1.0);
+            true
+        } else if key == gtk::gdk::Key::g {
+            shortcuts.pending_go.set(true);
+            standalone.status_label.set_text("Go: g top");
+            true
+        } else if key == gtk::gdk::Key::G {
+            scroll_standalone_message_to_edge(&standalone, true);
+            true
+        } else if key == gtk::gdk::Key::r {
+            shortcuts.pending_response.set(true);
+            standalone.response_menu_button.popup();
+            standalone
+                .status_label
+                .set_text("Respond: r reply, a reply all, f forward, A forward attached");
+            true
+        } else if key == gtk::gdk::Key::V {
+            shortcuts.pending_view.set(true);
+            standalone.view_menu_button.popup();
+            standalone
+                .status_label
+                .set_text("View: t text, v visual HTML, h headers, r raw source");
+            true
+        } else if key == gtk::gdk::Key::q {
+            toggle_standalone_quote_collapse(&opts, &st, &standalone);
+            true
+        } else if key == gtk::gdk::Key::y {
+            shortcuts.pending_copy.set(true);
+            standalone.copy_menu_button.popup();
+            standalone
+                .status_label
+                .set_text("Copy: m message id, t thread id, f from, o to, c cc, s subject");
+            true
+        } else if key == gtk::gdk::Key::I {
+            activate_standalone_image_policy_button(&opts, &st, &standalone);
+            true
+        } else {
+            false
+        };
+        propagation_for_handled(handled)
+    });
+    controller
+}
+
+fn connect_standalone_dropdown_sequence_keys(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    standalone: &Rc<StandaloneMessageWindow>,
+    shortcuts: &StandaloneShortcutState,
+) {
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let standalone_weak = Rc::downgrade(standalone);
+    let shortcut_state = shortcuts.clone();
+    controller.connect_key_pressed(move |_, key, _, _| {
+        let Some(standalone) = standalone_weak.upgrade() else {
+            return gtk::glib::Propagation::Proceed;
+        };
+        let handled = run_standalone_response_key(&opts, &w, &st, &standalone, key);
+        if handled {
+            shortcut_state.pending_response.set(false);
+            standalone.response_menu_button.popdown();
+        }
+        propagation_for_handled(handled)
+    });
+    standalone.response_menu_box.add_controller(controller);
+
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let opts = options.clone();
+    let st = state.clone();
+    let standalone_weak = Rc::downgrade(standalone);
+    let shortcut_state = shortcuts.clone();
+    controller.connect_key_pressed(move |_, key, _, _| {
+        let Some(standalone) = standalone_weak.upgrade() else {
+            return gtk::glib::Propagation::Proceed;
+        };
+        let handled = run_standalone_view_key(&opts, &st, &standalone, key);
+        if handled {
+            shortcut_state.pending_view.set(false);
+            standalone.view_menu_button.popdown();
+        }
+        propagation_for_handled(handled)
+    });
+    standalone.view_menu_box.add_controller(controller);
+
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let standalone_weak = Rc::downgrade(standalone);
+    let shortcut_state = shortcuts.clone();
+    controller.connect_key_pressed(move |_, key, _, _| {
+        let Some(standalone) = standalone_weak.upgrade() else {
+            return gtk::glib::Propagation::Proceed;
+        };
+        let handled = run_standalone_copy_key(&standalone, key);
+        if handled {
+            shortcut_state.pending_copy.set(false);
+            standalone.copy_menu_button.popdown();
+        }
+        propagation_for_handled(handled)
+    });
+    standalone.copy_menu_box.add_controller(controller);
+}
+
+fn propagation_for_handled(handled: bool) -> gtk::glib::Propagation {
+    if handled {
+        gtk::glib::Propagation::Stop
+    } else {
+        gtk::glib::Propagation::Proceed
+    }
+}
+
+fn popdown_standalone_shortcut_menus(standalone: &StandaloneMessageWindow) {
+    standalone.response_menu_button.popdown();
+    standalone.view_menu_button.popdown();
+    standalone.copy_menu_button.popdown();
+}
+
+fn run_standalone_response_key(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    standalone: &StandaloneMessageWindow,
+    key: gtk::gdk::Key,
+) -> bool {
+    let Some(action) = standalone_response_sequence_action(key) else {
+        return false;
+    };
+    run_standalone_response_action(options, widgets, state, standalone, action)
+}
+
+fn standalone_response_sequence_action(key: gtk::gdk::Key) -> Option<StandaloneResponseAction> {
+    if key == gtk::gdk::Key::r {
+        Some(StandaloneResponseAction::Reply(ReplyKind::Sender))
+    } else if key == gtk::gdk::Key::a {
+        Some(StandaloneResponseAction::Reply(ReplyKind::All))
+    } else if key == gtk::gdk::Key::f {
+        Some(StandaloneResponseAction::Forward)
+    } else if key == gtk::gdk::Key::A {
+        Some(StandaloneResponseAction::ForwardAttachment)
+    } else {
+        None
+    }
+}
+
+fn run_standalone_view_key(
+    options: &LaunchOptions,
+    state: &SharedState,
+    standalone: &StandaloneMessageWindow,
+    key: gtk::gdk::Key,
+) -> bool {
+    let Some(view) = standalone_view_sequence_action(key) else {
+        return false;
+    };
+    if view == MessageViewKind::Html
+        && standalone_current_message(standalone).is_none_or(|message| !message_has_html(&message))
+    {
+        standalone.status_label.set_text("No visual HTML part");
+        return true;
+    }
+    show_standalone_message_view(options, state, standalone, view);
+    true
+}
+
+fn standalone_view_sequence_action(key: gtk::gdk::Key) -> Option<MessageViewKind> {
+    if key == gtk::gdk::Key::t {
+        Some(MessageViewKind::Text)
+    } else if key == gtk::gdk::Key::v {
+        Some(MessageViewKind::Html)
+    } else if key == gtk::gdk::Key::h {
+        Some(MessageViewKind::Headers)
+    } else if key == gtk::gdk::Key::r {
+        Some(MessageViewKind::Raw)
+    } else {
+        None
+    }
+}
+
+fn run_standalone_copy_key(standalone: &StandaloneMessageWindow, key: gtk::gdk::Key) -> bool {
+    let Some(field) = standalone_copy_sequence_field(key) else {
+        return false;
+    };
+    copy_standalone_message_field(standalone, field);
+    true
+}
+
+fn standalone_copy_sequence_field(key: gtk::gdk::Key) -> Option<StandaloneCopyField> {
+    if key == gtk::gdk::Key::m {
+        Some(StandaloneCopyField::MessageId)
+    } else if key == gtk::gdk::Key::t {
+        Some(StandaloneCopyField::ThreadId)
+    } else if key == gtk::gdk::Key::f {
+        Some(StandaloneCopyField::From)
+    } else if key == gtk::gdk::Key::o {
+        Some(StandaloneCopyField::To)
+    } else if key == gtk::gdk::Key::c {
+        Some(StandaloneCopyField::Cc)
+    } else if key == gtk::gdk::Key::s {
+        Some(StandaloneCopyField::Subject)
+    } else {
+        None
+    }
+}
+
+fn standalone_current_message(
+    standalone: &StandaloneMessageWindow,
+) -> Option<notm_notmuch::MessageSummary> {
+    let state = standalone.state.borrow();
+    state.messages.get(state.selected_index).cloned()
+}
+
+fn select_standalone_message(
+    options: &LaunchOptions,
+    state: &SharedState,
+    standalone: &Rc<StandaloneMessageWindow>,
+    index: usize,
+) -> bool {
+    let view = {
+        let mut standalone_state = standalone.state.borrow_mut();
+        if index >= standalone_state.messages.len() {
+            standalone.status_label.set_text("Message index not found");
+            return false;
+        }
+        standalone_state.selected_index = index;
+        standalone_state.image_policy = ImagePolicy::Config;
+        standalone_state.view
+    };
+    show_standalone_message_view(options, state, standalone, view);
+    populate_standalone_message_menu(options, state, standalone);
+    standalone.message_menu_button.popdown();
+    true
+}
+
+fn populate_standalone_message_menu(
+    options: &LaunchOptions,
+    state: &SharedState,
+    standalone: &Rc<StandaloneMessageWindow>,
+) {
+    clear_box(&standalone.message_menu_box);
+    let (messages, selected_index) = {
+        let standalone_state = standalone.state.borrow();
+        (
+            standalone_state.messages.clone(),
+            standalone_state.selected_index,
+        )
+    };
+    let total = messages.len();
+    standalone.message_menu_button.set_visible(total > 1);
+    standalone.collapse_quotes_button.set_visible(total > 1);
+    standalone.message_menu_button.set_label(&format!(
+        "Message {}/{}",
+        selected_index.saturating_add(1),
+        total.max(1)
+    ));
+    for (index, message) in messages.iter().enumerate() {
+        let subject = non_empty_or(message.subject.trim(), "(no subject)");
+        let button = gtk::Button::with_label(&format!("{}: {}", index + 1, subject));
+        if index == selected_index {
+            button.add_css_class("suggested-action");
+        }
+        let opts = options.clone();
+        let st = state.clone();
+        let standalone_weak = Rc::downgrade(standalone);
+        button.connect_clicked(move |_| {
+            if let Some(standalone) = standalone_weak.upgrade() {
+                select_standalone_message(&opts, &st, &standalone, index);
+            }
+        });
+        standalone.message_menu_box.append(&button);
+    }
+}
+
+fn show_standalone_message_view(
+    options: &LaunchOptions,
+    state: &SharedState,
+    standalone: &StandaloneMessageWindow,
+    view: MessageViewKind,
+) {
+    let Some(message) = standalone_current_message(standalone) else {
+        standalone.status_label.set_text("No selected message");
+        return;
+    };
+    if view == MessageViewKind::Html && !message_has_html(&message) {
+        standalone.status_label.set_text("No visual HTML part");
+        return;
+    }
+    standalone
+        .window
+        .set_title(Some(&standalone_message_window_title(&message)));
+    refresh_standalone_message_header(standalone, &message);
+    match view {
+        MessageViewKind::Text => show_standalone_text_message(standalone, &message),
+        MessageViewKind::Html => show_standalone_html_message(options, state, standalone, &message),
+        MessageViewKind::Headers => show_standalone_headers(standalone, &message),
+        MessageViewKind::Raw => show_standalone_raw(standalone, &message),
+    }
+    update_standalone_message_buttons(options, state, standalone, &message);
+}
+
+fn show_standalone_text_message(
+    standalone: &StandaloneMessageWindow,
+    message: &notm_notmuch::MessageSummary,
+) {
+    let collapse_quotes = standalone.state.borrow().collapse_quotes;
+    match render_message_text(message, collapse_quotes) {
+        Ok(rendered) => {
+            set_standalone_active_message_view(standalone, MessageViewKind::Text);
+            standalone.text_view.set_monospace(false);
+            standalone.text_view.buffer().set_text(&rendered);
+            standalone.status_label.set_text("Text message shown");
+        }
+        Err(err) => standalone
+            .status_label
+            .set_text(&format!("Text view failed: {err}")),
+    }
+}
+
+fn show_standalone_html_message(
+    options: &LaunchOptions,
+    state: &SharedState,
+    standalone: &StandaloneMessageWindow,
+    message: &notm_notmuch::MessageSummary,
+) {
+    let image_policy = standalone.state.borrow().image_policy;
+    match render_visual_html_for_message(options, state, message, image_policy) {
+        Ok((document, _, allow_remote_images, sender, decode_warning_count)) => {
+            set_html_image_loading(&standalone.html_view, allow_remote_images);
+            standalone
+                .html_view
+                .load_html(&document, Some("about:blank"));
+            set_standalone_active_message_view(standalone, MessageViewKind::Html);
+            standalone.status_label.set_text(&html_status_text(
+                image_policy,
+                allow_remote_images,
+                sender.as_deref(),
+                decode_warning_count,
+            ));
+        }
+        Err(err) => standalone
+            .status_label
+            .set_text(&format!("Visual HTML failed: {err}")),
+    }
+}
+
+fn show_standalone_headers(
+    standalone: &StandaloneMessageWindow,
+    message: &notm_notmuch::MessageSummary,
+) {
+    let result = (|| -> anyhow::Result<String> {
+        let filename = message_filename(message)?;
+        Ok(header_block(&std::fs::read_to_string(filename)?))
+    })();
+    match result {
+        Ok(headers) => {
+            set_standalone_active_message_view(standalone, MessageViewKind::Headers);
+            standalone.text_view.set_monospace(true);
+            standalone.text_view.buffer().set_text(&headers);
+            standalone
+                .status_label
+                .set_text("Full message headers shown");
+        }
+        Err(err) => standalone
+            .status_label
+            .set_text(&format!("Full headers failed: {err}")),
+    }
+}
+
+fn show_standalone_raw(
+    standalone: &StandaloneMessageWindow,
+    message: &notm_notmuch::MessageSummary,
+) {
+    let result = (|| -> anyhow::Result<String> {
+        let filename = message_filename(message)?;
+        Ok(std::fs::read_to_string(filename)?)
+    })();
+    match result {
+        Ok(raw) => {
+            set_standalone_active_message_view(standalone, MessageViewKind::Raw);
+            standalone.text_view.set_monospace(true);
+            standalone.text_view.buffer().set_text(&raw);
+            standalone.status_label.set_text("Raw message source shown");
+        }
+        Err(err) => standalone
+            .status_label
+            .set_text(&format!("Raw source failed: {err}")),
+    }
+}
+
+fn set_standalone_active_message_view(
+    standalone: &StandaloneMessageWindow,
+    active: MessageViewKind,
+) {
+    for button in [
+        &standalone.view_text_button,
+        &standalone.view_html_button,
+        &standalone.view_headers_button,
+        &standalone.view_raw_button,
+    ] {
+        button.remove_css_class("suggested-action");
+    }
+    match active {
+        MessageViewKind::Text => {
+            standalone
+                .view_text_button
+                .add_css_class("suggested-action");
+            standalone.message_stack.set_visible_child_name("text");
+        }
+        MessageViewKind::Html => {
+            standalone
+                .view_html_button
+                .add_css_class("suggested-action");
+            standalone.message_stack.set_visible_child_name("html");
+        }
+        MessageViewKind::Headers => {
+            standalone
+                .view_headers_button
+                .add_css_class("suggested-action");
+            standalone.message_stack.set_visible_child_name("text");
+        }
+        MessageViewKind::Raw => {
+            standalone.view_raw_button.add_css_class("suggested-action");
+            standalone.message_stack.set_visible_child_name("text");
+        }
+    }
+    standalone.state.borrow_mut().view = active;
+}
+
+fn toggle_standalone_quote_collapse(
+    options: &LaunchOptions,
+    state: &SharedState,
+    standalone: &StandaloneMessageWindow,
+) {
+    let enabled = {
+        let mut standalone_state = standalone.state.borrow_mut();
+        standalone_state.collapse_quotes = !standalone_state.collapse_quotes;
+        standalone_state.collapse_quotes
+    };
+    show_standalone_message_view(options, state, standalone, MessageViewKind::Text);
+    standalone.status_label.set_text(if enabled {
+        "Quote collapse enabled"
+    } else {
+        "Quote collapse disabled"
+    });
+}
+
+fn activate_standalone_image_policy_button(
+    options: &LaunchOptions,
+    state: &SharedState,
+    standalone: &StandaloneMessageWindow,
+) {
+    let Some(message) = standalone_current_message(standalone) else {
+        standalone.status_label.set_text("No message selected");
+        return;
+    };
+    if message_allows_images(options, state, &message) {
+        update_standalone_message_buttons(options, state, standalone, &message);
+        return;
+    }
+    let policy = if standalone.state.borrow().view == MessageViewKind::Html
+        && webkit_view_images_allowed(&standalone.html_view)
+    {
+        ImagePolicy::TrustSender
+    } else {
+        ImagePolicy::Once
+    };
+    standalone.state.borrow_mut().image_policy = policy;
+    show_standalone_message_view(options, state, standalone, MessageViewKind::Html);
+}
+
+fn update_standalone_message_buttons(
+    options: &LaunchOptions,
+    state: &SharedState,
+    standalone: &StandaloneMessageWindow,
+    message: &notm_notmuch::MessageSummary,
+) {
+    let has_html = message_has_html(message);
+    let html_visible = standalone.state.borrow().view == MessageViewKind::Html;
+    standalone.view_html_button.set_visible(has_html);
+    standalone.view_html_button.set_sensitive(has_html);
+    standalone
+        .html_policy_row
+        .set_visible(html_visible && has_html);
+    standalone
+        .image_policy_button
+        .set_visible(html_visible && has_html);
+    if !has_html {
+        standalone.image_policy_button.set_label("Load images once");
+        standalone.image_policy_button.set_sensitive(false);
+        update_standalone_button_binding_labels(standalone, state);
+        return;
+    }
+    if html_visible {
+        let image_policy = if webkit_view_images_allowed(&standalone.html_view) {
+            if message_allows_images(options, state, message) {
+                "remote images allowed"
+            } else {
+                "remote images loaded for this view"
+            }
+        } else {
+            "remote images blocked"
+        };
+        standalone.html_policy_label.set_text(&format!(
+            "Sanitized HTML view: message JavaScript disabled; {image_policy}; links open externally."
+        ));
+    }
+    if message_allows_images(options, state, message) {
+        let sender = message_sender_email(message);
+        let sender_trusted = sender
+            .as_deref()
+            .is_some_and(|sender| image_sender_is_trusted(state, sender));
+        standalone.image_policy_button.set_label(if sender_trusted {
+            "Images trusted"
+        } else {
+            "Images allowed"
+        });
+        standalone.image_policy_button.set_sensitive(false);
+    } else if html_visible && webkit_view_images_allowed(&standalone.html_view) {
+        standalone
+            .image_policy_button
+            .set_label("Trust sender images");
+        standalone
+            .image_policy_button
+            .set_sensitive(message_sender_email(message).is_some());
+    } else {
+        standalone.image_policy_button.set_label("Load images once");
+        standalone.image_policy_button.set_sensitive(true);
+    }
+    update_standalone_button_binding_labels(standalone, state);
+}
+
+fn refresh_standalone_message_header(
+    standalone: &StandaloneMessageWindow,
+    message: &notm_notmuch::MessageSummary,
+) {
+    clear_box(&standalone.message_header_box);
+    let (index, total) = {
+        let state = standalone.state.borrow();
+        (state.selected_index + 1, state.messages.len().max(1))
+    };
+    standalone
+        .message_header_box
+        .append(&standalone_message_header(message, index, total));
+    standalone
+        .message_header_box
+        .set_tooltip_text(Some(&format!(
+            "Message-ID: {}\nFiles: {}",
+            message.message_id,
+            message.filenames.join(", ")
+        )));
+}
+
+fn standalone_message_window_title(message: &notm_notmuch::MessageSummary) -> String {
+    let subject = non_empty_or(&message.subject, "(no subject)");
+    format!("notm: {}", truncate_status_text(subject, 80))
+}
+
+fn standalone_message_header(
+    message: &notm_notmuch::MessageSummary,
+    index: usize,
+    total: usize,
+) -> gtk::Box {
+    let header = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let count = gtk::Label::new(Some(&format!("Message {index} of {total}")));
+    count.add_css_class("notm-message-header-badge");
+    count.set_xalign(0.0);
+    header.append(&count);
+
+    let grid = gtk::Grid::new();
+    grid.set_column_spacing(10);
+    grid.set_row_spacing(4);
+    grid.set_hexpand(true);
+    let mut row = 0;
+    append_message_header_field(&grid, &mut row, "Subject", &message.subject);
+    append_message_header_field(&grid, &mut row, "Date", &format_message_date(message.date));
+    append_message_header_field(&grid, &mut row, "From", &message.from);
+    append_message_header_field(&grid, &mut row, "To", &message.to);
+    if !message.cc.trim().is_empty() {
+        append_message_header_field(&grid, &mut row, "Cc", &message.cc);
+    }
+    append_message_header_field(&grid, &mut row, "Tags", &message.tags.join(" "));
+    header.append(&grid);
+    header
+}
+
+fn copy_standalone_message_field(standalone: &StandaloneMessageWindow, field: StandaloneCopyField) {
+    let Some(message) = standalone_current_message(standalone) else {
+        standalone.status_label.set_text("No message to copy from");
+        return;
+    };
+    let (text, label) = match field {
+        StandaloneCopyField::MessageId => (message.message_id.clone(), "message id"),
+        StandaloneCopyField::ThreadId => (message.thread_id.clone(), "thread id"),
+        StandaloneCopyField::From => (header_emails(&message.from), "from email"),
+        StandaloneCopyField::To => (header_emails(&message.to), "to email"),
+        StandaloneCopyField::Cc => (header_emails(&message.cc), "cc email"),
+        StandaloneCopyField::Subject => (message.subject.clone(), "subject"),
+    };
+    if text.trim().is_empty() {
+        standalone
+            .status_label
+            .set_text(&format!("No {label} to copy"));
+    } else {
+        copy_to_clipboard(&text);
+        standalone.status_label.set_text(&format!("Copied {label}"));
+    }
+}
+
+fn run_standalone_response_action(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    standalone: &StandaloneMessageWindow,
+    action: StandaloneResponseAction,
+) -> bool {
+    let Some(message) = standalone_current_message(standalone) else {
+        standalone.status_label.set_text("No message selected");
+        return false;
+    };
+    let result = match action {
+        StandaloneResponseAction::Reply(kind) => {
+            composed_reply_for_message(options, &message, kind)
+                .map(|message| (message, "Reply composer opened"))
+        }
+        StandaloneResponseAction::Forward => composed_inline_forward_for_message(options, &message)
+            .map(|message| (message, "Forward composer opened")),
+        StandaloneResponseAction::ForwardAttachment => {
+            composed_attachment_forward_for_message(options, &message)
+                .map(|message| (message, "Forward-as-attachment composer opened"))
+        }
+    };
+    match result {
+        Ok((message, status)) => {
+            set_pane_visibility(widgets, state, ActivePane::Message, true);
+            fill_composer(widgets, state, message);
+            widgets.status_label.set_text(status);
+            widgets.window.present();
+            standalone.status_label.set_text(status);
+            true
+        }
+        Err(err) => {
+            state.borrow_mut().last_error = Some(err.to_string());
+            standalone
+                .status_label
+                .set_text(&format!("Response failed: {err}"));
+            false
+        }
+    }
+}
+
+fn composed_reply_for_message(
+    options: &LaunchOptions,
+    message: &notm_notmuch::MessageSummary,
+    kind: ReplyKind,
+) -> anyhow::Result<ComposedMessage> {
+    let path = message_filename(message)?;
+    let identity = identity(options).ok_or_else(|| anyhow::anyhow!("no identity configured"))?;
+    let parsed = parse_file(path)?;
+    let mut own = options.other_email.clone();
+    if let Some(email) = &options.primary_email {
+        own.push(email.clone());
+    }
+    Ok(build_reply(&parsed, &identity, &own, kind))
+}
+
+fn composed_inline_forward_for_message(
+    options: &LaunchOptions,
+    message: &notm_notmuch::MessageSummary,
+) -> anyhow::Result<ComposedMessage> {
+    let path = message_filename(message)?;
+    let identity = identity(options).ok_or_else(|| anyhow::anyhow!("no identity configured"))?;
+    Ok(build_inline_forward(&parse_file(path)?, &identity))
+}
+
+fn composed_attachment_forward_for_message(
+    options: &LaunchOptions,
+    message: &notm_notmuch::MessageSummary,
+) -> anyhow::Result<ComposedMessage> {
+    let path = message_filename(message)?;
+    let identity = identity(options).ok_or_else(|| anyhow::anyhow!("no identity configured"))?;
+    let raw = std::fs::read(path)?;
+    let parsed = notm_mail::mime::parse_rfc5322(&raw)?;
+    Ok(build_attachment_forward(&parsed, &identity, raw))
+}
+
+fn standalone_html_view_is_visible(standalone: &StandaloneMessageWindow) -> bool {
+    standalone.state.borrow().view == MessageViewKind::Html
+}
+
+fn scroll_standalone_message_lines(standalone: &StandaloneMessageWindow, lines: f64) {
+    if standalone_html_view_is_visible(standalone) {
+        scroll_web_view_lines(&standalone.html_view, &standalone.status_label, lines);
+    } else {
+        scroll_window_lines(&standalone.text_scrolled, lines);
+    }
+}
+
+fn scroll_standalone_message_pages(standalone: &StandaloneMessageWindow, pages: f64) {
+    if standalone_html_view_is_visible(standalone) {
+        scroll_web_view_pages(&standalone.html_view, &standalone.status_label, pages);
+    } else {
+        scroll_window_pages(&standalone.text_scrolled, pages);
+    }
+}
+
+fn scroll_standalone_message_to_edge(standalone: &StandaloneMessageWindow, bottom: bool) {
+    if standalone_html_view_is_visible(standalone) {
+        scroll_web_view_to_edge(&standalone.html_view, &standalone.status_label, bottom);
+    } else {
+        scroll_window_to_edge(&standalone.text_scrolled, bottom);
+    }
 }
 
 fn push_undo_tag_action(undo_state: &UndoState, action: UndoTagAction) {
@@ -13074,6 +14608,16 @@ fn handle_automation_request(
             }
         }
         "pane_visibility" => pane_visibility_json(widgets, state),
+        "message_action_labels" => json!({
+            "ok": true,
+            "respond": widgets.response_menu_button.label().map(|label| label.to_string()),
+            "reply": widgets.reply_button.label().map(|label| label.to_string()),
+            "view": widgets.view_menu_button.label().map(|label| label.to_string()),
+            "collapse_quotes": widgets.collapse_quotes_button.label().map(|label| label.to_string()),
+            "copy": widgets.copy_menu_button.label().map(|label| label.to_string()),
+            "image_policy": widgets.image_policy_button.label().map(|label| label.to_string()),
+            "archive": widgets.archive_button.label().map(|label| label.to_string()),
+        }),
         "layout_state" => layout_state_json(widgets, state),
         "toggle_layout" => {
             toggle_layout_preference(options, widgets, state);
@@ -13174,6 +14718,86 @@ fn handle_automation_request(
             let idx = selected_thread_index(widgets).unwrap_or(0);
             open_thread_by_index(options, widgets, state, idx);
             json!({"ok": true, "state": &*state.borrow()})
+        }
+        "standalone_message_windows" => {
+            spin_main_context_for(Duration::from_millis(100));
+            standalone_message_windows_json(widgets, state)
+        }
+        "standalone_select_message" => {
+            let window_index = req
+                .args
+                .get("window_index")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            let message_index = req
+                .args
+                .get("message_index")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            let standalone = widgets
+                .standalone_windows
+                .borrow()
+                .get(window_index)
+                .cloned();
+            match standalone {
+                Some(standalone) => {
+                    let ok = select_standalone_message(options, state, &standalone, message_index);
+                    json!({
+                        "ok": ok,
+                        "window": standalone_message_window_json(&standalone),
+                        "main_selected_message": state.borrow().selected_message,
+                    })
+                }
+                None => json!({"ok": false, "error": "standalone window index not found"}),
+            }
+        }
+        "standalone_respond" => {
+            let window_index = req
+                .args
+                .get("window_index")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            let action_name = req
+                .args
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("reply");
+            let action = match action_name {
+                "reply" => Some(StandaloneResponseAction::Reply(ReplyKind::Sender)),
+                "reply_all" => Some(StandaloneResponseAction::Reply(ReplyKind::All)),
+                "forward" => Some(StandaloneResponseAction::Forward),
+                "forward_attachment" => Some(StandaloneResponseAction::ForwardAttachment),
+                _ => None,
+            };
+            let standalone = widgets
+                .standalone_windows
+                .borrow()
+                .get(window_index)
+                .cloned();
+            match (standalone, action) {
+                (Some(standalone), Some(action)) => {
+                    let ok = run_standalone_response_action(
+                        options,
+                        widgets,
+                        state,
+                        &standalone,
+                        action,
+                    );
+                    json!({
+                        "ok": ok,
+                        "window": standalone_message_window_json(&standalone),
+                        "compose_fields": state.borrow().compose_fields,
+                        "main_selected_message": state.borrow().selected_message,
+                        "status": standalone.status_label.text().to_string(),
+                    })
+                }
+                (None, _) => {
+                    json!({"ok": false, "error": "standalone window index not found"})
+                }
+                (_, None) => {
+                    json!({"ok": false, "error": format!("unknown standalone response action: {action_name}")})
+                }
+            }
         }
         "archive_selected" => {
             tag_selected(
@@ -13727,6 +15351,49 @@ fn handle_automation_request(
         other => json!({"ok": false, "error": format!("unknown test-harness command: {other}")}),
     };
     let _ = req.response.send(result);
+}
+
+fn standalone_message_windows_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
+    let windows = widgets
+        .standalone_windows
+        .borrow()
+        .iter()
+        .map(|standalone| standalone_message_window_json(standalone))
+        .collect::<Vec<_>>();
+    json!({
+        "ok": true,
+        "windows": windows,
+        "main_selected_thread": state.borrow().selected_thread,
+        "main_selected_message": state.borrow().selected_message,
+    })
+}
+
+fn standalone_message_window_json(standalone: &StandaloneMessageWindow) -> serde_json::Value {
+    let state = standalone.state.borrow();
+    let selected_message = state.messages.get(state.selected_index);
+    let message_ids = state
+        .messages
+        .iter()
+        .map(|message| message.message_id.clone())
+        .collect::<Vec<_>>();
+    let view = match state.view {
+        MessageViewKind::Text => "text",
+        MessageViewKind::Html => "html",
+        MessageViewKind::Headers => "headers",
+        MessageViewKind::Raw => "raw",
+    };
+    json!({
+        "id": standalone.id,
+        "selected_index": state.selected_index,
+        "message_count": state.messages.len(),
+        "selected_message": selected_message,
+        "message_ids": message_ids,
+        "view": view,
+        "collapse_quotes": state.collapse_quotes,
+        "image_policy": format!("{:?}", state.image_policy).to_ascii_lowercase(),
+        "title": standalone.window.title().map(|title| title.to_string()),
+        "status": standalone.status_label.text().to_string(),
+    })
 }
 
 fn string_array_arg(args: &serde_json::Value, name: &str) -> Vec<String> {
@@ -17440,5 +19107,85 @@ mod tests {
         assert_eq!(startup.len(), 2);
         assert_eq!(startup[0].name, "receive");
         assert_eq!(startup[1].name, "database_update");
+    }
+
+    #[test]
+    fn hidden_message_pane_opens_threads_in_standalone_windows() {
+        assert_eq!(
+            thread_open_destination(true),
+            ThreadOpenDestination::InlinePane
+        );
+        assert_eq!(
+            thread_open_destination(false),
+            ThreadOpenDestination::StandaloneWindow
+        );
+    }
+
+    #[test]
+    fn hidden_message_pane_suppresses_pane_only_binding_hints() {
+        assert_eq!(visible_binding(true, "r"), "r");
+        assert_eq!(visible_binding(false, "r"), "");
+    }
+
+    #[test]
+    fn standalone_message_shortcut_sequences_match_their_menu_bindings() {
+        assert_eq!(
+            standalone_response_sequence_action(gtk::gdk::Key::r),
+            Some(StandaloneResponseAction::Reply(ReplyKind::Sender))
+        );
+        assert_eq!(
+            standalone_response_sequence_action(gtk::gdk::Key::a),
+            Some(StandaloneResponseAction::Reply(ReplyKind::All))
+        );
+        assert_eq!(
+            standalone_response_sequence_action(gtk::gdk::Key::f),
+            Some(StandaloneResponseAction::Forward)
+        );
+        assert_eq!(
+            standalone_response_sequence_action(gtk::gdk::Key::A),
+            Some(StandaloneResponseAction::ForwardAttachment)
+        );
+        assert_eq!(
+            standalone_view_sequence_action(gtk::gdk::Key::t),
+            Some(MessageViewKind::Text)
+        );
+        assert_eq!(
+            standalone_view_sequence_action(gtk::gdk::Key::v),
+            Some(MessageViewKind::Html)
+        );
+        assert_eq!(
+            standalone_view_sequence_action(gtk::gdk::Key::h),
+            Some(MessageViewKind::Headers)
+        );
+        assert_eq!(
+            standalone_view_sequence_action(gtk::gdk::Key::r),
+            Some(MessageViewKind::Raw)
+        );
+        assert_eq!(
+            standalone_copy_sequence_field(gtk::gdk::Key::m),
+            Some(StandaloneCopyField::MessageId)
+        );
+        assert_eq!(
+            standalone_copy_sequence_field(gtk::gdk::Key::t),
+            Some(StandaloneCopyField::ThreadId)
+        );
+        assert_eq!(
+            standalone_copy_sequence_field(gtk::gdk::Key::f),
+            Some(StandaloneCopyField::From)
+        );
+        assert_eq!(
+            standalone_copy_sequence_field(gtk::gdk::Key::o),
+            Some(StandaloneCopyField::To)
+        );
+        assert_eq!(
+            standalone_copy_sequence_field(gtk::gdk::Key::c),
+            Some(StandaloneCopyField::Cc)
+        );
+        assert_eq!(
+            standalone_copy_sequence_field(gtk::gdk::Key::s),
+            Some(StandaloneCopyField::Subject)
+        );
+        assert_eq!(standalone_view_sequence_action(gtk::gdk::Key::j), None);
+        assert_eq!(standalone_copy_sequence_field(gtk::gdk::Key::j), None);
     }
 }

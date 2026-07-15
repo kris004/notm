@@ -1485,6 +1485,131 @@ fn timed_out_send_reports_failure_and_leaves_desktop_responsive() -> anyhow::Res
 }
 
 #[test]
+fn fixture_standalone_message_window_keeps_its_thread_snapshot() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP fixture_standalone_message_window_keeps_its_thread_snapshot: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running standalone message-window UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-standalone-window-ui-{run_id}"));
+    let token = format!("notm-standalone-window-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+
+    let visible_labels = driver.command("message_action_labels", json!({}))?;
+    assert_eq!(visible_labels["respond"], "Respond (r)", "{visible_labels}");
+    assert_eq!(visible_labels["archive"], "Archive (a)", "{visible_labels}");
+
+    let hidden = driver.command(
+        "set_pane_visibility",
+        json!({"pane": "message", "visible": false}),
+    )?;
+    assert_eq!(hidden["ok"], true, "message pane did not hide: {hidden}");
+    let hidden_labels = driver.command("message_action_labels", json!({}))?;
+    assert_eq!(hidden_labels["respond"], "Respond", "{hidden_labels}");
+    assert_eq!(hidden_labels["reply"], "Reply", "{hidden_labels}");
+    assert_eq!(hidden_labels["view"], "View", "{hidden_labels}");
+    assert_eq!(
+        hidden_labels["collapse_quotes"], "Collapse quotes",
+        "{hidden_labels}"
+    );
+    assert_eq!(hidden_labels["copy"], "Copy", "{hidden_labels}");
+    assert_eq!(
+        hidden_labels["archive"], "Archive (a)",
+        "hiding the message pane suppressed a thread action binding: {hidden_labels}"
+    );
+
+    select_first_thread(&mut driver, "subject:\"Three message thread\"")?;
+    let opened = driver.command("open_selected_thread", json!({}))?;
+    assert_eq!(
+        opened["ok"], true,
+        "fixture thread did not open in a standalone window: {opened}"
+    );
+
+    let standalone = driver.command("standalone_message_windows", json!({}))?;
+    let windows = json_array_at(&standalone, &["windows"])?;
+    ensure!(
+        windows.len() == 1,
+        "expected one standalone message window: {standalone}"
+    );
+    assert_eq!(windows[0]["message_count"], 3, "{standalone}");
+    assert_eq!(windows[0]["selected_index"], 2, "{standalone}");
+    assert_eq!(
+        windows[0]["selected_message"]["message_id"], "thread-reply2-three-message@fixture.test",
+        "standalone did not start on the newest thread message: {standalone}"
+    );
+
+    select_first_thread(&mut driver, "subject:\"Unicode\"")?;
+    let after_main_change = driver.command("standalone_message_windows", json!({}))?;
+    let windows = json_array_at(&after_main_change, &["windows"])?;
+    ensure!(
+        windows.len() == 1,
+        "changing the main selection replaced or duplicated the standalone window: \
+         {after_main_change}"
+    );
+    assert_eq!(
+        windows[0]["selected_message"]["message_id"], "thread-reply2-three-message@fixture.test",
+        "main selection leaked into the standalone window: {after_main_change}"
+    );
+    assert_eq!(
+        after_main_change["main_selected_message"]["message_id"], "unicode@fixture.test",
+        "main selection did not change to the second thread: {after_main_change}"
+    );
+
+    let selected = driver.command(
+        "standalone_select_message",
+        json!({"window_index": 0, "message_index": 0}),
+    )?;
+    assert_eq!(
+        selected["ok"], true,
+        "standalone message navigation failed: {selected}"
+    );
+    assert_eq!(
+        selected["window"]["selected_message"]["message_id"],
+        "thread-root-three-message@fixture.test",
+        "standalone navigation selected the wrong snapshot message: {selected}"
+    );
+    assert_eq!(selected["window"]["message_count"], 3, "{selected}");
+    assert_eq!(
+        selected["main_selected_message"]["message_id"], "unicode@fixture.test",
+        "standalone navigation changed the main message selection: {selected}"
+    );
+
+    let reply = driver.command(
+        "standalone_respond",
+        json!({"window_index": 0, "action": "reply"}),
+    )?;
+    assert_eq!(
+        reply["ok"], true,
+        "standalone reply did not bridge to the main composer: {reply}"
+    );
+    assert_eq!(
+        reply["compose_fields"]["in_reply_to"], "<thread-root-three-message@fixture.test>",
+        "standalone reply targeted the main thread instead of its snapshot: {reply}"
+    );
+    assert_eq!(
+        reply["compose_fields"]["subject"], "Re: Three message thread",
+        "standalone reply used the wrong subject: {reply}"
+    );
+    assert_eq!(
+        reply["main_selected_message"]["message_id"], "unicode@fixture.test",
+        "standalone reply rewrote the main message selection: {reply}"
+    );
+    let visibility = driver.command("pane_visibility", json!({}))?;
+    assert_eq!(
+        visibility["message_view"], true,
+        "standalone reply did not reveal the main composer pane: {visibility}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn fixture_tag_undo_restores_each_messages_original_tags() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment() else {
         eprintln!(
