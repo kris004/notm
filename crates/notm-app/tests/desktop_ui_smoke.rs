@@ -604,6 +604,59 @@ fn assert_target_message_rendered(driver: &mut UiDriver) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn fixture_reply_all_preserves_quoted_names_and_flattens_groups() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP fixture_reply_all_preserves_quoted_names_and_flattens_groups: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running reply-all address desktop UI smoke with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-reply-all-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+             \n[identity]\nname = \"Fixture User\"\nprimary_email = \"fixture@example.test\"\nother_email = [\"alt@example.test\"]\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+        ),
+    )?;
+    let token = format!("notm-reply-all-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    select_first_thread(&mut driver, "id:reply-all-addresses@fixture.test")?;
+
+    let reply = driver.command("reply_all_selected", json!({}))?;
+    assert_eq!(reply["ok"], true, "reply-all command failed: {reply}");
+    let fields = &reply["compose_fields"];
+    assert_eq!(
+        fields["to"], r#"Sender <sender@example.test>, "Doe, Jane" <jane@example.test>"#,
+        "reply-all did not preserve the quoted display name: {reply}"
+    );
+    assert_eq!(
+        fields["cc"], r#""Smith, John" <john@example.test>, other@example.test"#,
+        "reply-all did not flatten the recipient group in order: {reply}"
+    );
+    for identity in ["fixture@example.test", "alt@example.test"] {
+        ensure!(
+            !fields["to"].as_str().unwrap_or_default().contains(identity)
+                && !fields["cc"].as_str().unwrap_or_default().contains(identity),
+            "reply-all retained fixture identity {identity}: {reply}"
+        );
+    }
+
+    Ok(())
+}
+
 #[test]
 fn fixture_attachment_save_keeps_existing_files() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment() else {

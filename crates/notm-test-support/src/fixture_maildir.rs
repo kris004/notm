@@ -163,6 +163,7 @@ fn fixture_messages() -> Vec<FixtureMessage> {
             None,
             Some("replyto@example.test"),
         ),
+        reply_all_address_msg(),
         msg(
             "sent-like",
             "fixture@example.test",
@@ -270,6 +271,13 @@ fn attachment_msg() -> FixtureMessage {
 fn html_with_malformed_attachment_msg() -> FixtureMessage {
     FixtureMessage {
         raw: "From: broken-attachment@example.test\r\nTo: fixture@example.test\r\nSubject: HTML with malformed attachment\r\nDate: Thu, 18 Jun 2026 20:01:15 -0600\r\nMessage-ID: <html-malformed-attachment@fixture.test>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=broken-attachment-boundary\r\n\r\n--broken-attachment-boundary\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><p>Readable HTML body.</p></body></html>\r\n--broken-attachment-boundary\r\nContent-Type: application/octet-stream; name=broken.bin\r\nContent-Disposition: attachment; filename=broken.bin\r\nContent-Transfer-Encoding: base64\r\n\r\n!!!!\r\n--broken-attachment-boundary\r\nContent-Type: text/plain; name=good.txt\r\nContent-Disposition: attachment; filename=good.txt\r\nContent-Transfer-Encoding: base64\r\n\r\nZ29vZCBzaWJsaW5n\r\n--broken-attachment-boundary--\r\n".to_string(),
+        tags: vec!["inbox"],
+    }
+}
+
+fn reply_all_address_msg() -> FixtureMessage {
+    FixtureMessage {
+        raw: "From: Sender <sender@example.test>\r\nTo: Fixture User <fixture@example.test>, \"Doe, Jane\" <jane@example.test>\r\nCc: Project Team: \"Smith, John\" <john@example.test>, other@example.test, Fixture Alias <alt@example.test>;\r\nSubject: Quoted and grouped recipients\r\nDate: Thu, 18 Jun 2026 20:01:30 -0600\r\nMessage-ID: <reply-all-addresses@fixture.test>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nReply-all address fixture body.\r\n".to_string(),
         tags: vec!["inbox"],
     }
 }

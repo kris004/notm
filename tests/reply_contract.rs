@@ -27,6 +27,43 @@ fn reply_all_excludes_own_identity_and_sets_thread_headers() -> anyhow::Result<(
 }
 
 #[test]
+fn reply_all_preserves_quoted_names_and_flattens_recipient_groups() -> anyhow::Result<()> {
+    let raw = br#"From: Sender <sender@example.test>
+To: Me <me@example.test>, "Doe, Jane" <jane@example.test>
+Cc: Friends: "Smith, John" <john@example.test>, other@example.test;
+Subject: Group reply
+Message-ID: <group-reply@example.test>
+Content-Type: text/plain; charset=utf-8
+
+Body"#;
+    let parsed = parse_rfc5322(raw)?;
+    let identity = Identity {
+        name: Some("Me".into()),
+        email: "me@example.test".into(),
+    };
+
+    let reply = build_reply(
+        &parsed,
+        &identity,
+        &["me@example.test".into()],
+        ReplyKind::All,
+    );
+
+    assert_eq!(
+        reply.to,
+        vec![
+            "Sender <sender@example.test>",
+            r#""Doe, Jane" <jane@example.test>"#,
+        ]
+    );
+    assert_eq!(
+        reply.cc,
+        vec![r#""Smith, John" <john@example.test>"#, "other@example.test",]
+    );
+    Ok(())
+}
+
+#[test]
 fn html_only_reply_keeps_html_quote_hidden_from_plain_composer() -> anyhow::Result<()> {
     let raw = b"From: Alice <alice@example.test>\r\nTo: Me <me@example.test>\r\nSubject: HTML Hello\r\nDate: Thu, 25 Jun 2026 05:30:00 +0000\r\nMessage-ID: <html-orig@example.test>\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><p><b>Hello</b> from HTML</p><script>bad()</script></body></html>";
     let parsed = parse_rfc5322(raw)?;
