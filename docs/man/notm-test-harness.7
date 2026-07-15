@@ -133,8 +133,24 @@ notm launch --fixture \\
 .BR toggle_debug_panel .
 .SH SAFETY
 Keep the socket local to the user session and use a token.  Prefer fixture data
-for test-harness runs.  Do not run receive/sync commands or live-send tests
-unless a user explicitly configured and requested that path.
+for test-harness runs.  Fixture mode does not run configured receive,
+database-update, or external-send commands; sends are captured locally and tag
+changes are confined to the disposable fixture database.
+.PP
+On a non-fixture account,
+.B automation.allow_live_send_test
+must be true for
+.B compose_send
+and
+.B automation.allow_live_tag_test
+must be true for tag mutations.  Both default to false, and the gates also
+apply when the operation is requested through
+.BR run_command .
+Non-fixture sync retains its separate explicit
+.B [sync]
+enablement.  Draft and attachment commands can change configured local files
+and are intentionally outside the send/tag gates; invoke them only when those
+file changes are intended.
 .SH FILES
 .TP
 .I artifacts/screenshots/

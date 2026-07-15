@@ -254,6 +254,19 @@ section controls its local socket path, token, screenshot directory, and
 live-test gates.  This section is for development and smoke-test support, not
 normal mail operation.  See
 .BR notm-test-harness (7).
+.TP
+.B allow_live_send_test
+Permit developer-test-harness sends against a non-fixture account and permit
+the explicit
+.B live-self-send
+command.  Defaults to false.
+.TP
+.B allow_live_tag_test
+Permit developer-test-harness tag mutations against a non-fixture database.
+Defaults to false.
+.PP
+Fixture mode ignores configured external send and sync commands, captures sends
+locally, and confines tag changes to its disposable database.
 .SH LEGACY KEYS
 The obsolete keys
 .BR ui.confirm_destructive_tag_actions ,

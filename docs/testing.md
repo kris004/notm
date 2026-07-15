@@ -45,6 +45,16 @@ cargo run -p notm-app -- launch --fixture \
   --test-harness-token dev-token
 ```
 
+Fixture launch replaces account identity and data paths with disposable fixture
+values. It never runs configured receive/database-update commands or an
+external send helper; fixture sends are captured locally and tag changes apply
+only to the disposable database.
+
+For a non-fixture harness, sending and tag mutation are denied unless
+`automation.allow_live_send_test` or `automation.allow_live_tag_test` is
+explicitly enabled, respectively. The same gates apply when a mutating action
+is reached through `run_command`.
+
 Then drive the same path the change is meant to affect. A basic smoke check is:
 
 1. `health` responds with `ok: true`.

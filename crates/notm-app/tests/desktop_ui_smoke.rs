@@ -33,7 +33,7 @@ impl Drop for ChildGuard {
 
 impl FixtureApp {
     fn spawn(work_dir: PathBuf, token: &str) -> anyhow::Result<Self> {
-        Self::spawn_inner(work_dir, token, None, None, None)
+        Self::spawn_inner(work_dir, token, None, None, None, true)
     }
 
     fn spawn_with_message_id(
@@ -41,7 +41,7 @@ impl FixtureApp {
         token: &str,
         message_id: &str,
     ) -> anyhow::Result<Self> {
-        Self::spawn_inner(work_dir, token, None, Some(message_id), None)
+        Self::spawn_inner(work_dir, token, None, Some(message_id), None, true)
     }
 
     fn spawn_with_application_id(
@@ -49,7 +49,7 @@ impl FixtureApp {
         token: &str,
         application_id: &str,
     ) -> anyhow::Result<Self> {
-        Self::spawn_inner(work_dir, token, None, None, Some(application_id))
+        Self::spawn_inner(work_dir, token, None, None, Some(application_id), true)
     }
 
     #[cfg(unix)]
@@ -58,7 +58,16 @@ impl FixtureApp {
         token: &str,
         config_path: &std::path::Path,
     ) -> anyhow::Result<Self> {
-        Self::spawn_inner(work_dir, token, Some(config_path), None, None)
+        Self::spawn_inner(work_dir, token, Some(config_path), None, None, false)
+    }
+
+    #[cfg(unix)]
+    fn spawn_fixture_with_config(
+        work_dir: PathBuf,
+        token: &str,
+        config_path: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(work_dir, token, Some(config_path), None, None, true)
     }
 
     fn spawn_inner(
@@ -67,6 +76,7 @@ impl FixtureApp {
         config_path: Option<&std::path::Path>,
         message_id: Option<&str>,
         application_id: Option<&str>,
+        fixture: bool,
     ) -> anyhow::Result<Self> {
         let socket_path = work_dir.join("h.sock");
         let log_path = work_dir.join("notm.log");
@@ -86,19 +96,13 @@ impl FixtureApp {
             .with_context(|| format!("creating app log {}", log_path.display()))?;
         let mut command = Command::new(env!("CARGO_BIN_EXE_notm"));
         if let Some(config_path) = config_path {
-            command.arg("--config").arg(config_path).args([
-                "launch",
-                "--test-harness",
-                "--test-harness-socket",
-            ]);
-        } else {
-            command.args([
-                "launch",
-                "--fixture",
-                "--test-harness",
-                "--test-harness-socket",
-            ]);
+            command.arg("--config").arg(config_path);
         }
+        command.arg("launch");
+        if fixture {
+            command.arg("--fixture");
+        }
+        command.args(["--test-harness", "--test-harness-socket"]);
         command
             .arg(&socket_path)
             .args(["--test-harness-token", token]);
@@ -427,6 +431,237 @@ fn fixture_compose_attachment_headers_are_safe_and_round_trip() -> anyhow::Resul
             && attachments[0].bytes == b"attachment header smoke",
         "captured attachment did not round-trip through the UI send path: {attachments:?}"
     );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_harness_quarantines_external_commands() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP fixture_harness_quarantines_external_commands: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running fixture side-effect quarantine UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-fixture-safety-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let marker = work_dir.join("external-command-ran");
+    let helper = work_dir.join("external-helper");
+    fs::write(
+        &helper,
+        "#!/bin/sh\nprintf 'external command ran\\n' >> \"$1\"\n",
+    )?;
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755))?;
+    let sync_command =
+        toml::Value::String(format!("{} {}", helper.display(), marker.display())).to_string();
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[identity]\nname = \"Live User\"\nprimary_email = \"live@example.test\"\n\
+             \n[send]\nenabled = true\ncommand = {}\nargs = [{}]\nmode = \"stdin_rfc5322\"\nsave_sent = true\nsent_maildir = {}\nindex_sent_after_send = true\n\
+             \n[drafts]\nsave_maildir = true\nmaildir = {}\nindex_after_save = true\n\
+             \n[sync]\nenabled = true\nexternal_receive_enabled = true\nexternal_receive_on_startup = true\nexternal_receive_command = {}\nnotmuch_database_update_enabled = true\nnotmuch_database_update_on_startup = true\nnotmuch_database_update_command = {}\n\
+             \n[automation]\nallow_live_send_test = true\nallow_live_tag_test = true\n",
+            toml_path(&helper),
+            toml_path(&marker),
+            toml_path(&work_dir.join("Live-Sent")),
+            toml_path(&work_dir.join("Live-Drafts")),
+            sync_command,
+            sync_command,
+        ),
+    )?;
+
+    let token = format!("notm-fixture-safety-ui-{run_id}");
+    let mut app = FixtureApp::spawn_fixture_with_config(work_dir.clone(), &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    thread::sleep(Duration::from_millis(600));
+    ensure!(
+        !marker.exists(),
+        "fixture launch ran configured startup command: {}\n{}",
+        marker.display(),
+        app.logs()
+    );
+
+    for (command, args) in [
+        ("run_manual_sync", json!({})),
+        ("run_command", json!({"command": ":sync"})),
+    ] {
+        let response = driver.command(command, args)?;
+        assert_eq!(
+            response["ok"], false,
+            "fixture sync command was not blocked: {response}"
+        );
+        ensure!(
+            response["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("disabled in fixture mode")),
+            "fixture sync error was not explicit: {response}"
+        );
+    }
+
+    driver.command("open_compose", json!({}))?;
+    for (command, value) in [
+        ("compose_set_from", "Fixture User <fixture@example.test>"),
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Fixture safety smoke"),
+        ("compose_set_body", "Fixture safety body"),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(response["ok"], true, "{command} failed: {response}");
+    }
+    let send = driver.command("compose_send", json!({}))?;
+    assert_eq!(
+        send["last_send_report"]["accepted"], true,
+        "fixture fake send was not accepted: {send}"
+    );
+    let capture = send["last_send_report"]["captured_path"]
+        .as_str()
+        .with_context(|| format!("fixture send returned no capture path: {send}"))?;
+    ensure!(
+        PathBuf::from(capture).is_file(),
+        "fixture capture does not exist: {capture}"
+    );
+    ensure!(
+        !marker.exists(),
+        "fixture send ran configured external helper: {}",
+        marker.display()
+    );
+    ensure!(
+        !work_dir.join("Live-Sent").exists() && !work_dir.join("Live-Drafts").exists(),
+        "fixture mode wrote into configured live persistence directories"
+    );
+
+    select_first_thread(&mut driver, "subject:\"Unread inbox message\"")?;
+    let reply = driver.command("reply_selected", json!({}))?;
+    assert_eq!(
+        reply["ok"], true,
+        "fixture identity was not available for safe reply testing: {reply}"
+    );
+    ensure!(
+        reply["compose_fields"]["from"]
+            .as_str()
+            .is_some_and(|from| from.contains("fixture@example.test")),
+        "fixture reply did not use the fixture identity: {reply}"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn live_harness_denies_ungated_mutations_and_reports_reply_noops() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP live_harness_denies_ungated_mutations_and_reports_reply_noops: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running live harness gate UI smoke with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-live-gate-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let marker = work_dir.join("send-helper-ran");
+    let helper = work_dir.join("send-helper");
+    fs::write(&helper, "#!/bin/sh\nprintf 'sent\\n' > \"$1\"\n")?;
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755))?;
+    let notmuch_config_path = work_dir.join("notmuch-config-without-identity");
+    fs::write(
+        &notmuch_config_path,
+        format!("[database]\npath={}\n", fixture.root.display()),
+    )?;
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+             \n[send]\nenabled = true\ncommand = {}\nargs = [{}]\nmode = \"stdin_rfc5322\"\nsave_sent = false\n\
+             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n",
+            toml_path(&fixture.root),
+            toml_path(&notmuch_config_path),
+            toml_path(&helper),
+            toml_path(&marker),
+        ),
+    )?;
+
+    let token = format!("notm-live-gate-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir.clone(), &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    select_first_thread(&mut driver, "subject:\"Unread inbox message\"")?;
+    let tags_before = message_tags(&driver.command("app_state", json!({}))?)?;
+
+    for (command, args, gate) in [
+        ("archive_selected", json!({}), "allow_live_tag_test=true"),
+        (
+            "run_command",
+            json!({"command": ":archive"}),
+            "allow_live_tag_test=true",
+        ),
+    ] {
+        let response = driver.command(command, args)?;
+        assert_eq!(response["ok"], false, "ungated tag ran: {response}");
+        ensure!(
+            response["error"]
+                .as_str()
+                .is_some_and(|error| error.contains(gate)),
+            "tag gate error did not name the opt-in: {response}"
+        );
+    }
+    let tags_after = message_tags(&driver.command("app_state", json!({}))?)?;
+    assert_eq!(
+        tags_after, tags_before,
+        "ungated tag operation changed tags"
+    );
+
+    driver.command("open_compose", json!({}))?;
+    for (command, value) in [
+        ("compose_set_from", "sender@example.test"),
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Must not send"),
+        ("compose_set_body", "Must not send"),
+    ] {
+        driver.command(command, json!({"value": value}))?;
+    }
+    let send = driver.command("compose_send", json!({}))?;
+    assert_eq!(send["ok"], false, "ungated live send ran: {send}");
+    ensure!(
+        send["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("allow_live_send_test=true")),
+        "send gate error did not name the opt-in: {send}"
+    );
+    ensure!(!marker.exists(), "ungated send helper was executed");
+
+    select_first_thread(&mut driver, "subject:\"Unread inbox message\"")?;
+    for (command, args) in [
+        ("reply_selected", json!({})),
+        ("reply_all_selected", json!({})),
+        ("run_command", json!({"command": ":reply"})),
+    ] {
+        let response = driver.command(command, args)?;
+        assert_eq!(
+            response["ok"], false,
+            "missing-identity reply reported success: {response}"
+        );
+        ensure!(
+            response["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("No identity configured")),
+            "reply no-op error was not truthful: {response}"
+        );
+    }
 
     Ok(())
 }
@@ -942,7 +1177,8 @@ fn external_file_arg_send_reports_existing_sent_copy() -> anyhow::Result<()> {
             "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
              \n[identity]\nname = \"Fixture Sender\"\nprimary_email = \"sender@example.test\"\n\
              \n[send]\nenabled = true\ntransport = \"external\"\ncommand = {}\nargs = [{}]\nmode = \"file_arg\"\ntimeout_seconds = 5\nsave_sent = true\nsent_maildir = {}\nindex_sent_after_send = false\n\
-             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n",
+             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n\
+             \n[automation]\nallow_live_send_test = true\n",
             toml_path(&fixture.root),
             toml_path(&fixture.config_path),
             toml_path(&helper),
@@ -1049,7 +1285,8 @@ fn timed_out_send_reports_failure_and_leaves_desktop_responsive() -> anyhow::Res
             "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
              \n[identity]\nname = \"Fixture Sender\"\nprimary_email = \"sender@example.test\"\n\
              \n[send]\nenabled = true\ncommand = {}\nargs = [{}]\nmode = \"stdin_rfc5322\"\ntimeout_seconds = 1\nsave_sent = false\n\
-             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n",
+             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n\
+             \n[automation]\nallow_live_send_test = true\n",
             toml_path(&fixture.root),
             toml_path(&fixture.config_path),
             toml_path(&helper),

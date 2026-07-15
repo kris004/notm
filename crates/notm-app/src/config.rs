@@ -339,7 +339,7 @@ pub struct AutomationConfig {
     pub token: Option<String>,
     #[serde(default = "default_screenshot_dir")]
     pub screenshot_dir: PathBuf,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub allow_live_send_test: bool,
     #[serde(default)]
     pub allow_live_tag_test: bool,
@@ -352,7 +352,7 @@ impl Default for AutomationConfig {
             socket_path: None,
             token: None,
             screenshot_dir: PathBuf::from("artifacts/screenshots"),
-            allow_live_send_test: true,
+            allow_live_send_test: false,
             allow_live_tag_test: false,
         }
     }
@@ -587,6 +587,21 @@ mod tests {
         let config: AppConfig = toml::from_str("").expect("empty config should deserialize");
 
         assert_eq!(config.ui.layout, "auto");
+    }
+
+    #[test]
+    fn live_test_harness_mutations_are_disabled_by_default() {
+        let config: AppConfig = toml::from_str("").expect("empty config should deserialize");
+
+        assert!(!config.automation.allow_live_send_test);
+        assert!(!config.automation.allow_live_tag_test);
+
+        let enabled: AppConfig = toml::from_str(
+            "[automation]\nallow_live_send_test = true\nallow_live_tag_test = true\n",
+        )
+        .expect("explicit live-test gates should deserialize");
+        assert!(enabled.automation.allow_live_send_test);
+        assert!(enabled.automation.allow_live_tag_test);
     }
 
     #[test]

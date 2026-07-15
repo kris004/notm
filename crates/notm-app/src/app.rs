@@ -29,14 +29,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             };
             let mut options = launch_options(&cfg, Some(app_config_path.clone()));
             if let Some(fixture) = &fixture_guard {
-                options.database_path = Some(fixture.root.clone());
-                options.config_path = Some(fixture.config_path.clone());
-                options.default_query = "tag:inbox".to_string();
-                options.send_command = None;
-                options.fake_send_capture_dir = Some(fixture.root.join("captured-send"));
-                options.draft_path = Some(fixture.root.join(".notm-fixture-draft.json"));
-                options.drafts_dir = Some(fixture.root.join(".notm-fixture-drafts"));
-                options.app_config_path = Some(fixture.root.join(".notm-fixture-config.toml"));
+                apply_fixture_mode(&mut options, fixture);
             }
             if let Some(message_id) = message_id {
                 apply_message_id_target(&mut options, &message_id)?;
@@ -118,6 +111,9 @@ fn launch_options(cfg: &config::AppConfig, app_config_path: Option<PathBuf>) -> 
         automation_enabled: cfg.automation.enabled,
         automation_socket: cfg.automation.socket_path.clone(),
         automation_token: cfg.automation.token.clone(),
+        fixture_mode: false,
+        allow_live_send_test: cfg.automation.allow_live_send_test,
+        allow_live_tag_test: cfg.automation.allow_live_tag_test,
         show_debug_panel: cfg.ui.show_debug_panel,
         start_maximized: cfg.ui.start_maximized,
         show_sidebar: cfg.ui.show_sidebar,
@@ -149,6 +145,46 @@ fn launch_options(cfg: &config::AppConfig, app_config_path: Option<PathBuf>) -> 
         open_message_id: None,
         runtime_settings: Default::default(),
     }
+}
+
+fn apply_fixture_mode(options: &mut LaunchOptions, fixture: &notm_test_support::FixtureDatabase) {
+    let identity = notm_notmuch::config::parse_notmuch_config_identity(&fixture.config_path);
+    options.fixture_mode = true;
+    options.database_path = Some(fixture.root.clone());
+    options.config_path = Some(fixture.config_path.clone());
+    options.profile = None;
+    options.default_query = "tag:inbox".to_string();
+    options.identity_name = identity.name;
+    options.primary_email = identity.primary_email;
+    options.other_email = identity.other_email;
+
+    options.send_enabled = true;
+    options.send_command = None;
+    options.send_args.clear();
+    options.send_working_dir = None;
+    options.send_env.clear();
+    options.fake_send_capture_dir = Some(fixture.root.join("captured-send"));
+    options.save_sent = false;
+    options.sent_maildir = None;
+    options.index_sent_after_send = false;
+
+    options.save_drafts_to_maildir = false;
+    options.draft_maildir = None;
+    options.index_draft_after_save = false;
+    options.draft_path = Some(fixture.root.join(".notm-fixture-draft.json"));
+    options.drafts_dir = Some(fixture.root.join(".notm-fixture-drafts"));
+    options.app_config_path = Some(fixture.root.join(".notm-fixture-config.toml"));
+
+    options.sync_enabled = false;
+    options.notmuch_database_update_enabled = false;
+    options.notmuch_database_update_on_startup = false;
+    options.notmuch_database_update_command.clear();
+    options.external_receive_enabled = false;
+    options.external_receive_on_startup = false;
+    options.external_receive_command.clear();
+
+    options.allow_live_send_test = false;
+    options.allow_live_tag_test = false;
 }
 
 fn normalize_message_id(raw: &str) -> anyhow::Result<String> {
@@ -342,5 +378,78 @@ mod tests {
         let options = super::launch_options(&cfg, None);
 
         assert_eq!(options.layout, "stacked");
+    }
+
+    #[test]
+    fn launch_options_passes_explicit_live_test_gates() {
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.automation.allow_live_send_test = true;
+        cfg.automation.allow_live_tag_test = true;
+
+        let options = super::launch_options(&cfg, None);
+
+        assert!(options.allow_live_send_test);
+        assert!(options.allow_live_tag_test);
+        assert!(!options.fixture_mode);
+    }
+
+    #[test]
+    fn fixture_mode_replaces_live_side_effect_configuration() {
+        use std::path::PathBuf;
+
+        let fixture = notm_test_support::FixtureDatabase::create().expect("fixture");
+        let mut options = LaunchOptions {
+            send_enabled: false,
+            send_command: Some(PathBuf::from("/live/send-helper")),
+            send_args: vec!["--live".to_string()],
+            send_working_dir: Some(PathBuf::from("/live")),
+            save_sent: true,
+            sent_maildir: Some(PathBuf::from("/live/Sent")),
+            index_sent_after_send: true,
+            save_drafts_to_maildir: true,
+            draft_maildir: Some(PathBuf::from("/live/Drafts")),
+            index_draft_after_save: true,
+            sync_enabled: true,
+            notmuch_database_update_enabled: true,
+            notmuch_database_update_on_startup: true,
+            notmuch_database_update_command: "live-index".to_string(),
+            external_receive_enabled: true,
+            external_receive_on_startup: true,
+            external_receive_command: "live-receive".to_string(),
+            allow_live_send_test: true,
+            allow_live_tag_test: true,
+            ..LaunchOptions::default()
+        };
+
+        super::apply_fixture_mode(&mut options, &fixture);
+
+        assert!(options.fixture_mode);
+        assert_eq!(options.database_path.as_ref(), Some(&fixture.root));
+        assert_eq!(options.config_path.as_ref(), Some(&fixture.config_path));
+        assert_eq!(
+            options.primary_email.as_deref(),
+            Some("fixture@example.test")
+        );
+        assert_eq!(options.other_email, ["alt@example.test"]);
+        assert!(options.send_enabled);
+        assert!(options.send_command.is_none());
+        assert!(options.send_args.is_empty());
+        assert!(options.send_working_dir.is_none());
+        assert!(options.fake_send_capture_dir.is_some());
+        assert!(!options.save_sent);
+        assert!(options.sent_maildir.is_none());
+        assert!(!options.index_sent_after_send);
+        assert!(!options.save_drafts_to_maildir);
+        assert!(options.draft_maildir.is_none());
+        assert!(!options.index_draft_after_save);
+        assert!(!options.sync_enabled);
+        assert!(!options.notmuch_database_update_enabled);
+        assert!(!options.notmuch_database_update_on_startup);
+        assert!(options.notmuch_database_update_command.is_empty());
+        assert!(!options.external_receive_enabled);
+        assert!(!options.external_receive_on_startup);
+        assert!(options.external_receive_command.is_empty());
+        assert!(!options.allow_live_send_test);
+        assert!(!options.allow_live_tag_test);
     }
 }

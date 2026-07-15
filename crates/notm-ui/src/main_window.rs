@@ -121,6 +121,9 @@ pub struct LaunchOptions {
     pub automation_enabled: bool,
     pub automation_socket: Option<PathBuf>,
     pub automation_token: Option<String>,
+    pub fixture_mode: bool,
+    pub allow_live_send_test: bool,
+    pub allow_live_tag_test: bool,
     pub show_debug_panel: bool,
     pub start_maximized: bool,
     pub show_sidebar: bool,
@@ -186,6 +189,9 @@ impl Default for LaunchOptions {
             automation_enabled: false,
             automation_socket: None,
             automation_token: None,
+            fixture_mode: false,
+            allow_live_send_test: false,
+            allow_live_tag_test: false,
             show_debug_panel: false,
             start_maximized: false,
             show_sidebar: true,
@@ -11797,6 +11803,16 @@ fn run_sync_commands(
     kind: SyncRunKind,
     refresh_after: bool,
 ) {
+    if options.fixture_mode {
+        if kind == SyncRunKind::Manual {
+            widgets
+                .status_label
+                .set_text("External sync is disabled in fixture mode");
+            state.borrow_mut().last_operation = Some("fixture sync blocked".to_string());
+        }
+        update_debug(widgets, state);
+        return;
+    }
     if !options.sync_enabled {
         if kind == SyncRunKind::Manual {
             widgets.status_label.set_text("Manual sync is disabled");
@@ -11870,6 +11886,9 @@ fn run_sync_commands(
 }
 
 fn sync_command_specs(options: &LaunchOptions, kind: SyncRunKind) -> Vec<SyncCommandSpec> {
+    if options.fixture_mode {
+        return Vec::new();
+    }
     let mut commands = Vec::new();
     if options.external_receive_enabled
         && !options.external_receive_command.trim().is_empty()
@@ -11918,26 +11937,26 @@ fn reply_selected(
     widgets: &Widgets,
     state: &SharedState,
     kind: ReplyKind,
-) {
+) -> bool {
     let Some(message) = state.borrow().selected_message.clone() else {
         widgets
             .status_label
             .set_text("No selected message to reply to");
-        return;
+        return false;
     };
     let Some(path) = message.filenames.first() else {
         widgets
             .status_label
             .set_text("Selected message has no filename");
-        return;
+        return false;
     };
     let Some(id) = identity(options) else {
         widgets
             .status_label
             .set_text("No identity configured for reply");
-        return;
+        return false;
     };
-    match parse_file(path) {
+    let replied = match parse_file(path) {
         Ok(parsed) => {
             let mut own = options.other_email.clone();
             if let Some(email) = &options.primary_email {
@@ -11946,12 +11965,17 @@ fn reply_selected(
             let reply = build_reply(&parsed, &id, &own, kind);
             fill_composer(widgets, state, reply);
             widgets.status_label.set_text("Reply composer opened");
+            true
         }
-        Err(err) => widgets
-            .status_label
-            .set_text(&format!("Reply parse failed: {err}")),
-    }
+        Err(err) => {
+            widgets
+                .status_label
+                .set_text(&format!("Reply parse failed: {err}"));
+            false
+        }
+    };
     update_debug(widgets, state);
+    replied
 }
 
 fn forward_selected(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -12184,6 +12208,16 @@ fn send_message_with_config(
     if !options.send_enabled {
         anyhow::bail!("send.enabled is false");
     }
+    if options.fixture_mode {
+        let capture_dir = options.fake_send_capture_dir.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("fixture mode requires a disposable fake-send capture directory")
+        })?;
+        let rt = tokio::runtime::Runtime::new()?;
+        let transport = FakeSendTransport {
+            capture_dir: capture_dir.clone(),
+        };
+        return rt.block_on(transport.send(message));
+    }
     if let Some(command) = &options.send_command {
         let rt = tokio::runtime::Runtime::new()?;
         let transport = ExternalCommandTransport {
@@ -12370,6 +12404,12 @@ fn handle_automation_request(
     saved_store: &SavedSearchStore,
     req: AutomationRequest,
 ) {
+    if let Err(err) = ensure_automation_request_allowed(options, &req.command, &req.args) {
+        let _ = req
+            .response
+            .send(json!({"ok": false, "error": err.to_string()}));
+        return;
+    }
     let result = match req.command.as_str() {
         "health" => json!({"ok": true, "state": "running"}),
         "app_state" => json!({"ok": true, "state": &*state.borrow()}),
@@ -13007,14 +13047,16 @@ fn handle_automation_request(
             send_compose(options, widgets, state);
             json!({"ok": true, "last_send_report": state.borrow().last_send_report, "last_error": state.borrow().last_error})
         }
-        "reply_selected" => {
-            reply_selected(options, widgets, state, ReplyKind::Sender);
-            json!({"ok": true, "compose_fields": state.borrow().compose_fields})
-        }
-        "reply_all_selected" => {
-            reply_selected(options, widgets, state, ReplyKind::All);
-            json!({"ok": true, "compose_fields": state.borrow().compose_fields})
-        }
+        "reply_selected" => automation_reply_response(
+            reply_selected(options, widgets, state, ReplyKind::Sender),
+            widgets,
+            state,
+        ),
+        "reply_all_selected" => automation_reply_response(
+            reply_selected(options, widgets, state, ReplyKind::All),
+            widgets,
+            state,
+        ),
         "forward_selected" => {
             forward_selected(options, widgets, state);
             json!({"ok": true, "compose_fields": state.borrow().compose_fields})
@@ -13270,6 +13312,89 @@ fn string_array_arg(args: &serde_json::Value, name: &str) -> Vec<String> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutomationOperation {
+    Send,
+    Tag,
+    ExternalSync,
+}
+
+fn ensure_automation_request_allowed(
+    options: &LaunchOptions,
+    command: &str,
+    args: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let operation = match command {
+        "compose_send" => Some(AutomationOperation::Send),
+        "archive_selected"
+        | "mark_read_selected"
+        | "mark_unread_selected"
+        | "flag_selected"
+        | "unflag_selected"
+        | "trash_selected"
+        | "spam_selected"
+        | "add_custom_tag_from_entry"
+        | "remove_custom_tag_from_entry"
+        | "tag_selected"
+        | "add_tag_selected"
+        | "remove_tag_selected"
+        | "undo_last_tag" => Some(AutomationOperation::Tag),
+        "run_manual_sync" => Some(AutomationOperation::ExternalSync),
+        "run_command" => args
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .and_then(automation_named_command_operation),
+        _ => None,
+    };
+    let Some(operation) = operation else {
+        return Ok(());
+    };
+    if options.fixture_mode {
+        anyhow::ensure!(
+            operation != AutomationOperation::ExternalSync,
+            "external sync is disabled in fixture mode"
+        );
+        return Ok(());
+    }
+    match operation {
+        AutomationOperation::Send => anyhow::ensure!(
+            options.allow_live_send_test,
+            "live test-harness send is disabled; set automation.allow_live_send_test=true"
+        ),
+        AutomationOperation::Tag => anyhow::ensure!(
+            options.allow_live_tag_test,
+            "live test-harness tag changes are disabled; set automation.allow_live_tag_test=true"
+        ),
+        AutomationOperation::ExternalSync => {}
+    }
+    Ok(())
+}
+
+fn automation_named_command_operation(command: &str) -> Option<AutomationOperation> {
+    match normalize_command_input(command).as_str() {
+        "archive" | "mark_read" | "mark read" | "mark_unread" | "mark unread" | "flag"
+        | "unflag" | "trash" | "undo_last_tag" | "undo" => Some(AutomationOperation::Tag),
+        "sync" | "manual_sync" | "run_manual_sync" => Some(AutomationOperation::ExternalSync),
+        _ => None,
+    }
+}
+
+fn automation_reply_response(
+    replied: bool,
+    widgets: &Widgets,
+    state: &SharedState,
+) -> serde_json::Value {
+    if replied {
+        json!({"ok": true, "compose_fields": state.borrow().compose_fields})
+    } else {
+        json!({
+            "ok": false,
+            "error": widgets.status_label.text().to_string(),
+            "compose_fields": state.borrow().compose_fields,
+        })
+    }
+}
+
 fn run_named_command(
     command: &str,
     options: &LaunchOptions,
@@ -13312,14 +13437,16 @@ fn run_named_command(
             open_compose(widgets, state);
             json!({"ok": true, "compose_fields": state.borrow().compose_fields})
         }
-        "reply" => {
-            reply_selected(options, widgets, state, ReplyKind::Sender);
-            json!({"ok": true, "compose_fields": state.borrow().compose_fields})
-        }
-        "reply_all" | "reply all" => {
-            reply_selected(options, widgets, state, ReplyKind::All);
-            json!({"ok": true, "compose_fields": state.borrow().compose_fields})
-        }
+        "reply" => automation_reply_response(
+            reply_selected(options, widgets, state, ReplyKind::Sender),
+            widgets,
+            state,
+        ),
+        "reply_all" | "reply all" => automation_reply_response(
+            reply_selected(options, widgets, state, ReplyKind::All),
+            widgets,
+            state,
+        ),
         "forward" => {
             forward_selected(options, widgets, state);
             json!({"ok": true, "compose_fields": state.borrow().compose_fields})
@@ -15079,9 +15206,9 @@ fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions
     );
     let allow_live_send_test = settings_check_row(
         &form,
-        "Allow self-send test",
-        toml_bool(&existing, "automation", "allow_live_send_test", true),
-        "Only affects the separate live-self-send validation command; normal sending uses the compose Send button and send settings above.",
+        "Allow live send tests",
+        toml_bool(&existing, "automation", "allow_live_send_test", false),
+        "Permit test-harness sends against a live account and the separate live-self-send validation command. Normal interactive sending is unaffected.",
     );
     let allow_live_tag_test = settings_check_row(
         &form,
@@ -16148,6 +16275,112 @@ mod tests {
             err.to_string().contains("refusing to fake-send"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_harness_live_mutations_require_explicit_gates() {
+        let mut options = LaunchOptions::default();
+
+        let send_error = ensure_automation_request_allowed(&options, "compose_send", &json!({}))
+            .expect_err("live harness send should be gated");
+        assert!(send_error.to_string().contains("allow_live_send_test=true"));
+
+        let tag_error = ensure_automation_request_allowed(&options, "archive_selected", &json!({}))
+            .expect_err("live harness tag should be gated");
+        assert!(tag_error.to_string().contains("allow_live_tag_test=true"));
+
+        let nested_error = ensure_automation_request_allowed(
+            &options,
+            "run_command",
+            &json!({"command": ":archive"}),
+        )
+        .expect_err("nested tag command should not bypass the gate");
+        assert!(
+            nested_error
+                .to_string()
+                .contains("allow_live_tag_test=true")
+        );
+
+        options.allow_live_send_test = true;
+        options.allow_live_tag_test = true;
+        ensure_automation_request_allowed(&options, "compose_send", &json!({}))
+            .expect("explicit send gate");
+        ensure_automation_request_allowed(&options, "archive_selected", &json!({}))
+            .expect("explicit tag gate");
+        ensure_automation_request_allowed(&options, "run_command", &json!({"command": ":archive"}))
+            .expect("explicit tag gate should cover nested command");
+    }
+
+    #[test]
+    fn fixture_harness_allows_disposable_mutations_but_never_sync() {
+        let options = LaunchOptions {
+            fixture_mode: true,
+            ..LaunchOptions::default()
+        };
+
+        ensure_automation_request_allowed(&options, "compose_send", &json!({}))
+            .expect("fixture fake send");
+        ensure_automation_request_allowed(&options, "archive_selected", &json!({}))
+            .expect("fixture tag mutation");
+        let direct = ensure_automation_request_allowed(&options, "run_manual_sync", &json!({}))
+            .expect_err("fixture sync should be blocked");
+        assert!(direct.to_string().contains("disabled in fixture mode"));
+        let nested = ensure_automation_request_allowed(
+            &options,
+            "run_command",
+            &json!({"command": ":sync"}),
+        )
+        .expect_err("nested fixture sync should be blocked");
+        assert!(nested.to_string().contains("disabled in fixture mode"));
+    }
+
+    #[test]
+    fn fixture_send_uses_fake_capture_even_if_an_external_command_is_present() {
+        let capture_dir = std::env::temp_dir().join(format!(
+            "notm-fixture-send-policy-{}",
+            Uuid::new_v4().simple()
+        ));
+        let options = LaunchOptions {
+            fixture_mode: true,
+            fake_send_capture_dir: Some(capture_dir.clone()),
+            send_command: Some(PathBuf::from("notm-command-that-must-not-run")),
+            ..LaunchOptions::default()
+        };
+        let message = ComposedMessage::new(
+            "sender@example.test".to_string(),
+            vec!["recipient@example.test".to_string()],
+            "fixture policy".to_string(),
+            "body".to_string(),
+        );
+
+        let report = send_message_with_config(&options, message).expect("fixture fake send");
+
+        assert!(report.accepted);
+        assert!(
+            report
+                .captured_path
+                .as_ref()
+                .is_some_and(|path| Path::new(path).is_file())
+        );
+        let _ = std::fs::remove_dir_all(capture_dir);
+    }
+
+    #[test]
+    fn fixture_mode_produces_no_external_sync_commands() {
+        let options = LaunchOptions {
+            fixture_mode: true,
+            sync_enabled: true,
+            external_receive_enabled: true,
+            external_receive_on_startup: true,
+            external_receive_command: "must-not-run".to_string(),
+            notmuch_database_update_enabled: true,
+            notmuch_database_update_on_startup: true,
+            notmuch_database_update_command: "must-not-run".to_string(),
+            ..LaunchOptions::default()
+        };
+
+        assert!(sync_command_specs(&options, SyncRunKind::Manual).is_empty());
+        assert!(sync_command_specs(&options, SyncRunKind::Startup).is_empty());
     }
 
     #[test]

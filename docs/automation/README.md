@@ -45,10 +45,19 @@ Example request:
 - Keep the harness socket local-only. Do not expose it outside the user session.
 - Always use a token for non-fixture runs.
 - Prefer fixture runs before live mailbox runs.
-- Do not run receive/sync commands unless a user explicitly configured and asked
-  for that path.
-- Live send validation sends real mail. Use `live-self-send` or UI send tests
-  only when the configured transport and recipient are intentionally chosen.
+- Fixture mode never runs configured receive/database-update commands or an
+  external send helper. It captures sends locally and applies tags only to its
+  disposable database.
+- Non-fixture `compose_send` requests require
+  `automation.allow_live_send_test = true`. Non-fixture tag mutations require
+  `automation.allow_live_tag_test = true`. These gates also apply to actions
+  reached through `run_command`; both default to false.
+- Non-fixture receive/sync commands still use the explicit `[sync]` enablement
+  and command settings. Run them only when the user intentionally requested the
+  configured path.
+- Draft save/delete and attachment operations use the configured local paths;
+  they are not covered by the live send/tag gates and should be driven only
+  when those local file changes are intentional.
 - Screenshot and report artifacts are local validation outputs and are ignored by
   git except for `artifacts/logs/.gitkeep`.
 
