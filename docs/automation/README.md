@@ -40,6 +40,14 @@ Example request:
 {"token":"dev-token","command":"run_search","args":{"query":"tag:inbox"}}
 ```
 
+`run_search` schedules work and returns immediately with `scheduled: true` and
+the new generation. `select_saved_search` and `load_more_threads` use the same
+background-search state. Poll `search_status` until `loading` is false before
+inspecting final rows; a non-null `error` means the current generation failed.
+Fixture harnesses may add `test_delay_ms` (up to 5000) when testing that the UI
+and harness remain responsive during an outstanding search. The delay option is
+rejected for non-fixture runs.
+
 ## Safety boundaries
 
 - Keep the harness socket local-only. Do not expose it outside the user session.
@@ -65,7 +73,7 @@ Example request:
 
 Implemented test-harness commands include:
 
-- health/state: `health`, `app_state`, `get_logs`, `screenshot`
+- health/state: `health`, `app_state`, `search_status`, `get_logs`, `screenshot`
 - search/navigation: `focus_search`, `set_search_query`, `run_search`,
   `load_more_threads`, `scroll_thread_list_to_bottom`, `thread_page_info`,
   `thread_selection_view_state`, `thread_row_layout`, `thread_list_rows`,

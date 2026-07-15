@@ -280,8 +280,63 @@ fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
         "unhealthy fixture app: {health}"
     );
 
-    let search = driver.command("run_search", json!({"query": "tag:inbox"}))?;
-    assert_eq!(search["ok"], true, "fixture search failed: {search}");
+    let delayed_search = driver.command(
+        "run_search",
+        json!({"query": "subject:\"Unicode\"", "test_delay_ms": 1200}),
+    )?;
+    assert_eq!(
+        delayed_search["ok"], true,
+        "fixture search was not scheduled: {delayed_search}"
+    );
+    assert_eq!(
+        delayed_search["scheduled"], true,
+        "fixture search response did not report async scheduling: {delayed_search}"
+    );
+    assert_eq!(
+        delayed_search["state"]["search_loading"], true,
+        "fixture search completed synchronously instead of returning control: {delayed_search}"
+    );
+    let responsive_health = driver.command("health", json!({}))?;
+    assert_eq!(
+        responsive_health["ok"], true,
+        "harness stopped responding while a search was outstanding: {responsive_health}"
+    );
+    let outstanding = driver.command("search_status", json!({}))?;
+    assert_eq!(
+        outstanding["loading"], true,
+        "delayed fixture search was not outstanding during the responsiveness check: {outstanding}"
+    );
+    let edited_search = driver.command("set_search_query", json!({"query": "tag:inbox"}))?;
+    assert_eq!(
+        edited_search["ok"], true,
+        "editing the active query failed: {edited_search}"
+    );
+    let current_search = driver.command("search_status", json!({}))?;
+    assert_eq!(
+        current_search["loading"], true,
+        "debounced query edit did not reserve background search work: {current_search}"
+    );
+    let delayed_generation = delayed_search["generation"]
+        .as_u64()
+        .context("delayed search response had no generation")?;
+    let current_generation = current_search["generation"]
+        .as_u64()
+        .context("debounced search status had no generation")?;
+    ensure!(
+        current_generation > delayed_generation,
+        "query edit did not invalidate the outstanding generation: delayed={delayed_search}, current={current_search}"
+    );
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    thread::sleep(Duration::from_millis(1300));
+    let search = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        search["state"]["current_query"], "tag:inbox",
+        "stale delayed result replaced the current search: {search}"
+    );
+    assert_eq!(
+        search["state"]["search_loading"], false,
+        "stale delayed result changed the settled loading state: {search}"
+    );
     let rows = json_array_at(&search, &["state", "thread_list_items"])?;
     ensure!(!rows.is_empty(), "fixture search returned no thread rows");
     ensure!(
@@ -297,6 +352,40 @@ fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
         }),
         "tag:inbox returned a row without the inbox tag: {rows:?}"
     );
+
+    let unread_scheduled = driver.command("select_saved_search", json!({"name": "Unread"}))?;
+    assert_eq!(
+        unread_scheduled["state"]["search_loading"], true,
+        "saved search did not schedule background work: {unread_scheduled}"
+    );
+    let unread = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    assert_eq!(
+        unread["state"]["current_query"], "tag:unread and not tag:trash and not tag:spam",
+        "saved search loaded the wrong query: {unread}"
+    );
+    let unread_rows = json_array_at(&unread, &["state", "thread_list_items"])?;
+    ensure!(
+        !unread_rows.is_empty()
+            && unread_rows.iter().all(|row| {
+                row["tags"]
+                    .as_array()
+                    .is_some_and(|tags| tags.iter().any(|tag| tag == "unread"))
+            }),
+        "Unread saved search returned unexpected rows: {unread_rows:?}"
+    );
+    let inbox_scheduled = driver.command("select_saved_search", json!({"name": "Inbox"}))?;
+    assert_eq!(
+        inbox_scheduled["state"]["search_loading"], true,
+        "Inbox restore did not schedule background work: {inbox_scheduled}"
+    );
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let direct_restore = driver.command("run_search", json!({"query": "tag:inbox"}))?;
+    assert_eq!(
+        direct_restore["scheduled"], true,
+        "direct inbox restore was not scheduled: {direct_restore}"
+    );
+    let search = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let rows = json_array_at(&search, &["state", "thread_list_items"])?;
 
     let page = driver.command("thread_page_info", json!({}))?;
     assert_eq!(page["ok"], true, "page inspection failed: {page}");
@@ -832,11 +921,30 @@ fn validated_config_launches_and_invalid_layout_requests_are_rejected() -> anyho
     let mut driver = app.connect(&token)?;
     let health = driver.command("health", json!({}))?;
     assert_eq!(health["ok"], true, "validated app was unhealthy: {health}");
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
 
     let page = driver.command("thread_page_info", json!({}))?;
     assert_eq!(
         page["page_size"], 1,
         "configured page size was ignored: {page}"
+    );
+    assert_eq!(
+        page["loaded"], 1,
+        "initial one-row page was not loaded: {page}"
+    );
+    assert_eq!(
+        page["can_load_more"], true,
+        "fixture did not expose another page: {page}"
+    );
+    let load_more = driver.command("load_more_threads", json!({"select_last": false}))?;
+    assert_eq!(
+        load_more["scheduled"], true,
+        "paging was not scheduled in the background: {load_more}"
+    );
+    let paged = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    assert_eq!(
+        paged["state"]["thread_loaded_count"], 2,
+        "paging did not append the second fixture row: {paged}"
     );
     let before = driver.command("layout_state", json!({}))?;
     assert_eq!(
@@ -1679,6 +1787,11 @@ fn fixture_tag_undo_restores_each_messages_original_tags() -> anyhow::Result<()>
         Value::Null,
         "undo operation failed: {undone}"
     );
+    assert_eq!(
+        undone["state"]["search_loading"], true,
+        "tag undo did not schedule a result refresh: {undone}"
+    );
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
     let actions = driver.command("undo_tag_actions", json!({}))?;
     ensure!(
         json_array_at(&actions, &["actions"])?.is_empty(),
@@ -1693,7 +1806,12 @@ fn fixture_tag_undo_restores_each_messages_original_tags() -> anyhow::Result<()>
 }
 
 fn select_first_thread(driver: &mut UiDriver, query: &str) -> anyhow::Result<()> {
-    let search = driver.command("run_search", json!({"query": query}))?;
+    let scheduled = driver.command("run_search", json!({"query": query}))?;
+    ensure!(
+        scheduled["scheduled"] == true,
+        "fixture search was not scheduled: {scheduled}"
+    );
+    let search = driver.wait_for_search(STARTUP_TIMEOUT)?;
     let rows = json_array_at(&search, &["state", "thread_list_items"])?;
     ensure!(rows.len() == 1, "expected one fixture thread: {search}");
     let selected = driver.command("select_thread_by_index", json!({"index": 0}))?;

@@ -2,7 +2,8 @@ use std::{
     io::{BufRead, Write},
     os::unix::net::UnixStream,
     path::Path,
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 use serde_json::{Value, json};
@@ -30,5 +31,27 @@ impl UiDriver {
         let mut line = String::new();
         reader.read_line(&mut line)?;
         Ok(serde_json::from_str(&line)?)
+    }
+
+    pub fn wait_for_search(&mut self, timeout: Duration) -> anyhow::Result<Value> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let status = self.command("search_status", json!({}))?;
+            anyhow::ensure!(status["ok"] == true, "search status failed: {status}");
+            let loading = status["loading"]
+                .as_bool()
+                .ok_or_else(|| anyhow::anyhow!("search status has no loading flag: {status}"))?;
+            if !loading {
+                if let Some(error) = status["error"].as_str() {
+                    anyhow::bail!("search failed: {error}");
+                }
+                return self.command("app_state", json!({}));
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "search did not complete within {timeout:?}: {status}"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
     }
 }

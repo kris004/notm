@@ -147,6 +147,18 @@ class Harness:
     def entry_state(self) -> dict[str, Any]:
         return self.request("entry_state")
 
+    def wait_for_search(self) -> dict[str, Any]:
+        def completed_state() -> dict[str, Any] | None:
+            status = self.request("search_status")
+            if status.get("loading") is True:
+                return None
+            error = status.get("error")
+            if isinstance(error, str):
+                raise SmokeFailure(f"search failed: {error}")
+            return self.state()
+
+        return wait_until("fixture search to complete", completed_state)
+
 
 class WtypeDriver:
     """Keep each virtual keyboard connected so the headless seat stays active."""
@@ -267,7 +279,9 @@ def selected_target(state_value: dict[str, Any]) -> dict[str, Any] | None:
 
 def load_target(harness: Harness) -> dict[str, Any]:
     response = harness.request("run_search", {"query": TARGET_QUERY})
-    response_state = response.get("state")
+    if response.get("scheduled") is not True:
+        raise SmokeFailure(f"fixture search was not scheduled: {response!r}")
+    response_state = harness.wait_for_search()
     if isinstance(response_state, dict):
         message = selected_target(response_state)
         if message is not None:

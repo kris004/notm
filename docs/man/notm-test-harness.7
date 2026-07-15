@@ -48,10 +48,25 @@ notm launch --fixture \\
 .nf
 {"token":"dev-token","command":"run_search","args":{"query":"tag:inbox"}}
 .fi
+.PP
+.B run_search
+schedules the search and returns immediately. Poll
+.B search_status
+until
+.B loading
+is false before inspecting final rows.
+.B select_saved_search
+and
+.B load_more_threads
+use the same background-search state. Fixture harness requests may pass
+.B test_delay_ms
+(maximum 5000) to validate responsiveness while worker-side search work is
+outstanding; non-fixture runs reject that test-only argument.
 .SH TEST COMMAND GROUPS
 .SS Health and state
 .BR health ,
 .BR app_state ,
+.BR search_status ,
 .BR get_logs ,
 .BR screenshot .
 .SS Search and navigation

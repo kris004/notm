@@ -697,6 +697,13 @@ struct SearchResponse {
     result: anyhow::Result<SearchData>,
 }
 
+struct SearchWorkerRequest {
+    query: String,
+    generation: u64,
+    select_first: bool,
+    delay: Duration,
+}
+
 struct AddressSuggestionsResponse {
     result: anyhow::Result<Vec<String>>,
 }
@@ -724,6 +731,7 @@ const STATUS_BAR_MAX_WIDTH_CHARS: i32 = 120;
 const HTML_LINK_STATUS_URI_MAX_CHARS: usize = 96;
 const THREAD_ROW_PREFIX: &str = "thread";
 const THREAD_STATUS_PREFIX: &str = "status";
+const MAX_FIXTURE_SEARCH_DELAY: Duration = Duration::from_secs(5);
 const AUTO_STACKED_BELOW_WIDTH: i32 = 1280;
 const AUTO_THREE_PANE_ABOVE_WIDTH: i32 = 1360;
 const MESSAGE_VIEW_MIN_WIDTH: i32 = 280;
@@ -1737,7 +1745,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle 
         let st = state.clone();
         let query = options.default_query.clone();
         gtk::glib::timeout_add_local_once(Duration::from_millis(0), move || {
-            run_search_async(&opts, &w, &st, &query);
+            run_search(&opts, &w, &st, &query);
             refresh_address_suggestions_async(&opts, &w, &st);
         });
     }
@@ -3683,47 +3691,47 @@ fn connect_address_suggestion_list(widgets: &Widgets, state: &SharedState) {
 }
 
 fn connect_search_debounce(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
-    let (tx, rx) = mpsc::channel::<SearchResponse>();
     let opts = options.clone();
     let w = widgets.clone();
+    let st = state.clone();
+    let debounce_generation = Rc::new(Cell::new(0_u64));
+    let active_debounce_generation = debounce_generation.clone();
     widgets.search_entry.connect_changed(move |entry| {
         let query = entry.text().to_string();
+        let generation = active_debounce_generation.get().saturating_add(1);
+        active_debounce_generation.set(generation);
+        let search_generation = reserve_search_generation(&w);
         if query.trim().is_empty() {
+            cancel_search_activity(&mut st.borrow_mut(), search_generation);
+            w.status_label.set_text("Search cleared");
+            update_thread_result_label(&w, &st);
+            update_debug(&w, &st);
             return;
         }
-        let generation = w.search_generation.get().saturating_add(1);
-        w.search_generation.set(generation);
-        let tx = tx.clone();
+        prepare_search_activity(&w, &st, search_generation, &query);
         let opts = opts.clone();
+        let w = w.clone();
+        let st = st.clone();
+        let active_debounce_generation = active_debounce_generation.clone();
         gtk::glib::timeout_add_local_once(Duration::from_millis(350), move || {
-            thread::spawn(move || {
-                let result = execute_search(&opts, &query);
-                let _ = tx.send(SearchResponse { generation, result });
-            });
-        });
-    });
-
-    let w = widgets.clone();
-    let st = state.clone();
-    let poll_opts = options.clone();
-    gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
-        while let Ok(response) = rx.try_recv() {
-            if response.generation == w.search_generation.get() {
-                match response.result {
-                    Ok(data) => {
-                        let select_first = !widget_contains_focus(w.search_entry.upcast_ref());
-                        apply_search_data(&poll_opts, &w, &st, data, select_first);
-                    }
-                    Err(err) => apply_search_error(&w, &st, err),
-                }
-            } else {
-                st.borrow_mut().last_operation = Some(format!(
-                    "discarded stale search generation {}",
-                    response.generation
-                ));
+            if generation != active_debounce_generation.get()
+                || search_generation != w.search_generation.get()
+            {
+                return;
             }
-        }
-        gtk::glib::ControlFlow::Continue
+            let select_first = !widget_contains_focus(w.search_entry.upcast_ref());
+            launch_search_worker(
+                &opts,
+                &w,
+                &st,
+                SearchWorkerRequest {
+                    query,
+                    generation: search_generation,
+                    select_first,
+                    delay: Duration::ZERO,
+                },
+            );
+        });
     });
 }
 
@@ -5329,6 +5337,12 @@ fn load_thread_page_containing_index(
     query: &str,
     target_index: usize,
 ) {
+    if state.borrow().search_loading {
+        widgets
+            .status_label
+            .set_text("Wait for the current search before loading another page");
+        return;
+    }
     let visual_anchor_index = visual_selection_anchor_index(widgets, state);
     let target_number = target_index + 1;
     let page_size = runtime_page_size(options);
@@ -5350,6 +5364,8 @@ fn load_thread_page_containing_index(
     let query = query.to_string();
     let generation = widgets.search_generation.get().saturating_add(1);
     widgets.search_generation.set(generation);
+    begin_search_activity(&mut state.borrow_mut(), generation, &query);
+    widgets.thread_result_label.set_text("Loading thread page…");
     thread::spawn(move || {
         let result = execute_search_page(&opts, &query, offset);
         let _ = tx.send(ThreadPageResponse {
@@ -5365,7 +5381,7 @@ fn load_thread_page_containing_index(
     let st = state.clone();
     gtk::glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
         Ok(response) => {
-            if response.generation == w.search_generation.get() {
+            if complete_search_activity(&w, &st, response.generation) {
                 match response.result {
                     Ok(data) => {
                         let keep_visual = response.visual_anchor_index.is_some()
@@ -5390,7 +5406,9 @@ fn load_thread_page_containing_index(
         }
         Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
         Err(mpsc::TryRecvError::Disconnected) => {
-            apply_search_error(&w, &st, anyhow::anyhow!("thread page load cancelled"));
+            if complete_search_activity(&w, &st, generation) {
+                apply_search_error(&w, &st, anyhow::anyhow!("thread page load cancelled"));
+            }
             gtk::glib::ControlFlow::Break
         }
     });
@@ -5400,10 +5418,6 @@ fn set_thread_loading_indicator(widgets: &Widgets, message: &str) {
     widgets.status_label.set_text(message);
     widgets.load_more_button.set_label("Loading…");
     widgets.load_more_button.set_sensitive(false);
-    let context = gtk::glib::MainContext::default();
-    while context.pending() {
-        context.iteration(false);
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6883,7 +6897,7 @@ fn connect_auto_load_more(options: &LaunchOptions, widgets: &Widgets, state: &Sh
         let (can_load_more, offset) = {
             let state = st.borrow();
             (
-                state.can_load_more_threads,
+                state.can_load_more_threads && !state.search_loading,
                 state.thread_window_offset + state.thread_list_items.len(),
             )
         };
@@ -7982,9 +7996,10 @@ fn delete_active_draft_from_ui(options: &LaunchOptions, widgets: &Widgets, state
             }
             let current = state.borrow().current_query.clone();
             run_search(options, widgets, state, &current);
-            widgets
-                .status_label
-                .set_text(&format!("Deleted local draft {}", draft.path.display()));
+            widgets.status_label.set_text(&format!(
+                "Deleted local draft {}; reloading search…",
+                draft.path.display()
+            ));
             {
                 let mut state = state.borrow_mut();
                 state.last_error = None;
@@ -10045,9 +10060,9 @@ fn connect_actions(
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
-    widgets
-        .load_more_button
-        .connect_clicked(move |_| load_more_threads(&opts, &w, &st, true));
+    widgets.load_more_button.connect_clicked(move |_| {
+        load_more_threads(&opts, &w, &st, true);
+    });
 
     let opts = options.clone();
     let w = widgets.clone();
@@ -10223,36 +10238,64 @@ fn connect_tag_button(
     });
 }
 
-fn run_search(options: &LaunchOptions, widgets: &Widgets, state: &SharedState, query: &str) {
-    widgets
-        .search_generation
-        .set(widgets.search_generation.get().saturating_add(1));
-    match execute_search_page(options, query, 0) {
-        Ok(data) => apply_search_data(options, widgets, state, data, true),
-        Err(err) => {
-            state.borrow_mut().last_error = Some(err.to_string());
-            widgets
-                .status_label
-                .set_text(&format!("Search failed: {err}"));
-            update_debug(widgets, state);
-        }
-    }
+fn run_search(options: &LaunchOptions, widgets: &Widgets, state: &SharedState, query: &str) -> u64 {
+    schedule_search(options, widgets, state, query, true, Duration::ZERO)
 }
 
-fn run_search_async(options: &LaunchOptions, widgets: &Widgets, state: &SharedState, query: &str) {
+fn schedule_search(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    query: &str,
+    select_first: bool,
+    worker_delay: Duration,
+) -> u64 {
+    let generation = reserve_search_generation(widgets);
+    prepare_search_activity(widgets, state, generation, query);
+    launch_search_worker(
+        options,
+        widgets,
+        state,
+        SearchWorkerRequest {
+            query: query.to_string(),
+            generation,
+            select_first,
+            delay: worker_delay,
+        },
+    );
+    generation
+}
+
+fn reserve_search_generation(widgets: &Widgets) -> u64 {
     let generation = widgets.search_generation.get().saturating_add(1);
     widgets.search_generation.set(generation);
+    generation
+}
+
+fn prepare_search_activity(widgets: &Widgets, state: &SharedState, generation: u64, query: &str) {
+    begin_search_activity(&mut state.borrow_mut(), generation, query);
     widgets
         .status_label
         .set_text(&format!("Loading search `{query}`…"));
     widgets.thread_result_label.set_text("Loading search…");
     widgets.load_more_button.set_sensitive(false);
+}
 
+fn launch_search_worker(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    request: SearchWorkerRequest,
+) {
     let (tx, rx) = mpsc::channel::<SearchResponse>();
     let opts = options.clone();
-    let query = query.to_string();
+    let generation = request.generation;
+    let select_first = request.select_first;
     thread::spawn(move || {
-        let result = execute_search_page(&opts, &query, 0);
+        if !request.delay.is_zero() {
+            thread::sleep(request.delay);
+        }
+        let result = execute_search_page(&opts, &request.query, 0);
         let _ = tx.send(SearchResponse { generation, result });
     });
 
@@ -10261,29 +10304,52 @@ fn run_search_async(options: &LaunchOptions, widgets: &Widgets, state: &SharedSt
     let st = state.clone();
     gtk::glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
         Ok(response) => {
-            if response.generation == w.search_generation.get() {
+            if complete_search_activity(&w, &st, response.generation) {
                 match response.result {
-                    Ok(data) => apply_search_data(&opts, &w, &st, data, true),
+                    Ok(data) => apply_search_data(&opts, &w, &st, data, select_first),
                     Err(err) => apply_search_error(&w, &st, err),
                 }
-            } else {
-                st.borrow_mut().last_operation = Some(format!(
-                    "discarded stale search generation {}",
-                    response.generation
-                ));
             }
             gtk::glib::ControlFlow::Break
         }
         Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
         Err(mpsc::TryRecvError::Disconnected) => {
-            apply_search_error(&w, &st, anyhow::anyhow!("search cancelled"));
+            if complete_search_activity(&w, &st, generation) {
+                apply_search_error(&w, &st, anyhow::anyhow!("search cancelled"));
+            }
             gtk::glib::ControlFlow::Break
         }
     });
 }
 
-fn execute_search(options: &LaunchOptions, query: &str) -> anyhow::Result<SearchData> {
-    execute_search_page(options, query, 0)
+fn begin_search_activity(state: &mut UiState, generation: u64, query: &str) {
+    state.search_loading = true;
+    state.search_generation = generation;
+    state.pending_search_query = Some(query.to_string());
+    state.search_error = None;
+}
+
+fn finish_search_activity(state: &mut UiState, generation: u64) -> bool {
+    if state.search_generation != generation {
+        return false;
+    }
+    state.search_loading = false;
+    state.pending_search_query = None;
+    true
+}
+
+fn cancel_search_activity(state: &mut UiState, generation: u64) {
+    state.search_loading = false;
+    state.search_generation = generation;
+    state.pending_search_query = None;
+    state.search_error = None;
+}
+
+fn complete_search_activity(widgets: &Widgets, state: &SharedState, generation: u64) -> bool {
+    if widgets.search_generation.get() != generation {
+        return false;
+    }
+    finish_search_activity(&mut state.borrow_mut(), generation)
 }
 
 fn execute_search_page(
@@ -10342,7 +10408,10 @@ fn load_more_threads(
     widgets: &Widgets,
     state: &SharedState,
     select_last_loaded: bool,
-) {
+) -> bool {
+    if state.borrow().search_loading {
+        return false;
+    }
     let (query, offset, can_load_more) = {
         let state = state.borrow();
         (
@@ -10355,7 +10424,7 @@ fn load_more_threads(
         widgets
             .status_label
             .set_text("All currently counted threads are already loaded");
-        return;
+        return false;
     }
     set_thread_loading_indicator(
         widgets,
@@ -10365,6 +10434,8 @@ fn load_more_threads(
     let opts = options.clone();
     let generation = widgets.search_generation.get().saturating_add(1);
     widgets.search_generation.set(generation);
+    begin_search_activity(&mut state.borrow_mut(), generation, &query);
+    widgets.thread_result_label.set_text("Loading more…");
     thread::spawn(move || {
         let result = execute_search_page(&opts, &query, offset);
         let _ = tx.send(SearchResponse { generation, result });
@@ -10375,7 +10446,7 @@ fn load_more_threads(
     let st = state.clone();
     gtk::glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
         Ok(response) => {
-            if response.generation == w.search_generation.get() {
+            if complete_search_activity(&w, &st, response.generation) {
                 match response.result {
                     Ok(data) => append_search_data(&opts, &w, &st, data, select_last_loaded),
                     Err(err) => apply_search_error(&w, &st, err),
@@ -10385,10 +10456,13 @@ fn load_more_threads(
         }
         Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
         Err(mpsc::TryRecvError::Disconnected) => {
-            apply_search_error(&w, &st, anyhow::anyhow!("thread page load cancelled"));
+            if complete_search_activity(&w, &st, generation) {
+                apply_search_error(&w, &st, anyhow::anyhow!("thread page load cancelled"));
+            }
             gtk::glib::ControlFlow::Break
         }
     });
+    true
 }
 
 fn apply_search_data(
@@ -10427,6 +10501,7 @@ fn apply_search_data(
         s.database_path = Some(data.database_path);
         s.database_revision = Some(data.revision);
         s.last_error = None;
+        s.search_error = None;
         s.last_operation = Some(format!(
             "search `{}` loaded {} of {} thread(s) from offset {}{}",
             query,
@@ -10532,6 +10607,7 @@ fn append_search_data(
         s.database_path = Some(data.database_path);
         s.database_revision = Some(data.revision);
         s.last_error = None;
+        s.search_error = None;
         s.last_operation = Some(format!(
             "loaded page at offset {}: {}{}",
             offset,
@@ -10596,6 +10672,13 @@ fn restore_thread_selection(
 
 fn update_thread_result_label(widgets: &Widgets, state: &SharedState) {
     let state_ref = state.borrow();
+    if state_ref.search_loading {
+        drop(state_ref);
+        widgets.thread_result_label.set_text("Loading search…");
+        widgets.load_more_button.set_label("Loading…");
+        widgets.load_more_button.set_sensitive(false);
+        return;
+    }
     let status = thread_window_status_from_parts(
         state_ref.thread_window_offset,
         state_ref.thread_list_items.len(),
@@ -10667,6 +10750,7 @@ fn apply_search_error(widgets: &Widgets, state: &SharedState, err: anyhow::Error
     {
         let mut state = state.borrow_mut();
         state.last_error = Some(err.to_string());
+        state.search_error = Some(err.to_string());
         if state.thread_list_items.is_empty() {
             state.thread_loaded_count = 0;
             state.thread_total_count = 0;
@@ -10676,8 +10760,8 @@ fn apply_search_error(widgets: &Widgets, state: &SharedState, err: anyhow::Error
     widgets.status_label.set_text(&message);
     if state.borrow().thread_list_items.is_empty() {
         show_thread_list_message(widgets, &message);
-        update_thread_result_label(widgets, state);
     }
+    update_thread_result_label(widgets, state);
     update_debug(widgets, state);
 }
 
@@ -13291,9 +13375,10 @@ fn undo_tag_action(
             set_undo_tag_available(widgets, !undo_state.borrow().is_empty());
             let current = state.borrow().current_query.clone();
             run_search(options, widgets, state, &current);
-            widgets
-                .status_label
-                .set_text(&format!("Undid tag operation: {}", action.label));
+            widgets.status_label.set_text(&format!(
+                "Undid tag operation: {}; reloading search…",
+                action.label
+            ));
         }
         Err(err) => {
             push_undo_tag_action(undo_state, action);
@@ -14341,6 +14426,41 @@ fn setup_automation(
     });
 }
 
+fn search_status_json(state: &SharedState) -> serde_json::Value {
+    let state = state.borrow();
+    json!({
+        "ok": true,
+        "loading": state.search_loading,
+        "generation": state.search_generation,
+        "pending_query": state.pending_search_query,
+        "error": state.search_error,
+        "current_query": state.current_query,
+    })
+}
+
+fn fixture_search_worker_delay(
+    options: &LaunchOptions,
+    args: &serde_json::Value,
+) -> anyhow::Result<Duration> {
+    let Some(value) = args.get("test_delay_ms") else {
+        return Ok(Duration::ZERO);
+    };
+    anyhow::ensure!(
+        options.fixture_mode && options.automation_enabled,
+        "test_delay_ms is available only in fixture test-harness mode"
+    );
+    let milliseconds = value
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("test_delay_ms must be a non-negative whole number"))?;
+    let delay = Duration::from_millis(milliseconds);
+    anyhow::ensure!(
+        delay <= MAX_FIXTURE_SEARCH_DELAY,
+        "test_delay_ms must not exceed {}",
+        MAX_FIXTURE_SEARCH_DELAY.as_millis()
+    );
+    Ok(delay)
+}
+
 fn handle_automation_request(
     options: &LaunchOptions,
     widgets: &Widgets,
@@ -14358,6 +14478,7 @@ fn handle_automation_request(
     let result = match req.command.as_str() {
         "health" => json!({"ok": true, "state": "running"}),
         "app_state" => json!({"ok": true, "state": &*state.borrow()}),
+        "search_status" => search_status_json(state),
         "screenshot" => {
             let name = req
                 .args
@@ -14450,8 +14571,19 @@ fn handle_automation_request(
             } else {
                 widgets.search_entry.text().to_string()
             };
-            run_search(options, widgets, state, &query);
-            json!({"ok": true, "state": &*state.borrow()})
+            match fixture_search_worker_delay(options, &req.args) {
+                Ok(worker_delay) => {
+                    let generation =
+                        schedule_search(options, widgets, state, &query, true, worker_delay);
+                    json!({
+                        "ok": true,
+                        "scheduled": true,
+                        "generation": generation,
+                        "state": &*state.borrow(),
+                    })
+                }
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            }
         }
         "load_more_threads" => {
             let select_last = req
@@ -14459,8 +14591,8 @@ fn handle_automation_request(
                 .get("select_last")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(true);
-            load_more_threads(options, widgets, state, select_last);
-            json!({"ok": state.borrow().last_error.is_none(), "state": &*state.borrow()})
+            let scheduled = load_more_threads(options, widgets, state, select_last);
+            json!({"ok": true, "scheduled": scheduled, "state": &*state.borrow()})
         }
         "thread_page_info" => {
             let state = state.borrow();
@@ -14474,6 +14606,10 @@ fn handle_automation_request(
                 "page_size": state.thread_page_size,
                 "can_load_more": state.can_load_more_threads,
                 "current_query": state.current_query,
+                "search_loading": state.search_loading,
+                "search_generation": state.search_generation,
+                "pending_search_query": state.pending_search_query,
+                "search_error": state.search_error,
             })
         }
         "thread_selection_view_state" | "selection_view_state" => {
@@ -14554,7 +14690,12 @@ fn handle_automation_request(
             } else {
                 open_saved_search_name(options, widgets, state, name);
             }
-            json!({"ok": true, "state": &*state.borrow()})
+            json!({
+                "ok": true,
+                "scheduled": state.borrow().search_loading,
+                "generation": state.borrow().search_generation,
+                "state": &*state.borrow(),
+            })
         }
         "custom_saved_searches" => {
             json!({"ok": true, "custom_saved_searches": &*saved_store.borrow()})
@@ -17407,20 +17548,22 @@ fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions
             };
 
             if response == gtk::ResponseType::Apply {
-                let search_reloaded = apply_runtime_settings_values(&opts, &w, &st, &values);
+                let search_reload_scheduled =
+                    apply_runtime_settings_values(&opts, &w, &st, &values);
                 status.set_text(&settings_status_text(
                     "Settings applied where possible",
-                    search_reloaded,
+                    search_reload_scheduled,
                 ));
                 return;
             }
 
             match persist_settings_values(&opts, &values) {
                 Ok(()) => {
-                    let search_reloaded = apply_runtime_settings_values(&opts, &w, &st, &values);
+                    let search_reload_scheduled =
+                        apply_runtime_settings_values(&opts, &w, &st, &values);
                     status.set_text(&settings_status_text(
                         "Settings saved and applied where possible",
-                        search_reloaded,
+                        search_reload_scheduled,
                     ));
                     d.close();
                 }
@@ -17678,9 +17821,9 @@ fn apply_runtime_settings_values(
     search_settings_changed
 }
 
-fn settings_status_text(base: &str, search_reloaded: bool) -> String {
-    if search_reloaded {
-        format!("{base}; current search reloaded")
+fn settings_status_text(base: &str, search_reload_scheduled: bool) -> String {
+    if search_reload_scheduled {
+        format!("{base}; current search reload scheduled")
     } else {
         base.to_string()
     }
@@ -18432,6 +18575,60 @@ mod tests {
     }
 
     #[test]
+    fn stale_search_completion_cannot_finish_the_current_generation() {
+        let mut state = UiState::default();
+        begin_search_activity(&mut state, 4, "tag:inbox");
+        begin_search_activity(&mut state, 5, "tag:unread");
+
+        assert!(!finish_search_activity(&mut state, 4));
+        assert!(state.search_loading);
+        assert_eq!(state.search_generation, 5);
+        assert_eq!(state.pending_search_query.as_deref(), Some("tag:unread"));
+
+        assert!(finish_search_activity(&mut state, 5));
+        assert!(!state.search_loading);
+        assert_eq!(state.pending_search_query, None);
+
+        begin_search_activity(&mut state, 6, "tag:flagged");
+        cancel_search_activity(&mut state, 7);
+        assert!(!finish_search_activity(&mut state, 6));
+        assert!(!state.search_loading);
+        assert_eq!(state.search_generation, 7);
+        assert_eq!(state.pending_search_query, None);
+    }
+
+    #[test]
+    fn delayed_search_work_is_scoped_to_fixture_harnesses() {
+        let fixture = LaunchOptions {
+            fixture_mode: true,
+            automation_enabled: true,
+            ..LaunchOptions::default()
+        };
+        assert_eq!(
+            fixture_search_worker_delay(&fixture, &json!({"test_delay_ms": 250}))
+                .expect("fixture delay"),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            fixture_search_worker_delay(&LaunchOptions::default(), &json!({}))
+                .expect("no requested delay"),
+            Duration::ZERO
+        );
+        assert!(
+            fixture_search_worker_delay(&LaunchOptions::default(), &json!({"test_delay_ms": 1}))
+                .unwrap_err()
+                .to_string()
+                .contains("fixture test-harness mode")
+        );
+        assert!(
+            fixture_search_worker_delay(&fixture, &json!({"test_delay_ms": 5001}))
+                .unwrap_err()
+                .to_string()
+                .contains("must not exceed")
+        );
+    }
+
+    #[test]
     fn fixture_send_uses_fake_capture_even_if_an_external_command_is_present() {
         let capture_dir = std::env::temp_dir().join(format!(
             "notm-fixture-send-policy-{}",
@@ -18800,14 +18997,14 @@ mod tests {
     }
 
     #[test]
-    fn settings_status_text_distinguishes_search_reload() {
+    fn settings_status_text_distinguishes_scheduled_search_reload() {
         assert_eq!(
             settings_status_text("Settings applied where possible", false),
             "Settings applied where possible"
         );
         assert_eq!(
             settings_status_text("Settings saved and applied where possible", true),
-            "Settings saved and applied where possible; current search reloaded"
+            "Settings saved and applied where possible; current search reload scheduled"
         );
     }
 

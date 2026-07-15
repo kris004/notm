@@ -32,6 +32,14 @@ pub struct UiState {
     pub last_send_report: Option<SendReport>,
     pub last_error: Option<String>,
     pub last_operation: Option<String>,
+    #[serde(default)]
+    pub search_loading: bool,
+    #[serde(default)]
+    pub search_generation: u64,
+    #[serde(default)]
+    pub pending_search_query: Option<String>,
+    #[serde(default)]
+    pub search_error: Option<String>,
     pub database_path: Option<String>,
     pub database_revision: Option<Revision>,
     pub automation_enabled: bool,
@@ -79,6 +87,10 @@ impl Default for UiState {
             last_send_report: None,
             last_error: None,
             last_operation: None,
+            search_loading: false,
+            search_generation: 0,
+            pending_search_query: None,
+            search_error: None,
             database_path: None,
             database_revision: None,
             automation_enabled: false,

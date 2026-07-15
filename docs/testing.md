@@ -58,8 +58,15 @@ is reached through `run_command`.
 Then drive the same path the change is meant to affect. A basic smoke check is:
 
 1. `health` responds with `ok: true`.
-2. `run_search` for `tag:inbox` succeeds.
-3. `thread_page_info` reports loaded fixture rows.
+2. `run_search` for `tag:inbox` reports `scheduled: true` without waiting for
+   Notmuch.
+3. Poll `search_status` until `loading` is false and confirm `error` is null.
+4. `thread_page_info` reports loaded fixture rows.
+
+For a narrowly scoped responsiveness check, fixture harness requests may pass
+`test_delay_ms` to `run_search` (maximum 5000). The delay runs on the search
+worker, so `health` and `search_status` must remain responsive while the search
+is outstanding. This argument is rejected outside fixture harness mode.
 
 For a bug fix, capture or reproduce the symptom first, then rerun the same
 fixture/live path after the change and confirm the symptom is gone. Rust compile,
