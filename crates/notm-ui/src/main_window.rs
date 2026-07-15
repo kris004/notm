@@ -337,6 +337,19 @@ fn open_or_present_main_window(
     launch_options.open_message_id =
         resolved_new_window_message_id(open_message_id, options.open_message_id.as_deref());
     let handle = build_ui(app, launch_options);
+    let main_window_weak = Rc::downgrade(main_window);
+    handle.window.connect_destroy(move |window| {
+        let Some(main_window) = main_window_weak.upgrade() else {
+            return;
+        };
+        let is_current_window = main_window
+            .borrow()
+            .as_ref()
+            .is_some_and(|handle| handle.window == *window);
+        if is_current_window {
+            main_window.borrow_mut().take();
+        }
+    });
     *main_window.borrow_mut() = Some(handle);
 }
 
@@ -406,6 +419,8 @@ struct Widgets {
     search_entry: gtk::Entry,
     search_button: gtk::Button,
     search_generation: Rc<Cell<u64>>,
+    sync_refresh_generation: Rc<Cell<Option<u64>>>,
+    requested_search_query: Rc<RefCell<String>>,
     input_mode_generation: Rc<Cell<u64>>,
     search_suggestions_list: gtk::ListBox,
     search_completion: Rc<RefCell<Option<SearchCompletionSession>>>,
@@ -417,6 +432,7 @@ struct Widgets {
     thread_scroll_generation: Rc<Cell<u64>>,
     thread_result_label: gtk::Label,
     load_more_button: gtk::Button,
+    manual_sync_button: Option<gtk::Button>,
     thread_scrolled: gtk::ScrolledWindow,
     compose_button: gtk::Button,
     debug_button: gtk::Button,
@@ -867,6 +883,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle 
     let state = Rc::new(RefCell::new(initial_state));
     let undo_state: UndoState = Rc::new(RefCell::new(load_undo_tag_actions()));
     let search_generation = Rc::new(Cell::new(0_u64));
+    let sync_refresh_generation = Rc::new(Cell::new(None));
     let hidden_tag_searches: HiddenTagSearchStore = Rc::new(RefCell::new(
         options.hidden_tag_searches.iter().cloned().collect(),
     ));
@@ -1536,6 +1553,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle 
         search_entry,
         search_button: search_button.clone(),
         search_generation,
+        sync_refresh_generation,
+        requested_search_query: Rc::new(RefCell::new(options.default_query.clone())),
         input_mode_generation: Rc::new(Cell::new(0)),
         search_suggestions_list,
         search_completion,
@@ -1547,6 +1566,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle 
         thread_scroll_generation,
         thread_result_label,
         load_more_button,
+        manual_sync_button: manual_sync_button.clone(),
         thread_scrolled: scrolled_threads,
         compose_button: compose_button.clone(),
         debug_button: debug_button.clone(),
@@ -1662,11 +1682,13 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle 
     );
     connect_custom_tag_editor(&options, &widgets, &state, &undo_state, &single_tag_button);
     connect_notmuch_tag_command_editor(&options, &widgets, &state, &undo_state);
-    if let Some(sync_button) = manual_sync_button {
+    if let Some(sync_button) = widgets.manual_sync_button.clone() {
         let opts = options.clone();
         let w = widgets.clone();
         let st = state.clone();
-        sync_button.connect_clicked(move |_| run_manual_sync(&opts, &w, &st));
+        sync_button.connect_clicked(move |_| {
+            let _ = run_manual_sync(&opts, &w, &st, Duration::ZERO);
+        });
     }
 
     connect_actions(
@@ -3121,6 +3143,7 @@ fn close_tag_editors(widgets: &Widgets) {
 fn update_custom_tag_controls(widgets: &Widgets, state: &SharedState) {
     let has_tag = !widgets.custom_tag_entry.text().trim().is_empty();
     let can_remove = custom_tag_can_remove(widgets, state);
+    let sync_in_progress = state.borrow().sync_in_progress;
     widgets.single_tag_action_label.set_text(if !has_tag {
         "Add/remove tag: type a tag"
     } else if can_remove {
@@ -3132,7 +3155,9 @@ fn update_custom_tag_controls(widgets: &Widgets, state: &SharedState) {
     widgets
         .single_tag_apply_button
         .set_label(if can_remove { "Remove tag" } else { "Add tag" });
-    widgets.single_tag_apply_button.set_sensitive(has_tag);
+    widgets
+        .single_tag_apply_button
+        .set_sensitive(has_tag && !sync_in_progress);
 }
 
 fn custom_tag_can_remove(widgets: &Widgets, state: &SharedState) -> bool {
@@ -3700,14 +3725,52 @@ fn connect_search_debounce(options: &LaunchOptions, widgets: &Widgets, state: &S
         let query = entry.text().to_string();
         let generation = active_debounce_generation.get().saturating_add(1);
         active_debounce_generation.set(generation);
-        let search_generation = reserve_search_generation(&w);
         if query.trim().is_empty() {
+            w.requested_search_query.borrow_mut().clear();
+            if st.borrow().sync_in_progress
+                && w.sync_refresh_generation.get() == Some(st.borrow().search_generation)
+            {
+                w.status_label.set_text("Sync: refreshing messages…");
+                update_debug(&w, &st);
+                return;
+            }
+            let replace_cancelled_search = {
+                let state = st.borrow();
+                state.sync_in_progress && state.search_loading
+            };
+            let search_generation = reserve_search_generation(&w);
             cancel_search_activity(&mut st.borrow_mut(), search_generation);
-            w.status_label.set_text("Search cleared");
-            update_thread_result_label(&w, &st);
-            update_debug(&w, &st);
+            if replace_cancelled_search {
+                let refresh_query = st.borrow().current_query.clone();
+                let fallback_generation = reserve_search_generation(&w);
+                prepare_search_activity_preserving_request(
+                    &w,
+                    &st,
+                    fallback_generation,
+                    &refresh_query,
+                );
+                let opts = opts.clone();
+                let w = w.clone();
+                let st = st.clone();
+                launch_search_worker(
+                    &opts,
+                    &w,
+                    &st,
+                    SearchWorkerRequest {
+                        query: refresh_query,
+                        generation: fallback_generation,
+                        select_first: true,
+                        delay: Duration::ZERO,
+                    },
+                );
+            } else {
+                w.status_label.set_text("Search cleared");
+                update_thread_result_label(&w, &st);
+                update_debug(&w, &st);
+            }
             return;
         }
+        let search_generation = reserve_search_generation(&w);
         prepare_search_activity(&w, &st, search_generation, &query);
         let opts = opts.clone();
         let w = w.clone();
@@ -7740,7 +7803,10 @@ fn clear_transient_autosave_error(last_error: &mut Option<String>) -> bool {
 }
 
 fn update_draft_action_buttons(widgets: &Widgets, state: &SharedState) {
-    let active_draft = state.borrow().active_draft.clone();
+    let (active_draft, sync_in_progress) = {
+        let state = state.borrow();
+        (state.active_draft.clone(), state.sync_in_progress)
+    };
     if let Some(active_draft) = active_draft {
         let current_fields = compose_fields(widgets, state);
         if current_fields == active_draft.saved_fields {
@@ -7753,6 +7819,10 @@ fn update_draft_action_buttons(widgets: &Widgets, state: &SharedState) {
         widgets.clear_draft_button.set_label("Discard draft");
         widgets.delete_local_draft_button.set_visible(false);
     }
+    widgets.save_draft_button.set_sensitive(!sync_in_progress);
+    widgets
+        .delete_local_draft_button
+        .set_sensitive(!sync_in_progress);
     update_button_binding_labels(widgets, state);
 }
 
@@ -7910,6 +7980,7 @@ fn save_current_draft(
     widgets: &Widgets,
     state: &SharedState,
 ) -> anyhow::Result<DraftSaveReport> {
+    ensure_mailbox_write_allowed(widgets, state, MailboxWrite::DraftSave)?;
     let fields = compose_fields(widgets, state);
     anyhow::ensure!(fields_has_content(&fields), "draft has no content");
     let previous_draft = state.borrow().active_draft.clone();
@@ -7977,12 +8048,19 @@ fn delete_draft_source(options: &LaunchOptions, draft: &ActiveDraft) -> anyhow::
     Ok(())
 }
 
-fn delete_active_draft_from_ui(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+fn delete_active_draft_from_ui(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) -> bool {
+    if ensure_mailbox_write_allowed(widgets, state, MailboxWrite::DraftDelete).is_err() {
+        return false;
+    }
     let Some(draft) = state.borrow().active_draft.clone() else {
         widgets
             .status_label
             .set_text("No saved local draft to delete");
-        return;
+        return false;
     };
     match delete_draft_source(options, &draft) {
         Ok(()) => {
@@ -7992,7 +8070,7 @@ fn delete_active_draft_from_ui(options: &LaunchOptions, widgets: &Widgets, state
                 widgets.legacy_draft_path.as_deref(),
             ) {
                 report_draft_persistence_error(widgets, state, "Draft recovery clear failed", &err);
-                return;
+                return false;
             }
             let current = state.borrow().current_query.clone();
             run_search(options, widgets, state, &current);
@@ -8006,6 +8084,7 @@ fn delete_active_draft_from_ui(options: &LaunchOptions, widgets: &Widgets, state
                 state.last_operation =
                     Some(format!("deleted local draft {}", draft.path.display()));
             }
+            true
         }
         Err(err) => {
             state.borrow_mut().last_error = Some(err.to_string());
@@ -8013,6 +8092,7 @@ fn delete_active_draft_from_ui(options: &LaunchOptions, widgets: &Widgets, state
                 .status_label
                 .set_text(&format!("Delete local draft failed: {err}"));
             update_debug(widgets, state);
+            false
         }
     }
 }
@@ -8172,7 +8252,8 @@ fn load_selected_named_draft(widgets: &Widgets, state: &SharedState) -> anyhow::
     Ok(())
 }
 
-fn delete_selected_named_draft(widgets: &Widgets) -> anyhow::Result<()> {
+fn delete_selected_named_draft(widgets: &Widgets, state: &SharedState) -> anyhow::Result<()> {
+    ensure_mailbox_write_allowed(widgets, state, MailboxWrite::DraftDelete)?;
     let (path, _) = selected_named_draft(widgets)?;
     std::fs::remove_file(path)?;
     refresh_draft_list(widgets);
@@ -8940,12 +9021,13 @@ fn activate_image_policy_button(options: &LaunchOptions, widgets: &Widgets, stat
 fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     let html_visible = html_view_is_visible(widgets);
     let has_html = selected_message_has_html(state);
-    let (has_message, selected_thread, message_count) = {
+    let (has_message, selected_thread, message_count, sync_in_progress) = {
         let state = state.borrow();
         (
             state.selected_message.is_some(),
             state.selected_thread.clone(),
             state.messages.len(),
+            state.sync_in_progress,
         )
     };
     let has_thread = selected_thread.is_some();
@@ -8958,9 +9040,23 @@ fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, sta
         .collapse_quotes_button
         .set_visible(multiple_messages);
     widgets.response_menu_button.set_sensitive(has_message);
-    widgets.read_toggle_button.set_sensitive(has_thread);
-    widgets.flag_toggle_button.set_sensitive(has_thread);
     let tag_targets = tag_target_threads(state);
+    let can_mutate_tags = !sync_in_progress && !tag_targets.is_empty();
+    for button in [
+        &widgets.archive_button,
+        &widgets.read_toggle_button,
+        &widgets.flag_toggle_button,
+        &widgets.trash_button,
+        &widgets.spam_button,
+        &widgets.single_tag_button,
+        &widgets.tag_command_button,
+    ] {
+        button.set_sensitive(can_mutate_tags);
+    }
+    widgets.tag_menu_button.set_sensitive(can_mutate_tags);
+    widgets
+        .tag_command_apply_button
+        .set_sensitive(can_mutate_tags);
     if !tag_targets.is_empty() {
         widgets.read_toggle_button.set_label(
             if tag_targets.iter().any(|thread| thread.has_unread) {
@@ -10210,7 +10306,9 @@ fn connect_actions(
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
-    send_button.connect_clicked(move |_| send_compose(&opts, &w, &st));
+    send_button.connect_clicked(move |_| {
+        let _ = send_compose(&opts, &w, &st);
+    });
 }
 
 fn connect_tag_button(
@@ -10273,6 +10371,16 @@ fn reserve_search_generation(widgets: &Widgets) -> u64 {
 }
 
 fn prepare_search_activity(widgets: &Widgets, state: &SharedState, generation: u64, query: &str) {
+    *widgets.requested_search_query.borrow_mut() = query.to_string();
+    prepare_search_activity_preserving_request(widgets, state, generation, query);
+}
+
+fn prepare_search_activity_preserving_request(
+    widgets: &Widgets,
+    state: &SharedState,
+    generation: u64,
+    query: &str,
+) {
     begin_search_activity(&mut state.borrow_mut(), generation, query);
     widgets
         .status_label
@@ -10309,6 +10417,7 @@ fn launch_search_worker(
                     Ok(data) => apply_search_data(&opts, &w, &st, data, select_first),
                     Err(err) => apply_search_error(&w, &st, err),
                 }
+                record_full_search_outcome(&st, response.generation);
             }
             gtk::glib::ControlFlow::Break
         }
@@ -10316,10 +10425,17 @@ fn launch_search_worker(
         Err(mpsc::TryRecvError::Disconnected) => {
             if complete_search_activity(&w, &st, generation) {
                 apply_search_error(&w, &st, anyhow::anyhow!("search cancelled"));
+                record_full_search_outcome(&st, generation);
             }
             gtk::glib::ControlFlow::Break
         }
     });
+}
+
+fn record_full_search_outcome(state: &SharedState, generation: u64) {
+    let mut state = state.borrow_mut();
+    state.full_search_outcome_generation = generation;
+    state.full_search_outcome_error = state.search_error.clone();
 }
 
 fn begin_search_activity(state: &mut UiState, generation: u64, query: &str) {
@@ -13020,6 +13136,40 @@ fn undo_detail_for_thread(thread: &notm_notmuch::ThreadSummary) -> String {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MailboxWrite {
+    Tag,
+    DraftSave,
+    DraftDelete,
+    Send,
+}
+
+fn sync_block_reason(sync_in_progress: bool, operation: MailboxWrite) -> Option<&'static str> {
+    if !sync_in_progress {
+        return None;
+    }
+    Some(match operation {
+        MailboxWrite::Tag => "tag changes are unavailable while sync is in progress",
+        MailboxWrite::DraftSave => "draft saving is unavailable while sync is in progress",
+        MailboxWrite::DraftDelete => "draft deletion is unavailable while sync is in progress",
+        MailboxWrite::Send => "sending is unavailable while sync is in progress",
+    })
+}
+
+fn ensure_mailbox_write_allowed(
+    widgets: &Widgets,
+    state: &SharedState,
+    operation: MailboxWrite,
+) -> anyhow::Result<()> {
+    let Some(message) = sync_block_reason(state.borrow().sync_in_progress, operation) else {
+        return Ok(());
+    };
+    widgets.status_label.set_text(message);
+    state.borrow_mut().last_operation = Some(message.to_string());
+    update_debug(widgets, state);
+    anyhow::bail!(message)
+}
+
 fn tag_selected(
     options: &LaunchOptions,
     widgets: &Widgets,
@@ -13027,6 +13177,9 @@ fn tag_selected(
     undo_state: &UndoState,
     mutation: TagMutation,
 ) -> bool {
+    if ensure_mailbox_write_allowed(widgets, state, MailboxWrite::Tag).is_err() {
+        return false;
+    }
     let visual_target = {
         let state = state.borrow();
         visual_selection_range_from_state(&state).map(|(start, end)| {
@@ -13261,6 +13414,24 @@ fn set_undo_tag_available(widgets: &Widgets, available: bool) {
     }
 }
 
+fn update_sync_sensitive_controls(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    let sync_in_progress = state.borrow().sync_in_progress;
+    if let Some(button) = &widgets.manual_sync_button {
+        button.set_sensitive(!sync_in_progress);
+    }
+    widgets.send_button.set_sensitive(!sync_in_progress);
+    widgets.undo_tag_button.set_sensitive(!sync_in_progress);
+    widgets
+        .undo_last_tag_button
+        .set_sensitive(!sync_in_progress);
+    widgets
+        .undo_list_tag_button
+        .set_sensitive(!sync_in_progress);
+    update_message_action_buttons(options, widgets, state);
+    update_custom_tag_controls(widgets, state);
+    update_draft_action_buttons(widgets, state);
+}
+
 fn update_message_menu(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     while let Some(child) = widgets.message_menu_box.first_child() {
         widgets.message_menu_box.remove(&child);
@@ -13347,13 +13518,16 @@ fn undo_last_tag(
     widgets: &Widgets,
     state: &SharedState,
     undo_state: &UndoState,
-) {
+) -> bool {
+    if ensure_mailbox_write_allowed(widgets, state, MailboxWrite::Tag).is_err() {
+        return false;
+    }
     let Some(action) = pop_last_undo_tag_action(undo_state) else {
         set_undo_tag_available(widgets, false);
         widgets.status_label.set_text("No tag operation to undo");
-        return;
+        return false;
     };
-    undo_tag_action(options, widgets, state, undo_state, action);
+    undo_tag_action(options, widgets, state, undo_state, action)
 }
 
 fn undo_tag_action(
@@ -13362,7 +13536,12 @@ fn undo_tag_action(
     state: &SharedState,
     undo_state: &UndoState,
     action: UndoTagAction,
-) {
+) -> bool {
+    if ensure_mailbox_write_allowed(widgets, state, MailboxWrite::Tag).is_err() {
+        push_undo_tag_action(undo_state, action);
+        set_undo_tag_available(widgets, true);
+        return false;
+    }
     let mutations = action.mutations.clone();
     let result = (|| -> anyhow::Result<()> {
         let db = Database::open(&open_config(options), DatabaseMode::ReadWrite)?;
@@ -13379,6 +13558,7 @@ fn undo_tag_action(
                 "Undid tag operation: {}; reloading search…",
                 action.label
             ));
+            true
         }
         Err(err) => {
             push_undo_tag_action(undo_state, action);
@@ -13388,6 +13568,7 @@ fn undo_tag_action(
                 .status_label
                 .set_text(&format!("Undo failed: {err}"));
             update_debug(widgets, state);
+            false
         }
     }
 }
@@ -13753,6 +13934,9 @@ fn apply_selected_undo_dialog_actions(
     cursor: usize,
     actions_len: usize,
 ) {
+    if ensure_mailbox_write_allowed(widgets, state, MailboxWrite::Tag).is_err() {
+        return;
+    }
     if actions_len == 0 {
         widgets.status_label.set_text("No tag operation to undo");
         dialog.close();
@@ -13785,7 +13969,7 @@ fn apply_selected_undo_dialog_actions(
     removed.sort_by_key(|(display_index, _)| *display_index);
     let count = removed.len();
     for (_, action) in removed {
-        undo_tag_action(options, widgets, state, undo_state, action);
+        let _ = undo_tag_action(options, widgets, state, undo_state, action);
     }
     if count == 0 {
         widgets
@@ -13811,12 +13995,35 @@ struct SyncCommandSpec {
     command: String,
 }
 
-fn run_manual_sync(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
-    run_sync_commands(options, widgets, state, SyncRunKind::Manual, true);
+struct SyncResponse {
+    result: anyhow::Result<Vec<String>>,
+}
+
+fn run_manual_sync(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    refresh_delay: Duration,
+) -> anyhow::Result<()> {
+    run_sync_commands(
+        options,
+        widgets,
+        state,
+        SyncRunKind::Manual,
+        true,
+        refresh_delay,
+    )
 }
 
 fn run_startup_sync(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
-    run_sync_commands(options, widgets, state, SyncRunKind::Startup, true);
+    let _ = run_sync_commands(
+        options,
+        widgets,
+        state,
+        SyncRunKind::Startup,
+        true,
+        Duration::ZERO,
+    );
 }
 
 fn run_sync_commands(
@@ -13825,7 +14032,8 @@ fn run_sync_commands(
     state: &SharedState,
     kind: SyncRunKind,
     refresh_after: bool,
-) {
+    refresh_delay: Duration,
+) -> anyhow::Result<()> {
     if options.fixture_mode {
         if kind == SyncRunKind::Manual {
             widgets
@@ -13834,7 +14042,7 @@ fn run_sync_commands(
             state.borrow_mut().last_operation = Some("fixture sync blocked".to_string());
         }
         update_debug(widgets, state);
-        return;
+        anyhow::bail!("external sync is disabled in fixture mode");
     }
     if !options.sync_enabled {
         if kind == SyncRunKind::Manual {
@@ -13842,7 +14050,12 @@ fn run_sync_commands(
             state.borrow_mut().last_operation = Some("manual sync disabled".to_string());
         }
         update_debug(widgets, state);
-        return;
+        anyhow::bail!("manual sync is disabled");
+    }
+    if state.borrow().sync_in_progress {
+        widgets.status_label.set_text("Sync is already running");
+        update_debug(widgets, state);
+        anyhow::bail!("sync is already running");
     }
     let commands = sync_command_specs(options, kind);
     if commands.is_empty() {
@@ -13855,57 +14068,266 @@ fn run_sync_commands(
         } else {
             // No startup sync was requested; keep the normal startup search status/debug context.
         }
-        return;
+        anyhow::bail!("manual sync has no commands to run");
     }
     let label = match kind {
         SyncRunKind::Manual => "Manual sync",
         SyncRunKind::Startup => "Startup sync",
     };
+    let application_hold = widgets
+        .window
+        .application()
+        .ok_or_else(|| anyhow::anyhow!("main window is not attached to the GTK application"))?
+        .hold();
     widgets
         .status_label
         .set_text(&format!("{label}: running {} command(s)…", commands.len()));
-    let result = (|| -> anyhow::Result<Vec<String>> {
-        let mut reports = Vec::new();
-        for spec in commands {
-            let output = Command::new("sh").arg("-c").arg(&spec.command).output()?;
-            reports.push(format!(
-                "{}: status={:?} stdout={} stderr={}",
-                spec.name,
-                output.status.code(),
-                String::from_utf8_lossy(&output.stdout).trim(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-            anyhow::ensure!(
-                output.status.success(),
-                "{} command `{}` failed with status {:?}",
-                label,
-                spec.name,
-                output.status.code()
-            );
-        }
-        Ok(reports)
-    })();
-    match result {
-        Ok(reports) => {
-            state.borrow_mut().last_operation = Some(format!(
-                "{}: {}",
-                label.to_ascii_lowercase(),
-                reports.join("; ")
-            ));
-            widgets.status_label.set_text(&format!("{label} completed"));
-            if refresh_after {
-                let current = state.borrow().current_query.clone();
-                run_search(options, widgets, state, &current);
+    {
+        let mut state = state.borrow_mut();
+        state.sync_in_progress = true;
+        state.last_error = None;
+        state.last_operation = Some(format!("{} started", label.to_ascii_lowercase()));
+    }
+    update_sync_sensitive_controls(options, widgets, state);
+    update_debug(widgets, state);
+
+    let rx = spawn_sync_commands(label, commands);
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let mut application_hold = Some(application_hold);
+    gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
+        let _keep_application_alive = application_hold.as_ref();
+        match rx.try_recv() {
+            Ok(response) => {
+                match response.result {
+                    Ok(reports) if refresh_after => {
+                        st.borrow_mut().last_operation = Some(format!(
+                            "{} commands completed; refreshing messages",
+                            label.to_ascii_lowercase()
+                        ));
+                        w.status_label
+                            .set_text(&format!("{label}: refreshing messages…"));
+                        let query = sync_refresh_query(&w, &st);
+                        let generation =
+                            schedule_search(&opts, &w, &st, &query, true, refresh_delay);
+                        w.sync_refresh_generation.set(Some(generation));
+                        let application_hold = application_hold
+                            .take()
+                            .expect("sync application hold should still be owned");
+                        wait_for_sync_refresh(SyncRefreshWait {
+                            options: opts.clone(),
+                            widgets: w.clone(),
+                            state: st.clone(),
+                            label,
+                            reports,
+                            generation,
+                            application_hold,
+                        });
+                    }
+                    Ok(reports) => {
+                        apply_sync_success(&w, &st, label, &reports);
+                        finish_sync_activity(&opts, &w, &st);
+                        drop(application_hold.take());
+                    }
+                    Err(err) => {
+                        apply_sync_error(&w, &st, label, err);
+                        finish_sync_activity(&opts, &w, &st);
+                        drop(application_hold.take());
+                    }
+                }
+                gtk::glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                apply_sync_error(&w, &st, label, anyhow::anyhow!("sync worker disconnected"));
+                finish_sync_activity(&opts, &w, &st);
+                drop(application_hold.take());
+                gtk::glib::ControlFlow::Break
             }
         }
-        Err(err) => {
-            state.borrow_mut().last_error = Some(err.to_string());
-            widgets
-                .status_label
-                .set_text(&format!("{label} failed: {err}"));
-            update_debug(widgets, state);
-        }
+    });
+    Ok(())
+}
+
+fn sync_refresh_query(widgets: &Widgets, state: &SharedState) -> String {
+    let requested_query = widgets.requested_search_query.borrow().clone();
+    if requested_query.trim().is_empty() {
+        state.borrow().current_query.clone()
+    } else {
+        requested_query
     }
+}
+
+struct SyncRefreshWait {
+    options: LaunchOptions,
+    widgets: Widgets,
+    state: SharedState,
+    label: &'static str,
+    reports: Vec<String>,
+    generation: u64,
+    application_hold: gtk::gio::ApplicationHoldGuard,
+}
+
+fn wait_for_sync_refresh(wait: SyncRefreshWait) {
+    let SyncRefreshWait {
+        options,
+        widgets,
+        state,
+        label,
+        reports,
+        generation,
+        application_hold,
+    } = wait;
+    gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
+        let _keep_application_alive = &application_hold;
+        let (search_loading, full_search_outcome) = {
+            let state = state.borrow();
+            (
+                state.search_loading,
+                full_search_outcome_at_or_after(&state, generation),
+            )
+        };
+        if search_loading || full_search_outcome.is_none() {
+            return gtk::glib::ControlFlow::Continue;
+        }
+        if let Some(Err(error)) = full_search_outcome {
+            apply_sync_error(
+                &widgets,
+                &state,
+                label,
+                anyhow::anyhow!("message refresh failed: {error}"),
+            );
+        } else {
+            apply_sync_success(&widgets, &state, label, &reports);
+        }
+        finish_sync_activity(&options, &widgets, &state);
+        gtk::glib::ControlFlow::Break
+    });
+}
+
+fn full_search_outcome_at_or_after(state: &UiState, generation: u64) -> Option<Result<(), String>> {
+    (state.full_search_outcome_generation >= generation)
+        .then(|| state.full_search_outcome_error.clone().map_or(Ok(()), Err))
+}
+
+fn apply_sync_success(widgets: &Widgets, state: &SharedState, label: &str, reports: &[String]) {
+    let mut state = state.borrow_mut();
+    state.last_error = None;
+    state.last_operation = Some(format!(
+        "{}: {}",
+        label.to_ascii_lowercase(),
+        reports.join("; ")
+    ));
+    drop(state);
+    widgets.status_label.set_text(&format!("{label} completed"));
+}
+
+fn finish_sync_activity(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    state.borrow_mut().sync_in_progress = false;
+    widgets.sync_refresh_generation.set(None);
+    update_sync_sensitive_controls(options, widgets, state);
+    update_debug(widgets, state);
+}
+
+fn spawn_sync_commands(
+    label: &'static str,
+    commands: Vec<SyncCommandSpec>,
+) -> mpsc::Receiver<SyncResponse> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = execute_sync_commands(label, commands);
+        let _ = tx.send(SyncResponse { result });
+    });
+    rx
+}
+
+fn execute_sync_commands(
+    label: &str,
+    commands: Vec<SyncCommandSpec>,
+) -> anyhow::Result<Vec<String>> {
+    let mut reports = Vec::new();
+    for spec in commands {
+        let output = Command::new("sh").arg("-c").arg(&spec.command).output()?;
+        reports.push(format!(
+            "{}: status={:?} stdout={} stderr={}",
+            spec.name,
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+        anyhow::ensure!(
+            output.status.success(),
+            "{} command `{}` failed with status {:?}",
+            label,
+            spec.name,
+            output.status.code()
+        );
+    }
+    Ok(reports)
+}
+
+fn apply_sync_error(widgets: &Widgets, state: &SharedState, label: &str, err: anyhow::Error) {
+    let message = err.to_string();
+    {
+        let mut state = state.borrow_mut();
+        state.last_error = Some(message.clone());
+        state.last_operation = Some(format!("{} failed: {message}", label.to_ascii_lowercase()));
+    }
+    widgets
+        .status_label
+        .set_text(&format!("{label} failed: {message}"));
+}
+
+fn manual_sync_response(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    let refresh_delay = match sync_refresh_worker_delay(options, args) {
+        Ok(delay) => delay,
+        Err(err) => {
+            return json!({
+                "ok": false,
+                "pending": false,
+                "error": err.to_string(),
+                "state": &*state.borrow(),
+            });
+        }
+    };
+    match run_manual_sync(options, widgets, state, refresh_delay) {
+        Ok(()) => json!({"ok": true, "pending": true, "state": &*state.borrow()}),
+        Err(err) => json!({
+            "ok": false,
+            "pending": false,
+            "error": err.to_string(),
+            "state": &*state.borrow(),
+        }),
+    }
+}
+
+fn sync_refresh_worker_delay(
+    options: &LaunchOptions,
+    args: &serde_json::Value,
+) -> anyhow::Result<Duration> {
+    let Some(value) = args.get("test_refresh_delay_ms") else {
+        return Ok(Duration::ZERO);
+    };
+    anyhow::ensure!(
+        options.automation_enabled && !options.fixture_mode,
+        "test_refresh_delay_ms is available only for non-fixture test-harness syncs"
+    );
+    let milliseconds = value.as_u64().ok_or_else(|| {
+        anyhow::anyhow!("test_refresh_delay_ms must be a non-negative whole number")
+    })?;
+    let delay = Duration::from_millis(milliseconds);
+    anyhow::ensure!(
+        delay <= MAX_FIXTURE_SEARCH_DELAY,
+        "test_refresh_delay_ms must not exceed {}",
+        MAX_FIXTURE_SEARCH_DELAY.as_millis()
+    );
+    Ok(delay)
 }
 
 fn sync_command_specs(options: &LaunchOptions, kind: SyncRunKind) -> Vec<SyncCommandSpec> {
@@ -14139,7 +14561,10 @@ fn default_compose_attachment_dir() -> PathBuf {
     compose_state_path(&default_state_home(), "compose-attachments")
 }
 
-fn send_compose(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+fn send_compose(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) -> bool {
+    if ensure_mailbox_write_allowed(widgets, state, MailboxWrite::Send).is_err() {
+        return false;
+    }
     let fields = compose_fields(widgets, state);
     state.borrow_mut().compose_fields = fields.clone();
     let message = match composed_message_from_fields(&fields) {
@@ -14150,13 +14575,14 @@ fn send_compose(options: &LaunchOptions, widgets: &Widgets, state: &SharedState)
                 .set_text(&format!("Compose message build failed: {err}"));
             state.borrow_mut().last_error = Some(err.to_string());
             update_debug(widgets, state);
-            return;
+            return false;
         }
     };
     let message_for_persistence = message.clone();
     let result = send_message_with_config(options, message);
-    match result {
+    let sent = match result {
         Ok(mut report) => {
+            let accepted = report.accepted;
             widgets.status_label.set_text(if report.accepted {
                 if report.captured_path.is_some() && options.send_command.is_none() {
                     "Fake send captured"
@@ -14220,15 +14646,18 @@ fn send_compose(options: &LaunchOptions, widgets: &Widgets, state: &SharedState)
                 }
                 clear_draft_widgets(options, widgets, state);
             }
+            accepted
         }
         Err(err) => {
             widgets
                 .status_label
                 .set_text(&format!("Send failed: {err}"));
             state.borrow_mut().last_error = Some(err.to_string());
+            false
         }
-    }
+    };
     update_debug(widgets, state);
+    sent
 }
 
 fn send_message_with_config(
@@ -14477,6 +14906,20 @@ fn handle_automation_request(
     }
     let result = match req.command.as_str() {
         "health" => json!({"ok": true, "state": "running"}),
+        "close_main_window" => {
+            let window = widgets.window.clone();
+            let response_written = req.response_written;
+            gtk::glib::timeout_add_local(Duration::from_millis(10), move || match response_written
+                .try_recv()
+            {
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                    window.close();
+                    gtk::glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            });
+            json!({"ok": true})
+        }
         "app_state" => json!({"ok": true, "state": &*state.borrow()}),
         "search_status" => search_status_json(state),
         "screenshot" => {
@@ -14561,9 +15004,8 @@ fn handle_automation_request(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
             widgets.search_entry.set_text(query);
-            state.borrow_mut().current_query = query.to_string();
             widgets.search_entry.set_position(-1);
-            json!({"ok": true, "current_query": query})
+            json!({"ok": true, "current_query": query, "state": &*state.borrow()})
         }
         "run_search" => {
             let query = if let Some(q) = req.args.get("query").and_then(|v| v.as_str()) {
@@ -14941,7 +15383,7 @@ fn handle_automation_request(
             }
         }
         "archive_selected" => {
-            tag_selected(
+            let ok = tag_selected(
                 options,
                 widgets,
                 state,
@@ -14952,10 +15394,10 @@ fn handle_automation_request(
                     sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
-            json!({"ok": true, "state": &*state.borrow()})
+            automation_mutation_response(ok, widgets, state)
         }
         "mark_read_selected" => {
-            tag_selected(
+            let ok = tag_selected(
                 options,
                 widgets,
                 state,
@@ -14966,10 +15408,10 @@ fn handle_automation_request(
                     sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
-            json!({"ok": true, "state": &*state.borrow()})
+            automation_mutation_response(ok, widgets, state)
         }
         "mark_unread_selected" => {
-            tag_selected(
+            let ok = tag_selected(
                 options,
                 widgets,
                 state,
@@ -14980,10 +15422,10 @@ fn handle_automation_request(
                     sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
-            json!({"ok": true, "state": &*state.borrow()})
+            automation_mutation_response(ok, widgets, state)
         }
         "flag_selected" => {
-            tag_selected(
+            let ok = tag_selected(
                 options,
                 widgets,
                 state,
@@ -14994,10 +15436,10 @@ fn handle_automation_request(
                     sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
-            json!({"ok": true, "state": &*state.borrow()})
+            automation_mutation_response(ok, widgets, state)
         }
         "unflag_selected" => {
-            tag_selected(
+            let ok = tag_selected(
                 options,
                 widgets,
                 state,
@@ -15008,10 +15450,10 @@ fn handle_automation_request(
                     sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
-            json!({"ok": true, "state": &*state.borrow()})
+            automation_mutation_response(ok, widgets, state)
         }
         "trash_selected" => {
-            tag_selected(
+            let ok = tag_selected(
                 options,
                 widgets,
                 state,
@@ -15022,10 +15464,10 @@ fn handle_automation_request(
                     sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
-            json!({"ok": true, "state": &*state.borrow()})
+            automation_mutation_response(ok, widgets, state)
         }
         "spam_selected" => {
-            tag_selected(
+            let ok = tag_selected(
                 options,
                 widgets,
                 state,
@@ -15036,7 +15478,7 @@ fn handle_automation_request(
                     sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
-            json!({"ok": true, "state": &*state.borrow()})
+            automation_mutation_response(ok, widgets, state)
         }
         "set_custom_tag_entry" => {
             let tag = req
@@ -15048,12 +15490,12 @@ fn handle_automation_request(
             json!({"ok": true, "tag": tag})
         }
         "add_custom_tag_from_entry" => {
-            apply_custom_tag_from_entry(options, widgets, state, undo_state, true);
-            json!({"ok": true, "state": &*state.borrow()})
+            let ok = apply_custom_tag_from_entry(options, widgets, state, undo_state, true);
+            automation_mutation_response(ok, widgets, state)
         }
         "remove_custom_tag_from_entry" => {
-            apply_custom_tag_from_entry(options, widgets, state, undo_state, false);
-            json!({"ok": true, "state": &*state.borrow()})
+            let ok = apply_custom_tag_from_entry(options, widgets, state, undo_state, false);
+            automation_mutation_response(ok, widgets, state)
         }
         "tag_selected" | "add_tag_selected" | "remove_tag_selected" => {
             let mut add = string_array_arg(&req.args, "add");
@@ -15070,7 +15512,7 @@ fn handle_automation_request(
             if req.command == "remove_tag_selected" && remove.is_empty() {
                 remove = string_array_arg(&req.args, "tags");
             }
-            tag_selected(
+            let ok = tag_selected(
                 options,
                 widgets,
                 state,
@@ -15081,11 +15523,11 @@ fn handle_automation_request(
                     sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
-            json!({"ok": true, "state": &*state.borrow()})
+            automation_mutation_response(ok, widgets, state)
         }
         "undo_last_tag" => {
-            undo_last_tag(options, widgets, state, undo_state);
-            json!({"ok": true, "state": &*state.borrow()})
+            let ok = undo_last_tag(options, widgets, state, undo_state);
+            automation_mutation_response(ok, widgets, state)
         }
         "undo_tag_actions" => {
             let actions = undo_state
@@ -15096,10 +15538,7 @@ fn handle_automation_request(
                 .collect::<Vec<_>>();
             json!({"ok": true, "actions": actions})
         }
-        "run_manual_sync" => {
-            run_manual_sync(options, widgets, state);
-            json!({"ok": state.borrow().last_error.is_none(), "state": &*state.borrow()})
-        }
+        "run_manual_sync" => manual_sync_response(options, widgets, state, &req.args),
         "open_compose" => {
             open_compose(widgets, state);
             json!({"ok": true, "compose_fields": state.borrow().compose_fields})
@@ -15216,13 +15655,14 @@ fn handle_automation_request(
             Ok(()) => json!({"ok": true, "compose_fields": state.borrow().compose_fields}),
             Err(err) => json!({"ok": false, "error": err.to_string()}),
         },
-        "delete_selected_draft" => match delete_selected_named_draft(widgets) {
+        "delete_selected_draft" => match delete_selected_named_draft(widgets, state) {
             Ok(()) => json!({"ok": true}),
             Err(err) => json!({"ok": false, "error": err.to_string()}),
         },
         "delete_active_draft" | "delete_local_draft" => {
-            delete_active_draft_from_ui(options, widgets, state);
-            json!({"ok": state.borrow().last_error.is_none(), "compose_fields": state.borrow().compose_fields, "active_draft": state.borrow().active_draft, "last_error": state.borrow().last_error})
+            let ok = delete_active_draft_from_ui(options, widgets, state);
+            let error = (!ok).then(|| widgets.status_label.text().to_string());
+            json!({"ok": ok, "error": error, "compose_fields": state.borrow().compose_fields, "active_draft": state.borrow().active_draft, "last_error": state.borrow().last_error})
         }
         "load_draft" => {
             restore_draft_if_present(widgets, state);
@@ -15239,8 +15679,9 @@ fn handle_automation_request(
             }
         }
         "compose_send" => {
-            send_compose(options, widgets, state);
-            json!({"ok": true, "last_send_report": state.borrow().last_send_report, "last_error": state.borrow().last_error})
+            let ok = send_compose(options, widgets, state);
+            let error = (!ok).then(|| widgets.status_label.text().to_string());
+            json!({"ok": ok, "error": error, "last_send_report": state.borrow().last_send_report, "last_error": state.borrow().last_error})
         }
         "reply_selected" => automation_reply_response(
             reply_selected(options, widgets, state, ReplyKind::Sender),
@@ -15494,6 +15935,15 @@ fn handle_automation_request(
     let _ = req.response.send(result);
 }
 
+fn automation_mutation_response(
+    ok: bool,
+    widgets: &Widgets,
+    state: &SharedState,
+) -> serde_json::Value {
+    let error = (!ok).then(|| widgets.status_label.text().to_string());
+    json!({"ok": ok, "error": error, "state": &*state.borrow()})
+}
+
 fn standalone_message_windows_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
     let windows = widgets
         .standalone_windows
@@ -15702,7 +16152,7 @@ fn run_named_command(
             json!({"ok": true, "state": &*state.borrow()})
         }
         "archive" => {
-            tag_selected(
+            let ok = tag_selected(
                 options,
                 widgets,
                 state,
@@ -15713,10 +16163,10 @@ fn run_named_command(
                     sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
-            json!({"ok": true, "state": &*state.borrow()})
+            automation_mutation_response(ok, widgets, state)
         }
         "mark_read" | "mark read" => {
-            tag_selected(
+            let ok = tag_selected(
                 options,
                 widgets,
                 state,
@@ -15727,10 +16177,10 @@ fn run_named_command(
                     sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
-            json!({"ok": true, "state": &*state.borrow()})
+            automation_mutation_response(ok, widgets, state)
         }
         "mark_unread" | "mark unread" => {
-            tag_selected(
+            let ok = tag_selected(
                 options,
                 widgets,
                 state,
@@ -15741,10 +16191,10 @@ fn run_named_command(
                     sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
-            json!({"ok": true, "state": &*state.borrow()})
+            automation_mutation_response(ok, widgets, state)
         }
         "flag" => {
-            tag_selected(
+            let ok = tag_selected(
                 options,
                 widgets,
                 state,
@@ -15755,10 +16205,10 @@ fn run_named_command(
                     sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
-            json!({"ok": true, "state": &*state.borrow()})
+            automation_mutation_response(ok, widgets, state)
         }
         "unflag" => {
-            tag_selected(
+            let ok = tag_selected(
                 options,
                 widgets,
                 state,
@@ -15769,10 +16219,10 @@ fn run_named_command(
                     sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
-            json!({"ok": true, "state": &*state.borrow()})
+            automation_mutation_response(ok, widgets, state)
         }
         "trash" => {
-            tag_selected(
+            let ok = tag_selected(
                 options,
                 widgets,
                 state,
@@ -15783,7 +16233,7 @@ fn run_named_command(
                     sync_maildir_flags: runtime_sync_maildir_flags_after_tag_change(options),
                 },
             );
-            json!({"ok": true, "state": &*state.borrow()})
+            automation_mutation_response(ok, widgets, state)
         }
         "toggle_debug_panel" | "debug" => {
             widgets
@@ -15929,12 +16379,11 @@ fn run_named_command(
             json!({"ok": true})
         }
         "undo_last_tag" | "undo" => {
-            undo_last_tag(options, widgets, state, undo_state);
-            json!({"ok": true, "state": &*state.borrow()})
+            let ok = undo_last_tag(options, widgets, state, undo_state);
+            automation_mutation_response(ok, widgets, state)
         }
         "sync" | "manual_sync" | "run_manual_sync" => {
-            run_manual_sync(options, widgets, state);
-            json!({"ok": state.borrow().last_error.is_none(), "state": &*state.borrow()})
+            manual_sync_response(options, widgets, state, &serde_json::Value::Null)
         }
         "" => json!({"ok": false, "error": "missing command"}),
         other => json!({"ok": false, "error": format!("unknown command palette command: {other}")}),
@@ -15944,7 +16393,7 @@ fn run_named_command(
 fn update_debug(widgets: &Widgets, state: &SharedState) {
     let s = state.borrow();
     let text = format!(
-        "query: {}\nselected_thread: {}\nselected_message: {}\nlayout: {} ({})\ndatabase_path: {}\ndatabase_revision: {}\nlast_operation: {}\nlast_error: {}\ntest_harness: {}\nlast_send: {}\n",
+        "query: {}\nselected_thread: {}\nselected_message: {}\nlayout: {} ({})\ndatabase_path: {}\ndatabase_revision: {}\nlast_operation: {}\nlast_error: {}\ntest_harness: {}\nsync_in_progress: {}\nlast_send: {}\n",
         s.current_query,
         s.selected_thread
             .as_ref()
@@ -15964,6 +16413,7 @@ fn update_debug(widgets: &Widgets, state: &SharedState) {
         s.last_operation.as_deref().unwrap_or(""),
         s.last_error.as_deref().unwrap_or(""),
         s.automation_enabled,
+        s.sync_in_progress,
         s.last_send_report
             .as_ref()
             .map(|r| format!("accepted={} status={:?}", r.accepted, r.exit_status))
@@ -18588,13 +19038,29 @@ mod tests {
         assert!(finish_search_activity(&mut state, 5));
         assert!(!state.search_loading);
         assert_eq!(state.pending_search_query, None);
+        state.full_search_outcome_generation = 5;
+        state.full_search_outcome_error = Some("full search failed".to_string());
 
         begin_search_activity(&mut state, 6, "tag:flagged");
         cancel_search_activity(&mut state, 7);
         assert!(!finish_search_activity(&mut state, 6));
         assert!(!state.search_loading);
         assert_eq!(state.search_generation, 7);
+        assert_eq!(state.full_search_outcome_generation, 5);
+        assert_eq!(
+            full_search_outcome_at_or_after(&state, 4),
+            Some(Err("full search failed".to_string()))
+        );
+        assert_eq!(full_search_outcome_at_or_after(&state, 6), None);
         assert_eq!(state.pending_search_query, None);
+
+        state.search_error = Some("unrelated page load failed".to_string());
+        state.full_search_outcome_error = None;
+        assert_eq!(
+            full_search_outcome_at_or_after(&state, 5),
+            Some(Ok(())),
+            "an unrelated mutable search error replaced the recorded full-search outcome"
+        );
     }
 
     #[test]
@@ -18622,6 +19088,40 @@ mod tests {
         );
         assert!(
             fixture_search_worker_delay(&fixture, &json!({"test_delay_ms": 5001}))
+                .unwrap_err()
+                .to_string()
+                .contains("must not exceed")
+        );
+    }
+
+    #[test]
+    fn delayed_sync_refresh_work_is_scoped_to_non_fixture_harnesses() {
+        let harness = LaunchOptions {
+            automation_enabled: true,
+            ..LaunchOptions::default()
+        };
+        assert_eq!(
+            sync_refresh_worker_delay(&harness, &json!({"test_refresh_delay_ms": 250}))
+                .expect("non-fixture harness delay"),
+            Duration::from_millis(250)
+        );
+        for options in [
+            LaunchOptions::default(),
+            LaunchOptions {
+                automation_enabled: true,
+                fixture_mode: true,
+                ..LaunchOptions::default()
+            },
+        ] {
+            assert!(
+                sync_refresh_worker_delay(&options, &json!({"test_refresh_delay_ms": 1}))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("non-fixture test-harness syncs")
+            );
+        }
+        assert!(
+            sync_refresh_worker_delay(&harness, &json!({"test_refresh_delay_ms": 5001}))
                 .unwrap_err()
                 .to_string()
                 .contains("must not exceed")
@@ -19281,6 +19781,23 @@ mod tests {
     }
 
     #[test]
+    fn sync_blocks_mailbox_writers_only_while_pending() {
+        for operation in [
+            MailboxWrite::Tag,
+            MailboxWrite::DraftSave,
+            MailboxWrite::DraftDelete,
+            MailboxWrite::Send,
+        ] {
+            assert_eq!(sync_block_reason(false, operation), None);
+            assert!(
+                sync_block_reason(true, operation)
+                    .is_some_and(|message| message.contains("sync is in progress")),
+                "missing sync conflict for {operation:?}"
+            );
+        }
+    }
+
+    #[test]
     fn sync_command_selection_separates_manual_from_startup() {
         let mut options = LaunchOptions {
             sync_enabled: true,
@@ -19384,5 +19901,49 @@ mod tests {
         );
         assert_eq!(standalone_view_sequence_action(gtk::gdk::Key::j), None);
         assert_eq!(standalone_copy_sequence_field(gtk::gdk::Key::j), None);
+    }
+
+    #[test]
+    fn sync_worker_returns_before_a_slow_command_finishes() {
+        let started = Instant::now();
+        let receiver = spawn_sync_commands(
+            "Test sync",
+            vec![SyncCommandSpec {
+                name: "receive",
+                command: "sleep 1; printf done".to_string(),
+            }],
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "starting a background sync waited for its command"
+        );
+        let response = receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("background sync response");
+        let reports = response.result.expect("slow sync command should succeed");
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].contains("stdout=done"));
+    }
+
+    #[test]
+    fn sync_command_failure_stops_later_commands() {
+        let directory = tempfile::tempdir().expect("temporary sync directory");
+        let marker = directory.path().join("later-command-ran");
+        let commands = vec![
+            SyncCommandSpec {
+                name: "receive",
+                command: "exit 7".to_string(),
+            },
+            SyncCommandSpec {
+                name: "database_update",
+                command: format!("printf ran > {}", marker.display()),
+            },
+        ];
+
+        let error = execute_sync_commands("Test sync", commands)
+            .expect_err("failing receive command should fail the sync");
+        assert!(error.to_string().contains("failed with status Some(7)"));
+        assert!(!marker.exists(), "a command after the failure was executed");
     }
 }

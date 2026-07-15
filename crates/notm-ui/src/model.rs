@@ -30,12 +30,18 @@ pub struct UiState {
     pub input_mode: InputMode,
     pub active_pane: ActivePane,
     pub last_send_report: Option<SendReport>,
+    #[serde(default)]
+    pub sync_in_progress: bool,
     pub last_error: Option<String>,
     pub last_operation: Option<String>,
     #[serde(default)]
     pub search_loading: bool,
     #[serde(default)]
     pub search_generation: u64,
+    #[serde(default)]
+    pub full_search_outcome_generation: u64,
+    #[serde(default)]
+    pub full_search_outcome_error: Option<String>,
     #[serde(default)]
     pub pending_search_query: Option<String>,
     #[serde(default)]
@@ -85,10 +91,13 @@ impl Default for UiState {
             input_mode: InputMode::Normal,
             active_pane: ActivePane::Threads,
             last_send_report: None,
+            sync_in_progress: false,
             last_error: None,
             last_operation: None,
             search_loading: false,
             search_generation: 0,
+            full_search_outcome_generation: 0,
+            full_search_outcome_error: None,
             pending_search_query: None,
             search_error: None,
             database_path: None,

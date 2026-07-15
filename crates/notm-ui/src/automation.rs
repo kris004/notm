@@ -15,6 +15,7 @@ pub struct AutomationRequest {
     pub command: String,
     pub args: Value,
     pub response: mpsc::Sender<Value>,
+    pub response_written: mpsc::Receiver<()>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,11 +74,13 @@ fn handle_client(
             continue;
         }
         let (resp_tx, resp_rx) = mpsc::channel();
+        let (written_tx, written_rx) = mpsc::channel();
         if tx
             .send(AutomationRequest {
                 command: incoming.command,
                 args: incoming.args,
                 response: resp_tx,
+                response_written: written_rx,
             })
             .is_err()
         {
@@ -91,6 +94,8 @@ fn handle_client(
         match resp_rx.recv_timeout(Duration::from_secs(15)) {
             Ok(value) => {
                 let _ = writeln!(writer, "{}", value);
+                let _ = writer.flush();
+                let _ = written_tx.send(());
             }
             Err(_) => {
                 let _ = writeln!(

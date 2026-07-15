@@ -108,13 +108,24 @@ Implemented test-harness commands include:
   `show_shortcuts`, `help_search`, `run_command`, `run_manual_sync`,
   `open_settings`, `save_settings`, `resize_window`, `pane_visibility`,
   `set_pane_visibility`, `layout_state`, `set_layout`, `toggle_layout`,
-  `toggle_debug_panel`, custom saved-search commands, and custom tag-editor
-  commands
+  `toggle_debug_panel`, `close_main_window`, custom saved-search commands, and
+  custom tag-editor commands
 
 `focus_search` and `focus_compose_field` move GTK focus without forcing Insert
 mode. Tests that exercise keyboard editing should send the same `/`, `i`, or
 Enter transition that a user would use instead of relying on the harness to
 change modes implicitly.
+
+`run_manual_sync` returns with `pending: true` after the configured commands
+have started in the background. Poll `app_state.state.sync_in_progress` until
+it becomes false before asserting the command result or refreshed mail state;
+the flag remains true until the post-sync search refresh also finishes.
+Non-fixture harness checks may pass `test_refresh_delay_ms` (maximum 5000) to
+keep that refresh pending while they exercise responsiveness and cancellation
+behavior; normal UI and command-palette syncs never add this delay.
+
+`close_main_window` closes only the primary window after returning its response.
+Standalone message windows, if any, are left open.
 
 `set_layout` accepts `auto`, `columns` (with `three_pane` kept as a
 compatibility spelling), and `stacked`. `toggle_layout` cycles through columns,

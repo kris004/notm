@@ -167,6 +167,22 @@ impl FixtureApp {
             .unwrap_or_else(|err| format!("could not read app log: {err}"))
     }
 
+    fn wait_for_exit(&mut self, timeout: Duration) -> anyhow::Result<std::process::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "fixture app did not exit within {timeout:?}\n{}",
+                    self.logs()
+                );
+            }
+            thread::sleep(STARTUP_POLL_INTERVAL);
+        }
+    }
+
     fn request_message_id(
         &self,
         token: &str,
@@ -440,6 +456,15 @@ fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
         "fixture composer dropped Bcc recipients from its send submission:\n{captured}"
     );
 
+    let close = driver.command("close_main_window", json!({}))?;
+    assert_eq!(close["ok"], true, "main-window close failed: {close}");
+    drop(driver);
+    let status = app.wait_for_exit(Duration::from_secs(3))?;
+    ensure!(
+        status.success(),
+        "fixture app did not exit cleanly: {status}"
+    );
+
     Ok(())
 }
 
@@ -640,6 +665,366 @@ fn fixture_harness_quarantines_external_commands() -> anyhow::Result<()> {
             .is_some_and(|from| from.contains("fixture@example.test")),
         "fixture reply did not use the fixture identity: {reply}"
     );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn slow_manual_sync_keeps_desktop_responsive() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP slow_manual_sync_keeps_desktop_responsive: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running non-blocking manual-sync UI smoke with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-async-sync-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let marker = work_dir.join("sync-completed");
+    let helper = work_dir.join("sync-helper");
+    let send_marker = work_dir.join("send-should-not-run");
+    let send_helper = work_dir.join("send-helper");
+    fs::write(
+        &helper,
+        "#!/bin/sh\nsleep 3\nprintf 'completed\\n' > \"$1\"\n",
+    )?;
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755))?;
+    fs::write(
+        &send_helper,
+        "#!/bin/sh\ncat >/dev/null\nprintf 'sent\\n' > \"$1\"\n",
+    )?;
+    fs::set_permissions(&send_helper, fs::Permissions::from_mode(0o755))?;
+    let sync_command =
+        toml::Value::String(format!("{} {}", helper.display(), marker.display())).to_string();
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+             \n[identity]\nname = \"Fixture Sender\"\nprimary_email = \"sender@example.test\"\n\
+             \n[sync]\nenabled = true\nexternal_receive_enabled = true\nexternal_receive_on_startup = false\nexternal_receive_command = {}\n\
+             \n[send]\nenabled = true\ncommand = {}\nargs = [{}]\nmode = \"stdin_rfc5322\"\nsave_sent = false\n\
+             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n\
+             \n[automation]\nallow_live_send_test = true\nallow_live_tag_test = true\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+            sync_command,
+            toml_path(&send_helper),
+            toml_path(&send_marker),
+        ),
+    )?;
+
+    let token = format!("notm-async-sync-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+
+    select_first_thread(&mut driver, "subject:\"Unread inbox message\"")?;
+    driver.command("open_compose", json!({}))?;
+    for (command, value) in [
+        ("compose_set_from", "Fixture Sender <sender@example.test>"),
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Sync overlap draft"),
+        ("compose_set_body", "Sync overlap body"),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(response["ok"], true, "{command} failed: {response}");
+    }
+    let saved_draft = driver.command("save_draft", json!({}))?;
+    assert_eq!(
+        saved_draft["ok"], true,
+        "pre-sync draft save failed: {saved_draft}"
+    );
+    let saved_draft_path = saved_draft["report"]["local_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("saved draft has no local path: {saved_draft}"))?;
+
+    let started = Instant::now();
+    let response = driver.command("run_manual_sync", json!({"test_refresh_delay_ms": 1200}))?;
+    let start_elapsed = started.elapsed();
+    assert_eq!(
+        response["ok"], true,
+        "manual sync did not start: {response}"
+    );
+    assert_eq!(
+        response["pending"], true,
+        "manual sync did not report pending work: {response}"
+    );
+    assert_eq!(
+        response["state"]["sync_in_progress"], true,
+        "manual sync was not marked in progress: {response}"
+    );
+    ensure!(
+        start_elapsed < Duration::from_millis(750),
+        "manual sync blocked for {start_elapsed:?} before responding"
+    );
+
+    let health_started = Instant::now();
+    let health = driver.command("health", json!({}))?;
+    let health_elapsed = health_started.elapsed();
+    assert_eq!(health["ok"], true, "desktop became unhealthy: {health}");
+    ensure!(
+        health_elapsed < Duration::from_millis(750),
+        "health waited {health_elapsed:?} for the sync helper"
+    );
+    let in_progress = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        in_progress["state"]["sync_in_progress"], true,
+        "slow helper completed before responsiveness was checked: {in_progress}"
+    );
+
+    let duplicate = driver.command("run_manual_sync", json!({}))?;
+    assert_eq!(
+        duplicate["ok"], false,
+        "overlapping manual sync was accepted: {duplicate}"
+    );
+    ensure!(
+        duplicate["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("already running")),
+        "overlapping sync error was not explicit: {duplicate}"
+    );
+
+    let fresh_path = fixture
+        .maildir
+        .join("cur")
+        .join(format!("{run_id}.sync-refresh:2,"));
+    fs::write(
+        &fresh_path,
+        format!(
+            "From: refresh@example.test\r\nTo: fixture@example.test\r\n\
+             Subject: Sync refresh arrival\r\nDate: Wed, 15 Jul 2026 16:00:00 -0600\r\n\
+             Message-ID: <sync-refresh-{run_id}@fixture.test>\r\n\
+             MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n\
+             Arrived during sync.\r\n"
+        ),
+    )?;
+    fixture
+        .open_readwrite()?
+        .index_file_with_tags(&fresh_path, &["inbox", "sync-refresh"])?;
+
+    let edited = driver.command(
+        "compose_set_subject",
+        json!({"value": "Composer remains editable during sync"}),
+    )?;
+    assert_eq!(
+        edited["compose_fields"]["subject"], "Composer remains editable during sync",
+        "composer editing was blocked during sync: {edited}"
+    );
+    for (command, args) in [
+        ("tag_selected", json!({"add": ["must-not-apply"]})),
+        ("save_draft", json!({})),
+        ("delete_active_draft", json!({})),
+        ("compose_send", json!({})),
+    ] {
+        let blocked = driver.command(command, args)?;
+        assert_eq!(
+            blocked["ok"], false,
+            "{command} was accepted during sync: {blocked}"
+        );
+        ensure!(
+            blocked["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("sync is in progress")),
+            "{command} did not explain the sync conflict: {blocked}"
+        );
+    }
+    ensure!(
+        saved_draft_path.is_file(),
+        "blocked draft deletion removed {}",
+        saved_draft_path.display()
+    );
+    ensure!(
+        !send_marker.exists(),
+        "blocked send still executed its helper"
+    );
+
+    let refresh_search = driver.command("run_search", json!({"query": "tag:sync-refresh"}))?;
+    assert_eq!(
+        refresh_search["scheduled"], true,
+        "sync-time search was not scheduled: {refresh_search}"
+    );
+    let refresh_search = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    assert_eq!(
+        refresh_search["state"]["sync_in_progress"], true,
+        "sync finished before the responsiveness checks completed: {refresh_search}"
+    );
+
+    let refresh_deadline = Instant::now() + Duration::from_secs(6);
+    let refreshing = loop {
+        let state = driver.command("app_state", json!({}))?;
+        let refresh_started = marker.is_file()
+            && state["state"]["sync_in_progress"] == true
+            && state["state"]["search_loading"] == true
+            && state["state"]["last_operation"]
+                .as_str()
+                .is_some_and(|operation| operation.contains("refreshing messages"));
+        if refresh_started {
+            break state;
+        }
+        ensure!(
+            Instant::now() < refresh_deadline,
+            "sync did not enter its delayed refresh phase: {state}\n{}",
+            app.logs()
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    let sync_refresh_generation = refreshing["state"]["search_generation"]
+        .as_u64()
+        .context("sync refresh state had no search generation")?;
+    let cleared = driver.command("set_search_query", json!({"query": ""}))?;
+    assert_eq!(cleared["ok"], true, "clearing the search failed: {cleared}");
+    thread::sleep(Duration::from_millis(250));
+    let still_refreshing = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        still_refreshing["state"]["sync_in_progress"], true,
+        "clearing the search ended sync before a refresh outcome: {still_refreshing}"
+    );
+    assert_eq!(
+        still_refreshing["state"]["search_loading"], true,
+        "clearing the search cancelled the required sync refresh: {still_refreshing}"
+    );
+    ensure!(
+        still_refreshing["state"]["full_search_outcome_generation"]
+            .as_u64()
+            .is_some_and(|generation| generation < sync_refresh_generation),
+        "sync completed its deliberately delayed refresh too early: {still_refreshing}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let completed = loop {
+        let state = driver.command("app_state", json!({}))?;
+        if state["state"]["sync_in_progress"] == false {
+            break state;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "manual sync did not finish before timeout: {state}\n{}",
+            app.logs()
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        completed["state"]["last_error"],
+        Value::Null,
+        "manual sync failed: {completed}"
+    );
+    assert_eq!(
+        completed["state"]["search_loading"], false,
+        "sync reported completion before its refresh settled: {completed}"
+    );
+    assert_eq!(
+        completed["state"]["current_query"], "tag:sync-refresh",
+        "sync refresh replaced the user's active query: {completed}"
+    );
+    let refreshed_rows = json_array_at(&completed, &["state", "thread_list_items"])?;
+    ensure!(
+        refreshed_rows
+            .iter()
+            .any(|row| row["subject"] == "Sync refresh arrival"),
+        "post-sync refresh did not expose the new message: {completed}"
+    );
+    ensure!(
+        marker.is_file(),
+        "manual sync helper did not create its marker"
+    );
+
+    let post_sync_tag = driver.command("tag_selected", json!({"add": ["post-sync-ok"]}))?;
+    assert_eq!(
+        post_sync_tag["ok"], true,
+        "tagging stayed blocked after sync: {post_sync_tag}"
+    );
+    let delete_draft = driver.command("delete_selected_draft", json!({}))?;
+    assert_eq!(
+        delete_draft["ok"], true,
+        "draft deletion stayed blocked after sync: {delete_draft}"
+    );
+    ensure!(
+        !saved_draft_path.exists(),
+        "post-sync draft deletion left {} behind",
+        saved_draft_path.display()
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn closing_main_window_waits_for_manual_sync() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP closing_main_window_waits_for_manual_sync: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running manual-sync application-lifetime UI smoke with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-sync-lifetime-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let marker = work_dir.join("sync-completed");
+    let helper = work_dir.join("sync-helper");
+    fs::write(
+        &helper,
+        "#!/bin/sh\nsleep 2\nprintf 'completed\\n' > \"$1\"\n",
+    )?;
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755))?;
+    let sync_command =
+        toml::Value::String(format!("{} {}", helper.display(), marker.display())).to_string();
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+             \n[sync]\nenabled = true\nexternal_receive_enabled = true\nexternal_receive_on_startup = false\nexternal_receive_command = {}\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+            sync_command,
+        ),
+    )?;
+
+    let token = format!("notm-sync-lifetime-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    let started = driver.command("run_manual_sync", json!({}))?;
+    assert_eq!(started["ok"], true, "manual sync did not start: {started}");
+    assert_eq!(
+        started["state"]["sync_in_progress"], true,
+        "manual sync was not pending: {started}"
+    );
+
+    let close = driver.command("close_main_window", json!({}))?;
+    assert_eq!(close["ok"], true, "main-window close failed: {close}");
+    drop(driver);
+    thread::sleep(Duration::from_millis(250));
+    ensure!(
+        app.child.try_wait()?.is_none(),
+        "app exited while its sync helper was still running\n{}",
+        app.logs()
+    );
+    ensure!(
+        !marker.exists(),
+        "sync helper completed before lifetime check"
+    );
+
+    let status = app.wait_for_exit(Duration::from_secs(8))?;
+    ensure!(
+        status.success(),
+        "app failed while finishing sync after close: {status}\n{}",
+        app.logs()
+    );
+    ensure!(marker.is_file(), "sync helper was abandoned after close");
 
     Ok(())
 }

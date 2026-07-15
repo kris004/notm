@@ -145,7 +145,25 @@ outstanding; non-fixture runs reject that test-only argument.
 .BR layout_state ,
 .BR set_layout ,
 .BR toggle_layout ,
+.BR close_main_window ,
 .BR toggle_debug_panel .
+.PP
+.B run_manual_sync
+returns with
+.B pending
+set to true after the configured commands start in the background.  Poll
+.B app_state.state.sync_in_progress
+until it becomes false before checking the command result or refreshed mail
+state.  The flag remains true until the post-sync search refresh also finishes.
+Non-fixture harness checks may pass
+.B test_refresh_delay_ms
+(maximum 5000) to keep that refresh pending while testing responsiveness and
+cancellation behavior.  Normal UI and command-palette syncs do not add this
+delay.
+.PP
+.B close_main_window
+closes only the primary window after returning its response.  Standalone
+message windows are left open.
 .SH SAFETY
 Keep the socket local to the user session and use a token.  Prefer fixture data
 for test-harness runs.  Fixture mode does not run configured receive,
