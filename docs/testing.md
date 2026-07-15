@@ -63,6 +63,11 @@ Then drive the same path the change is meant to affect. A basic smoke check is:
 3. Poll `search_status` until `loading` is false and confirm `error` is null.
 4. `thread_page_info` reports loaded fixture rows.
 
+When a GUI smoke sends a message, `compose_send` returning `pending: true`
+means the composed snapshot was queued, not that sending finished. Poll
+`app_state.state.send_in_progress` until it becomes false before checking
+`last_send_report`, `last_error`, or send-related file changes.
+
 For a narrowly scoped responsiveness check, fixture harness requests may pass
 `test_delay_ms` to `run_search` (maximum 5000). The delay runs on the search
 worker, so `health` and `search_status` must remain responsive while the search

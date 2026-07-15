@@ -26,10 +26,14 @@ pub struct UiState {
     pub trusted_image_senders: Vec<String>,
     pub pending_open_message_id: Option<String>,
     pub compose_fields: ComposeFields,
+    #[serde(default)]
+    pub compose_generation: u64,
     pub active_draft: Option<ActiveDraft>,
     pub input_mode: InputMode,
     pub active_pane: ActivePane,
     pub last_send_report: Option<SendReport>,
+    #[serde(default)]
+    pub send_in_progress: bool,
     #[serde(default)]
     pub sync_in_progress: bool,
     pub last_error: Option<String>,
@@ -87,10 +91,12 @@ impl Default for UiState {
             trusted_image_senders: Vec::new(),
             pending_open_message_id: None,
             compose_fields: ComposeFields::default(),
+            compose_generation: 0,
             active_draft: None,
             input_mode: InputMode::Normal,
             active_pane: ActivePane::Threads,
             last_send_report: None,
+            send_in_progress: false,
             sync_in_progress: false,
             last_error: None,
             last_operation: None,

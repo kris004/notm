@@ -54,4 +54,25 @@ impl UiDriver {
             thread::sleep(Duration::from_millis(25));
         }
     }
+
+    pub fn wait_for_send(&mut self, timeout: Duration) -> anyhow::Result<Value> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let response = self.command("app_state", json!({}))?;
+            anyhow::ensure!(response["ok"] == true, "app state failed: {response}");
+            let in_progress = response["state"]["send_in_progress"]
+                .as_bool()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("app state has no send-in-progress flag: {response}")
+                })?;
+            if !in_progress {
+                return Ok(response);
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "send did not complete within {timeout:?}: {response}"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
 }

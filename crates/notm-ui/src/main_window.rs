@@ -326,6 +326,7 @@ fn open_or_present_main_window(
     open_message_id: Option<String>,
 ) {
     if let Some(handle) = main_window.borrow().as_ref().cloned() {
+        handle.widgets.close_when_idle.set(false);
         if let Some(message_id) = open_message_id {
             open_message_id_request(options, &handle.widgets, &handle.state, &message_id);
         }
@@ -510,6 +511,8 @@ struct Widgets {
     compose_bcc: gtk::Entry,
     compose_subject: gtk::Entry,
     compose_body: SourceView,
+    compose_autosave_suppressed: Rc<Cell<bool>>,
+    close_when_idle: Rc<Cell<bool>>,
     compose_vim_context: VimIMContext,
     compose_scrolled: gtk::ScrolledWindow,
     compose_attachments: gtk::Label,
@@ -1644,6 +1647,8 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle 
         compose_bcc,
         compose_subject,
         compose_body,
+        compose_autosave_suppressed: Rc::new(Cell::new(false)),
+        close_when_idle: Rc::new(Cell::new(false)),
         compose_vim_context: compose_vim_context.clone(),
         compose_scrolled: scrolled_compose_body.clone(),
         compose_attachments,
@@ -1737,6 +1742,23 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle 
     connect_input_mode_focus(&widgets, &state);
     install_shortcuts(&options, &widgets, &state, &undo_state, &saved_search_store);
     connect_auto_load_more(&options, &widgets, &state);
+    {
+        let w = widgets.clone();
+        let st = state.clone();
+        window.connect_close_request(move |window| {
+            let background_activity = {
+                let state = st.borrow();
+                state.send_in_progress || state.sync_in_progress
+            };
+            if background_activity {
+                w.close_when_idle.set(true);
+                window.set_visible(false);
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            }
+        });
+    }
 
     if options.automation_enabled {
         setup_automation(&options, &widgets, &state, &undo_state, &saved_search_store);
@@ -3143,7 +3165,10 @@ fn close_tag_editors(widgets: &Widgets) {
 fn update_custom_tag_controls(widgets: &Widgets, state: &SharedState) {
     let has_tag = !widgets.custom_tag_entry.text().trim().is_empty();
     let can_remove = custom_tag_can_remove(widgets, state);
-    let sync_in_progress = state.borrow().sync_in_progress;
+    let background_activity = {
+        let state = state.borrow();
+        state.sync_in_progress || state.send_in_progress
+    };
     widgets.single_tag_action_label.set_text(if !has_tag {
         "Add/remove tag: type a tag"
     } else if can_remove {
@@ -3157,7 +3182,7 @@ fn update_custom_tag_controls(widgets: &Widgets, state: &SharedState) {
         .set_label(if can_remove { "Remove tag" } else { "Add tag" });
     widgets
         .single_tag_apply_button
-        .set_sensitive(has_tag && !sync_in_progress);
+        .set_sensitive(has_tag && !background_activity);
 }
 
 fn custom_tag_can_remove(widgets: &Widgets, state: &SharedState) -> bool {
@@ -3469,8 +3494,7 @@ fn connect_compose_helpers(
         let has_unsaved_changes = active_draft
             .as_ref()
             .is_some_and(|draft| compose_fields(&w, &st) != draft.saved_fields);
-        clear_draft_widgets(&opts, &w, &st);
-        match clear_recovery_draft_files(&w.draft_path, w.legacy_draft_path.as_deref()) {
+        match clear_current_draft_from_ui(&opts, &w, &st) {
             Ok(()) => {
                 let status = match (active_draft.is_some(), has_unsaved_changes) {
                     (true, true) => "Draft changes discarded",
@@ -6134,7 +6158,7 @@ fn install_shortcuts(
             && (key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter)
             && compose_view_is_visible(&w)
         {
-            send_compose(&opts, &w, &st);
+            let _ = send_compose(&opts, &w, &st);
             return gtk::glib::Propagation::Stop;
         }
         if key == gtk::gdk::Key::Escape && st.borrow().visual_select_mode {
@@ -6719,8 +6743,7 @@ fn install_shortcuts(
             true
         } else if key == gtk::gdk::Key::x && compose_view_is_visible(&w) {
             clear_numeric_prefix(&numeric_prefix);
-            clear_draft_widgets(&opts, &w, &st);
-            match clear_recovery_draft_files(&w.draft_path, w.legacy_draft_path.as_deref()) {
+            match clear_current_draft_from_ui(&opts, &w, &st) {
                 Ok(()) => w.status_label.set_text("Composer closed"),
                 Err(err) => {
                     report_draft_persistence_error(&w, &st, "Draft clear failed", &err)
@@ -7746,9 +7769,18 @@ fn compose_fields(widgets: &Widgets, state: &SharedState) -> ComposeFields {
     fields
 }
 
+fn record_compose_edit(state: &SharedState, fields: ComposeFields) {
+    let mut state = state.borrow_mut();
+    state.compose_fields = fields;
+    state.compose_generation = state.compose_generation.saturating_add(1);
+}
+
 fn autosave_draft_from_widgets(widgets: &Widgets, state: &SharedState) {
+    if widgets.compose_autosave_suppressed.get() {
+        return;
+    }
     let fields = compose_fields(widgets, state);
-    state.borrow_mut().compose_fields = fields.clone();
+    record_compose_edit(state, fields.clone());
     update_attachment_label(widgets, &fields.attachments);
     persist_recovery_draft_from_ui(widgets, state, &fields);
     update_draft_action_buttons(widgets, state);
@@ -7803,9 +7835,13 @@ fn clear_transient_autosave_error(last_error: &mut Option<String>) -> bool {
 }
 
 fn update_draft_action_buttons(widgets: &Widgets, state: &SharedState) {
-    let (active_draft, sync_in_progress) = {
+    let (active_draft, background_activity, send_in_progress) = {
         let state = state.borrow();
-        (state.active_draft.clone(), state.sync_in_progress)
+        (
+            state.active_draft.clone(),
+            state.sync_in_progress || state.send_in_progress,
+            state.send_in_progress,
+        )
     };
     if let Some(active_draft) = active_draft {
         let current_fields = compose_fields(widgets, state);
@@ -7819,10 +7855,14 @@ fn update_draft_action_buttons(widgets: &Widgets, state: &SharedState) {
         widgets.clear_draft_button.set_label("Discard draft");
         widgets.delete_local_draft_button.set_visible(false);
     }
-    widgets.save_draft_button.set_sensitive(!sync_in_progress);
+    widgets
+        .save_draft_button
+        .set_sensitive(!background_activity);
+    widgets.clear_draft_button.set_sensitive(!send_in_progress);
     widgets
         .delete_local_draft_button
-        .set_sensitive(!sync_in_progress);
+        .set_sensitive(!background_activity);
+    widgets.draft_list.set_sensitive(!send_in_progress);
     update_button_binding_labels(widgets, state);
 }
 
@@ -7980,7 +8020,7 @@ fn save_current_draft(
     widgets: &Widgets,
     state: &SharedState,
 ) -> anyhow::Result<DraftSaveReport> {
-    ensure_mailbox_write_allowed(widgets, state, MailboxWrite::DraftSave)?;
+    ensure_user_operation_allowed(widgets, state, UserOperation::DraftSave)?;
     let fields = compose_fields(widgets, state);
     anyhow::ensure!(fields_has_content(&fields), "draft has no content");
     let previous_draft = state.borrow().active_draft.clone();
@@ -8037,6 +8077,12 @@ fn set_active_draft(widgets: &Widgets, state: &SharedState, active_draft: Option
     update_draft_action_buttons(widgets, state);
 }
 
+fn detach_active_draft_for_message_view(widgets: &Widgets, state: &SharedState) {
+    if !state.borrow().send_in_progress {
+        set_active_draft(widgets, state, None);
+    }
+}
+
 fn delete_draft_source(options: &LaunchOptions, draft: &ActiveDraft) -> anyhow::Result<()> {
     if draft.indexed {
         let db = Database::open(&open_config(options), DatabaseMode::ReadWrite)?;
@@ -8053,7 +8099,7 @@ fn delete_active_draft_from_ui(
     widgets: &Widgets,
     state: &SharedState,
 ) -> bool {
-    if ensure_mailbox_write_allowed(widgets, state, MailboxWrite::DraftDelete).is_err() {
+    if ensure_user_operation_allowed(widgets, state, UserOperation::DraftDelete).is_err() {
         return false;
     }
     let Some(draft) = state.borrow().active_draft.clone() else {
@@ -8236,6 +8282,7 @@ fn selected_named_draft(widgets: &Widgets) -> anyhow::Result<(PathBuf, ComposeFi
 }
 
 fn load_selected_named_draft(widgets: &Widgets, state: &SharedState) -> anyhow::Result<()> {
+    ensure_user_operation_allowed(widgets, state, UserOperation::DraftLoad)?;
     let (path, fields) = selected_named_draft(widgets)?;
     apply_compose_fields(widgets, state, fields.clone());
     set_active_draft(
@@ -8253,7 +8300,7 @@ fn load_selected_named_draft(widgets: &Widgets, state: &SharedState) -> anyhow::
 }
 
 fn delete_selected_named_draft(widgets: &Widgets, state: &SharedState) -> anyhow::Result<()> {
-    ensure_mailbox_write_allowed(widgets, state, MailboxWrite::DraftDelete)?;
+    ensure_user_operation_allowed(widgets, state, UserOperation::DraftDelete)?;
     let (path, _) = selected_named_draft(widgets)?;
     std::fs::remove_file(path)?;
     refresh_draft_list(widgets);
@@ -8270,7 +8317,10 @@ fn migrate_legacy_recovery_draft(path: &Path, legacy_path: &Path) -> anyhow::Res
     Ok(true)
 }
 
-fn restore_draft_if_present(widgets: &Widgets, state: &SharedState) {
+fn restore_draft_if_present(widgets: &Widgets, state: &SharedState) -> bool {
+    if ensure_user_operation_allowed(widgets, state, UserOperation::DraftLoad).is_err() {
+        return false;
+    }
     let migration = widgets
         .legacy_draft_path
         .as_deref()
@@ -8291,8 +8341,9 @@ fn restore_draft_if_present(widgets: &Widgets, state: &SharedState) {
     let Some(source_path) = source_path else {
         if let Some(err) = migration_error {
             report_draft_persistence_error(widgets, state, "Draft recovery migration failed", &err);
+            return false;
         }
-        return;
+        return true;
     };
     let fields = match std::fs::read(source_path)
         .map_err(anyhow::Error::from)
@@ -8301,7 +8352,7 @@ fn restore_draft_if_present(widgets: &Widgets, state: &SharedState) {
         Ok(fields) => fields,
         Err(err) => {
             report_draft_persistence_error(widgets, state, "Draft recovery failed", &err);
-            return;
+            return false;
         }
     };
     if !fields_has_content(&fields) {
@@ -8309,8 +8360,9 @@ fn restore_draft_if_present(widgets: &Widgets, state: &SharedState) {
             clear_recovery_draft_files(&widgets.draft_path, widgets.legacy_draft_path.as_deref())
         {
             report_draft_persistence_error(widgets, state, "Draft recovery clear failed", &err);
+            return false;
         }
-        return;
+        return true;
     }
     apply_compose_fields(widgets, state, fields);
     show_compose_view(widgets);
@@ -8331,6 +8383,7 @@ fn restore_draft_if_present(widgets: &Widgets, state: &SharedState) {
             .status_label
             .set_text(&format!("Recovered draft from {}", source_path.display()));
     }
+    true
 }
 
 fn remove_file_if_present(path: &Path) -> anyhow::Result<()> {
@@ -8352,6 +8405,16 @@ fn clear_recovery_draft_files(path: &Path, legacy_path: Option<&Path>) -> anyhow
         anyhow::bail!("could not remove recovery draft: {}", errors.join("; "));
     }
     Ok(())
+}
+
+fn clear_current_draft_from_ui(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) -> anyhow::Result<()> {
+    ensure_user_operation_allowed(widgets, state, UserOperation::DraftClear)?;
+    clear_draft_widgets(options, widgets, state);
+    clear_recovery_draft_files(&widgets.draft_path, widgets.legacy_draft_path.as_deref())
 }
 
 fn clear_draft_widgets(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -8391,7 +8454,7 @@ fn apply_compose_fields(widgets: &Widgets, state: &SharedState, fields: ComposeF
     widgets.compose_body.buffer().set_text(&fields.body);
     move_compose_cursor_to_start(widgets);
     update_attachment_label(widgets, &fields.attachments);
-    state.borrow_mut().compose_fields = fields.clone();
+    record_compose_edit(state, fields.clone());
     persist_recovery_draft_from_ui(widgets, state, &fields);
     update_draft_action_buttons(widgets, state);
 }
@@ -8418,7 +8481,7 @@ fn add_attachment_path(widgets: &Widgets, state: &SharedState, path: PathBuf) {
         fields.attachments.push(path_text);
     }
     update_attachment_label(widgets, &fields.attachments);
-    state.borrow_mut().compose_fields = fields.clone();
+    record_compose_edit(state, fields.clone());
     let saved = persist_recovery_draft_from_ui(widgets, state, &fields);
     update_draft_action_buttons(widgets, state);
     if saved {
@@ -9021,13 +9084,14 @@ fn activate_image_policy_button(options: &LaunchOptions, widgets: &Widgets, stat
 fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     let html_visible = html_view_is_visible(widgets);
     let has_html = selected_message_has_html(state);
-    let (has_message, selected_thread, message_count, sync_in_progress) = {
+    let (has_message, selected_thread, message_count, background_activity, send_in_progress) = {
         let state = state.borrow();
         (
             state.selected_message.is_some(),
             state.selected_thread.clone(),
             state.messages.len(),
-            state.sync_in_progress,
+            state.sync_in_progress || state.send_in_progress,
+            state.send_in_progress,
         )
     };
     let has_thread = selected_thread.is_some();
@@ -9039,9 +9103,11 @@ fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, sta
     widgets
         .collapse_quotes_button
         .set_visible(multiple_messages);
-    widgets.response_menu_button.set_sensitive(has_message);
+    widgets
+        .response_menu_button
+        .set_sensitive(has_message && !send_in_progress);
     let tag_targets = tag_target_threads(state);
-    let can_mutate_tags = !sync_in_progress && !tag_targets.is_empty();
+    let can_mutate_tags = !background_activity && !tag_targets.is_empty();
     for button in [
         &widgets.archive_button,
         &widgets.read_toggle_button,
@@ -9390,6 +9456,7 @@ fn is_draft_message(options: &LaunchOptions, message: &notm_notmuch::MessageSumm
 }
 
 fn open_selected_draft_message(widgets: &Widgets, state: &SharedState) -> anyhow::Result<()> {
+    ensure_user_operation_allowed(widgets, state, UserOperation::DraftLoad)?;
     let message = state
         .borrow()
         .selected_message
@@ -10248,7 +10315,9 @@ fn connect_actions(
 
     let w = widgets.clone();
     let st = state.clone();
-    compose_button.connect_clicked(move |_| open_compose(&w, &st));
+    compose_button.connect_clicked(move |_| {
+        let _ = open_compose(&w, &st);
+    });
 
     let opts = options.clone();
     let w = widgets.clone();
@@ -11528,7 +11597,7 @@ fn select_thread_by_index(
                     }
                 }
             } else {
-                set_active_draft(widgets, state, None);
+                detach_active_draft_for_message_view(widgets, state);
                 show_preferred_selected_message_view(options, widgets, state);
                 state.borrow_mut().active_pane = ActivePane::Threads;
                 focus_after_thread_preview(widgets, state, preserve_search_focus);
@@ -11633,7 +11702,7 @@ fn open_loaded_thread_at_message(
                         }
                     }
                 } else {
-                    set_active_draft(widgets, state, None);
+                    detach_active_draft_for_message_view(widgets, state);
                     show_preferred_selected_message_view(options, widgets, state);
                     widgets.status_label.set_text(&format!(
                         "Opened message {} ({}/{})",
@@ -11734,7 +11803,7 @@ fn open_thread_by_index(
                     }
                 }
             } else {
-                set_active_draft(widgets, state, None);
+                detach_active_draft_for_message_view(widgets, state);
                 show_preferred_selected_message_view(options, widgets, state);
                 widgets
                     .status_label
@@ -11988,6 +12057,7 @@ fn open_standalone_message_window(
         .standalone_windows
         .borrow_mut()
         .push(standalone.clone());
+    update_standalone_response_controls(widgets, state);
     let windows = widgets.standalone_windows.clone();
     window.connect_close_request(move |_| {
         windows
@@ -12885,6 +12955,10 @@ fn run_standalone_response_action(
     standalone: &StandaloneMessageWindow,
     action: StandaloneResponseAction,
 ) -> bool {
+    if let Err(err) = ensure_user_operation_allowed(widgets, state, UserOperation::ComposeReplace) {
+        standalone.status_label.set_text(&err.to_string());
+        return false;
+    }
     let Some(message) = standalone_current_message(standalone) else {
         standalone.status_label.set_text("No message selected");
         return false;
@@ -13137,31 +13211,71 @@ fn undo_detail_for_thread(thread: &notm_notmuch::ThreadSummary) -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MailboxWrite {
+enum UserOperation {
+    ComposeEdit,
     Tag,
     DraftSave,
     DraftDelete,
+    DraftLoad,
+    DraftClear,
+    ComposeReplace,
     Send,
+    Sync,
 }
 
-fn sync_block_reason(sync_in_progress: bool, operation: MailboxWrite) -> Option<&'static str> {
-    if !sync_in_progress {
+fn background_activity_block_reason(
+    sync_in_progress: bool,
+    send_in_progress: bool,
+    operation: UserOperation,
+) -> Option<&'static str> {
+    if operation == UserOperation::ComposeEdit {
         return None;
     }
-    Some(match operation {
-        MailboxWrite::Tag => "tag changes are unavailable while sync is in progress",
-        MailboxWrite::DraftSave => "draft saving is unavailable while sync is in progress",
-        MailboxWrite::DraftDelete => "draft deletion is unavailable while sync is in progress",
-        MailboxWrite::Send => "sending is unavailable while sync is in progress",
-    })
+    if sync_in_progress {
+        return match operation {
+            UserOperation::ComposeEdit
+            | UserOperation::DraftLoad
+            | UserOperation::DraftClear
+            | UserOperation::ComposeReplace => None,
+            UserOperation::Tag => Some("tag changes are unavailable while sync is in progress"),
+            UserOperation::DraftSave => {
+                Some("draft saving is unavailable while sync is in progress")
+            }
+            UserOperation::DraftDelete => {
+                Some("draft deletion is unavailable while sync is in progress")
+            }
+            UserOperation::Send => Some("sending is unavailable while sync is in progress"),
+            UserOperation::Sync => Some("sync is already running"),
+        };
+    }
+    if send_in_progress {
+        return Some(match operation {
+            UserOperation::ComposeEdit => unreachable!(),
+            UserOperation::Tag => "tag changes are unavailable while send is in progress",
+            UserOperation::DraftSave => "draft saving is unavailable while send is in progress",
+            UserOperation::DraftDelete => "draft deletion is unavailable while send is in progress",
+            UserOperation::DraftLoad => "draft loading is unavailable while send is in progress",
+            UserOperation::DraftClear => "draft clearing is unavailable while send is in progress",
+            UserOperation::ComposeReplace => {
+                "replacing the composer is unavailable while send is in progress"
+            }
+            UserOperation::Send => "send is already in progress",
+            UserOperation::Sync => "sync is unavailable while send is in progress",
+        });
+    }
+    None
 }
 
-fn ensure_mailbox_write_allowed(
+fn ensure_user_operation_allowed(
     widgets: &Widgets,
     state: &SharedState,
-    operation: MailboxWrite,
+    operation: UserOperation,
 ) -> anyhow::Result<()> {
-    let Some(message) = sync_block_reason(state.borrow().sync_in_progress, operation) else {
+    let message = {
+        let state = state.borrow();
+        background_activity_block_reason(state.sync_in_progress, state.send_in_progress, operation)
+    };
+    let Some(message) = message else {
         return Ok(());
     };
     widgets.status_label.set_text(message);
@@ -13177,7 +13291,7 @@ fn tag_selected(
     undo_state: &UndoState,
     mutation: TagMutation,
 ) -> bool {
-    if ensure_mailbox_write_allowed(widgets, state, MailboxWrite::Tag).is_err() {
+    if ensure_user_operation_allowed(widgets, state, UserOperation::Tag).is_err() {
         return false;
     }
     let visual_target = {
@@ -13414,22 +13528,60 @@ fn set_undo_tag_available(widgets: &Widgets, available: bool) {
     }
 }
 
-fn update_sync_sensitive_controls(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
-    let sync_in_progress = state.borrow().sync_in_progress;
+fn update_background_activity_controls(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) {
+    let (background_activity, send_in_progress) = {
+        let state = state.borrow();
+        (
+            state.sync_in_progress || state.send_in_progress,
+            state.send_in_progress,
+        )
+    };
     if let Some(button) = &widgets.manual_sync_button {
-        button.set_sensitive(!sync_in_progress);
+        button.set_sensitive(!background_activity);
     }
-    widgets.send_button.set_sensitive(!sync_in_progress);
-    widgets.undo_tag_button.set_sensitive(!sync_in_progress);
+    widgets.send_button.set_sensitive(!background_activity);
+    widgets.compose_button.set_sensitive(!send_in_progress);
+    if send_in_progress {
+        widgets.response_menu_button.popdown();
+    }
+    for button in [
+        &widgets.reply_button,
+        &widgets.reply_all_button,
+        &widgets.forward_button,
+        &widgets.forward_attachment_button,
+    ] {
+        button.set_sensitive(!send_in_progress);
+    }
+    update_standalone_response_controls(widgets, state);
+    widgets.undo_tag_button.set_sensitive(!background_activity);
     widgets
         .undo_last_tag_button
-        .set_sensitive(!sync_in_progress);
+        .set_sensitive(!background_activity);
     widgets
         .undo_list_tag_button
-        .set_sensitive(!sync_in_progress);
+        .set_sensitive(!background_activity);
     update_message_action_buttons(options, widgets, state);
     update_custom_tag_controls(widgets, state);
     update_draft_action_buttons(widgets, state);
+}
+
+fn update_standalone_response_controls(widgets: &Widgets, state: &SharedState) {
+    let sensitive = !state.borrow().send_in_progress;
+    for standalone in widgets.standalone_windows.borrow().iter() {
+        standalone.response_menu_button.set_sensitive(sensitive);
+        for button in [
+            &standalone.reply_button,
+            &standalone.reply_all_button,
+            &standalone.forward_button,
+            &standalone.forward_attachment_button,
+        ] {
+            button.set_sensitive(sensitive);
+        }
+    }
 }
 
 fn update_message_menu(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -13508,7 +13660,7 @@ fn select_message_by_index(
             }
         }
     } else {
-        set_active_draft(widgets, state, None);
+        detach_active_draft_for_message_view(widgets, state);
         show_preferred_selected_message_view(options, widgets, state);
     }
 }
@@ -13519,7 +13671,7 @@ fn undo_last_tag(
     state: &SharedState,
     undo_state: &UndoState,
 ) -> bool {
-    if ensure_mailbox_write_allowed(widgets, state, MailboxWrite::Tag).is_err() {
+    if ensure_user_operation_allowed(widgets, state, UserOperation::Tag).is_err() {
         return false;
     }
     let Some(action) = pop_last_undo_tag_action(undo_state) else {
@@ -13537,7 +13689,7 @@ fn undo_tag_action(
     undo_state: &UndoState,
     action: UndoTagAction,
 ) -> bool {
-    if ensure_mailbox_write_allowed(widgets, state, MailboxWrite::Tag).is_err() {
+    if ensure_user_operation_allowed(widgets, state, UserOperation::Tag).is_err() {
         push_undo_tag_action(undo_state, action);
         set_undo_tag_available(widgets, true);
         return false;
@@ -13934,7 +14086,7 @@ fn apply_selected_undo_dialog_actions(
     cursor: usize,
     actions_len: usize,
 ) {
-    if ensure_mailbox_write_allowed(widgets, state, MailboxWrite::Tag).is_err() {
+    if ensure_user_operation_allowed(widgets, state, UserOperation::Tag).is_err() {
         return;
     }
     if actions_len == 0 {
@@ -14052,11 +14204,7 @@ fn run_sync_commands(
         update_debug(widgets, state);
         anyhow::bail!("manual sync is disabled");
     }
-    if state.borrow().sync_in_progress {
-        widgets.status_label.set_text("Sync is already running");
-        update_debug(widgets, state);
-        anyhow::bail!("sync is already running");
-    }
+    ensure_user_operation_allowed(widgets, state, UserOperation::Sync)?;
     let commands = sync_command_specs(options, kind);
     if commands.is_empty() {
         if kind == SyncRunKind::Manual {
@@ -14088,7 +14236,7 @@ fn run_sync_commands(
         state.last_error = None;
         state.last_operation = Some(format!("{} started", label.to_ascii_lowercase()));
     }
-    update_sync_sensitive_controls(options, widgets, state);
+    update_background_activity_controls(options, widgets, state);
     update_debug(widgets, state);
 
     let rx = spawn_sync_commands(label, commands);
@@ -14226,8 +14374,19 @@ fn apply_sync_success(widgets: &Widgets, state: &SharedState, label: &str, repor
 fn finish_sync_activity(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     state.borrow_mut().sync_in_progress = false;
     widgets.sync_refresh_generation.set(None);
-    update_sync_sensitive_controls(options, widgets, state);
+    update_background_activity_controls(options, widgets, state);
     update_debug(widgets, state);
+    close_main_window_after_background_activity(widgets, state);
+}
+
+fn close_main_window_after_background_activity(widgets: &Widgets, state: &SharedState) {
+    let background_activity = {
+        let state = state.borrow();
+        state.send_in_progress || state.sync_in_progress
+    };
+    if !background_activity && widgets.close_when_idle.replace(false) {
+        widgets.window.close();
+    }
 }
 
 fn spawn_sync_commands(
@@ -14356,7 +14515,10 @@ fn sync_command_specs(options: &LaunchOptions, kind: SyncRunKind) -> Vec<SyncCom
     commands
 }
 
-fn open_compose(widgets: &Widgets, state: &SharedState) {
+fn open_compose(widgets: &Widgets, state: &SharedState) -> bool {
+    if ensure_user_operation_allowed(widgets, state, UserOperation::ComposeReplace).is_err() {
+        return false;
+    }
     show_compose_view(widgets);
     set_active_draft(widgets, state, None);
     move_compose_cursor_to_start(widgets);
@@ -14367,6 +14529,7 @@ fn open_compose(widgets: &Widgets, state: &SharedState) {
         state.compose_fields.references.clear();
         state.compose_fields.text_reply_quote = None;
         state.compose_fields.html_reply_quote = None;
+        state.compose_generation = state.compose_generation.saturating_add(1);
         state.last_operation = Some("opened composer".to_string());
     }
     if state.borrow().input_mode == InputMode::Insert {
@@ -14375,6 +14538,7 @@ fn open_compose(widgets: &Widgets, state: &SharedState) {
         focus_active_pane(widgets, state);
     }
     update_debug(widgets, state);
+    true
 }
 
 fn reply_selected(
@@ -14383,6 +14547,9 @@ fn reply_selected(
     state: &SharedState,
     kind: ReplyKind,
 ) -> bool {
+    if ensure_user_operation_allowed(widgets, state, UserOperation::ComposeReplace).is_err() {
+        return false;
+    }
     let Some(message) = state.borrow().selected_message.clone() else {
         widgets
             .status_label
@@ -14423,73 +14590,93 @@ fn reply_selected(
     replied
 }
 
-fn forward_selected(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+fn forward_selected(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) -> bool {
+    if ensure_user_operation_allowed(widgets, state, UserOperation::ComposeReplace).is_err() {
+        return false;
+    }
     let Some(message) = state.borrow().selected_message.clone() else {
         widgets
             .status_label
             .set_text("No selected message to forward");
-        return;
+        return false;
     };
     let Some(path) = message.filenames.first() else {
         widgets
             .status_label
             .set_text("Selected message has no filename");
-        return;
+        return false;
     };
     let Some(id) = identity(options) else {
         widgets
             .status_label
             .set_text("No identity configured for forward");
-        return;
+        return false;
     };
-    match parse_file(path) {
-        Ok(parsed) => fill_composer(widgets, state, build_inline_forward(&parsed, &id)),
-        Err(err) => widgets
-            .status_label
-            .set_text(&format!("Forward parse failed: {err}")),
-    }
+    let forwarded = match parse_file(path) {
+        Ok(parsed) => {
+            fill_composer(widgets, state, build_inline_forward(&parsed, &id));
+            true
+        }
+        Err(err) => {
+            widgets
+                .status_label
+                .set_text(&format!("Forward parse failed: {err}"));
+            false
+        }
+    };
     update_debug(widgets, state);
+    forwarded
 }
 
-fn forward_as_attachment_selected(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+fn forward_as_attachment_selected(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) -> bool {
+    if ensure_user_operation_allowed(widgets, state, UserOperation::ComposeReplace).is_err() {
+        return false;
+    }
     let Some(message) = state.borrow().selected_message.clone() else {
         widgets
             .status_label
             .set_text("No selected message to forward");
-        return;
+        return false;
     };
     let Some(path) = message.filenames.first() else {
         widgets
             .status_label
             .set_text("Selected message has no filename");
-        return;
+        return false;
     };
     let Some(id) = identity(options) else {
         widgets
             .status_label
             .set_text("No identity configured for forward");
-        return;
+        return false;
     };
     let result = (|| -> anyhow::Result<ComposedMessage> {
         let raw = std::fs::read(path)?;
         let parsed = notm_mail::mime::parse_rfc5322(&raw)?;
         Ok(build_attachment_forward(&parsed, &id, raw))
     })();
-    match result {
+    let forwarded = match result {
         Ok(message) => {
             fill_composer(widgets, state, message);
             widgets
                 .status_label
                 .set_text("Forward-as-attachment composer opened");
+            true
         }
         Err(err) => {
             state.borrow_mut().last_error = Some(err.to_string());
             widgets
                 .status_label
                 .set_text(&format!("Forward-as-attachment failed: {err}"));
+            false
         }
-    }
+    };
     update_debug(widgets, state);
+    forwarded
 }
 
 fn fill_composer(widgets: &Widgets, state: &SharedState, message: ComposedMessage) {
@@ -14519,11 +14706,8 @@ fn fill_composer(widgets: &Widgets, state: &SharedState, message: ComposedMessag
                 .set_text(&format!("Attachment cache failed: {err}"));
         }
     }
-    {
-        let mut state = state.borrow_mut();
-        state.compose_fields = fields.clone();
-        state.active_pane = ActivePane::Message;
-    }
+    record_compose_edit(state, fields.clone());
+    state.borrow_mut().active_pane = ActivePane::Message;
     persist_recovery_draft_from_ui(widgets, state, &fields);
     if state.borrow().input_mode == InputMode::Insert {
         widgets.compose_to.grab_focus();
@@ -14561,103 +14745,467 @@ fn default_compose_attachment_dir() -> PathBuf {
     compose_state_path(&default_state_home(), "compose-attachments")
 }
 
-fn send_compose(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) -> bool {
-    if ensure_mailbox_write_allowed(widgets, state, MailboxWrite::Send).is_err() {
-        return false;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendFailureStage {
+    Compose,
+    Transport,
+}
+
+#[derive(Debug)]
+struct SendFailure {
+    stage: SendFailureStage,
+    error: anyhow::Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendCleanupStage {
+    SentPersistence,
+    DraftDelete,
+    RecoveryClear,
+    NewerDraftAutosave,
+    DraftIdentity,
+}
+
+#[derive(Debug)]
+struct SendCleanupIssue {
+    stage: SendCleanupStage,
+    error: String,
+}
+
+impl SendCleanupIssue {
+    fn new(stage: SendCleanupStage, error: impl ToString) -> Self {
+        Self {
+            stage,
+            error: error.to_string(),
+        }
     }
-    let fields = compose_fields(widgets, state);
-    state.borrow_mut().compose_fields = fields.clone();
-    let message = match composed_message_from_fields(&fields) {
-        Ok(message) => message,
-        Err(err) => {
-            widgets
-                .status_label
-                .set_text(&format!("Compose message build failed: {err}"));
-            state.borrow_mut().last_error = Some(err.to_string());
-            update_debug(widgets, state);
-            return false;
+
+    fn description(&self) -> &'static str {
+        match self.stage {
+            SendCleanupStage::SentPersistence => "sent save/index failed",
+            SendCleanupStage::DraftDelete => "draft delete failed",
+            SendCleanupStage::RecoveryClear => "draft recovery clear failed",
+            SendCleanupStage::NewerDraftAutosave => "newer draft autosave failed",
+            SendCleanupStage::DraftIdentity => "active draft changed unexpectedly",
         }
+    }
+}
+
+struct SendSuccess {
+    report: notm_mail::SendReport,
+    persisted: Option<PersistedMessage>,
+    issues: Vec<SendCleanupIssue>,
+}
+
+struct SendResponse {
+    result: Result<SendSuccess, SendFailure>,
+}
+
+struct PendingSend {
+    options: LaunchOptions,
+    widgets: Widgets,
+    state: SharedState,
+    sent_generation: u64,
+    sent_draft: Option<ActiveDraft>,
+    application_hold: gtk::gio::ApplicationHoldGuard,
+}
+
+fn send_compose(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) -> anyhow::Result<()> {
+    ensure_user_operation_allowed(widgets, state, UserOperation::Send)?;
+    let application_hold = widgets
+        .window
+        .application()
+        .ok_or_else(|| anyhow::anyhow!("main window is not attached to the GTK application"))?
+        .hold();
+    let sent_fields = compose_fields(widgets, state);
+    let (sent_generation, sent_draft) = {
+        let state = state.borrow();
+        (state.compose_generation, state.active_draft.clone())
     };
-    let message_for_persistence = message.clone();
-    let result = send_message_with_config(options, message);
-    let sent = match result {
-        Ok(mut report) => {
-            let accepted = report.accepted;
-            widgets.status_label.set_text(if report.accepted {
-                if report.captured_path.is_some() && options.send_command.is_none() {
-                    "Fake send captured"
-                } else {
-                    "Send accepted"
-                }
-            } else {
-                "Send failed"
-            });
-            if report.accepted {
-                match persist_sent_message(options, &message_for_persistence) {
-                    Ok(Some(persisted)) => {
-                        if report.captured_path.is_none() {
-                            report.captured_path = Some(persisted.path.display().to_string());
-                        }
-                        state.borrow_mut().last_operation = Some(format!(
-                            "saved sent message to {}{}",
-                            persisted.path.display(),
-                            persisted
-                                .indexed_message_id
-                                .as_deref()
-                                .map(|id| format!(" and indexed {id}"))
-                                .unwrap_or_default()
-                        ));
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        state.borrow_mut().last_error = Some(err.to_string());
-                        widgets
-                            .status_label
-                            .set_text(&format!("Send accepted; sent save/index failed: {err}"));
-                    }
-                }
-            }
-            state.borrow_mut().last_send_report = Some(report);
-            if state
-                .borrow()
-                .last_send_report
-                .as_ref()
-                .map(|r| r.accepted)
-                .unwrap_or(false)
-            {
-                if let Some(draft) = state.borrow().active_draft.clone()
-                    && let Err(err) = delete_draft_source(options, &draft)
-                {
-                    state.borrow_mut().last_error = Some(err.to_string());
-                    widgets
-                        .status_label
-                        .set_text(&format!("Send accepted; draft delete failed: {err}"));
-                }
-                if let Err(err) = clear_recovery_draft_files(
-                    &widgets.draft_path,
-                    widgets.legacy_draft_path.as_deref(),
-                ) {
-                    report_draft_persistence_error(
-                        widgets,
-                        state,
-                        "Send accepted; draft recovery clear failed",
-                        &err,
-                    );
-                }
-                clear_draft_widgets(options, widgets, state);
-            }
-            accepted
-        }
-        Err(err) => {
-            widgets
-                .status_label
-                .set_text(&format!("Send failed: {err}"));
-            state.borrow_mut().last_error = Some(err.to_string());
-            false
-        }
-    };
+    let rx = spawn_send(options.clone(), sent_fields.clone())?;
+    {
+        let mut state = state.borrow_mut();
+        state.compose_fields = sent_fields.clone();
+        state.send_in_progress = true;
+        state.last_send_report = None;
+        state.last_error = None;
+        state.last_operation = Some("send started".to_string());
+    }
+    widgets.status_label.set_text("Sending…");
+    update_background_activity_controls(options, widgets, state);
     update_debug(widgets, state);
-    sent
+
+    let pending = PendingSend {
+        options: options.clone(),
+        widgets: widgets.clone(),
+        state: state.clone(),
+        sent_generation,
+        sent_draft,
+        application_hold,
+    };
+    let mut pending = Some(pending);
+    gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
+        let _keep_application_alive = pending.as_ref().map(|pending| &pending.application_hold);
+        match rx.try_recv() {
+            Ok(response) => {
+                continue_send_completion(
+                    pending.take().expect("pending send should still be owned"),
+                    response,
+                );
+                gtk::glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                finish_send_failure(
+                    pending.take().expect("pending send should still be owned"),
+                    "Send failed",
+                    "send worker disconnected",
+                );
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
+    Ok(())
+}
+
+fn send_start_response(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) -> serde_json::Value {
+    match send_compose(options, widgets, state) {
+        Ok(()) => json!({"ok": true, "pending": true, "state": &*state.borrow()}),
+        Err(err) => json!({
+            "ok": false,
+            "pending": false,
+            "error": err.to_string(),
+            "state": &*state.borrow(),
+        }),
+    }
+}
+
+fn spawn_send(
+    options: LaunchOptions,
+    fields: ComposeFields,
+) -> anyhow::Result<mpsc::Receiver<SendResponse>> {
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("notm-send".to_string())
+        .spawn(move || {
+            let result = execute_send(&options, &fields);
+            let _ = tx.send(SendResponse { result });
+        })?;
+    Ok(rx)
+}
+
+fn execute_send(
+    options: &LaunchOptions,
+    fields: &ComposeFields,
+) -> Result<SendSuccess, SendFailure> {
+    let message = composed_message_from_fields(fields).map_err(|error| SendFailure {
+        stage: SendFailureStage::Compose,
+        error,
+    })?;
+    let message_for_persistence = message.clone();
+    let mut report = send_message_with_config(options, message).map_err(|error| SendFailure {
+        stage: SendFailureStage::Transport,
+        error,
+    })?;
+    let mut persisted = None;
+    let mut issues = Vec::new();
+    if report.accepted {
+        match persist_sent_message(options, &message_for_persistence) {
+            Ok(saved) => {
+                if report.captured_path.is_none()
+                    && let Some(saved) = &saved
+                {
+                    report.captured_path = Some(saved.path.display().to_string());
+                }
+                persisted = saved;
+            }
+            Err(err) => issues.push(SendCleanupIssue::new(
+                SendCleanupStage::SentPersistence,
+                err,
+            )),
+        }
+    }
+    Ok(SendSuccess {
+        report,
+        persisted,
+        issues,
+    })
+}
+
+fn continue_send_completion(pending: PendingSend, response: SendResponse) {
+    match response.result {
+        Err(failure) => {
+            let prefix = match failure.stage {
+                SendFailureStage::Compose => "Compose message build failed",
+                SendFailureStage::Transport => "Send failed",
+            };
+            finish_send_failure(pending, prefix, &failure.error.to_string());
+        }
+        Ok(success) if success.report.accepted => {
+            begin_accepted_send_cleanup(pending, success);
+        }
+        Ok(success) => finish_send_success(pending, success, false),
+    }
+}
+
+fn begin_accepted_send_cleanup(pending: PendingSend, mut success: SendSuccess) {
+    let Some(draft) = pending.sent_draft.clone() else {
+        finish_send_success(pending, success, false);
+        return;
+    };
+    if pending.state.borrow().active_draft.as_ref() != Some(&draft) {
+        success.issues.push(SendCleanupIssue::new(
+            SendCleanupStage::DraftIdentity,
+            "captured draft is no longer active",
+        ));
+        finish_send_success(pending, success, false);
+        return;
+    }
+    let rx = match spawn_sent_draft_delete(pending.options.clone(), draft) {
+        Ok(rx) => rx,
+        Err(err) => {
+            success
+                .issues
+                .push(SendCleanupIssue::new(SendCleanupStage::DraftDelete, err));
+            finish_send_success(pending, success, false);
+            return;
+        }
+    };
+    let mut pending = Some(pending);
+    let mut success = Some(success);
+    gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
+        let _keep_application_alive = pending.as_ref().map(|pending| &pending.application_hold);
+        match rx.try_recv() {
+            Ok(result) => {
+                let mut success = success.take().expect("send success should still be owned");
+                let draft_deleted = match result {
+                    Ok(()) => true,
+                    Err(err) => {
+                        success
+                            .issues
+                            .push(SendCleanupIssue::new(SendCleanupStage::DraftDelete, err));
+                        false
+                    }
+                };
+                finish_send_success(
+                    pending.take().expect("pending send should still be owned"),
+                    success,
+                    draft_deleted,
+                );
+                gtk::glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let mut success = success.take().expect("send success should still be owned");
+                success.issues.push(SendCleanupIssue::new(
+                    SendCleanupStage::DraftDelete,
+                    "draft delete worker disconnected",
+                ));
+                finish_send_success(
+                    pending.take().expect("pending send should still be owned"),
+                    success,
+                    false,
+                );
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+fn spawn_sent_draft_delete(
+    options: LaunchOptions,
+    draft: ActiveDraft,
+) -> anyhow::Result<mpsc::Receiver<anyhow::Result<()>>> {
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("notm-sent-draft-delete".to_string())
+        .spawn(move || {
+            let _ = tx.send(delete_draft_source(&options, &draft));
+        })?;
+    Ok(rx)
+}
+
+fn finish_send_failure(pending: PendingSend, prefix: &str, error: &str) {
+    let message = format!("{prefix}: {error}");
+    {
+        let mut state = pending.state.borrow_mut();
+        state.last_error = Some(error.to_string());
+        state.last_operation = Some(message.clone());
+    }
+    pending.widgets.status_label.set_text(&message);
+    finish_send_activity(&pending);
+}
+
+fn finish_send_success(pending: PendingSend, mut success: SendSuccess, draft_deleted: bool) {
+    let accepted = success.report.accepted;
+    let pending_autosave_error = pending
+        .state
+        .borrow()
+        .last_error
+        .as_deref()
+        .filter(|error| error.starts_with("Draft autosave failed:"))
+        .map(ToOwned::to_owned);
+    let newer_composer_changes =
+        accepted && finish_accepted_send_cleanup(&pending, &mut success, draft_deleted);
+    if newer_composer_changes && let Some(error) = pending_autosave_error {
+        success.issues.push(SendCleanupIssue::new(
+            SendCleanupStage::NewerDraftAutosave,
+            error,
+        ));
+    }
+    let issue_summary = format_send_cleanup_issues(&success.issues);
+    let operation = send_operation_summary(&success, issue_summary.as_deref());
+    let status = if accepted {
+        if let Some(summary) = &issue_summary {
+            format!("Send accepted; cleanup issues: {summary}")
+        } else if newer_composer_changes {
+            "Send accepted; newer composer changes kept".to_string()
+        } else if success.report.captured_path.is_some() && pending.options.send_command.is_none() {
+            "Fake send captured".to_string()
+        } else {
+            "Send accepted".to_string()
+        }
+    } else {
+        send_rejection_message(&success.report)
+    };
+    {
+        let mut state = pending.state.borrow_mut();
+        state.last_send_report = Some(success.report);
+        state.last_error = if accepted {
+            issue_summary
+        } else {
+            Some(status.clone())
+        };
+        state.last_operation = Some(operation);
+    }
+    pending.widgets.status_label.set_text(&status);
+    refresh_draft_list(&pending.widgets);
+    finish_send_activity(&pending);
+}
+
+fn finish_accepted_send_cleanup(
+    pending: &PendingSend,
+    success: &mut SendSuccess,
+    draft_deleted: bool,
+) -> bool {
+    let same_active_draft =
+        pending.state.borrow().active_draft.as_ref() == pending.sent_draft.as_ref();
+    if pending.sent_draft.is_some() && draft_deleted {
+        if same_active_draft {
+            set_active_draft(&pending.widgets, &pending.state, None);
+        } else {
+            success.issues.push(SendCleanupIssue::new(
+                SendCleanupStage::DraftIdentity,
+                "captured draft changed before cleanup completed",
+            ));
+        }
+    }
+
+    let composer_unchanged = pending.state.borrow().compose_generation == pending.sent_generation;
+    let source_cleanup_allows_reset = pending.sent_draft.is_none() || draft_deleted;
+    let recovery_cleared = if composer_unchanged && source_cleanup_allows_reset {
+        match clear_recovery_draft_files(
+            &pending.widgets.draft_path,
+            pending.widgets.legacy_draft_path.as_deref(),
+        ) {
+            Ok(()) => true,
+            Err(err) => {
+                success
+                    .issues
+                    .push(SendCleanupIssue::new(SendCleanupStage::RecoveryClear, err));
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if composer_unchanged && source_cleanup_allows_reset && recovery_cleared {
+        reset_composer_after_send(&pending.options, &pending.widgets, &pending.state);
+    }
+    !composer_unchanged
+}
+
+fn reset_composer_after_send(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    let fields = ComposeFields {
+        from: widgets.compose_from.text().to_string(),
+        ..ComposeFields::default()
+    };
+    widgets.compose_autosave_suppressed.set(true);
+    widgets.compose_from.set_text(&fields.from);
+    widgets.compose_to.set_text("");
+    widgets.compose_cc.set_text("");
+    widgets.compose_bcc.set_text("");
+    widgets.compose_subject.set_text("");
+    widgets.compose_body.buffer().set_text("");
+    widgets.compose_autosave_suppressed.set(false);
+    update_attachment_label(widgets, &[]);
+    {
+        let mut state = state.borrow_mut();
+        state.compose_fields = fields;
+        state.compose_generation = state.compose_generation.saturating_add(1);
+        state.active_draft = None;
+    }
+    widgets.address_suggestions_list.set_visible(false);
+    update_draft_action_buttons(widgets, state);
+    restore_message_view_after_compose(options, widgets, state);
+}
+
+fn format_send_cleanup_issues(issues: &[SendCleanupIssue]) -> Option<String> {
+    (!issues.is_empty()).then(|| {
+        issues
+            .iter()
+            .map(|issue| format!("{}: {}", issue.description(), issue.error))
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
+}
+
+fn send_operation_summary(success: &SendSuccess, issue_summary: Option<&str>) -> String {
+    if !success.report.accepted {
+        return send_rejection_message(&success.report);
+    }
+    let mut details = vec!["send accepted".to_string()];
+    if let Some(persisted) = &success.persisted {
+        details.push(format!(
+            "saved sent message to {}{}",
+            persisted.path.display(),
+            persisted
+                .indexed_message_id
+                .as_deref()
+                .map(|id| format!(" and indexed {id}"))
+                .unwrap_or_default()
+        ));
+    }
+    if let Some(summary) = issue_summary {
+        details.push(format!("cleanup issues: {summary}"));
+    }
+    details.join("; ")
+}
+
+fn send_rejection_message(report: &notm_mail::SendReport) -> String {
+    let mut message = "Send was not accepted".to_string();
+    if let Some(status) = report.exit_status {
+        message.push_str(&format!(" (status {status})"));
+    }
+    if !report.stderr.trim().is_empty() {
+        message.push_str(&format!(": {}", report.stderr.trim()));
+    }
+    message
+}
+
+fn finish_send_activity(pending: &PendingSend) {
+    pending.state.borrow_mut().send_in_progress = false;
+    update_background_activity_controls(&pending.options, &pending.widgets, &pending.state);
+    update_debug(&pending.widgets, &pending.state);
+    close_main_window_after_background_activity(&pending.widgets, &pending.state);
 }
 
 fn send_message_with_config(
@@ -15540,8 +16088,8 @@ fn handle_automation_request(
         }
         "run_manual_sync" => manual_sync_response(options, widgets, state, &req.args),
         "open_compose" => {
-            open_compose(widgets, state);
-            json!({"ok": true, "compose_fields": state.borrow().compose_fields})
+            let opened = open_compose(widgets, state);
+            automation_reply_response(opened, widgets, state)
         }
         "compose_set_from"
         | "compose_set_to"
@@ -15566,7 +16114,7 @@ fn handle_automation_request(
                 }
                 _ => {}
             }
-            state.borrow_mut().compose_fields = compose_fields(widgets, state);
+            record_compose_edit(state, compose_fields(widgets, state));
             json!({"ok": true, "compose_fields": state.borrow().compose_fields})
         }
         "compose_add_attachment" => {
@@ -15595,7 +16143,7 @@ fn handle_automation_request(
                 matching_address_suggestions(&input, &state.borrow().address_suggestions, 20);
             if let Some(suggestion) = suggestions.get(index) {
                 apply_recipient_suggestion(&widgets.compose_to, suggestion);
-                state.borrow_mut().compose_fields = compose_fields(widgets, state);
+                record_compose_edit(state, compose_fields(widgets, state));
                 json!({"ok": true, "suggestion": suggestion, "compose_fields": state.borrow().compose_fields})
             } else {
                 json!({"ok": false, "error": "address suggestion index not found"})
@@ -15615,7 +16163,7 @@ fn handle_automation_request(
             };
             let completed = apply_recipient_completion(entry, state);
             update_address_suggestions_label(widgets, state, &entry.text());
-            state.borrow_mut().compose_fields = compose_fields(widgets, state);
+            record_compose_edit(state, compose_fields(widgets, state));
             json!({"ok": completed, "compose_fields": state.borrow().compose_fields})
         }
         "save_draft" => match save_current_draft(options, widgets, state) {
@@ -15665,24 +16213,16 @@ fn handle_automation_request(
             json!({"ok": ok, "error": error, "compose_fields": state.borrow().compose_fields, "active_draft": state.borrow().active_draft, "last_error": state.borrow().last_error})
         }
         "load_draft" => {
-            restore_draft_if_present(widgets, state);
-            json!({"ok": true, "compose_fields": state.borrow().compose_fields})
+            let loaded = restore_draft_if_present(widgets, state);
+            automation_reply_response(loaded, widgets, state)
         }
-        "clear_draft" => {
-            clear_draft_widgets(options, widgets, state);
-            match clear_recovery_draft_files(
-                &widgets.draft_path,
-                widgets.legacy_draft_path.as_deref(),
-            ) {
-                Ok(()) => json!({"ok": true, "compose_fields": state.borrow().compose_fields}),
-                Err(err) => json!({"ok": false, "error": err.to_string()}),
+        "clear_draft" => match clear_current_draft_from_ui(options, widgets, state) {
+            Ok(()) => json!({"ok": true, "compose_fields": state.borrow().compose_fields}),
+            Err(err) => {
+                json!({"ok": false, "error": err.to_string(), "compose_fields": state.borrow().compose_fields})
             }
-        }
-        "compose_send" => {
-            let ok = send_compose(options, widgets, state);
-            let error = (!ok).then(|| widgets.status_label.text().to_string());
-            json!({"ok": ok, "error": error, "last_send_report": state.borrow().last_send_report, "last_error": state.borrow().last_error})
-        }
+        },
+        "compose_send" => send_start_response(options, widgets, state),
         "reply_selected" => automation_reply_response(
             reply_selected(options, widgets, state, ReplyKind::Sender),
             widgets,
@@ -15694,12 +16234,12 @@ fn handle_automation_request(
             state,
         ),
         "forward_selected" => {
-            forward_selected(options, widgets, state);
-            json!({"ok": true, "compose_fields": state.borrow().compose_fields})
+            let forwarded = forward_selected(options, widgets, state);
+            automation_reply_response(forwarded, widgets, state)
         }
         "forward_as_attachment_selected" => {
-            forward_as_attachment_selected(options, widgets, state);
-            json!({"ok": true, "compose_fields": state.borrow().compose_fields, "last_error": state.borrow().last_error})
+            let forwarded = forward_as_attachment_selected(options, widgets, state);
+            automation_reply_response(forwarded, widgets, state)
         }
         "toggle_debug_panel" => {
             widgets
@@ -16122,8 +16662,8 @@ fn run_named_command(
             json!({"ok": true, "state": &*state.borrow()})
         }
         "compose" => {
-            open_compose(widgets, state);
-            json!({"ok": true, "compose_fields": state.borrow().compose_fields})
+            let opened = open_compose(widgets, state);
+            automation_reply_response(opened, widgets, state)
         }
         "reply" => automation_reply_response(
             reply_selected(options, widgets, state, ReplyKind::Sender),
@@ -16136,12 +16676,12 @@ fn run_named_command(
             state,
         ),
         "forward" => {
-            forward_selected(options, widgets, state);
-            json!({"ok": true, "compose_fields": state.borrow().compose_fields})
+            let forwarded = forward_selected(options, widgets, state);
+            automation_reply_response(forwarded, widgets, state)
         }
         "forward_attachment" | "forward_as_attachment" => {
-            forward_as_attachment_selected(options, widgets, state);
-            json!({"ok": true, "compose_fields": state.borrow().compose_fields, "last_error": state.borrow().last_error})
+            let forwarded = forward_as_attachment_selected(options, widgets, state);
+            automation_reply_response(forwarded, widgets, state)
         }
         "visual_select" => {
             enter_visual_select_mode(widgets, state);
@@ -16393,7 +16933,7 @@ fn run_named_command(
 fn update_debug(widgets: &Widgets, state: &SharedState) {
     let s = state.borrow();
     let text = format!(
-        "query: {}\nselected_thread: {}\nselected_message: {}\nlayout: {} ({})\ndatabase_path: {}\ndatabase_revision: {}\nlast_operation: {}\nlast_error: {}\ntest_harness: {}\nsync_in_progress: {}\nlast_send: {}\n",
+        "query: {}\nselected_thread: {}\nselected_message: {}\nlayout: {} ({})\ndatabase_path: {}\ndatabase_revision: {}\nlast_operation: {}\nlast_error: {}\ntest_harness: {}\nsend_in_progress: {}\nsync_in_progress: {}\nlast_send: {}\n",
         s.current_query,
         s.selected_thread
             .as_ref()
@@ -16413,6 +16953,7 @@ fn update_debug(widgets: &Widgets, state: &SharedState) {
         s.last_operation.as_deref().unwrap_or(""),
         s.last_error.as_deref().unwrap_or(""),
         s.automation_enabled,
+        s.send_in_progress,
         s.sync_in_progress,
         s.last_send_report
             .as_ref()
@@ -19781,20 +20322,79 @@ mod tests {
     }
 
     #[test]
-    fn sync_blocks_mailbox_writers_only_while_pending() {
-        for operation in [
-            MailboxWrite::Tag,
-            MailboxWrite::DraftSave,
-            MailboxWrite::DraftDelete,
-            MailboxWrite::Send,
-        ] {
-            assert_eq!(sync_block_reason(false, operation), None);
-            assert!(
-                sync_block_reason(true, operation)
-                    .is_some_and(|message| message.contains("sync is in progress")),
-                "missing sync conflict for {operation:?}"
+    fn background_activity_rules_keep_edits_safe_and_serialize_writers() {
+        let operations = [
+            UserOperation::ComposeEdit,
+            UserOperation::Tag,
+            UserOperation::DraftSave,
+            UserOperation::DraftDelete,
+            UserOperation::DraftLoad,
+            UserOperation::DraftClear,
+            UserOperation::ComposeReplace,
+            UserOperation::Send,
+            UserOperation::Sync,
+        ];
+        for operation in operations {
+            assert_eq!(
+                background_activity_block_reason(false, false, operation),
+                None,
+                "idle operation was blocked: {operation:?}"
             );
         }
+        for operation in [
+            UserOperation::Tag,
+            UserOperation::DraftSave,
+            UserOperation::DraftDelete,
+            UserOperation::Send,
+            UserOperation::Sync,
+        ] {
+            assert!(
+                background_activity_block_reason(true, false, operation).is_some(),
+                "sync did not block {operation:?}"
+            );
+        }
+        for operation in [
+            UserOperation::ComposeEdit,
+            UserOperation::DraftLoad,
+            UserOperation::DraftClear,
+            UserOperation::ComposeReplace,
+        ] {
+            assert_eq!(
+                background_activity_block_reason(true, false, operation),
+                None,
+                "sync unnecessarily blocked {operation:?}"
+            );
+        }
+        for operation in operations
+            .into_iter()
+            .filter(|operation| *operation != UserOperation::ComposeEdit)
+        {
+            assert!(
+                background_activity_block_reason(false, true, operation)
+                    .is_some_and(|message| message.contains("send is")),
+                "send did not block {operation:?}"
+            );
+        }
+        assert_eq!(
+            background_activity_block_reason(false, true, UserOperation::ComposeEdit),
+            None
+        );
+    }
+
+    #[test]
+    fn send_cleanup_issues_preserve_every_stage_in_order() {
+        let issues = vec![
+            SendCleanupIssue::new(SendCleanupStage::SentPersistence, "sent store"),
+            SendCleanupIssue::new(SendCleanupStage::DraftDelete, "draft source"),
+            SendCleanupIssue::new(SendCleanupStage::RecoveryClear, "recovery file"),
+        ];
+
+        assert_eq!(
+            format_send_cleanup_issues(&issues).as_deref(),
+            Some(
+                "sent save/index failed: sent store; draft delete failed: draft source; draft recovery clear failed: recovery file"
+            )
+        );
     }
 
     #[test]
@@ -19924,6 +20524,37 @@ mod tests {
         let reports = response.result.expect("slow sync command should succeed");
         assert_eq!(reports.len(), 1);
         assert!(reports[0].contains("stdout=done"));
+    }
+
+    #[test]
+    fn send_worker_returns_before_a_slow_transport_finishes() {
+        let options = LaunchOptions {
+            send_enabled: true,
+            send_command: Some(PathBuf::from("/bin/sh")),
+            send_args: vec!["-c".to_string(), "sleep 1; cat >/dev/null".to_string()],
+            send_mode: notm_mail::transport::TransportMode::StdinRfc5322,
+            save_sent: false,
+            ..LaunchOptions::default()
+        };
+        let fields = ComposeFields {
+            from: "Sender <sender@example.test>".to_string(),
+            to: "recipient@example.test".to_string(),
+            subject: "Slow worker".to_string(),
+            body: "Slow worker body".to_string(),
+            ..ComposeFields::default()
+        };
+        let started = Instant::now();
+        let receiver = spawn_send(options, fields).expect("spawn send worker");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "starting a background send waited for its transport"
+        );
+        let response = receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("background send response");
+        let success = response.result.expect("slow send should succeed");
+        assert!(success.report.accepted);
     }
 
     #[test]

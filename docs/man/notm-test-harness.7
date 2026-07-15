@@ -161,6 +161,17 @@ Non-fixture harness checks may pass
 cancellation behavior.  Normal UI and command-palette syncs do not add this
 delay.
 .PP
+.B compose_send
+returns with
+.B pending
+set to true after the composed snapshot is queued.  Poll
+.B app_state.state.send_in_progress
+until it becomes false before checking
+.BR last_send_report ,
+.BR last_error ,
+or send-related file changes.  If the primary window closes while a send is
+pending, the application remains alive until send finalization completes.
+.PP
 .B close_main_window
 closes only the primary window after returning its response.  Standalone
 message windows are left open.

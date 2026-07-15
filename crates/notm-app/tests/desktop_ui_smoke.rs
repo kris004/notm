@@ -62,6 +62,23 @@ impl FixtureApp {
     }
 
     #[cfg(unix)]
+    fn spawn_with_config_and_application_id(
+        work_dir: PathBuf,
+        token: &str,
+        config_path: &std::path::Path,
+        application_id: &str,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(
+            work_dir,
+            token,
+            Some(config_path),
+            None,
+            Some(application_id),
+            false,
+        )
+    }
+
+    #[cfg(unix)]
     fn spawn_fixture_with_config(
         work_dir: PathBuf,
         token: &str,
@@ -441,12 +458,18 @@ fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
         );
     }
 
-    let send = driver.command("compose_send", json!({}))?;
+    let started = driver.command("compose_send", json!({}))?;
+    assert_eq!(started["ok"], true, "fixture send did not start: {started}");
     assert_eq!(
-        send["last_send_report"]["accepted"], true,
+        started["pending"], true,
+        "fixture send did not report pending work: {started}"
+    );
+    let send = driver.wait_for_send(STARTUP_TIMEOUT)?;
+    assert_eq!(
+        send["state"]["last_send_report"]["accepted"], true,
         "fixture composer send was not accepted: {send}"
     );
-    let captured_path = send["last_send_report"]["captured_path"]
+    let captured_path = send["state"]["last_send_report"]["captured_path"]
         .as_str()
         .with_context(|| format!("fixture send did not report a capture path: {send}"))?;
     let captured = fs::read_to_string(captured_path)
@@ -514,12 +537,18 @@ fn fixture_compose_attachment_headers_are_safe_and_round_trip() -> anyhow::Resul
         "fixture attachment was not added: {add_attachment}"
     );
 
-    let send = driver.command("compose_send", json!({}))?;
+    let started = driver.command("compose_send", json!({}))?;
+    assert_eq!(started["ok"], true, "fixture send did not start: {started}");
     assert_eq!(
-        send["last_send_report"]["accepted"], true,
+        started["pending"], true,
+        "fixture send did not report pending work: {started}"
+    );
+    let send = driver.wait_for_send(STARTUP_TIMEOUT)?;
+    assert_eq!(
+        send["state"]["last_send_report"]["accepted"], true,
         "fixture composer send was not accepted: {send}"
     );
-    let captured_path = send["last_send_report"]["captured_path"]
+    let captured_path = send["state"]["last_send_report"]["captured_path"]
         .as_str()
         .with_context(|| format!("fixture send did not report a capture path: {send}"))?;
     let captured = fs::read(captured_path)
@@ -631,12 +660,18 @@ fn fixture_harness_quarantines_external_commands() -> anyhow::Result<()> {
         let response = driver.command(command, json!({"value": value}))?;
         assert_eq!(response["ok"], true, "{command} failed: {response}");
     }
-    let send = driver.command("compose_send", json!({}))?;
+    let started = driver.command("compose_send", json!({}))?;
+    assert_eq!(started["ok"], true, "fixture send did not start: {started}");
     assert_eq!(
-        send["last_send_report"]["accepted"], true,
+        started["pending"], true,
+        "fixture send did not report pending work: {started}"
+    );
+    let send = driver.wait_for_send(STARTUP_TIMEOUT)?;
+    assert_eq!(
+        send["state"]["last_send_report"]["accepted"], true,
         "fixture fake send was not accepted: {send}"
     );
-    let capture = send["last_send_report"]["captured_path"]
+    let capture = send["state"]["last_send_report"]["captured_path"]
         .as_str()
         .with_context(|| format!("fixture send returned no capture path: {send}"))?;
     ensure!(
@@ -1837,12 +1872,21 @@ fn external_file_arg_send_reports_existing_sent_copy() -> anyhow::Result<()> {
         );
     }
 
-    let send = driver.command("compose_send", json!({}))?;
+    let started = driver.command("compose_send", json!({}))?;
     assert_eq!(
-        send["last_send_report"]["accepted"], true,
+        started["ok"], true,
+        "configured send did not start: {started}"
+    );
+    assert_eq!(
+        started["pending"], true,
+        "configured send did not report pending work: {started}"
+    );
+    let send = driver.wait_for_send(STARTUP_TIMEOUT)?;
+    assert_eq!(
+        send["state"]["last_send_report"]["accepted"], true,
         "external file-argument send was not accepted: {send}"
     );
-    let reported_path = send["last_send_report"]["captured_path"]
+    let reported_path = send["state"]["last_send_report"]["captured_path"]
         .as_str()
         .map(PathBuf::from)
         .with_context(|| format!("sent-copy send did not report a durable path: {send}"))?;
@@ -1944,12 +1988,50 @@ fn timed_out_send_reports_failure_and_leaves_desktop_responsive() -> anyhow::Res
         );
     }
 
-    let send = driver.command("compose_send", json!({}))?;
+    let send_started_at = Instant::now();
+    let started = driver.command("compose_send", json!({}))?;
+    assert_eq!(started["ok"], true, "timed send did not start: {started}");
+    assert_eq!(
+        started["pending"], true,
+        "timed send did not report pending work: {started}"
+    );
     ensure!(
-        send["last_send_report"].is_null(),
+        send_started_at.elapsed() < Duration::from_millis(750),
+        "starting a slow send blocked the desktop for {:?}",
+        send_started_at.elapsed()
+    );
+
+    let health_started_at = Instant::now();
+    let health = driver.command("health", json!({}))?;
+    assert_eq!(health["ok"], true, "desktop blocked during send: {health}");
+    ensure!(
+        health_started_at.elapsed() < Duration::from_millis(750),
+        "health check blocked behind the send for {:?}",
+        health_started_at.elapsed()
+    );
+    let pending = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        pending["state"]["send_in_progress"], true,
+        "send was not pending during responsiveness checks: {pending}"
+    );
+    let duplicate = driver.command("compose_send", json!({}))?;
+    assert_eq!(
+        duplicate["ok"], false,
+        "duplicate send started: {duplicate}"
+    );
+    ensure!(
+        duplicate["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("send is already in progress")),
+        "duplicate-send error was not explicit: {duplicate}"
+    );
+
+    let send = driver.wait_for_send(Duration::from_secs(5))?;
+    ensure!(
+        send["state"]["last_send_report"].is_null(),
         "timed-out send unexpectedly produced a report: {send}"
     );
-    let last_error = send["last_error"]
+    let last_error = send["state"]["last_error"]
         .as_str()
         .with_context(|| format!("timed-out send did not report an error: {send}"))?;
     ensure!(
@@ -1957,10 +2039,9 @@ fn timed_out_send_reports_failure_and_leaves_desktop_responsive() -> anyhow::Res
         "unexpected timed-out send error: {last_error}"
     );
 
-    let state = driver.command("app_state", json!({}))?;
     assert_eq!(
-        state["state"]["compose_fields"]["subject"], "Timeout desktop smoke",
-        "failed send cleared the composer: {state}"
+        send["state"]["compose_fields"]["subject"], "Timeout desktop smoke",
+        "failed send cleared the composer: {send}"
     );
     let health = driver.command("health", json!({}))?;
     assert_eq!(
@@ -1974,6 +2055,528 @@ fn timed_out_send_reports_failure_and_leaves_desktop_responsive() -> anyhow::Res
         "send helper descendant survived after the UI reported a timeout"
     );
 
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn slow_send_preserves_newer_composer_edits_and_serializes_writes() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP slow_send_preserves_newer_composer_edits_and_serializes_writes: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running non-blocking send-overlap desktop UI smoke with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-async-send-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let send_capture = work_dir.join("sent-message.eml");
+    let send_helper = work_dir.join("send-helper");
+    fs::write(&send_helper, "#!/bin/sh\ncat > \"$1\"\nsleep 4\n")?;
+    fs::set_permissions(&send_helper, fs::Permissions::from_mode(0o755))?;
+    let sync_marker = work_dir.join("sync-must-not-run");
+    let sync_helper = work_dir.join("sync-helper");
+    fs::write(&sync_helper, "#!/bin/sh\nprintf 'ran\\n' > \"$1\"\n")?;
+    fs::set_permissions(&sync_helper, fs::Permissions::from_mode(0o755))?;
+    let sync_command = toml::Value::String(format!(
+        "{} {}",
+        sync_helper.display(),
+        sync_marker.display()
+    ))
+    .to_string();
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+             \n[identity]\nname = \"Fixture Sender\"\nprimary_email = \"sender@example.test\"\n\
+             \n[send]\nenabled = true\ncommand = {}\nargs = [{}]\nmode = \"stdin_rfc5322\"\ntimeout_seconds = 10\nsave_sent = false\n\
+             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n\
+             \n[sync]\nenabled = true\nexternal_receive_enabled = true\nexternal_receive_on_startup = false\nexternal_receive_command = {}\n\
+             \n[automation]\nallow_live_send_test = true\nallow_live_tag_test = true\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+            toml_path(&send_helper),
+            toml_path(&send_capture),
+            sync_command,
+        ),
+    )?;
+
+    let token = format!("notm-async-send-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir.clone(), &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    select_first_thread(&mut driver, "subject:\"Unread inbox message\"")?;
+    assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
+    for (command, value) in [
+        ("compose_set_from", "Fixture Sender <sender@example.test>"),
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Original slow-send subject"),
+        ("compose_set_body", "Original slow-send body"),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(response["ok"], true, "{command} failed: {response}");
+    }
+    let saved = driver.command("save_draft", json!({}))?;
+    assert_eq!(saved["ok"], true, "draft save failed: {saved}");
+    let saved_draft_path = saved["report"]["local_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("saved draft had no local path: {saved}"))?;
+    ensure!(saved_draft_path.is_file(), "saved draft is missing");
+
+    let send_started_at = Instant::now();
+    let started = driver.command("compose_send", json!({}))?;
+    assert_eq!(started["ok"], true, "slow send did not start: {started}");
+    assert_eq!(
+        started["pending"], true,
+        "slow send was not pending: {started}"
+    );
+    ensure!(
+        send_started_at.elapsed() < Duration::from_millis(750),
+        "slow send blocked its start response for {:?}",
+        send_started_at.elapsed()
+    );
+
+    for (command, value) in [
+        ("compose_set_subject", "Newer subject kept during send"),
+        ("compose_set_body", "Newer body kept during send"),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(
+            response["ok"], true,
+            "composer edit was blocked during send: {response}"
+        );
+    }
+    let health = driver.command("health", json!({}))?;
+    assert_eq!(health["ok"], true, "desktop blocked during send: {health}");
+    let browsed = driver.command("select_thread_by_index", json!({"index": 0}))?;
+    assert_eq!(browsed["ok"], true, "message browsing failed: {browsed}");
+    let after_browse = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        after_browse["state"]["active_draft"]["path"],
+        saved_draft_path.display().to_string(),
+        "message browsing detached the pending draft: {after_browse}"
+    );
+
+    assert_eq!(
+        driver.command("select_draft_by_index", json!({"index": 0}))?["ok"],
+        true
+    );
+    for (command, args) in [
+        ("tag_selected", json!({"add": ["must-not-apply"]})),
+        ("save_draft", json!({})),
+        ("delete_active_draft", json!({})),
+        ("delete_selected_draft", json!({})),
+        ("load_selected_draft", json!({})),
+        ("load_draft", json!({})),
+        ("clear_draft", json!({})),
+        ("open_compose", json!({})),
+        ("reply_selected", json!({})),
+        ("forward_selected", json!({})),
+        ("run_manual_sync", json!({})),
+    ] {
+        let blocked = driver.command(command, args)?;
+        assert_eq!(
+            blocked["ok"], false,
+            "{command} was accepted during send: {blocked}"
+        );
+        ensure!(
+            blocked["error"].as_str().is_some_and(|error| {
+                error.contains("send is") && error.contains("in progress")
+            }),
+            "{command} did not explain the send conflict: {blocked}"
+        );
+    }
+    ensure!(
+        saved_draft_path.is_file(),
+        "blocked draft operation removed {}",
+        saved_draft_path.display()
+    );
+    ensure!(!sync_marker.exists(), "blocked sync command still executed");
+
+    let send = driver.wait_for_send(Duration::from_secs(8))?;
+    assert_eq!(
+        send["state"]["last_send_report"]["accepted"], true,
+        "slow send was not accepted: {send}"
+    );
+    assert_eq!(
+        send["state"]["compose_fields"]["subject"], "Newer subject kept during send",
+        "accepted send discarded the newer subject: {send}"
+    );
+    assert_eq!(
+        send["state"]["compose_fields"]["body"], "Newer body kept during send",
+        "accepted send discarded the newer body: {send}"
+    );
+    ensure!(
+        send["state"]["active_draft"].is_null(),
+        "deleted sent draft remained active: {send}"
+    );
+    ensure!(
+        send["state"]["last_error"].is_null(),
+        "successful overlap send reported an error: {send}"
+    );
+    ensure!(
+        !saved_draft_path.exists(),
+        "accepted send did not remove its captured draft source"
+    );
+    let captured = fs::read_to_string(&send_capture)?;
+    ensure!(
+        captured.contains("\r\nSubject: Original slow-send subject\r\n")
+            && captured.contains("\r\n\r\nOriginal slow-send body")
+            && !captured.contains("Newer subject kept during send")
+            && !captured.contains("Newer body kept during send"),
+        "transport did not receive the immutable send snapshot:\n{captured}"
+    );
+    let recovery_path = work_dir.join("state/notm/draft.json");
+    let recovery: Value = serde_json::from_slice(&fs::read(&recovery_path)?)?;
+    assert_eq!(recovery["subject"], "Newer subject kept during send");
+    assert_eq!(recovery["body"], "Newer body kept during send");
+
+    let resaved = driver.command("save_draft", json!({}))?;
+    assert_eq!(
+        resaved["ok"], true,
+        "draft writing did not resume after send: {resaved}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn closing_main_window_waits_for_send_finalization() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP closing_main_window_waits_for_send_finalization: no DISPLAY or WAYLAND_DISPLAY \
+             is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running send lifetime desktop UI smoke with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-send-lifetime-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let send_capture = work_dir.join("sent-message.eml");
+    let send_helper = work_dir.join("send-helper");
+    fs::write(&send_helper, "#!/bin/sh\nsleep 2\ncat > \"$1\"\n")?;
+    fs::set_permissions(&send_helper, fs::Permissions::from_mode(0o755))?;
+    let sent_maildir = work_dir.join("Sent");
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+             \n[identity]\nname = \"Fixture Sender\"\nprimary_email = \"sender@example.test\"\n\
+             \n[send]\nenabled = true\ncommand = {}\nargs = [{}]\nmode = \"stdin_rfc5322\"\ntimeout_seconds = 10\nsave_sent = true\nsent_maildir = {}\nindex_sent_after_send = false\n\
+             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n\
+             \n[automation]\nallow_live_send_test = true\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+            toml_path(&send_helper),
+            toml_path(&send_capture),
+            toml_path(&sent_maildir),
+        ),
+    )?;
+
+    let token = format!("notm-send-lifetime-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir.clone(), &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
+    for (command, value) in [
+        ("compose_set_from", "Fixture Sender <sender@example.test>"),
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Close-window send lifetime"),
+        ("compose_set_body", "Close-window send body"),
+    ] {
+        assert_eq!(
+            driver.command(command, json!({"value": value}))?["ok"],
+            true
+        );
+    }
+    let saved = driver.command("save_draft", json!({}))?;
+    let saved_draft_path = saved["report"]["local_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("saved draft had no local path: {saved}"))?;
+    let recovery_path = work_dir.join("state/notm/draft.json");
+    ensure!(saved_draft_path.is_file() && recovery_path.is_file());
+
+    let started = driver.command("compose_send", json!({}))?;
+    assert_eq!(started["ok"], true, "send did not start: {started}");
+    assert_eq!(started["pending"], true, "send was not pending: {started}");
+    let close = driver.command("close_main_window", json!({}))?;
+    assert_eq!(close["ok"], true, "main-window close failed: {close}");
+    drop(driver);
+
+    thread::sleep(Duration::from_millis(300));
+    ensure!(
+        app.child.try_wait()?.is_none(),
+        "application exited before pending send finalization\n{}",
+        app.logs()
+    );
+    ensure!(
+        !send_capture.exists(),
+        "slow transport completed unexpectedly early"
+    );
+    ensure!(
+        saved_draft_path.is_file() && recovery_path.is_file(),
+        "draft cleanup ran before the transport accepted the message"
+    );
+
+    let status = app.wait_for_exit(Duration::from_secs(8))?;
+    ensure!(
+        status.success(),
+        "application exited with {status}\n{}",
+        app.logs()
+    );
+    ensure!(
+        send_capture.is_file(),
+        "transport capture is missing after exit"
+    );
+    ensure!(
+        sent_maildir
+            .join("cur")
+            .read_dir()?
+            .next()
+            .transpose()?
+            .is_some(),
+        "durable Sent copy was not finalized before exit"
+    );
+    ensure!(
+        !saved_draft_path.exists(),
+        "sent draft source survived finalization"
+    );
+    ensure!(
+        !recovery_path.exists(),
+        "recovery draft survived finalization"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn reactivating_during_send_reuses_the_pending_window_session() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP reactivating_during_send_reuses_the_pending_window_session: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running pending-send reactivation desktop UI smoke with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-send-reactivate-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let send_capture = work_dir.join("sent-message.eml");
+    let send_helper = work_dir.join("send-helper");
+    fs::write(&send_helper, "#!/bin/sh\nsleep 4\ncat > \"$1\"\n")?;
+    fs::set_permissions(&send_helper, fs::Permissions::from_mode(0o755))?;
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+             \n[identity]\nname = \"Fixture Sender\"\nprimary_email = \"sender@example.test\"\n\
+             \n[send]\nenabled = true\ncommand = {}\nargs = [{}]\nmode = \"stdin_rfc5322\"\ntimeout_seconds = 10\nsave_sent = false\n\
+             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n\
+             \n[automation]\nallow_live_send_test = true\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+            toml_path(&send_helper),
+            toml_path(&send_capture),
+        ),
+    )?;
+
+    let token = format!("notm-send-reactivate-ui-{run_id}");
+    let application_id = format!("dev.notm.Notm.Test.r{}", run_id.replace('-', ""));
+    let mut app = FixtureApp::spawn_with_config_and_application_id(
+        work_dir,
+        &token,
+        &config_path,
+        &application_id,
+    )?;
+    let mut driver = app.connect(&token)?;
+    assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
+    for (command, value) in [
+        ("compose_set_from", "Fixture Sender <sender@example.test>"),
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Reactivated pending send"),
+        ("compose_set_body", "Reactivation must reuse this state"),
+    ] {
+        assert_eq!(
+            driver.command(command, json!({"value": value}))?["ok"],
+            true
+        );
+    }
+    let started = driver.command("compose_send", json!({}))?;
+    assert_eq!(started["ok"], true, "send did not start: {started}");
+    assert_eq!(driver.command("close_main_window", json!({}))?["ok"], true);
+    thread::sleep(Duration::from_millis(200));
+    ensure!(
+        app.child.try_wait()?.is_none(),
+        "primary exited while its send was pending"
+    );
+
+    app.request_message_id(
+        &format!("secondary-{token}"),
+        &application_id,
+        "thread-root-three-message@fixture.test",
+    )?;
+    let reactivated = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        reactivated["state"]["send_in_progress"], true,
+        "reactivation created a second idle session: {reactivated}"
+    );
+    assert_eq!(
+        reactivated["state"]["compose_fields"]["subject"], "Reactivated pending send",
+        "reactivation lost the pending composer: {reactivated}"
+    );
+    let duplicate = driver.command("compose_send", json!({}))?;
+    assert_eq!(
+        duplicate["ok"], false,
+        "reactivated session allowed a second send"
+    );
+
+    let completed = driver.wait_for_send(Duration::from_secs(8))?;
+    assert_eq!(
+        completed["state"]["last_send_report"]["accepted"], true,
+        "reactivated pending send did not finish: {completed}"
+    );
+    ensure!(
+        send_capture.is_file(),
+        "reactivated transport capture is missing"
+    );
+    ensure!(
+        app.child.try_wait()?.is_none(),
+        "reactivated primary closed when its old pending send finished"
+    );
+    assert_eq!(driver.command("close_main_window", json!({}))?["ok"], true);
+    drop(driver);
+    let status = app.wait_for_exit(Duration::from_secs(3))?;
+    ensure!(
+        status.success(),
+        "reactivated app did not exit cleanly: {status}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn accepted_send_aggregates_cleanup_failures_and_preserves_recovery() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP accepted_send_aggregates_cleanup_failures_and_preserves_recovery: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running send cleanup-error desktop UI smoke with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-send-cleanup-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let send_helper = work_dir.join("send-helper");
+    fs::write(&send_helper, "#!/bin/sh\nsleep 2\ncat >/dev/null\n")?;
+    fs::set_permissions(&send_helper, fs::Permissions::from_mode(0o755))?;
+    let invalid_sent_maildir = work_dir.join("sent-is-a-file");
+    fs::write(&invalid_sent_maildir, b"not a maildir")?;
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+             \n[identity]\nname = \"Fixture Sender\"\nprimary_email = \"sender@example.test\"\n\
+             \n[send]\nenabled = true\ncommand = {}\nmode = \"stdin_rfc5322\"\ntimeout_seconds = 10\nsave_sent = true\nsent_maildir = {}\nindex_sent_after_send = false\n\
+             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n\
+             \n[automation]\nallow_live_send_test = true\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+            toml_path(&send_helper),
+            toml_path(&invalid_sent_maildir),
+        ),
+    )?;
+
+    let token = format!("notm-send-cleanup-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir.clone(), &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
+    for (command, value) in [
+        ("compose_set_from", "Fixture Sender <sender@example.test>"),
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Aggregate send cleanup failures"),
+        ("compose_set_body", "Accepted transport with broken cleanup"),
+    ] {
+        assert_eq!(
+            driver.command(command, json!({"value": value}))?["ok"],
+            true
+        );
+    }
+    let saved = driver.command("save_draft", json!({}))?;
+    let saved_draft_path = saved["report"]["local_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("saved draft had no local path: {saved}"))?;
+    let draft_dir = saved_draft_path.parent().context("saved draft parent")?;
+    fs::set_permissions(draft_dir, fs::Permissions::from_mode(0o555))?;
+
+    let started = driver.command("compose_send", json!({}))?;
+    assert_eq!(started["ok"], true, "send did not start: {started}");
+    let recovery_path = work_dir.join("state/notm/draft.json");
+    fs::remove_file(&recovery_path)?;
+    fs::create_dir(&recovery_path)?;
+
+    let send = driver.wait_for_send(Duration::from_secs(8));
+    fs::set_permissions(draft_dir, fs::Permissions::from_mode(0o755))?;
+    let send = send?;
+    assert_eq!(
+        send["state"]["last_send_report"]["accepted"], true,
+        "accepted report was lost to cleanup failures: {send}"
+    );
+    let error = send["state"]["last_error"]
+        .as_str()
+        .with_context(|| format!("cleanup failures were not reported: {send}"))?;
+    let sent_index = error
+        .find("sent save/index failed")
+        .with_context(|| format!("sent persistence failure missing: {error}"))?;
+    let draft_index = error
+        .find("draft delete failed")
+        .with_context(|| format!("draft deletion failure missing: {error}"))?;
+    ensure!(
+        sent_index < draft_index,
+        "cleanup failures were not reported in operation order: {error}"
+    );
+    ensure!(
+        !error.contains("draft recovery clear failed"),
+        "recovery cleanup ran after draft-source deletion failed: {error}"
+    );
+    ensure!(
+        saved_draft_path.is_file(),
+        "failed draft deletion removed its source"
+    );
+    assert_eq!(
+        send["state"]["compose_fields"]["subject"], "Aggregate send cleanup failures",
+        "cleanup failure cleared the composer: {send}"
+    );
+    ensure!(
+        recovery_path.is_dir(),
+        "recovery state was removed despite the surviving draft source"
+    );
+    fs::remove_dir(&recovery_path)?;
     Ok(())
 }
 

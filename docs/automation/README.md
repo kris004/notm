@@ -124,6 +124,12 @@ Non-fixture harness checks may pass `test_refresh_delay_ms` (maximum 5000) to
 keep that refresh pending while they exercise responsiveness and cancellation
 behavior; normal UI and command-palette syncs never add this delay.
 
+`compose_send` returns with `pending: true` after the composed snapshot has been
+queued. Poll `app_state.state.send_in_progress` until it becomes false before
+checking `last_send_report`, `last_error`, or send-related file changes. If the
+primary window closes while a send is pending, the application remains alive
+until send finalization completes.
+
 `close_main_window` closes only the primary window after returning its response.
 Standalone message windows, if any, are left open.
 
