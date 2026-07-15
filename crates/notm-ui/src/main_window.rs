@@ -24,7 +24,7 @@ use notm_mail::{
     compose::{AttachmentInput, Identity},
     forward::{build_attachment_forward, build_inline_forward},
     html_sanitize::sanitize_html,
-    mime::{extract_attachments_from_file, parse_file},
+    mime::{extract_attachments_from_file, extract_attachments_from_file_detailed, parse_file},
 };
 use notm_notmuch::{
     Database, DatabaseMode, MessageTagMutation, OpenConfig, QueryOptions, SortOrder, TagMutation,
@@ -563,6 +563,7 @@ enum MessageViewKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ThreadAttachmentItem {
     message_index: usize,
+    /// Stable depth-first attachment MIME-part index within the message.
     attachment_index: usize,
     message_id: String,
     filename: String,
@@ -7787,8 +7788,9 @@ fn save_selected_attachment(
         .filenames
         .first()
         .ok_or_else(|| anyhow::anyhow!("selected message has no file"))?;
-    let attachments = extract_attachments_from_file(filename)?;
-    let attachment = attachments
+    let report = extract_attachments_from_file_detailed(filename)?;
+    let attachment = report
+        .attachments
         .get(index)
         .ok_or_else(|| anyhow::anyhow!("attachment index {index} not found"))?;
     let target_dir = dir
@@ -7819,13 +7821,13 @@ fn refresh_thread_attachment_list(widgets: &Widgets, state: &SharedState) {
         let Some(filename) = message.filenames.first() else {
             continue;
         };
-        let Ok(attachments) = extract_attachments_from_file(filename) else {
+        let Ok(report) = extract_attachments_from_file_detailed(filename) else {
             continue;
         };
-        for (attachment_index, attachment) in attachments.into_iter().enumerate() {
+        for attachment in report.attachments {
             let item = ThreadAttachmentItem {
                 message_index,
-                attachment_index,
+                attachment_index: attachment.part_index,
                 message_id: message.message_id.clone(),
                 filename: attachment.filename,
                 content_type: attachment.content_type,
@@ -7989,10 +7991,12 @@ fn save_thread_attachment(
         .filenames
         .first()
         .ok_or_else(|| anyhow::anyhow!("attachment message has no file"))?;
-    let attachments = extract_attachments_from_file(filename)?;
-    let attachment = attachments
-        .get(item.attachment_index)
-        .ok_or_else(|| anyhow::anyhow!("attachment index not found"))?;
+    let report = extract_attachments_from_file_detailed(filename)?;
+    let attachment = report
+        .attachments
+        .iter()
+        .find(|attachment| attachment.part_index == item.attachment_index)
+        .ok_or_else(|| anyhow::anyhow!("attachment MIME part not found"))?;
     let target_dir = dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("artifacts/attachments"));
@@ -8102,17 +8106,33 @@ fn render_selected_message_text(widgets: &Widgets, state: &SharedState) -> anyho
                     &parsed.safe_body,
                     widgets.quote_collapse.get(),
                 ));
+                if !parsed.decode_warnings.is_empty() {
+                    if !rendered.is_empty() {
+                        rendered.push_str("\n\n");
+                    }
+                    rendered.push_str("MIME decode warnings:\n");
+                    for warning in &parsed.decode_warnings {
+                        rendered.push_str(&format!("- {warning}\n"));
+                    }
+                }
                 if !parsed.attachments.is_empty() {
                     rendered.push_str("\n\nAttachments:\n");
                     for att in &parsed.attachments {
-                        rendered.push_str(&format!(
-                            "- {} ({}, {} bytes)\n",
-                            att.filename
-                                .clone()
-                                .unwrap_or_else(|| "unnamed".to_string()),
-                            att.content_type,
-                            att.size
-                        ));
+                        let filename = att.filename.as_deref().unwrap_or("unnamed");
+                        match &att.decode_error {
+                            Some(error) => rendered.push_str(&format!(
+                                "- {filename} ({}, decode failed: {error})\n",
+                                att.content_type
+                            )),
+                            None if att.decode_warnings.is_empty() => rendered.push_str(&format!(
+                                "- {filename} ({}, {} bytes)\n",
+                                att.content_type, att.size
+                            )),
+                            None => rendered.push_str(&format!(
+                                "- {filename} ({}, {} bytes; decoded with warning)\n",
+                                att.content_type, att.size
+                            )),
+                        }
                     }
                 }
                 rendered.push_str("\n\nMIME tree:\n");
@@ -8856,7 +8876,7 @@ fn show_visual_html_with_image_policy(
     state: &SharedState,
     image_policy: ImagePolicy,
 ) {
-    let result = (|| -> anyhow::Result<(String, String, bool, Option<String>)> {
+    let result = (|| -> anyhow::Result<(String, String, bool, Option<String>, usize)> {
         let sender = selected_sender_email(state);
         if matches!(image_policy, ImagePolicy::TrustSender) {
             let sender = sender
@@ -8870,6 +8890,7 @@ fn show_visual_html_with_image_policy(
         };
         let filename = selected_message_filename(state)?;
         let parsed = parse_file(filename)?;
+        let decode_warning_count = parsed.decode_warnings.len();
         let html = parsed
             .html_body
             .ok_or_else(|| anyhow::anyhow!("selected message has no HTML body"))?;
@@ -8879,10 +8900,11 @@ fn show_visual_html_with_image_policy(
             html,
             allow_remote_images,
             sender,
+            decode_warning_count,
         ))
     })();
     match result {
-        Ok((document, original_html, allow_remote_images, sender)) => {
+        Ok((document, original_html, allow_remote_images, sender, decode_warning_count)) => {
             set_html_image_loading(&widgets.html_view, allow_remote_images);
             widgets.html_view.load_html(&document, Some("about:blank"));
             widgets.message_stack.set_visible_child_name("html");
@@ -8892,6 +8914,7 @@ fn show_visual_html_with_image_policy(
                 image_policy,
                 allow_remote_images,
                 sender.as_deref(),
+                decode_warning_count,
             ));
             {
                 let mut s = state.borrow_mut();
@@ -8928,8 +8951,9 @@ fn html_status_text(
     policy: ImagePolicy,
     allow_remote_images: bool,
     sender: Option<&str>,
+    decode_warning_count: usize,
 ) -> String {
-    match policy {
+    let status = match policy {
         ImagePolicy::Once if allow_remote_images => {
             "Visual HTML rendered; remote images allowed for this view only".to_string()
         }
@@ -8944,6 +8968,14 @@ fn html_status_text(
             _ => "Visual HTML rendered; remote images allowed by config".to_string(),
         },
         _ => "Visual HTML rendered; JavaScript and remote images disabled".to_string(),
+    };
+    if decode_warning_count == 0 {
+        status
+    } else {
+        format!(
+            "{status}; {decode_warning_count} MIME decode warning{}",
+            if decode_warning_count == 1 { "" } else { "s" }
+        )
     }
 }
 
@@ -9118,21 +9150,23 @@ fn html_view_state(
         .visible_child_name()
         .map(|name| name.to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    let (has_html, html_len, error) = match selected_message_filename(state).and_then(parse_file) {
-        Ok(parsed) => (
-            parsed
-                .html_body
-                .as_ref()
-                .is_some_and(|html| !html.trim().is_empty()),
-            parsed
-                .html_body
-                .as_ref()
-                .map(|html| html.len())
-                .unwrap_or(0),
-            None,
-        ),
-        Err(err) => (false, 0, Some(err.to_string())),
-    };
+    let (has_html, html_len, decode_warning_count, error) =
+        match selected_message_filename(state).and_then(parse_file) {
+            Ok(parsed) => (
+                parsed
+                    .html_body
+                    .as_ref()
+                    .is_some_and(|html| !html.trim().is_empty()),
+                parsed
+                    .html_body
+                    .as_ref()
+                    .map(|html| html.len())
+                    .unwrap_or(0),
+                parsed.decode_warnings.len(),
+                None,
+            ),
+            Err(err) => (false, 0, 0, Some(err.to_string())),
+        };
     let sender_email = selected_sender_email(state);
     let sender_trusted = sender_email
         .as_deref()
@@ -9146,6 +9180,8 @@ fn html_view_state(
         "html_visible": visible_child == "html",
         "has_html": has_html,
         "html_bytes": html_len,
+        "decode_warning_count": decode_warning_count,
+        "status_text": widgets.status_label.text().to_string(),
         "global_remote_images_allowed": runtime_remote_images(options),
         "sender_email": sender_email,
         "sender_trusted": sender_trusted,

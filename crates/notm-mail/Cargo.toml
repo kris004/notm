@@ -14,6 +14,7 @@ email_address.workspace = true
 html2text.workspace = true
 libc.workspace = true
 mailparse.workspace = true
+quoted_printable.workspace = true
 regex.workspace = true
 serde.workspace = true
 shell-words.workspace = true

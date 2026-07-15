@@ -1211,6 +1211,7 @@ dependencies = [
  "html2text",
  "libc",
  "mailparse",
+ "quoted_printable",
  "regex",
  "serde",
  "shell-words",

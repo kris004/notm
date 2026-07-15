@@ -681,6 +681,100 @@ fn fixture_attachment_save_keeps_existing_files() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn fixture_malformed_text_shows_a_decode_warning() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment() else {
+        eprintln!(
+            "SKIP fixture_malformed_text_shows_a_decode_warning: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running malformed MIME desktop UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-mime-warning-ui-{run_id}"));
+    let downloads = work_dir.join("downloads");
+    fs::create_dir_all(&downloads)?;
+    let token = format!("notm-mime-warning-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+    select_first_thread(&mut driver, "subject:\"Malformed transfer encoding\"")?;
+    let shown = driver.command("show_text_thread", json!({}))?;
+    assert_eq!(
+        shown["ok"], true,
+        "could not show malformed message: {shown}"
+    );
+
+    let rendered = driver.command("message_view_text", json!({}))?;
+    let text = rendered["text"]
+        .as_str()
+        .with_context(|| format!("message view response has no text: {rendered}"))?;
+    ensure!(
+        text.contains("MIME decode warnings:"),
+        "malformed text was silently blanked: {rendered}"
+    );
+    ensure!(
+        text.contains("Could not decode text/plain MIME part")
+            && text.contains("Base64 decode error"),
+        "message view did not explain the MIME failure: {rendered}"
+    );
+
+    select_first_thread(&mut driver, "subject:\"HTML with malformed attachment\"")?;
+    let listed = driver.command("attachment_list_items", json!({}))?;
+    let attachments = json_array_at(&listed, &["attachments"])?;
+    ensure!(
+        attachments.len() == 1
+            && attachments[0]["filename"] == "good.txt"
+            && attachments[0]["attachment_index"] == 1,
+        "a malformed attachment hid its valid sibling or changed its MIME index: {listed}"
+    );
+
+    let saved = driver.command(
+        "save_selected_attachment",
+        json!({"index": 0, "dir": downloads}),
+    )?;
+    assert_eq!(
+        saved["ok"], true,
+        "valid sibling could not be saved: {saved}"
+    );
+    let saved_path = saved["path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("sibling save returned no path: {saved}"))?;
+    assert_eq!(fs::read(saved_path)?, b"good sibling");
+
+    let text_view = driver.command("show_text_thread", json!({}))?;
+    assert_eq!(
+        text_view["ok"], true,
+        "could not show sibling text: {text_view}"
+    );
+    let rendered = driver.command("message_view_text", json!({}))?;
+    let text = rendered["text"]
+        .as_str()
+        .with_context(|| format!("sibling message view response has no text: {rendered}"))?;
+    ensure!(
+        text.contains("broken.bin") && text.contains("decode failed") && text.contains("good.txt"),
+        "attachment metadata or failure status was hidden in text view: {rendered}"
+    );
+
+    let visual = driver.command("show_visual_html", json!({}))?;
+    assert_eq!(visual["ok"], true, "valid HTML could not render: {visual}");
+    assert_eq!(
+        visual["html_view"]["decode_warning_count"], 1,
+        "visual HTML omitted MIME warning state: {visual}"
+    );
+    let status = visual["html_view"]["status_text"]
+        .as_str()
+        .with_context(|| format!("visual HTML response has no status: {visual}"))?;
+    ensure!(
+        status.contains("1 MIME decode warning"),
+        "visual HTML status silently hid the MIME warning: {visual}"
+    );
+
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn external_file_arg_send_reports_existing_sent_copy() -> anyhow::Result<()> {

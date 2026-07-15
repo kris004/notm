@@ -150,6 +150,7 @@ fn fixture_messages() -> Vec<FixtureMessage> {
         html_msg(),
         long_html_msg(),
         attachment_msg(),
+        html_with_malformed_attachment_msg(),
         msg(
             "multi-recipient",
             "erin@example.test",
@@ -199,6 +200,7 @@ fn fixture_messages() -> Vec<FixtureMessage> {
             None,
         ),
         malformed_msg(),
+        malformed_transfer_encoding_msg(),
         unicode_msg(),
     ]
 }
@@ -265,9 +267,23 @@ fn attachment_msg() -> FixtureMessage {
     }
 }
 
+fn html_with_malformed_attachment_msg() -> FixtureMessage {
+    FixtureMessage {
+        raw: "From: broken-attachment@example.test\r\nTo: fixture@example.test\r\nSubject: HTML with malformed attachment\r\nDate: Thu, 18 Jun 2026 20:01:15 -0600\r\nMessage-ID: <html-malformed-attachment@fixture.test>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=broken-attachment-boundary\r\n\r\n--broken-attachment-boundary\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><p>Readable HTML body.</p></body></html>\r\n--broken-attachment-boundary\r\nContent-Type: application/octet-stream; name=broken.bin\r\nContent-Disposition: attachment; filename=broken.bin\r\nContent-Transfer-Encoding: base64\r\n\r\n!!!!\r\n--broken-attachment-boundary\r\nContent-Type: text/plain; name=good.txt\r\nContent-Disposition: attachment; filename=good.txt\r\nContent-Transfer-Encoding: base64\r\n\r\nZ29vZCBzaWJsaW5n\r\n--broken-attachment-boundary--\r\n".to_string(),
+        tags: vec!["inbox"],
+    }
+}
+
 fn malformed_msg() -> FixtureMessage {
     FixtureMessage {
         raw: "From malformed@example.test\nTo: fixture@example.test\nSubject: Malformed but parseable\nMessage-ID: <malformed@fixture.test>\n\nbody".to_string(),
+        tags: vec!["inbox"],
+    }
+}
+
+fn malformed_transfer_encoding_msg() -> FixtureMessage {
+    FixtureMessage {
+        raw: "From: broken@example.test\r\nTo: fixture@example.test\r\nSubject: Malformed transfer encoding\r\nDate: Thu, 18 Jun 2026 20:01:30 -0600\r\nMessage-ID: <malformed-transfer-encoding@fixture.test>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n!!!!".to_string(),
         tags: vec!["inbox"],
     }
 }
