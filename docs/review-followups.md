@@ -60,7 +60,7 @@ the active table; it is not a second status table.
 Update this block at every handoff; historical evidence remains append-only.
 
 - Captured: 2026-08-09.
-- Branch: `main`. Last implementation and tested-tree HEAD: `4f16123`; current
+- Branch: `main`. Last implementation and tested-tree HEAD: `e942054`; current
   HEAD is the tracker-only evidence commit containing this snapshot.
 - Active item/child checkpoint: `R07-ATTACHMENTS.2`; implementation is present
   as unstaged worktree changes and is awaiting review and exact-tree validation.
@@ -125,7 +125,7 @@ scope of this work:
 | `S02-CACHES` | Bound the search and thread-detail caches, including accumulation across database revisions. | `OPEN` | `SEARCH_CACHE` and `THREAD_DETAIL_CACHE` are unbounded `BTreeMap`s with no eviction; delimiter-formatted keys also permit excluded-tag collisions. |
 | `S03-CI` | Add CI for formatting, Clippy, tests, and the real fixture-driven GTK smoke. | `IN PROGRESS` | `.1` is implemented and exact-tree validated at `dda9d45`; `.2` still requires the final integrated pushed SHA and green run URL. |
 | `S04-SYNC-DOCS` | Reconcile startup-sync documentation with the implemented opt-in startup settings. | `DONE` | Implemented and exact-tree validated at `4eb32d6`; current docs, Settings copy, sync selection tests, fixture gate, and non-skipping Wayland GTK smoke agree. |
-| `S05-PACKAGING` | Add an application icon and AppStream metadata, including installation support. | `IN PROGRESS` | `.1` canonical metadata and icon assets are implemented and exact-tree validated at `4f16123`; `.2` install/uninstall support remains uncommitted. |
+| `S05-PACKAGING` | Add an application icon and AppStream metadata, including installation support. | `DONE` | `.1` canonical assets were validated at `4f16123`; `.2` installation, migration, uninstall, and isolated packaging validation were exact-tree validated at `e942054`. |
 
 ## Execution order and validation isolation
 
@@ -530,6 +530,8 @@ Append entries; do not rewrite history.
 | 2026-08-09 | `R07-ATTACHMENTS.1` | Parent remains `IN PROGRESS` pending `.2`. | implementation `0bf9afd`; tested tree `0bf9afd` | In the stable exact checkout, formatting, workspace Clippy, workspace all-target/all-feature tests, `fixture-smoke`, `probe-send`, and `git diff --check` passed. Focused attachment storage tests passed 7/7, attachment-open tempdir tests passed 2/2, and `attachment_contract` passed 4/4. The required-display standalone GTK launch regression passed on `WAYLAND_DISPLAY=wayland-1` with exit 0 and no skip. Tests prove full-target authority/no-clobber numbering, sanitizer behavior, concurrent atomic reservation, mode 0700, and owner-drop cleanup. The committed files were byte-compared with the validated checkout. |
 
 | 2026-08-09 | `S05-PACKAGING.1` | `OPEN` -> `IN PROGRESS`; parent awaits `.2`. | implementation `4f16123`; tested tree `4f16123` | In the stable exact checkout, `desktop-file-validate`, `appstreamcli validate --strict --pedantic --no-net`, formatting, workspace Clippy with `-D warnings`, workspace all-target/all-feature tests, `fixture-smoke`, `probe-send`, and `git diff --check` passed. The canonical desktop, icon, and metainfo ID is `dev.notm.Notm`; the original GPL-3.0-or-later SVG has an explicit source/license record, and Cargo records the real private project remote. Ordinary network-enabled AppStream validation reports only unauthenticated 404 reachability for that accurate private remote, so strict/pedantic structural validation used `--no-net` rather than substituting an inaccurate public URL. The committed files were byte-compared with the validated exact checkout. |
+
+| 2026-08-09 | `S05-PACKAGING.2` | `IN PROGRESS` -> `DONE`. | implementation `e942054`; tested tree `e942054` | In the stable exact checkout, ShellCheck and `tests/packaging_install_smoke.sh` passed, followed by formatting, workspace Clippy with `-D warnings`, workspace all-target/all-feature tests, `fixture-smoke`, `probe-send`, and `git diff --check`. The smoke ran desktop and strict/pedantic offline AppStream validation, installed a disposable binary plus the canonical desktop file, icon, metainfo, and all man pages under a temporary `DESTDIR`, checked rewritten absolute `Exec`/`TryExec`, removed a simulated legacy launcher during both install and uninstall, removed every installed file, and preserved an outside sentinel. The committed files were byte-compared with the validated exact checkout. |
 
 ## Decision log
 
