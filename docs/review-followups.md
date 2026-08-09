@@ -60,10 +60,11 @@ the active table; it is not a second status table.
 Update this block at every handoff; historical evidence remains append-only.
 
 - Captured: 2026-08-09.
-- Branch: `main`. Last implementation and tested-tree HEAD: `e942054`; current
+- Branch: `main`. Last implementation and tested-tree HEAD: `eb9113f`; current
   HEAD is the tracker-only evidence commit containing this snapshot.
-- Active item/child checkpoint: `R07-ATTACHMENTS.2`; implementation is present
-  as unstaged worktree changes and is awaiting review and exact-tree validation.
+- Active item/child checkpoint: `R10-SETTINGS.1`; validation/model/theme
+  foundation is present as unstaged worktree changes, while `main_window.rs`
+  propagation, rendering, dialog seams, and GTK proof have not started.
 - Owner: Codex. Blockers: none recorded.
 - Unrelated dirty paths that must not be staged, overwritten, stashed, or reset:
   `Cargo.toml`, `Cargo.lock`, and
@@ -118,8 +119,8 @@ scope of this work:
 
 | ID | Recommendation | State | Verified current evidence |
 | --- | --- | --- | --- |
-| `R07-ATTACHMENTS` | Use a save chooser for Save; use private temporary storage for Open. | `IN PROGRESS` | `.1` storage/private-directory semantics are implemented and exact-tree validated at `0bf9afd`; `.2` chooser/opener wiring and GTK proof have not started. |
-| `R10-SETTINGS` | Make `ui.theme` and `ui.thread_preview_lines` functional rather than silently storing inert values. | `OPEN` | `bd9b8ac` added general validation, but these fields are absent from `LaunchOptions`/runtime rendering and `AppConfig::validate`; the dialog still uses `unwrap_or(2)`. |
+| `R07-ATTACHMENTS` | Use a save chooser for Save; use private temporary storage for Open. | `DONE` | `.1` storage/private-directory semantics were validated at `0bf9afd`; `.2` chooser/opener wiring, fixture seams, docs, and non-skipping GTK proof were exact-tree validated at `eb9113f`. |
+| `R10-SETTINGS` | Make `ui.theme` and `ui.thread_preview_lines` functional rather than silently storing inert values. | `IN PROGRESS` | Typed validation/theme foundation is present as unstaged work; runtime rendering, dialog behavior, persistence proof, and required-display GTK tests remain unfinished. |
 | `R12-DRAFTS` | Make named drafts visible and confirm destructive draft actions. | `OPEN` | Durable persistence/error reporting exists, but `draft_list` is populated without being appended to the composer and discard/delete handlers mutate immediately. |
 | `S01-MODULES` | Incrementally extract composer, search, attachment, settings, and standalone-window controllers from `main_window.rs`. | `OPEN` | `main_window.rs` is 20,580 lines; all 11 existing `widgets/*.rs` leaf files contain only placeholder comments. |
 | `S02-CACHES` | Bound the search and thread-detail caches, including accumulation across database revisions. | `OPEN` | `SEARCH_CACHE` and `THREAD_DETAIL_CACHE` are unbounded `BTreeMap`s with no eviction; delimiter-formatted keys also permit excluded-tag collisions. |
@@ -533,6 +534,8 @@ Append entries; do not rewrite history.
 
 | 2026-08-09 | `S05-PACKAGING.2` | `IN PROGRESS` -> `DONE`. | implementation `e942054`; tested tree `e942054` | In the stable exact checkout, ShellCheck and `tests/packaging_install_smoke.sh` passed, followed by formatting, workspace Clippy with `-D warnings`, workspace all-target/all-feature tests, `fixture-smoke`, `probe-send`, and `git diff --check`. The smoke ran desktop and strict/pedantic offline AppStream validation, installed a disposable binary plus the canonical desktop file, icon, metainfo, and all man pages under a temporary `DESTDIR`, checked rewritten absolute `Exec`/`TryExec`, removed a simulated legacy launcher during both install and uninstall, removed every installed file, and preserved an outside sentinel. The committed files were byte-compared with the validated exact checkout. |
 
+| 2026-08-09 | `R07-ATTACHMENTS.2` | Parent `IN PROGRESS` -> `DONE`. | implementation `eb9113f`; tested tree `eb9113f` | In the stable exact checkout, formatting, workspace Clippy with `-D warnings`, workspace all-target/all-feature tests, `fixture-smoke`, `probe-send`, attachment unit tests (mail 7/7 and UI 3/3), `mandoc -T lint`, and `git diff --check` passed. `fixture_attachment_save_keeps_existing_files` and the new `fixture_attachment_save_chooser_and_private_open_are_deterministic` both passed on `WAYLAND_DISPLAY=wayland-1`, exit 0, with no `SKIP`; the latter recorded normal application exit status 0. The smoke proves sanitized chooser defaults, authoritative renamed targets, no-clobber collision numbering, cancellation with unchanged state/no write, private mode-0700 Open storage, fixture fake-opener bytes/path, no `artifacts/attachments` change, and normal-exit cleanup. All normal UI/command compatibility paths share the controller, the explicit `dir` bypass remains storage-only, and the seams are documented. The committed files were byte-compared with the validated exact checkout. |
+
 ## Decision log
 
 Append explicit scope changes, user-approved deferrals, or superseding decisions
@@ -544,12 +547,9 @@ here. Absence of an entry means the scope above still applies.
 
 ## Exact next action
 
-Implement `R07-ATTACHMENTS.2` from the acceptance criteria: route all normal
-Save entry points through one GTK save chooser using the full-target helper;
-route every Open entry point through the application-owned private directory;
-add fixture-only pending chooser responses and a fake opener; remove both
-normal `artifacts/attachments` fallbacks; document the seams; and add a named
-non-skipping GTK smoke that drives accept, collision, cancel, Open, mode 0700,
-and normal-exit cleanup. Preserve the explicit harness `dir` storage bypass.
-Then exact-tree validate, commit only `.2`, and follow it with tracker-only
-evidence before marking the parent `DONE`.
+Complete `R10-SETTINGS.1`: integrate the typed theme and preview-line settings
+through `LaunchOptions`, runtime state, initial build, live Apply/Save, bounded
+preview rendering, and strict dialog validation; add deterministic harness
+state/response seams and named non-skipping GTK preview coverage. Then exact-tree
+validate and commit `.1` before implementing the three-mode theme smoke in
+`R10-SETTINGS.2`.
