@@ -60,20 +60,19 @@ the active table; it is not a second status table.
 Update this block at every handoff; historical evidence remains append-only.
 
 - Captured: 2026-08-09.
-- Branch: `main`. Last implementation and tested-tree HEAD: `4eb32d6`; current
+- Branch: `main`. Last implementation and tested-tree HEAD: `dda9d45`; current
   HEAD is the tracker-only evidence commit containing this snapshot.
-- Active item/child checkpoint: `S03-CI.1`; its implementation is present in
-  the worktree and requires exact-tree validation and an implementation commit.
-  `R07-ATTACHMENTS.1` is also implemented in the worktree but remains
-  uncommitted and must stay unstaged until its checkpoint is active.
+- Active item/child checkpoint: `R07-ATTACHMENTS.1`; its implementation is
+  present in the worktree and requires exact-tree validation and an
+  implementation commit.
 - Owner: Codex. Blockers: none recorded.
 - Unrelated dirty paths that must not be staged, overwritten, stashed, or reset:
   `Cargo.toml`, `Cargo.lock`, and
   `crates/notm-mail/src/html_sanitize.rs`.
 - Tracker baseline commit: `93bfe88`.
-- Exact next command: `git status --short --branch`, then export the
-  `S03-CI.1` patch into the stable exact checkout and run its targeted and
-  baseline validation.
+- Exact next command: `git status --short --branch`, then export only the
+  `R07-ATTACHMENTS.1` storage/private-directory patch into the stable exact
+  checkout and run its targeted and baseline validation.
 
 ## Completion protocol
 
@@ -124,7 +123,7 @@ scope of this work:
 | `R12-DRAFTS` | Make named drafts visible and confirm destructive draft actions. | `OPEN` | Durable persistence/error reporting exists, but `draft_list` is populated without being appended to the composer and discard/delete handlers mutate immediately. |
 | `S01-MODULES` | Incrementally extract composer, search, attachment, settings, and standalone-window controllers from `main_window.rs`. | `OPEN` | `main_window.rs` is 20,580 lines; all 11 existing `widgets/*.rs` leaf files contain only placeholder comments. |
 | `S02-CACHES` | Bound the search and thread-detail caches, including accumulation across database revisions. | `OPEN` | `SEARCH_CACHE` and `THREAD_DETAIL_CACHE` are unbounded `BTreeMap`s with no eviction; delimiter-formatted keys also permit excluded-tag collisions. |
-| `S03-CI` | Add CI for formatting, Clippy, tests, and the real fixture-driven GTK smoke. | `IN PROGRESS` | `.1` workflow and required-display changes are implemented but uncommitted in the worktree; `.2` still requires the final integrated pushed SHA and green run URL. |
+| `S03-CI` | Add CI for formatting, Clippy, tests, and the real fixture-driven GTK smoke. | `IN PROGRESS` | `.1` is implemented and exact-tree validated at `dda9d45`; `.2` still requires the final integrated pushed SHA and green run URL. |
 | `S04-SYNC-DOCS` | Reconcile startup-sync documentation with the implemented opt-in startup settings. | `DONE` | Implemented and exact-tree validated at `4eb32d6`; current docs, Settings copy, sync selection tests, fixture gate, and non-skipping Wayland GTK smoke agree. |
 | `S05-PACKAGING` | Add an application icon and AppStream metadata, including installation support. | `OPEN` | `packaging/notm.desktop` is the only asset, has no `Icon`, differs from application ID `dev.notm.Notm`, and the Makefile installs no icon/metainfo. |
 
@@ -527,6 +526,7 @@ Append entries; do not rewrite history.
 | 2026-08-09 | all | Baseline tracker committed; no implementation state change. | `93bfe88` | Committed this tracker alone before implementation so the eight-ID scope and evidence protocol could not be lost. |
 | 2026-08-09 | `S04-SYNC-DOCS` | `OPEN` -> `DONE` | implementation `4eb32d6`; tested tree `4eb32d6` | In the stable clean checkout, `cargo fmt --all -- --check`, workspace Clippy with `-D warnings`, workspace all-target/all-feature tests, `fixture-smoke`, `probe-send`, `cargo test -p notm-ui sync -- --nocapture` (6 passed), the app fixture-side-effect test, `mandoc -Tlint`, the required contradiction `rg`, and `git diff --check` all passed. `fixture_harness_quarantines_external_commands` passed on `WAYLAND_DISPLAY=wayland-1` with exit 0 and no `SKIP`. A pre-existing startup label failure was first reproduced 0/20 and corrected by prerequisite commit `21b8565`; the immediate standalone GTK regression then passed 20/20 with no skips. The committed S04 files were byte-compared with the validated exact checkout. |
 | 2026-08-09 | `R07-ATTACHMENTS`, `S03-CI` | `OPEN` -> `IN PROGRESS` | pending | Their first checkpoints are present only as unstaged worktree changes. They remain unfinished until separately exact-tree validated, committed, and followed by tracker-only evidence; `R07-ATTACHMENTS.2` and `S03-CI.2` have not been completed. |
+| 2026-08-09 | `S03-CI.1` | Parent remains `IN PROGRESS` pending `.2`. | implementation `dda9d45`; tested tree `dda9d45` | `actionlint` 1.7.12 with ShellCheck, full-SHA action-pin assertions, formatting, workspace Clippy, workspace all-target/all-feature tests, `fixture-smoke`, baseline `probe-send`, disposable `/usr/bin/true` `probe-send`, and `git diff --check` passed in the stable exact checkout. The focused required-display predicate passed; an actual unset-display run failed with the named `NOTM_REQUIRE_GTK_DISPLAY=1` error and no `SKIP`. The complete `desktop_ui_smoke` target ran serially under a fresh D-Bus session on `WAYLAND_DISPLAY=wayland-1`: 24 passed, exit 0, no skips. Local Gentoo lacked Xvfb/Xauth, so the exact Xvfb wrapper remains delegated to the workflow, which installs and verifies both; the committed files were byte-compared with the validated checkout. `.2` still requires a green remote run on the final integrated SHA. |
 
 ## Decision log
 
@@ -539,11 +539,12 @@ here. Absence of an entry means the scope above still applies.
 
 ## Exact next action
 
-Recheck `git status`, isolate only `.github/workflows/ci.yml` and the
-required-display changes in `crates/notm-app/tests/desktop_ui_smoke.rs`, and
-apply that patch to the stable clean exact checkout at `4eb32d6`. Run the
-focused required/no-display tests, actionlint/ShellCheck/YAML checks, the full
-required-display GTK target on the real Wayland display with no skips, and the
-baseline suite. Then commit `S03-CI.1` without the unrelated Cargo/HTML or
-uncommitted R07 changes and follow it with a tracker-only evidence commit;
-leave the parent `IN PROGRESS` pending `S03-CI.2`.
+Recheck `git status`, isolate only the `R07-ATTACHMENTS.1` changes in
+`crates/notm-mail/src/attachments.rs`, `crates/notm-ui/Cargo.toml`, and the
+private attachment-open directory ownership/plumbing/tests in
+`crates/notm-ui/src/main_window.rs`, and apply that patch to the stable clean
+exact checkout at `dda9d45`. Run the attachment storage/tempdir unit and
+contract tests plus the baseline suite. Then commit `.1` without the unrelated
+Cargo/HTML changes, verify the committed files against the tested checkout, and
+follow it with a tracker-only evidence commit; leave the parent `IN PROGRESS`
+for chooser/opener checkpoint `.2`.
