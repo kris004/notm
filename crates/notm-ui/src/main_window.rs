@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     fs::OpenOptions,
-    io::Write,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
     rc::Rc,
@@ -13,6 +13,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use chrono::Utc;
 use gtk::glib::variant::{StaticVariantType, ToVariant};
@@ -223,17 +226,26 @@ impl Default for LaunchOptions {
 
 pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
     sync_runtime_settings_from_launch_options(&options);
+    let attachment_open_tempdir = create_attachment_open_tempdir()?;
+    let attachment_open_dir = attachment_open_tempdir.path().to_path_buf();
     let app_builder = gtk::Application::builder()
         .application_id(application_id_for_launch(&options)?)
         .flags(application_flags_for_launch(&options));
     let app = app_builder.build();
     let main_window = Rc::new(RefCell::new(None::<MainWindowHandle>));
 
-    add_open_message_id_action(&app, &options, &main_window);
+    add_open_message_id_action(&app, &options, &main_window, &attachment_open_dir);
     let activate_options = options.clone();
     let activate_main_window = main_window.clone();
+    let activate_attachment_open_dir = attachment_open_dir.clone();
     app.connect_activate(move |app| {
-        open_or_present_main_window(app, &activate_options, &activate_main_window, None);
+        open_or_present_main_window(
+            app,
+            &activate_options,
+            &activate_main_window,
+            &activate_attachment_open_dir,
+            None,
+        );
     });
 
     if let Some(message_id) = &options.open_message_id {
@@ -254,7 +266,19 @@ pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
     }
 
     app.run_with_args(&["notm"]);
+    attachment_open_tempdir.close()?;
     Ok(())
+}
+
+fn create_attachment_open_tempdir() -> io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("notm-open-attachments-");
+    #[cfg(unix)]
+    builder.permissions(std::fs::Permissions::from_mode(0o700));
+    let directory = builder.tempdir()?;
+    #[cfg(unix)]
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    Ok(directory)
 }
 
 fn application_id_for_launch(options: &LaunchOptions) -> anyhow::Result<String> {
@@ -292,12 +316,14 @@ fn add_open_message_id_action(
     app: &gtk::Application,
     options: &LaunchOptions,
     main_window: &Rc<RefCell<Option<MainWindowHandle>>>,
+    attachment_open_dir: &Path,
 ) {
     let action =
         gtk::gio::SimpleAction::new(OPEN_MESSAGE_ID_ACTION, Some(&String::static_variant_type()));
     let action_app = app.clone();
     let action_options = options.clone();
     let action_main_window = main_window.clone();
+    let action_attachment_open_dir = attachment_open_dir.to_path_buf();
     action.connect_activate(move |_, parameter| {
         let Some(message_id) = parameter.and_then(|value| value.get::<String>()) else {
             return;
@@ -306,6 +332,7 @@ fn add_open_message_id_action(
             &action_app,
             &action_options,
             &action_main_window,
+            &action_attachment_open_dir,
             Some(message_id),
         );
     });
@@ -323,6 +350,7 @@ fn open_or_present_main_window(
     app: &gtk::Application,
     options: &LaunchOptions,
     main_window: &Rc<RefCell<Option<MainWindowHandle>>>,
+    attachment_open_dir: &Path,
     open_message_id: Option<String>,
 ) {
     if let Some(handle) = main_window.borrow().as_ref().cloned() {
@@ -337,7 +365,7 @@ fn open_or_present_main_window(
     let mut launch_options = options.clone();
     launch_options.open_message_id =
         resolved_new_window_message_id(open_message_id, options.open_message_id.as_deref());
-    let handle = build_ui(app, launch_options);
+    let handle = build_ui(app, launch_options, attachment_open_dir.to_path_buf());
     let main_window_weak = Rc::downgrade(main_window);
     handle.window.connect_destroy(move |window| {
         let Some(main_window) = main_window_weak.upgrade() else {
@@ -500,6 +528,7 @@ struct Widgets {
     attachment_scrolled: gtk::ScrolledWindow,
     attachment_list: gtk::ListBox,
     attachment_items: Rc<RefCell<Vec<ThreadAttachmentItem>>>,
+    attachment_open_dir: PathBuf,
     tag_search_box: gtk::Box,
     draft_path: PathBuf,
     legacy_draft_path: Option<PathBuf>,
@@ -851,7 +880,11 @@ impl ThreadListDisplay {
     }
 }
 
-fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle {
+fn build_ui(
+    app: &gtk::Application,
+    options: LaunchOptions,
+    attachment_open_dir: PathBuf,
+) -> MainWindowHandle {
     install_css();
     let layout_preference = runtime_layout_preference(&options);
     let initial_layout =
@@ -1636,6 +1669,7 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle 
         attachment_scrolled: scrolled_attachments,
         attachment_list,
         attachment_items: Rc::new(RefCell::new(Vec::new())),
+        attachment_open_dir,
         tag_search_box,
         draft_path,
         legacy_draft_path,
@@ -1667,6 +1701,10 @@ fn build_ui(app: &gtk::Application, options: LaunchOptions) -> MainWindowHandle 
         standalone_windows: Rc::new(RefCell::new(Vec::new())),
         standalone_next_id: Rc::new(Cell::new(1)),
     };
+    debug_assert!(
+        widgets.attachment_open_dir.is_dir(),
+        "application attachment-open directory must exist while the UI is running"
+    );
     apply_content_layout(&widgets, &state, initial_layout, false);
     apply_initial_pane_visibility(&options, &widgets, &state);
     update_active_pane_visuals(&widgets, &state);
@@ -19485,6 +19523,35 @@ fn table_entry<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_open_tempdir_is_removed_when_owner_drops() {
+        let directory = create_attachment_open_tempdir().expect("attachment-open temp directory");
+        let path = directory.path().to_path_buf();
+        std::fs::write(path.join("attachment.txt"), b"attachment")
+            .expect("write temporary attachment");
+
+        drop(directory);
+
+        assert!(
+            !path.exists(),
+            "dropping the application-owned TempDir must remove {}",
+            path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_open_tempdir_has_private_unix_permissions() {
+        let directory = create_attachment_open_tempdir().expect("attachment-open temp directory");
+        let mode = std::fs::metadata(directory.path())
+            .expect("attachment-open directory metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(mode, 0o700);
+    }
 
     #[test]
     fn message_header_values_stay_single_line_for_compact_pane_height() {

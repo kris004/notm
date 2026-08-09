@@ -1,4 +1,5 @@
 use std::{
+    ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -24,12 +25,36 @@ pub fn save_attachment_without_overwrite(
     bytes: &[u8],
 ) -> io::Result<PathBuf> {
     fs::create_dir_all(target_dir)?;
-    let filename = safe_filename(filename);
+    let filename = sanitize_attachment_filename(filename);
+    save_attachment_to_target_without_overwrite(&target_dir.join(filename), bytes)
+}
+
+/// Save attachment bytes to a complete target path without replacing a file.
+///
+/// The target's parent directory and basename are authoritative. If the target
+/// already exists, a numeric suffix is added before its final extension in the
+/// same directory. `create_new` atomically reserves each candidate, so
+/// concurrent saves cannot select the same path.
+pub fn save_attachment_to_target_without_overwrite(
+    target: &Path,
+    bytes: &[u8],
+) -> io::Result<PathBuf> {
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let filename = target.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "attachment target must include a filename",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
     let mut collision_index = 0_u64;
 
     loop {
-        let candidate = numbered_filename(&filename, collision_index);
-        let path = target_dir.join(candidate);
+        let candidate = numbered_filename(filename, collision_index);
+        let path = target.with_file_name(candidate);
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
                 file.write_all(bytes)?;
@@ -45,7 +70,8 @@ pub fn save_attachment_without_overwrite(
     }
 }
 
-fn safe_filename(filename: &str) -> String {
+/// Convert an untrusted MIME attachment filename into a safe local basename.
+pub fn sanitize_attachment_filename(filename: &str) -> String {
     let cleaned = filename
         .chars()
         .map(|character| match character {
@@ -60,19 +86,25 @@ fn safe_filename(filename: &str) -> String {
     }
 }
 
-fn numbered_filename(filename: &str, collision_index: u64) -> String {
+fn numbered_filename(filename: &OsStr, collision_index: u64) -> OsString {
     if collision_index == 0 {
-        return filename.to_string();
+        return filename.to_os_string();
     }
 
-    match filename.rfind('.') {
-        Some(dot_index) if dot_index > 0 && dot_index + 1 < filename.len() => format!(
-            "{} ({collision_index}){}",
-            &filename[..dot_index],
-            &filename[dot_index..]
-        ),
-        _ => format!("{filename} ({collision_index})"),
+    let filename_path = Path::new(filename);
+    let extension = filename_path
+        .extension()
+        .filter(|extension| !extension.is_empty());
+    let stem = extension
+        .and_then(|_| filename_path.file_stem())
+        .unwrap_or(filename);
+    let mut numbered = OsString::from(stem);
+    numbered.push(format!(" ({collision_index})"));
+    if let Some(extension) = extension {
+        numbered.push(".");
+        numbered.push(extension);
     }
+    numbered
 }
 
 #[cfg(test)]
@@ -121,6 +153,56 @@ mod tests {
         assert_eq!(fs::read(original).expect("read original"), b"keep original");
         assert_eq!(fs::read(first).expect("read first"), b"first attachment");
         assert_eq!(fs::read(second).expect("read second"), b"second attachment");
+    }
+
+    #[test]
+    fn full_target_parent_and_basename_are_authoritative() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let selected_parent = root.path().join("chosen-parent");
+        fs::create_dir_all(&selected_parent).expect("create selected parent");
+        let selected_target = selected_parent.join("chosen-output.dat");
+        fs::write(&selected_target, b"keep original").expect("write original");
+
+        let saved =
+            save_attachment_to_target_without_overwrite(&selected_target, b"attachment bytes")
+                .expect("save to selected target");
+
+        assert_eq!(saved, selected_parent.join("chosen-output (1).dat"));
+        assert_eq!(
+            fs::read(&selected_target).expect("read original"),
+            b"keep original"
+        );
+        assert_eq!(
+            fs::read(saved).expect("read saved attachment"),
+            b"attachment bytes"
+        );
+    }
+
+    #[test]
+    fn numbered_targets_preserve_extensionless_and_hidden_basenames() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        for (filename, expected) in [
+            ("README", "README (1)"),
+            (".mailcap", ".mailcap (1)"),
+            ("trailing.", "trailing. (1)"),
+        ] {
+            let target = directory.path().join(filename);
+            fs::write(&target, b"keep original").expect("write original");
+            let saved = save_attachment_to_target_without_overwrite(&target, b"attachment")
+                .expect("save numbered attachment");
+            assert_eq!(saved, directory.path().join(expected));
+        }
+    }
+
+    #[test]
+    fn sanitizer_replaces_unsafe_or_empty_basenames() {
+        assert_eq!(
+            sanitize_attachment_filename("../../unsafe\\name\0.txt"),
+            ".._.._unsafe_name_.txt"
+        );
+        for filename in ["", "   ", ".", ".."] {
+            assert_eq!(sanitize_attachment_filename(filename), "attachment.bin");
+        }
     }
 
     #[test]
