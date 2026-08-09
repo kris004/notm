@@ -34,7 +34,7 @@ impl Drop for ChildGuard {
 
 impl FixtureApp {
     fn spawn(work_dir: PathBuf, token: &str) -> anyhow::Result<Self> {
-        Self::spawn_inner(work_dir, token, None, None, None, true)
+        Self::spawn_inner(work_dir, token, None, None, None, true, None)
     }
 
     fn spawn_with_message_id(
@@ -42,7 +42,7 @@ impl FixtureApp {
         token: &str,
         message_id: &str,
     ) -> anyhow::Result<Self> {
-        Self::spawn_inner(work_dir, token, None, Some(message_id), None, true)
+        Self::spawn_inner(work_dir, token, None, Some(message_id), None, true, None)
     }
 
     fn spawn_with_application_id(
@@ -50,7 +50,15 @@ impl FixtureApp {
         token: &str,
         application_id: &str,
     ) -> anyhow::Result<Self> {
-        Self::spawn_inner(work_dir, token, None, None, Some(application_id), true)
+        Self::spawn_inner(
+            work_dir,
+            token,
+            None,
+            None,
+            Some(application_id),
+            true,
+            None,
+        )
     }
 
     #[cfg(unix)]
@@ -59,7 +67,7 @@ impl FixtureApp {
         token: &str,
         config_path: &std::path::Path,
     ) -> anyhow::Result<Self> {
-        Self::spawn_inner(work_dir, token, Some(config_path), None, None, false)
+        Self::spawn_inner(work_dir, token, Some(config_path), None, None, false, None)
     }
 
     #[cfg(unix)]
@@ -76,6 +84,7 @@ impl FixtureApp {
             None,
             Some(application_id),
             false,
+            None,
         )
     }
 
@@ -85,7 +94,25 @@ impl FixtureApp {
         token: &str,
         config_path: &std::path::Path,
     ) -> anyhow::Result<Self> {
-        Self::spawn_inner(work_dir, token, Some(config_path), None, None, true)
+        Self::spawn_inner(work_dir, token, Some(config_path), None, None, true, None)
+    }
+
+    #[cfg(unix)]
+    fn spawn_fixture_with_config_and_system_theme(
+        work_dir: PathBuf,
+        token: &str,
+        config_path: &std::path::Path,
+        prefers_dark: bool,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(
+            work_dir,
+            token,
+            Some(config_path),
+            None,
+            None,
+            true,
+            Some(prefers_dark),
+        )
     }
 
     fn spawn_inner(
@@ -95,6 +122,7 @@ impl FixtureApp {
         message_id: Option<&str>,
         application_id: Option<&str>,
         fixture: bool,
+        system_prefers_dark: Option<bool>,
     ) -> anyhow::Result<Self> {
         let socket_path = work_dir.join("h.sock");
         let log_path = work_dir.join("notm.log");
@@ -106,6 +134,20 @@ impl FixtureApp {
         for directory in [&home, &config_home, &cache_home, &data_home, &state_home] {
             fs::create_dir_all(directory)
                 .with_context(|| format!("creating test directory {}", directory.display()))?;
+        }
+        if let Some(prefers_dark) = system_prefers_dark {
+            let gtk_config_home = config_home.join("gtk-4.0");
+            fs::create_dir_all(&gtk_config_home)?;
+            fs::write(
+                gtk_config_home.join("settings.ini"),
+                format!(
+                    "[Settings]\ngtk-theme-name=Default\n\
+                     gtk-application-prefer-dark-theme={}\n\
+                     gtk-interface-color-scheme={}\n",
+                    if prefers_dark { "true" } else { "false" },
+                    if prefers_dark { "dark" } else { "light" }
+                ),
+            )?;
         }
         let log = OpenOptions::new()
             .create_new(true)
@@ -130,6 +172,10 @@ impl FixtureApp {
         command.env_remove(TEST_HARNESS_APPLICATION_ID_ENV);
         if let Some(application_id) = application_id {
             command.env(TEST_HARNESS_APPLICATION_ID_ENV, application_id);
+        }
+        command.env_remove("GTK_THEME");
+        if system_prefers_dark.is_some() {
+            command.env("GDK_DEBUG", "default-settings");
         }
         let child = command
             .env("HOME", home)
@@ -2965,6 +3011,342 @@ fn fixture_tag_undo_restores_each_messages_original_tags() -> anyhow::Result<()>
     select_first_thread(&mut driver, query)?;
     let restored = message_tags(&driver.command("app_state", json!({}))?)?;
     assert_eq!(restored, before);
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_settings_preview_limits_apply_without_partial_persistence() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_settings_preview_limits_apply_without_partial_persistence: no DISPLAY \
+             or WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running Settings preview-limit UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-settings-preview-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        "[ui]\ntheme = \"system\"\nthread_preview_lines = 2\nshow_thread_preview = true\n",
+    )?;
+    let token = format!("notm-settings-preview-ui-{run_id}");
+    let mut app = FixtureApp::spawn_fixture_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+
+    assert_eq!(driver.command("open_settings", json!({}))?["ok"], true);
+    let initial = driver.command("settings_test_state", json!({}))?;
+    assert_eq!(initial["dialog"]["visible"], true, "{initial}");
+    assert_eq!(initial["theme"]["requested"], "system", "{initial}");
+    assert_eq!(initial["preview"]["configured_lines"], 2, "{initial}");
+    assert_eq!(initial["preview"]["rendered"]["lines"], 2, "{initial}");
+    assert_eq!(initial["preview"]["rendered"]["visible"], true, "{initial}");
+    let initial_preview_text = initial["preview"]["rendered"]["text"].clone();
+    ensure!(
+        initial_preview_text
+            .as_str()
+            .is_some_and(|text| !text.is_empty()),
+        "fixture did not render a real thread preview label: {initial}"
+    );
+    let saved_config_path = PathBuf::from(
+        initial["app_config_path"]
+            .as_str()
+            .with_context(|| format!("Settings state has no app config path: {initial}"))?,
+    );
+    let original_saved_bytes = fs::read(&saved_config_path).ok();
+
+    for (theme, lines, response) in [
+        ("system", json!("not-a-number"), "apply"),
+        ("system", json!("not-a-number"), "save"),
+        ("system", json!(0), "apply"),
+        ("system", json!(0), "save"),
+        ("system", json!(21), "apply"),
+        ("system", json!(21), "save"),
+        ("sepia", json!(2), "save"),
+    ] {
+        let rejected = driver.command(
+            "respond_settings",
+            json!({
+                "response": response,
+                "theme": theme,
+                "thread_preview_lines": lines,
+                "show_thread_preview": true,
+            }),
+        )?;
+        assert_eq!(
+            rejected["ok"], false,
+            "invalid Settings input succeeded: {rejected}"
+        );
+        assert_eq!(rejected["state"]["dialog"]["visible"], true, "{rejected}");
+        assert_eq!(
+            rejected["state"]["preview"]["configured_lines"], 2,
+            "invalid Settings input changed runtime state: {rejected}"
+        );
+        assert_eq!(
+            rejected["state"]["preview"]["rendered"]["lines"], 2,
+            "invalid Settings input changed the rendered label: {rejected}"
+        );
+        assert_eq!(
+            rejected["state"]["preview"]["rendered"]["text"], initial_preview_text,
+            "invalid Settings input changed cached/rendered preview content: {rejected}"
+        );
+        assert_eq!(
+            rejected["state"]["theme"]["requested"], "system",
+            "{rejected}"
+        );
+        assert_eq!(
+            fs::read(&saved_config_path).ok(),
+            original_saved_bytes,
+            "invalid Settings input partially persisted to {}",
+            saved_config_path.display()
+        );
+    }
+
+    for lines in [1, 3] {
+        let applied = driver.command(
+            "respond_settings",
+            json!({
+                "response": "apply",
+                "theme": "system",
+                "thread_preview_lines": lines,
+                "show_thread_preview": true,
+            }),
+        )?;
+        assert_eq!(applied["ok"], true, "{applied}");
+        assert_eq!(
+            applied["state"]["preview"]["configured_lines"], lines,
+            "{applied}"
+        );
+        assert_eq!(
+            applied["state"]["preview"]["rendered"]["lines"], lines,
+            "{applied}"
+        );
+        assert_eq!(
+            applied["state"]["preview"]["rendered"]["visible"], true,
+            "{applied}"
+        );
+        assert_eq!(
+            fs::read(&saved_config_path).ok(),
+            original_saved_bytes,
+            "Apply unexpectedly persisted Settings"
+        );
+    }
+
+    let hidden = driver.command(
+        "respond_settings",
+        json!({
+            "response": "apply",
+            "theme": "system",
+            "thread_preview_lines": 3,
+            "show_thread_preview": false,
+        }),
+    )?;
+    assert_eq!(hidden["ok"], true, "{hidden}");
+    assert_eq!(
+        hidden["state"]["preview"]["configured_lines"], 3,
+        "{hidden}"
+    );
+    assert_eq!(
+        hidden["state"]["preview"]["show_thread_preview"], false,
+        "{hidden}"
+    );
+    assert_eq!(
+        hidden["state"]["preview"]["rendered"],
+        Value::Null,
+        "{hidden}"
+    );
+
+    let saved = driver.command(
+        "respond_settings",
+        json!({
+            "response": "save",
+            "theme": "system",
+            "thread_preview_lines": 3,
+            "show_thread_preview": true,
+        }),
+    )?;
+    assert_eq!(saved["ok"], true, "{saved}");
+    assert_eq!(saved["state"]["dialog"], Value::Null, "{saved}");
+    assert_eq!(saved["state"]["preview"]["configured_lines"], 3, "{saved}");
+    assert_eq!(saved["state"]["preview"]["rendered"]["lines"], 3, "{saved}");
+    let persisted: toml::Value = fs::read_to_string(&saved_config_path)?.parse()?;
+    assert_eq!(persisted["ui"]["theme"].as_str(), Some("system"));
+    assert_eq!(
+        persisted["ui"]["thread_preview_lines"].as_integer(),
+        Some(3)
+    );
+    assert_eq!(persisted["ui"]["show_thread_preview"].as_bool(), Some(true));
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_theme_modes_follow_both_simulated_system_preferences() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_theme_modes_follow_both_simulated_system_preferences: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running Settings theme UI smoke with {display}");
+
+    for system_prefers_dark in [false, true] {
+        let run_id = unique_run_id()?;
+        let mode = if system_prefers_dark { "dark" } else { "light" };
+        let work_dir = std::env::temp_dir().join(format!("notm-settings-theme-{mode}-ui-{run_id}"));
+        fs::create_dir_all(&work_dir)?;
+        let config_path = work_dir.join("notm.toml");
+        fs::write(
+            &config_path,
+            "[ui]\ntheme = \"system\"\nthread_preview_lines = 2\n",
+        )?;
+        let token = format!("notm-settings-theme-{mode}-ui-{run_id}");
+        let mut app = FixtureApp::spawn_fixture_with_config_and_system_theme(
+            work_dir,
+            &token,
+            &config_path,
+            system_prefers_dark,
+        )?;
+        let mut driver = app.connect(&token)?;
+        driver.wait_for_search(STARTUP_TIMEOUT)?;
+        assert_eq!(driver.command("open_settings", json!({}))?["ok"], true);
+        let initial = driver.command("settings_test_state", json!({}))?;
+        assert_eq!(initial["theme"]["requested"], "system", "{mode}: {initial}");
+        assert_eq!(initial["theme"]["effective"], mode, "{mode}: {initial}");
+        assert_eq!(
+            initial["preview"]["configured_lines"], 2,
+            "{mode}: {initial}"
+        );
+
+        let mut states = BTreeMap::new();
+        for requested in ["system", "light", "dark"] {
+            let applied = driver.command(
+                "respond_settings",
+                json!({
+                    "response": "apply",
+                    "theme": requested,
+                    "thread_preview_lines": 2,
+                    "show_thread_preview": true,
+                }),
+            )?;
+            assert_eq!(applied["ok"], true, "{mode}/{requested}: {applied}");
+            let theme = applied["state"]["theme"].clone();
+            assert_eq!(theme["requested"], requested, "{mode}/{requested}: {theme}");
+            let expected_effective = if requested == "system" {
+                mode
+            } else {
+                requested
+            };
+            assert_eq!(
+                theme["effective"], expected_effective,
+                "{mode}/{requested}: resolved theme_bg_color did not match: {theme}"
+            );
+            ensure!(
+                theme["resolved_theme_bg_color"]
+                    .as_str()
+                    .is_some_and(|color| !color.is_empty()),
+                "{mode}/{requested}: no resolved theme_bg_color: {theme}"
+            );
+            ensure!(
+                theme["resolved_theme_bg_luminance"].as_f64().is_some(),
+                "{mode}/{requested}: no resolved luminance: {theme}"
+            );
+            if requested != "system" {
+                assert_eq!(
+                    theme["gtk_theme_name"], "Default",
+                    "{mode}/{requested}: {theme}"
+                );
+                assert_eq!(
+                    theme["gtk_application_prefer_dark_theme"],
+                    requested == "dark",
+                    "{mode}/{requested}: {theme}"
+                );
+                if !theme["gtk_interface_color_scheme"].is_null() {
+                    assert_eq!(
+                        theme["gtk_interface_color_scheme"], requested,
+                        "{mode}/{requested}: GTK 4.20 override was not applied: {theme}"
+                    );
+                }
+            }
+            states.insert(requested, theme);
+        }
+
+        let light_luminance = states["light"]["resolved_theme_bg_luminance"]
+            .as_f64()
+            .context("light theme luminance")?;
+        let dark_luminance = states["dark"]["resolved_theme_bg_luminance"]
+            .as_f64()
+            .context("dark theme luminance")?;
+        ensure!(
+            light_luminance > 0.5 && dark_luminance < 0.5,
+            "{mode}: forced themes did not resolve to distinct supported backgrounds: {states:?}"
+        );
+        ensure!(
+            states["light"]["resolved_theme_bg_color"] != states["dark"]["resolved_theme_bg_color"],
+            "{mode}: forced themes resolved to the same color: {states:?}"
+        );
+
+        let restored = driver.command(
+            "respond_settings",
+            json!({
+                "response": "apply",
+                "theme": "system",
+                "thread_preview_lines": 2,
+                "show_thread_preview": true,
+            }),
+        )?;
+        assert_eq!(restored["ok"], true, "{mode}: {restored}");
+        let restored_theme = &restored["state"]["theme"];
+        assert_eq!(restored_theme["requested"], "system", "{mode}: {restored}");
+        assert_eq!(restored_theme["effective"], mode, "{mode}: {restored}");
+        assert_eq!(
+            restored_theme["gtk_application_prefer_dark_theme"], system_prefers_dark,
+            "{mode}: System did not reset the legacy application override: {restored}"
+        );
+        if !restored_theme["gtk_interface_color_scheme"].is_null() {
+            assert_eq!(
+                restored_theme["gtk_interface_color_scheme"], mode,
+                "{mode}: System did not restore the simulated GTK interface scheme: {restored}"
+            );
+        }
+
+        let saved = driver.command(
+            "respond_settings",
+            json!({
+                "response": "save",
+                "theme": "dark",
+                "thread_preview_lines": 2,
+                "show_thread_preview": true,
+            }),
+        )?;
+        assert_eq!(saved["ok"], true, "{mode}: {saved}");
+        assert_eq!(saved["state"]["dialog"], Value::Null, "{mode}: {saved}");
+        assert_eq!(
+            saved["state"]["theme"]["requested"], "dark",
+            "{mode}: {saved}"
+        );
+        assert_eq!(
+            saved["state"]["theme"]["effective"], "dark",
+            "{mode}: {saved}"
+        );
+        let saved_config_path = saved["state"]["app_config_path"]
+            .as_str()
+            .with_context(|| format!("{mode}: Save reported no app config path: {saved}"))?;
+        let persisted: toml::Value = fs::read_to_string(saved_config_path)?.parse()?;
+        assert_eq!(persisted["ui"]["theme"].as_str(), Some("dark"));
+        assert_eq!(
+            persisted["ui"]["thread_preview_lines"].as_integer(),
+            Some(2)
+        );
+    }
 
     Ok(())
 }

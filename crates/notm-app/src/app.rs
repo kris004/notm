@@ -3,7 +3,7 @@ use std::{path::PathBuf, time::Duration};
 use chrono::Utc;
 use notm_mail::{ComposedMessage, ExternalCommandTransport, FakeSendTransport, SendTransport};
 use notm_notmuch::{Database, DatabaseMode, OpenConfig, QueryOptions, SortOrder};
-use notm_ui::{LaunchOptions, SavedSearch};
+use notm_ui::{LaunchOptions, SavedSearch, model::ThemePreference};
 use uuid::Uuid;
 
 use crate::{
@@ -80,6 +80,12 @@ fn launch_options(cfg: &config::AppConfig, app_config_path: Option<PathBuf>) -> 
         default_query: cfg.notmuch.default_query.clone(),
         excluded_tags: cfg.notmuch.excluded_tags.clone(),
         page_size: cfg.ui.page_size,
+        theme: cfg
+            .ui
+            .theme
+            .parse::<ThemePreference>()
+            .expect("AppConfig::validate must reject unsupported ui.theme values"),
+        thread_preview_lines: cfg.ui.thread_preview_lines,
         identity_name: cfg.identity.name.clone(),
         primary_email: cfg.identity.primary_email.clone(),
         other_email: cfg.identity.other_email.clone(),
@@ -347,7 +353,7 @@ fn live_self_send(cfg: &config::AppConfig) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use notm_ui::LaunchOptions;
+    use notm_ui::{LaunchOptions, model::ThemePreference};
 
     #[test]
     fn normalize_message_id_accepts_rfc_angle_brackets() {
@@ -378,6 +384,18 @@ mod tests {
         let options = super::launch_options(&cfg, None);
 
         assert_eq!(options.layout, "stacked");
+    }
+
+    #[test]
+    fn launch_options_passes_theme_and_thread_preview_lines() {
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.ui.theme = "dark".to_string();
+        cfg.ui.thread_preview_lines = 7;
+
+        let options = super::launch_options(&cfg, None);
+
+        assert_eq!(options.theme, ThemePreference::Dark);
+        assert_eq!(options.thread_preview_lines, 7);
     }
 
     #[test]

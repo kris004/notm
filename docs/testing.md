@@ -78,6 +78,26 @@ fixture/live path after the change and confirm the symptom is gone. Rust compile
 Clippy, and unit tests are still useful, but they do not replace a runtime smoke
 check for UI warnings or behavior regressions.
 
+The Settings dialog has two named, fixture-backed GTK smokes. Required-display
+mode turns a missing display into a failure instead of a skip:
+
+```sh
+NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
+  cargo test -p notm-app --test desktop_ui_smoke \
+  fixture_settings_preview_limits_apply_without_partial_persistence \
+  -- --exact --nocapture --test-threads=1
+NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
+  cargo test -p notm-app --test desktop_ui_smoke \
+  fixture_theme_modes_follow_both_simulated_system_preferences \
+  -- --exact --nocapture --test-threads=1
+```
+
+The first drives the real dialog responses for one-line, three-line, and hidden
+previews and verifies that invalid values do not mutate runtime or persisted
+state. The second starts separate deterministic system-light and system-dark
+processes, exercises System/Light/Dark plus Save, and checks the resolved GTK
+theme background rather than trusting the requested enum.
+
 The focused-text shortcut regression has a self-contained headless Sway check.
 It requires `dbus-run-session`, `sway`, `swaymsg`, and `wtype`:
 

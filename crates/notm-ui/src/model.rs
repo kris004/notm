@@ -7,6 +7,61 @@ use notm_mail::SendReport;
 use notm_notmuch::{MessageSummary, Revision, ThreadSummary};
 use serde::{Deserialize, Serialize};
 
+/// Largest supported visual line limit for a thread-list body preview.
+///
+/// Preview text remains bounded independently of this display limit so changing
+/// the setting does not require a different thread-detail cache entry.
+pub const MAX_THREAD_PREVIEW_LINES: usize = 20;
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemePreference {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemePreference {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+}
+
+impl std::fmt::Display for ThemePreference {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseThemePreferenceError;
+
+impl std::fmt::Display for ParseThemePreferenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("expected exactly one of system, light, or dark")
+    }
+}
+
+impl std::error::Error for ParseThemePreferenceError {}
+
+impl std::str::FromStr for ThemePreference {
+    type Err = ParseThemePreferenceError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "system" => Ok(Self::System),
+            "light" => Ok(Self::Light),
+            "dark" => Ok(Self::Dark),
+            _ => Err(ParseThemePreferenceError),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiState {
     pub current_query: String,
@@ -56,6 +111,10 @@ pub struct UiState {
     pub screenshot_path: Option<PathBuf>,
     pub quote_collapse_enabled: bool,
     pub prefer_html_view: bool,
+    #[serde(default)]
+    pub theme: ThemePreference,
+    #[serde(default = "default_thread_preview_lines")]
+    pub thread_preview_lines: usize,
     pub show_thread_numbers: bool,
     pub show_thread_dates: bool,
     pub show_thread_tags: bool,
@@ -69,6 +128,10 @@ pub struct UiState {
     pub visual_selected_threads: BTreeSet<String>,
     pub visual_selection_pending_range: Option<(usize, usize)>,
     pub multi_selected_threads: BTreeSet<String>,
+}
+
+const fn default_thread_preview_lines() -> usize {
+    2
 }
 
 impl Default for UiState {
@@ -112,6 +175,8 @@ impl Default for UiState {
             screenshot_path: None,
             quote_collapse_enabled: false,
             prefer_html_view: false,
+            theme: ThemePreference::System,
+            thread_preview_lines: 2,
             show_thread_numbers: true,
             show_thread_dates: true,
             show_thread_tags: true,
@@ -193,4 +258,42 @@ pub struct ActiveDraft {
     pub message_id: Option<String>,
     pub indexed: bool,
     pub saved_fields: ComposeFields,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use super::{ThemePreference, UiState};
+
+    #[test]
+    fn theme_preference_accepts_only_the_documented_exact_values() {
+        for (value, expected) in [
+            ("system", ThemePreference::System),
+            ("light", ThemePreference::Light),
+            ("dark", ThemePreference::Dark),
+        ] {
+            assert_eq!(ThemePreference::from_str(value), Ok(expected));
+            assert_eq!(expected.as_str(), value);
+        }
+
+        for invalid in ["", "System", "LIGHT", "dark ", "auto"] {
+            assert!(
+                ThemePreference::from_str(invalid).is_err(),
+                "unexpectedly accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ui_state_without_new_settings_fields_uses_compatible_defaults() {
+        let mut serialized = serde_json::to_value(UiState::default()).expect("serialize UI state");
+        let object = serialized.as_object_mut().expect("UI state object");
+        object.remove("theme");
+        object.remove("thread_preview_lines");
+
+        let restored: UiState = serde_json::from_value(serialized).expect("deserialize old state");
+        assert_eq!(restored.theme, ThemePreference::System);
+        assert_eq!(restored.thread_preview_lines, 2);
+    }
 }

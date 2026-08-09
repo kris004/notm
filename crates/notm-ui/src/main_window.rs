@@ -51,9 +51,9 @@ use crate::{
     automation::{self, AutomationConfig, AutomationRequest},
     model::{
         ActiveDraft, ActivePane, ComposeFields, ContentLayout, InputMode, LayoutPreference,
-        ThreadUiDetails, UiState,
+        MAX_THREAD_PREVIEW_LINES, ThemePreference, ThreadUiDetails, UiState,
     },
-    screenshot,
+    screenshot, theme,
 };
 
 const NORMAL_APPLICATION_ID: &str = "dev.notm.Notm";
@@ -71,6 +71,8 @@ pub struct SavedSearch {
 #[derive(Debug, Clone)]
 pub struct RuntimeSettings {
     page_size: usize,
+    theme: ThemePreference,
+    thread_preview_lines: usize,
     excluded_tags: Vec<String>,
     sync_maildir_flags_after_tag_change: bool,
     remote_images: bool,
@@ -81,6 +83,8 @@ impl Default for RuntimeSettings {
     fn default() -> Self {
         Self {
             page_size: 100,
+            theme: ThemePreference::System,
+            thread_preview_lines: 2,
             excluded_tags: vec!["trash".to_string(), "spam".to_string()],
             sync_maildir_flags_after_tag_change: true,
             remote_images: false,
@@ -99,6 +103,8 @@ pub struct LaunchOptions {
     pub default_query: String,
     pub excluded_tags: Vec<String>,
     pub page_size: usize,
+    pub theme: ThemePreference,
+    pub thread_preview_lines: usize,
     pub identity_name: Option<String>,
     pub primary_email: Option<String>,
     pub other_email: Vec<String>,
@@ -167,6 +173,8 @@ impl Default for LaunchOptions {
             default_query: "tag:inbox and not tag:trash and not tag:spam".to_string(),
             excluded_tags: vec!["trash".to_string(), "spam".to_string()],
             page_size: 100,
+            theme: ThemePreference::System,
+            thread_preview_lines: 2,
             identity_name: None,
             primary_email: None,
             other_email: Vec::new(),
@@ -228,6 +236,7 @@ impl Default for LaunchOptions {
 }
 
 pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
+    validate_launch_options(&options)?;
     sync_runtime_settings_from_launch_options(&options);
     let attachment_open_tempdir = create_attachment_open_tempdir()?;
     let attachment_open_dir = attachment_open_tempdir.path().to_path_buf();
@@ -270,6 +279,11 @@ pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
 
     app.run_with_args(&["notm"]);
     attachment_open_tempdir.close()?;
+    Ok(())
+}
+
+fn validate_launch_options(options: &LaunchOptions) -> anyhow::Result<()> {
+    validate_thread_preview_lines(options.thread_preview_lines)?;
     Ok(())
 }
 
@@ -390,6 +404,8 @@ fn sync_runtime_settings_from_launch_options(options: &LaunchOptions) {
         options,
         RuntimeSettings {
             page_size: options.page_size.max(1),
+            theme: options.theme,
+            thread_preview_lines: options.thread_preview_lines,
             excluded_tags: options.excluded_tags.clone(),
             sync_maildir_flags_after_tag_change: options.sync_maildir_flags_after_tag_change,
             remote_images: options.remote_images,
@@ -417,6 +433,14 @@ fn runtime_page_size(options: &LaunchOptions) -> usize {
     runtime_settings(options).page_size.max(1)
 }
 
+fn runtime_theme(options: &LaunchOptions) -> ThemePreference {
+    runtime_settings(options).theme
+}
+
+fn runtime_thread_preview_lines(options: &LaunchOptions) -> usize {
+    runtime_settings(options).thread_preview_lines
+}
+
 fn runtime_excluded_tags(options: &LaunchOptions) -> Vec<String> {
     runtime_settings(options).excluded_tags
 }
@@ -436,6 +460,11 @@ fn runtime_layout_preference(options: &LaunchOptions) -> LayoutPreference {
 #[derive(Clone)]
 struct Widgets {
     window: gtk::ApplicationWindow,
+    gtk_settings: gtk::Settings,
+    css_provider: gtk::CssProvider,
+    theme_background_probe: gtk::Label,
+    pending_settings_dialog: Rc<RefCell<Option<PendingSettingsDialog>>>,
+    next_settings_dialog_id: Rc<Cell<u64>>,
     overlay: gtk::Overlay,
     outer_paned: gtk::Paned,
     content_paned: gtk::Paned,
@@ -753,6 +782,14 @@ struct PendingAttachmentSave {
     dialog: gtk::glib::WeakRef<gtk::FileChooserNative>,
 }
 
+struct PendingSettingsDialog {
+    id: u64,
+    dialog: gtk::glib::WeakRef<gtk::Dialog>,
+    theme: gtk::ComboBoxText,
+    thread_preview_lines: gtk::Entry,
+    show_thread_preview: gtk::CheckButton,
+}
+
 #[derive(Clone)]
 enum AttachmentOpener {
     System,
@@ -833,6 +870,9 @@ const MESSAGE_HEADER_VALUE_LINES: i32 = 1;
 const KEYBOARD_CURSOR_CLASS: &str = "notm-keyboard-cursor";
 const STATUS_BAR_MAX_WIDTH_CHARS: i32 = 120;
 const HTML_LINK_STATUS_URI_MAX_CHARS: usize = 96;
+// Cache enough normalized content for visual preview limits without keying the
+// thread-detail cache by a presentation setting.
+const THREAD_PREVIEW_CACHE_MAX_CHARS: usize = 1024;
 const THREAD_ROW_PREFIX: &str = "thread";
 const THREAD_STATUS_PREFIX: &str = "status";
 const MAX_FIXTURE_SEARCH_DELAY: Duration = Duration::from_secs(5);
@@ -913,6 +953,7 @@ struct ThreadListDisplay {
     dates: bool,
     tags: bool,
     preview: bool,
+    preview_lines: usize,
 }
 
 impl ThreadListDisplay {
@@ -922,16 +963,18 @@ impl ThreadListDisplay {
             dates: state.show_thread_dates,
             tags: state.show_thread_tags,
             preview: state.show_thread_preview,
+            preview_lines: state.thread_preview_lines,
         }
     }
 
     fn token_bits(self) -> String {
         format!(
-            "{}{}{}{}",
+            "{}{}{}{}-{}",
             if self.numbers { 1 } else { 0 },
             if self.dates { 1 } else { 0 },
             if self.tags { 1 } else { 0 },
-            if self.preview { 1 } else { 0 }
+            if self.preview { 1 } else { 0 },
+            self.preview_lines,
         )
     }
 }
@@ -941,7 +984,10 @@ fn build_ui(
     options: LaunchOptions,
     attachment_open_dir: PathBuf,
 ) -> MainWindowHandle {
-    install_css();
+    let display = gtk::gdk::Display::default().expect("GTK display must exist while building UI");
+    let css_provider = theme::install_css(&display);
+    let gtk_settings = gtk::Settings::default().expect("GTK settings must exist for the display");
+    theme::apply_theme_preference(&gtk_settings, &css_provider, runtime_theme(&options));
     let layout_preference = runtime_layout_preference(&options);
     let initial_layout =
         layout_for_preference(layout_preference, 1500, 900, ContentLayout::ThreePane);
@@ -955,6 +1001,8 @@ fn build_ui(
             .as_ref()
             .map(|p| p.display().to_string()),
         prefer_html_view: options.html_mode == "visual_html_preferred",
+        theme: runtime_theme(&options),
+        thread_preview_lines: runtime_thread_preview_lines(&options),
         show_thread_numbers: options.show_thread_numbers,
         show_thread_dates: options.show_thread_dates,
         show_thread_tags: options.show_thread_tags,
@@ -993,6 +1041,11 @@ fn build_ui(
     }
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let theme_background_probe = gtk::Label::new(None);
+    theme_background_probe.set_widget_name("notm-theme-background-probe");
+    theme_background_probe.add_css_class("notm-theme-background-probe");
+    theme_background_probe.set_visible(false);
+    root.append(&theme_background_probe);
     let top_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     top_bar.set_widget_name("notm-top-bar");
     top_bar.set_margin_start(8);
@@ -1630,6 +1683,11 @@ fn build_ui(
         .filter(|legacy_dir| legacy_dir != &drafts_dir);
     let widgets = Widgets {
         window: window.clone(),
+        gtk_settings,
+        css_provider,
+        theme_background_probe,
+        pending_settings_dialog: Rc::new(RefCell::new(None)),
+        next_settings_dialog_id: Rc::new(Cell::new(1)),
         overlay: overlay.clone(),
         outer_paned: outer_paned.clone(),
         content_paned: content_paned.clone(),
@@ -11571,6 +11629,12 @@ fn thread_row_widget(
         preview.set_halign(gtk::Align::Fill);
         preview.add_css_class("dim-label");
         preview.set_wrap(true);
+        preview.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        preview.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        preview.set_lines(
+            i32::try_from(display.preview_lines)
+                .expect("validated thread preview line count fits in i32"),
+        );
         content.append(&preview);
     }
     row_content.append(&content);
@@ -11701,11 +11765,13 @@ fn body_preview(body: &str) -> String {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('>'))
-        .take(2)
         .collect::<Vec<_>>()
         .join(" ");
-    if preview.chars().count() > 180 {
-        preview = preview.chars().take(177).collect::<String>();
+    if preview.chars().count() > THREAD_PREVIEW_CACHE_MAX_CHARS {
+        preview = preview
+            .chars()
+            .take(THREAD_PREVIEW_CACHE_MAX_CHARS.saturating_sub(1))
+            .collect::<String>();
         preview.push('…');
     }
     preview
@@ -16620,6 +16686,14 @@ fn handle_automation_request(
             show_settings(widgets, state, options);
             json!({"ok": true})
         }
+        "settings_test_state" => {
+            spin_main_context_for(Duration::from_millis(75));
+            settings_test_state_json(options, widgets, state)
+        }
+        "respond_settings" => match respond_settings_dialog(options, widgets, state, &req.args) {
+            Ok(response) => response,
+            Err(err) => json!({"ok": false, "error": err.to_string()}),
+        },
         "save_settings" => {
             let default_query = req
                 .args
@@ -16809,6 +16883,148 @@ fn attachment_test_state_json(widgets: &Widgets) -> serde_json::Value {
     })
 }
 
+fn rendered_thread_preview_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
+    let root = widgets.thread_list.clone().upcast::<gtk::Widget>();
+    let rendered = (0..state.borrow().thread_list_items.len()).find_map(|index| {
+        let name = format!("notm-thread-preview-{index}");
+        let label = find_widget_by_name(&root, &name)?
+            .downcast::<gtk::Label>()
+            .ok()?;
+        Some(json!({
+            "index": index,
+            "widget_name": name,
+            "visible": label.is_visible(),
+            "lines": label.lines(),
+            "wrap": label.wraps(),
+            "text": label.text().to_string(),
+        }))
+    });
+    let state = state.borrow();
+    json!({
+        "show_thread_preview": state.show_thread_preview,
+        "configured_lines": state.thread_preview_lines,
+        "rendered": rendered,
+    })
+}
+
+fn settings_test_state_json(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) -> serde_json::Value {
+    let dialog = widgets
+        .pending_settings_dialog
+        .borrow()
+        .as_ref()
+        .map(|pending| {
+            json!({
+                "id": pending.id,
+                "visible": pending
+                    .dialog
+                    .upgrade()
+                    .is_some_and(|dialog| dialog.is_visible()),
+                "theme": combo_active_id(&pending.theme),
+                "thread_preview_lines": pending.thread_preview_lines.text().to_string(),
+                "show_thread_preview": pending.show_thread_preview.is_active(),
+            })
+        });
+    let requested = state.borrow().theme;
+    let theme_state = theme::theme_state(
+        &widgets.theme_background_probe,
+        &widgets.gtk_settings,
+        &widgets.css_provider,
+        requested,
+    );
+    json!({
+        "ok": true,
+        "dialog": dialog,
+        "theme": theme_state,
+        "preview": rendered_thread_preview_json(widgets, state),
+        "app_config_path": options.app_config_path,
+        "status_text": widgets.status_label.text().to_string(),
+    })
+}
+
+fn respond_settings_dialog(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    args: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let (dialog_id, dialog, theme_combo, preview_entry, preview_check) = {
+        let pending = widgets.pending_settings_dialog.borrow();
+        let pending = pending
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no Settings dialog is pending"))?;
+        let requested_id = args
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(pending.id);
+        anyhow::ensure!(
+            requested_id == pending.id,
+            "Settings dialog id {requested_id} is not pending"
+        );
+        let dialog = pending
+            .dialog
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("pending Settings dialog is no longer available"))?;
+        (
+            pending.id,
+            dialog,
+            pending.theme.clone(),
+            pending.thread_preview_lines.clone(),
+            pending.show_thread_preview.clone(),
+        )
+    };
+
+    if let Some(requested_theme) = args.get("theme").and_then(serde_json::Value::as_str)
+        && !theme_combo.set_active_id(Some(requested_theme))
+    {
+        theme_combo.append(Some(requested_theme), requested_theme);
+        theme_combo.set_active_id(Some(requested_theme));
+    }
+    if let Some(lines) = args.get("thread_preview_lines") {
+        let text = match lines {
+            serde_json::Value::String(value) => value.clone(),
+            serde_json::Value::Number(value) => value.to_string(),
+            _ => anyhow::bail!("thread_preview_lines must be a string or whole number"),
+        };
+        preview_entry.set_text(&text);
+    }
+    if let Some(visible) = args
+        .get("show_thread_preview")
+        .and_then(serde_json::Value::as_bool)
+    {
+        preview_check.set_active(visible);
+    }
+
+    let response_name = args
+        .get("response")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("apply");
+    let response = match response_name {
+        "apply" => gtk::ResponseType::Apply,
+        "save" => gtk::ResponseType::Accept,
+        "close" | "cancel" => gtk::ResponseType::Close,
+        _ => anyhow::bail!("response must be apply, save, or close"),
+    };
+    dialog.response(response);
+    spin_main_context_for(Duration::from_millis(75));
+
+    let state_json = settings_test_state_json(options, widgets, state);
+    let status = widgets.status_label.text().to_string();
+    let accepted = !status.starts_with("Settings validation failed:")
+        && !status.starts_with("Settings save failed:")
+        && !status.starts_with("Settings were saved but could not be applied:");
+    Ok(json!({
+        "ok": accepted,
+        "dialog_id": dialog_id,
+        "response": response_name,
+        "error": (!accepted).then_some(status),
+        "state": state_json,
+    }))
+}
+
 fn standalone_message_windows_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
     let windows = widgets
         .standalone_windows
@@ -16894,9 +17110,10 @@ fn ensure_automation_request_allowed(
         | "remove_tag_selected"
         | "undo_last_tag" => Some(AutomationOperation::Tag),
         "run_manual_sync" => Some(AutomationOperation::ExternalSync),
-        "attachment_test_state" | "respond_attachment_save" => {
-            Some(AutomationOperation::FixtureOnly)
-        }
+        "attachment_test_state"
+        | "respond_attachment_save"
+        | "settings_test_state"
+        | "respond_settings" => Some(AutomationOperation::FixtureOnly),
         "run_command" => args
             .get("command")
             .and_then(serde_json::Value::as_str)
@@ -16909,7 +17126,7 @@ fn ensure_automation_request_allowed(
     if operation == AutomationOperation::FixtureOnly {
         anyhow::ensure!(
             options.fixture_mode,
-            "attachment test controls are available only in fixture mode"
+            "fixture UI controls are available only in fixture mode"
         );
         return Ok(());
     }
@@ -17441,18 +17658,6 @@ fn split_recipients(value: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned)
         .collect()
-}
-
-fn install_css() {
-    let provider = gtk::CssProvider::new();
-    provider.load_from_data(crate::theme::css());
-    if let Some(display) = gtk::gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-    }
 }
 
 fn command_name_candidates() -> &'static [&'static str] {
@@ -18338,6 +18543,17 @@ fn command_help_entries() -> &'static [HelpEntry] {
 }
 
 fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions) {
+    if let Some(dialog) = widgets
+        .pending_settings_dialog
+        .borrow()
+        .as_ref()
+        .and_then(|pending| pending.dialog.upgrade())
+    {
+        dialog.present();
+        return;
+    }
+    widgets.pending_settings_dialog.borrow_mut().take();
+
     let dialog = gtk::Dialog::builder()
         .title("notm settings")
         .transient_for(&widgets.window)
@@ -18454,12 +18670,13 @@ fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions
         "Theme preference",
         &[
             ("system", "System/default"),
-            ("dark", "Dark"),
             ("light", "Light"),
+            ("dark", "Dark"),
         ],
-        &toml_string(&existing, "ui", "theme").unwrap_or_else(|| "system".to_string()),
-        "Stored theme preference. Current UI uses the app theme CSS; relaunch required.",
+        state.borrow().theme.as_str(),
+        "Apply changes this window immediately. System follows the desktop preference; Light and Dark force an application appearance.",
     );
+    theme.set_widget_name("notm-settings-theme");
     let page_size = settings_entry_row(
         &form,
         "Page size",
@@ -18481,9 +18698,11 @@ fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions
     let thread_preview_lines = settings_entry_row(
         &form,
         "Thread preview lines",
-        &toml_usize(&existing, "ui", "thread_preview_lines", 2).to_string(),
-        "Stored preview-line preference. Relaunch required for all effects.",
+        &state.borrow().thread_preview_lines.to_string(),
+        "Visual line limit for wrapped thread previews (1 through 20). Apply changes rendered rows immediately.",
     );
+    thread_preview_lines.set_widget_name("notm-settings-thread-preview-lines");
+    thread_preview_lines.set_input_purpose(gtk::InputPurpose::Digits);
     let show_thread_numbers = settings_check_row(
         &form,
         "Show thread numbers",
@@ -18508,6 +18727,7 @@ fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions
         state.borrow().show_thread_preview,
         "Show message body previews in the thread list. Runtime command: :preview or :nopreview.",
     );
+    show_thread_preview.set_widget_name("notm-settings-show-thread-preview");
     let show_keybind_hints = settings_check_row(
         &form,
         "Show keybind hints",
@@ -18801,7 +19021,7 @@ fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions
 
     settings_note(
         &form,
-        "Apply updates this window where supported without writing the config file. Save writes the app config file and also applies the supported runtime changes. Layout, display, pane, HTML image, page-size, excluded-tag, and tag-sync changes apply to this window where possible. Data-source, identity, send, sync-command, startup, and test-harness changes require relaunch even after saving.",
+        "Apply updates this window without writing the config file. Save writes the app config file and also applies the runtime changes. Theme, thread-preview limit, layout, display, pane, HTML image, page-size, excluded-tag, and tag-sync changes apply immediately. Data-source, identity, send, sync-command, startup, and test-harness changes require relaunch even after saving.",
     );
 
     let filter_sections = Rc::new(RefCell::new(collect_settings_sections(&form)));
@@ -18813,10 +19033,28 @@ fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions
     dialog.add_button("Apply", gtk::ResponseType::Apply);
     dialog.add_button("Save", gtk::ResponseType::Accept);
     dialog.add_button("Close", gtk::ResponseType::Close);
+    if let Some(button) = dialog.widget_for_response(gtk::ResponseType::Apply) {
+        button.set_widget_name("notm-settings-apply");
+    }
+    if let Some(button) = dialog.widget_for_response(gtk::ResponseType::Accept) {
+        button.set_widget_name("notm-settings-save");
+    }
+    let dialog_id = widgets.next_settings_dialog_id.get();
+    widgets
+        .next_settings_dialog_id
+        .set(dialog_id.saturating_add(1));
+    *widgets.pending_settings_dialog.borrow_mut() = Some(PendingSettingsDialog {
+        id: dialog_id,
+        dialog: dialog.downgrade(),
+        theme: theme.clone(),
+        thread_preview_lines: thread_preview_lines.clone(),
+        show_thread_preview: show_thread_preview.clone(),
+    });
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
     let status = widgets.status_label.clone();
+    let pending_for_response = widgets.pending_settings_dialog.clone();
     dialog.connect_response(move |d, response| {
         if matches!(
             response,
@@ -18830,6 +19068,23 @@ fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions
                     return;
                 }
             };
+            let theme_value = match parse_settings_theme(&combo_active_id(&theme)) {
+                Ok(value) => value,
+                Err(err) => {
+                    status.set_text(&format!("Settings validation failed: {err}"));
+                    theme.grab_focus();
+                    return;
+                }
+            };
+            let thread_preview_lines_value =
+                match parse_settings_thread_preview_lines(&thread_preview_lines.text()) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        status.set_text(&format!("Settings validation failed: {err}"));
+                        thread_preview_lines.grab_focus();
+                        return;
+                    }
+                };
             let values = SettingsValues {
                 database_path: database_path.text().to_string(),
                 notmuch_config_path: notmuch_config_path.text().to_string(),
@@ -18841,9 +19096,9 @@ fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions
                 identity_name: identity_name.text().to_string(),
                 primary_email: primary_email.text().to_string(),
                 other_email: other_email.text().to_string(),
-                theme: combo_active_id(&theme),
+                theme: theme_value,
                 page_size: page_size_value,
-                thread_preview_lines: thread_preview_lines.text().parse::<usize>().unwrap_or(2),
+                thread_preview_lines: thread_preview_lines_value,
                 show_thread_numbers: show_thread_numbers.is_active(),
                 show_thread_dates: show_thread_dates.is_active(),
                 show_thread_tags: show_thread_tags.is_active(),
@@ -18892,33 +19147,58 @@ fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions
             };
 
             if response == gtk::ResponseType::Apply {
-                let search_reload_scheduled =
-                    apply_runtime_settings_values(&opts, &w, &st, &values);
-                status.set_text(&settings_status_text(
-                    "Settings applied where possible",
-                    search_reload_scheduled,
-                ));
+                match apply_runtime_settings_values(&opts, &w, &st, &values) {
+                    Ok(search_reload_scheduled) => status.set_text(&settings_status_text(
+                        "Settings applied where possible",
+                        search_reload_scheduled,
+                    )),
+                    Err(err) => {
+                        status.set_text(&format!("Settings validation failed: {err}"));
+                    }
+                }
                 return;
             }
 
             match persist_settings_values(&opts, &values) {
-                Ok(()) => {
-                    let search_reload_scheduled =
-                        apply_runtime_settings_values(&opts, &w, &st, &values);
-                    status.set_text(&settings_status_text(
-                        "Settings saved and applied where possible",
-                        search_reload_scheduled,
-                    ));
-                    d.close();
-                }
+                Ok(()) => match apply_runtime_settings_values(&opts, &w, &st, &values) {
+                    Ok(search_reload_scheduled) => {
+                        status.set_text(&settings_status_text(
+                            "Settings saved and applied where possible",
+                            search_reload_scheduled,
+                        ));
+                        d.close();
+                        clear_pending_settings_dialog(&pending_for_response, dialog_id);
+                    }
+                    Err(err) => status.set_text(&format!(
+                        "Settings were saved but could not be applied: {err}"
+                    )),
+                },
                 Err(err) => status.set_text(&format!("Settings save failed: {err}")),
             }
             return;
         }
         d.close();
+        clear_pending_settings_dialog(&pending_for_response, dialog_id);
+    });
+    let pending_settings_dialog = widgets.pending_settings_dialog.clone();
+    dialog.connect_destroy(move |_| {
+        clear_pending_settings_dialog(&pending_settings_dialog, dialog_id);
     });
     dialog.present();
     search.grab_focus();
+}
+
+fn clear_pending_settings_dialog(
+    pending: &Rc<RefCell<Option<PendingSettingsDialog>>>,
+    dialog_id: u64,
+) {
+    let is_current = pending
+        .borrow()
+        .as_ref()
+        .is_some_and(|dialog| dialog.id == dialog_id);
+    if is_current {
+        pending.borrow_mut().take();
+    }
 }
 
 struct SettingsValues {
@@ -18931,7 +19211,7 @@ struct SettingsValues {
     identity_name: String,
     primary_email: String,
     other_email: String,
-    theme: String,
+    theme: ThemePreference,
     page_size: usize,
     thread_preview_lines: usize,
     show_thread_numbers: bool,
@@ -19096,12 +19376,18 @@ fn apply_runtime_settings_values(
     widgets: &Widgets,
     state: &SharedState,
     values: &SettingsValues,
-) -> bool {
+) -> anyhow::Result<bool> {
+    validate_page_size(values.page_size)?;
+    validate_thread_preview_lines(values.thread_preview_lines)?;
     let next_excluded_tags = parse_string_list(&values.excluded_tags);
-    let next_page_size = values.page_size.max(1);
+    let next_page_size = values.page_size;
+    let next_theme = values.theme;
+    let next_thread_preview_lines = values.thread_preview_lines;
     let next_layout_preference = parse_layout_preference(&values.layout);
     let next_runtime = RuntimeSettings {
         page_size: next_page_size,
+        theme: next_theme,
+        thread_preview_lines: next_thread_preview_lines,
         excluded_tags: next_excluded_tags.clone(),
         sync_maildir_flags_after_tag_change: values.sync_maildir_flags_after_tag_change,
         remote_images: values.remote_images,
@@ -19113,6 +19399,8 @@ fn apply_runtime_settings_values(
     {
         let mut s = state.borrow_mut();
         s.thread_page_size = next_page_size;
+        s.theme = next_theme;
+        s.thread_preview_lines = next_thread_preview_lines;
         s.show_thread_numbers = values.show_thread_numbers;
         s.show_thread_dates = values.show_thread_dates;
         s.show_thread_tags = values.show_thread_tags;
@@ -19123,6 +19411,8 @@ fn apply_runtime_settings_values(
         s.trusted_image_senders =
             normalize_sender_list(&parse_string_list(&values.trusted_image_senders));
     }
+    theme::apply_theme_preference(&widgets.gtk_settings, &widgets.css_provider, next_theme);
+    widgets.theme_background_probe.queue_draw();
     {
         let hidden = parse_string_list(&values.hidden_tag_searches)
             .into_iter()
@@ -19162,7 +19452,7 @@ fn apply_runtime_settings_values(
     sync_pane_button_classes(widgets, state);
     update_active_pane_visuals(widgets, state);
     update_debug(widgets, state);
-    search_settings_changed
+    Ok(search_settings_changed)
 }
 
 fn settings_status_text(base: &str, search_reload_scheduled: bool) -> String {
@@ -19424,14 +19714,6 @@ fn toml_bool(value: &toml::Value, section: &str, key: &str, default: bool) -> bo
         .unwrap_or(default)
 }
 
-fn toml_usize(value: &toml::Value, section: &str, key: &str, default: usize) -> usize {
-    toml_section(value, section)
-        .and_then(|table| table.get(key))
-        .and_then(toml::Value::as_integer)
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(default)
-}
-
 fn option_path_text(value: &Option<PathBuf>) -> String {
     value
         .as_ref()
@@ -19449,6 +19731,32 @@ fn parse_settings_page_size(value: &str) -> anyhow::Result<usize> {
         .parse::<usize>()
         .map_err(|_| anyhow::anyhow!("page size must be a positive whole number"))?;
     validate_page_size(page_size)
+}
+
+fn parse_settings_theme(value: &str) -> anyhow::Result<ThemePreference> {
+    value.parse::<ThemePreference>().map_err(|_| {
+        anyhow::anyhow!("theme must be exactly one of system, light, or dark; got {value:?}")
+    })
+}
+
+fn parse_settings_thread_preview_lines(value: &str) -> anyhow::Result<usize> {
+    let lines = value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("thread preview lines must be a whole number from 1 to 20"))?;
+    validate_thread_preview_lines(lines)
+}
+
+fn validate_thread_preview_lines(lines: usize) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        (1..=MAX_THREAD_PREVIEW_LINES).contains(&lines),
+        "thread preview lines must be between 1 and {MAX_THREAD_PREVIEW_LINES}"
+    );
+    anyhow::ensure!(
+        i64::try_from(lines).is_ok(),
+        "thread preview line count is too large to store in configuration"
+    );
+    Ok(lines)
 }
 
 fn validate_page_size(page_size: usize) -> anyhow::Result<usize> {
@@ -19506,6 +19814,7 @@ fn transport_mode_name(mode: &TransportMode) -> String {
 
 fn persist_settings_values(options: &LaunchOptions, values: &SettingsValues) -> anyhow::Result<()> {
     let page_size = validate_page_size(values.page_size)?;
+    let thread_preview_lines = validate_thread_preview_lines(values.thread_preview_lines)?;
     let send_args = parse_string_list(&values.send_args);
     validate_send_settings(&values.send_mode, &send_args)?;
     let Some(path) = &options.app_config_path else {
@@ -19544,13 +19853,13 @@ fn persist_settings_values(options: &LaunchOptions, values: &SettingsValues) -> 
         parse_string_list(&values.other_email),
     );
 
-    set_string(root, "ui", "theme", &values.theme);
+    set_string(root, "ui", "theme", values.theme.as_str());
     set_int(root, "ui", "page_size", page_size as i64);
     set_int(
         root,
         "ui",
         "thread_preview_lines",
-        values.thread_preview_lines as i64,
+        thread_preview_lines as i64,
     );
     set_bool(
         root,
@@ -20471,6 +20780,77 @@ mod tests {
                 .to_string()
                 .contains("too large")
         );
+    }
+
+    #[test]
+    fn settings_theme_and_preview_lines_require_exact_supported_values() {
+        assert_eq!(
+            parse_settings_theme("system").unwrap(),
+            ThemePreference::System
+        );
+        assert_eq!(
+            parse_settings_theme("light").unwrap(),
+            ThemePreference::Light
+        );
+        assert_eq!(parse_settings_theme("dark").unwrap(), ThemePreference::Dark);
+        for invalid in ["", "System", "auto", "dark "] {
+            assert!(
+                parse_settings_theme(invalid).is_err(),
+                "unexpectedly accepted {invalid:?}"
+            );
+        }
+
+        assert_eq!(parse_settings_thread_preview_lines(" 1 ").unwrap(), 1);
+        assert_eq!(
+            parse_settings_thread_preview_lines(&MAX_THREAD_PREVIEW_LINES.to_string()).unwrap(),
+            MAX_THREAD_PREVIEW_LINES
+        );
+        for invalid in ["", "zero", "0", "21"] {
+            assert!(
+                parse_settings_thread_preview_lines(invalid).is_err(),
+                "unexpectedly accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn launch_theme_and_preview_lines_propagate_to_runtime_settings() {
+        let options = LaunchOptions {
+            theme: ThemePreference::Dark,
+            thread_preview_lines: 7,
+            ..LaunchOptions::default()
+        };
+
+        validate_launch_options(&options).expect("valid preview limit");
+        sync_runtime_settings_from_launch_options(&options);
+
+        assert_eq!(runtime_theme(&options), ThemePreference::Dark);
+        assert_eq!(runtime_thread_preview_lines(&options), 7);
+    }
+
+    #[test]
+    fn launch_rejects_out_of_range_thread_preview_lines_before_gtk_startup() {
+        for thread_preview_lines in [0, MAX_THREAD_PREVIEW_LINES + 1] {
+            let options = LaunchOptions {
+                thread_preview_lines,
+                ..LaunchOptions::default()
+            };
+            let error = launch(options).expect_err("invalid launch options must fail");
+            assert!(
+                error.to_string().contains("thread preview lines"),
+                "unexpected error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_body_preview_is_bounded_but_not_capped_at_two_source_lines() {
+        let preview = body_preview("first line\nsecond line\nthird line\n> ignored quote");
+        assert_eq!(preview, "first line second line third line");
+
+        let long = body_preview(&"x".repeat(THREAD_PREVIEW_CACHE_MAX_CHARS + 50));
+        assert_eq!(long.chars().count(), THREAD_PREVIEW_CACHE_MAX_CHARS);
+        assert!(long.ends_with('…'));
     }
 
     #[test]

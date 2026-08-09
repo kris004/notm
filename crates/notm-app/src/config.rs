@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use anyhow::Context;
+use notm_ui::model::{MAX_THREAD_PREVIEW_LINES, ThemePreference};
 use serde::{Deserialize, Serialize};
 
 use crate::paths;
@@ -35,6 +36,16 @@ impl AppConfig {
         anyhow::ensure!(
             self.ui.page_size > 0,
             "ui.page_size must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.ui.theme.parse::<ThemePreference>().is_ok(),
+            "ui.theme must be exactly one of system, light, or dark; got {:?}",
+            self.ui.theme
+        );
+        anyhow::ensure!(
+            (1..=MAX_THREAD_PREVIEW_LINES).contains(&self.ui.thread_preview_lines),
+            "ui.thread_preview_lines must be between 1 and {MAX_THREAD_PREVIEW_LINES}; got {}",
+            self.ui.thread_preview_lines
         );
         anyhow::ensure!(
             is_supported_layout(&self.ui.layout),
@@ -613,6 +624,31 @@ mod tests {
     }
 
     #[test]
+    fn documented_theme_values_and_preview_line_bounds_validate() {
+        for theme in ["system", "light", "dark"] {
+            for preview_lines in [1, super::MAX_THREAD_PREVIEW_LINES] {
+                parse_validated(&format!(
+                    "[ui]\ntheme = {theme:?}\nthread_preview_lines = {preview_lines}\n"
+                ))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "theme {theme:?} with {preview_lines} preview lines should validate: {error:#}"
+                    )
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn non_numeric_preview_line_count_is_rejected_during_deserialization() {
+        let error = toml::from_str::<AppConfig>("[ui]\nthread_preview_lines = \"two\"\n")
+            .expect_err("non-numeric preview line count should fail")
+            .to_string();
+
+        assert!(error.contains("thread_preview_lines"), "{error}");
+    }
+
+    #[test]
     fn unknown_config_keys_are_rejected_at_each_schema_level() {
         for (case, contents, unknown) in [
             ("root", "[appearance]\ntheme = \"dark\"\n", "appearance"),
@@ -707,6 +743,17 @@ mod tests {
                 "notmuch.open_readwrite_only_for_mutations",
             ),
             ("zero page size", "[ui]\npage_size = 0\n", "ui.page_size"),
+            ("theme", "[ui]\ntheme = \"auto\"\n", "ui.theme"),
+            (
+                "zero preview lines",
+                "[ui]\nthread_preview_lines = 0\n",
+                "ui.thread_preview_lines",
+            ),
+            (
+                "too many preview lines",
+                "[ui]\nthread_preview_lines = 21\n",
+                "ui.thread_preview_lines",
+            ),
             ("layout", "[ui]\nlayout = \"diagonal\"\n", "ui.layout"),
             (
                 "HTML mode",

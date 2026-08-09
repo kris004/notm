@@ -1,5 +1,197 @@
+use gtk::prelude::*;
+use gtk4 as gtk;
+use serde::Serialize;
+
+use crate::model::ThemePreference;
+
+const CSS_PROVIDER_COLOR_SCHEME_PROPERTY: &str = "prefers-color-scheme";
+const SETTINGS_INTERFACE_COLOR_SCHEME_PROPERTY: &str = "gtk-interface-color-scheme";
+const SETTINGS_THEME_NAME_PROPERTY: &str = "gtk-theme-name";
+const SETTINGS_PREFER_DARK_PROPERTY: &str = "gtk-application-prefer-dark-theme";
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ThemeState {
+    pub requested: ThemePreference,
+    pub effective: ThemePreference,
+    pub resolved_theme_bg_color: String,
+    pub resolved_theme_bg_luminance: f32,
+    pub gtk_theme_name: Option<String>,
+    pub gtk_application_prefer_dark_theme: bool,
+    pub provider_color_scheme: Option<String>,
+    pub gtk_interface_color_scheme: Option<String>,
+}
+
+/// Install the application stylesheet and return its provider for theme updates.
+pub fn install_css(display: &gtk::gdk::Display) -> gtk::CssProvider {
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(css());
+    gtk::style_context_add_provider_for_display(
+        display,
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+    provider
+}
+
+/// Apply an application theme preference without conflating `system` and `light`.
+///
+/// GTK 4.20 added `GtkSettings:gtk-interface-color-scheme`; it is selected
+/// dynamically so the crate can retain its GTK 4.12 minimum. Forced modes also
+/// use GTK's `Default` theme with the legacy dark-variant switch for the
+/// GTK 4.12-4.18 fallback. Returning to `system` removes the display Settings
+/// overrides so the built-in theme resumes following the session preference.
+/// The application provider is also restored to its `default` scheme; notm's
+/// CSS currently has no color-scheme media queries, so that provider value is
+/// diagnostic only and is not treated as evidence of the rendered scheme.
+pub fn apply_theme_preference(
+    settings: &gtk::Settings,
+    provider: &gtk::CssProvider,
+    requested: ThemePreference,
+) {
+    match requested {
+        ThemePreference::System => {
+            settings.reset_property(SETTINGS_THEME_NAME_PROPERTY);
+            settings.reset_property(SETTINGS_PREFER_DARK_PROPERTY);
+            if settings
+                .find_property(SETTINGS_INTERFACE_COLOR_SCHEME_PROPERTY)
+                .is_some()
+            {
+                settings.reset_property(SETTINGS_INTERFACE_COLOR_SCHEME_PROPERTY);
+            }
+        }
+        ThemePreference::Light => {
+            settings.set_gtk_theme_name(Some("Default"));
+            settings.set_gtk_application_prefer_dark_theme(false);
+        }
+        ThemePreference::Dark => {
+            settings.set_gtk_theme_name(Some("Default"));
+            settings.set_gtk_application_prefer_dark_theme(true);
+        }
+    }
+
+    // Apply the modern override after the legacy fallback. Changing the legacy
+    // properties can reload GTK's built-in theme provider, so doing this last is
+    // required for a forced light mode to win over a dark GTK 4.20 preference.
+    if requested != ThemePreference::System
+        && settings
+            .find_property(SETTINGS_INTERFACE_COLOR_SCHEME_PROPERTY)
+            .is_some()
+    {
+        set_enum_property_by_nick(
+            settings,
+            SETTINGS_INTERFACE_COLOR_SCHEME_PROPERTY,
+            requested.as_str(),
+        );
+    }
+
+    let provider_scheme = provider_scheme_nick(requested);
+    set_enum_property_by_nick(
+        provider,
+        CSS_PROVIDER_COLOR_SCHEME_PROPERTY,
+        provider_scheme,
+    );
+}
+
+fn provider_scheme_nick(requested: ThemePreference) -> &'static str {
+    match requested {
+        ThemePreference::System => "default",
+        ThemePreference::Light => "light",
+        ThemePreference::Dark => "dark",
+    }
+}
+
+/// Resolve GTK's live `theme_bg_color` through a styled probe and report its
+/// luminance alongside the raw GTK properties. This intentionally does not
+/// treat the serialized request or provider enum as proof that a theme override
+/// took effect. Callers should query again in system mode because the session
+/// preference may change.
+pub fn theme_state<W>(
+    background_probe: &W,
+    settings: &gtk::Settings,
+    provider: &gtk::CssProvider,
+    requested: ThemePreference,
+) -> ThemeState
+where
+    W: IsA<gtk::Widget>,
+{
+    let background = background_probe.color();
+    let luminance = relative_luminance(&background);
+    ThemeState {
+        requested,
+        effective: if luminance < 0.5 {
+            ThemePreference::Dark
+        } else {
+            ThemePreference::Light
+        },
+        resolved_theme_bg_color: background.to_string(),
+        resolved_theme_bg_luminance: luminance,
+        gtk_theme_name: settings.gtk_theme_name().map(|name| name.to_string()),
+        gtk_application_prefer_dark_theme: settings.is_gtk_application_prefer_dark_theme(),
+        provider_color_scheme: enum_property_nick(provider, CSS_PROVIDER_COLOR_SCHEME_PROPERTY),
+        gtk_interface_color_scheme: enum_property_nick(
+            settings,
+            SETTINGS_INTERFACE_COLOR_SCHEME_PROPERTY,
+        ),
+    }
+}
+
+fn relative_luminance(color: &gtk::gdk::RGBA) -> f32 {
+    fn linear(channel: f32) -> f32 {
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    0.2126 * linear(color.red()) + 0.7152 * linear(color.green()) + 0.0722 * linear(color.blue())
+}
+
+pub fn gtk_settings_theme_preference(settings: &gtk::Settings) -> ThemePreference {
+    match enum_property_nick(settings, SETTINGS_INTERFACE_COLOR_SCHEME_PROPERTY).as_deref() {
+        Some("dark") => ThemePreference::Dark,
+        Some("light") => ThemePreference::Light,
+        _ if settings.is_gtk_application_prefer_dark_theme()
+            || settings
+                .gtk_theme_name()
+                .is_some_and(|name| name.to_ascii_lowercase().contains("dark")) =>
+        {
+            ThemePreference::Dark
+        }
+        _ => ThemePreference::Light,
+    }
+}
+
+fn set_enum_property_by_nick<O>(object: &O, property: &str, nick: &str) -> bool
+where
+    O: IsA<gtk::glib::Object>,
+{
+    let Some(specification) = object.find_property(property) else {
+        return false;
+    };
+    let Some(class) = gtk::glib::EnumClass::with_type(specification.value_type()) else {
+        return false;
+    };
+    let Some(value) = class.to_value_by_nick(nick) else {
+        return false;
+    };
+    object.set_property_from_value(property, &value);
+    true
+}
+
+fn enum_property_nick<O>(object: &O, property: &str) -> Option<String>
+where
+    O: IsA<gtk::glib::Object>,
+{
+    object.find_property(property)?;
+    let value = object.property_value(property);
+    let (_, enum_value) = gtk::glib::EnumValue::from_value(&value)?;
+    Some(enum_value.nick().to_string())
+}
+
 pub fn css() -> &'static str {
     r#"
+    .notm-theme-background-probe { color: @theme_bg_color; }
     .notm-tag { padding: 2px 6px; border-radius: 10px; background: alpha(currentColor, .10); }
     #notm-left-sidebar button,
     #notm-left-sidebar entry,
@@ -194,4 +386,19 @@ pub fn css() -> &'static str {
     }
     #notm-debug-panel { font-family: monospace; }
     "#
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::model::ThemePreference;
+
+    #[test]
+    fn provider_color_scheme_mapping_uses_supported_enum_nicks() {
+        assert_eq!(
+            super::provider_scheme_nick(ThemePreference::System),
+            "default"
+        );
+        assert_eq!(super::provider_scheme_nick(ThemePreference::Light), "light");
+        assert_eq!(super::provider_scheme_nick(ThemePreference::Dark), "dark");
+    }
 }

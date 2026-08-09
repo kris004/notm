@@ -142,6 +142,8 @@ outstanding; non-fixture runs reject that test-only argument.
 .BR run_command ,
 .BR run_manual_sync ,
 .BR open_settings ,
+.BR settings_test_state ,
+.BR respond_settings ,
 .BR save_settings ,
 .BR resize_window ,
 .BR pane_visibility ,
@@ -209,6 +211,46 @@ Attachment Open writes a safely named file below an application-owned private
 temporary directory before launching it.  The directory has mode 0700 on Unix
 and is removed on normal process exit.  Fixture mode records the path in a fake
 opener rather than starting an external application.
+.PP
+After
+.BR open_settings ,
+the fixture-only
+.B settings_test_state
+command reports the real dialog identifier and visible controls, the requested
+theme and live resolved
+.B theme_bg_color
+and luminance with raw GTK properties, the configured preview limit, and the
+actual rendered preview label's line limit, visibility, and text.
+.B respond_settings
+drives that same GTK dialog's response signal.  It accepts optional
+.BR id ,
+.BR theme ,
+.BR thread_preview_lines ,
+and
+.B show_thread_preview
+arguments and a
+.B response
+of
+.BR apply ,
+.BR save ,
+or
+.BR close .
+For example:
+.PP
+.nf
+{"command":"respond_settings","args":{"response":"apply","theme":"dark","thread_preview_lines":3,"show_thread_preview":true}}
+.fi
+.PP
+Invalid theme or preview values leave the dialog open and change neither
+runtime state nor the config file.
+.B apply
+changes the running window without writing;
+.B save
+writes and then applies.  These two inspection/response commands are rejected
+outside fixture mode.  The older
+.B save_settings
+command persists only its basic direct-test fields and does not exercise the
+dialog.
 .SH SAFETY
 Keep the socket local to the user session and use a token.  Prefer fixture data
 for test-harness runs.  Fixture mode does not run configured receive,

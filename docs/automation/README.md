@@ -109,10 +109,10 @@ Implemented test-harness commands include:
   `copy_thread_id`
 - UI/debug: `open_command_palette`, `command_completion`, `open_shortcuts`,
   `show_shortcuts`, `help_search`, `run_command`, `run_manual_sync`,
-  `open_settings`, `save_settings`, `resize_window`, `pane_visibility`,
-  `set_pane_visibility`, `layout_state`, `set_layout`, `toggle_layout`,
-  `toggle_debug_panel`, `close_main_window`, custom saved-search commands, and
-  custom tag-editor commands
+  `open_settings`, `settings_test_state`, `respond_settings`, `save_settings`,
+  `resize_window`, `pane_visibility`, `set_pane_visibility`, `layout_state`,
+  `set_layout`, `toggle_layout`, `toggle_debug_panel`, `close_main_window`,
+  custom saved-search commands, and custom tag-editor commands
 
 `focus_search` and `focus_compose_field` move GTK focus without forcing Insert
 mode. Tests that exercise keyboard editing should send the same `/`, `i`, or
@@ -136,6 +136,25 @@ application directory before launching it. Fixture mode records the path in a
 fake opener instead of starting an external application. The directory and its
 files remain available while the app runs and are removed when the process
 exits normally.
+
+After `open_settings`, the fixture-only `settings_test_state` reports the real
+dialog ID and visible controls, the requested theme and live resolved
+`theme_bg_color`/luminance plus raw GTK properties, the configured preview
+limit, and the actual rendered preview label's line limit, visibility, and
+text. `respond_settings` drives that same GTK dialog's response signal. It
+accepts optional `id`, `theme`, `thread_preview_lines`, and
+`show_thread_preview` arguments plus `response` set to `apply`, `save`, or
+`close`, for example:
+
+```json
+{"token":"dev-token","command":"respond_settings","args":{"response":"apply","theme":"dark","thread_preview_lines":3,"show_thread_preview":true}}
+```
+
+This is a fixture-only UI-test seam, not an alternate settings API. Invalid
+theme or preview values leave the dialog open and do not update runtime state or
+the config file. `apply` changes the running window without writing; `save`
+writes and then applies. The older `save_settings` command persists only its
+basic direct-test fields and does not exercise the dialog.
 
 `run_manual_sync` returns with `pending: true` after the configured commands
 have started in the background. Poll `app_state.state.sync_in_progress` until
