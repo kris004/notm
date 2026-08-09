@@ -4636,9 +4636,9 @@ fn ensure_active_pane_visible(widgets: &Widgets, state: &SharedState) {
 
 fn pane_is_visible(widgets: &Widgets, pane: ActivePane) -> bool {
     match pane {
-        ActivePane::Sidebar => widgets.left_pane.is_visible(),
-        ActivePane::Threads => widgets.thread_pane.is_visible(),
-        ActivePane::Message => widgets.message_pane.is_visible(),
+        ActivePane::Sidebar => widgets.left_pane.get_visible(),
+        ActivePane::Threads => widgets.thread_pane.get_visible(),
+        ActivePane::Message => widgets.message_pane.get_visible(),
     }
 }
 
