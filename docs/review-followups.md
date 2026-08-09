@@ -60,19 +60,18 @@ the active table; it is not a second status table.
 Update this block at every handoff; historical evidence remains append-only.
 
 - Captured: 2026-08-09.
-- Branch: `main`. Last implementation and tested-tree HEAD: `92c01b6`; current
+- Branch: `main`. Last implementation and tested-tree HEAD: `a534c58`; current
   HEAD is the tracker-only evidence commit containing this snapshot.
-- Active item/child checkpoint: `R12-DRAFTS.1`; add the visible saved-drafts
-  list and its deterministic fixture controls before unifying destructive
-  confirmation in `.2`.
+- Active item/child checkpoint: `R12-DRAFTS.2`; unify every destructive and
+  compose-replacement path behind one typed confirmation controller.
 - Owner: Codex. Blockers: none recorded.
 - Unrelated dirty paths that must not be staged, overwritten, stashed, or reset:
   `Cargo.toml`, `Cargo.lock`, and
   `crates/notm-mail/src/html_sanitize.rs`.
 - Tracker baseline commit: `93bfe88`.
-- Exact next command: `git status --short --branch`, then inspect the composer
-  draft persistence and fixture-harness paths before implementing
-  `R12-DRAFTS.1`.
+- Exact next command: `git status --short --branch`, then inventory every
+  compose-replacement/discard/delete entry point and implement the shared
+  `R12-DRAFTS.2` confirmation controller.
 
 ## Completion protocol
 
@@ -120,7 +119,7 @@ scope of this work:
 | --- | --- | --- | --- |
 | `R07-ATTACHMENTS` | Use a save chooser for Save; use private temporary storage for Open. | `DONE` | `.1` storage/private-directory semantics were validated at `0bf9afd`; `.2` chooser/opener wiring, fixture seams, docs, and non-skipping GTK proof were exact-tree validated at `eb9113f`. |
 | `R10-SETTINGS` | Make `ui.theme` and `ui.thread_preview_lines` functional rather than silently storing inert values. | `DONE` | Both `.1` preview/validation/runtime behavior and `.2` three-mode theme behavior were exact-tree validated at `0bbddc4`, including real Settings-dialog seams and non-skipping GTK proof. |
-| `R12-DRAFTS` | Make named drafts visible and confirm destructive draft actions. | `OPEN` | Durable persistence/error reporting exists, but `draft_list` is populated without being appended to the composer and discard/delete handlers mutate immediately. |
+| `R12-DRAFTS` | Make named drafts visible and confirm destructive draft actions. | `IN PROGRESS` | `.1` visible saved-draft list, activation, safe deletion, fixture seams, and non-skipping GTK proof were exact-tree validated at `a534c58`; `.2` confirmation policy remains. |
 | `S01-MODULES` | Incrementally extract composer, search, attachment, settings, and standalone-window controllers from `main_window.rs`. | `OPEN` | `main_window.rs` is 20,580 lines; all 11 existing `widgets/*.rs` leaf files contain only placeholder comments. |
 | `S02-CACHES` | Bound the search and thread-detail caches, including accumulation across database revisions. | `DONE` | Exact-tree validated at `92c01b6`: typed full-identity keys and true-LRU caches bound search pages to 64 and thread details to 4,096 entries, with local-instance capacity/recency/collision/isolation proofs. |
 | `S03-CI` | Add CI for formatting, Clippy, tests, and the real fixture-driven GTK smoke. | `IN PROGRESS` | `.1` is implemented and exact-tree validated at `dda9d45`; `.2` still requires the final integrated pushed SHA and green run URL. |
@@ -539,6 +538,8 @@ Append entries; do not rewrite history.
 
 | 2026-08-09 | `S02-CACHES.1` | `OPEN` -> `DONE`. | implementation `92c01b6`; tested tree `92c01b6` | In the stable exact checkout, formatting, workspace Clippy with `-D warnings`, workspace all-target/all-feature tests, `fixture-smoke`, `probe-send`, and `git diff --check` passed. The 74 UI unit tests include local 64-entry search and 4,096-entry detail caches that prove per-insert bounds, hit recency, replacement without growth, true-LRU eviction, overflow rebasing, new revision/UUID eviction, every typed key dimension, excluded-tag comma-collision and order isolation, and path/revision/thread isolation. Fixture/search database integration passed 3/3. `fixture_app_serves_authenticated_desktop_harness` and `validated_config_launches_and_invalid_layout_requests_are_rejected` passed on `WAYLAND_DISPLAY=wayland-1`, exit 0, with no `SKIP`, covering async search and configured paging. Lock scopes are restricted to lookup/insert, cached previews remain pre-display-limit, and the architecture documentation names both limits. The committed files were byte-compared with the validated exact checkout. |
 
+| 2026-08-09 | `R12-DRAFTS.1` | `OPEN` -> `IN PROGRESS`; parent awaits `.2`. | implementation `a534c58`; tested tree `a534c58` | In the stable exact checkout, formatting, workspace Clippy with `-D warnings`, workspace all-target/all-feature tests, `fixture-smoke`, `probe-send`, man-page lint, and `git diff --check` passed. `fixture_saved_drafts_are_visible_activatable_and_delete_safely` passed on `WAYLAND_DISPLAY=wayland-1`, exit 0, with no `SKIP`; it proved the mapped labeled section, explicit empty state, bounded 72--160px scroller, rendered row, real row-activation load, clearly labeled per-selection Delete action, byte-preserving deletion failure with visible error and retained active draft, successful retry, active-state clearing only after unlink, and restored empty state. The existing manual-sync and send-overlap draft smokes also passed required-display with no skips. Unit tests cover fixture-only controls and active-path matching; the committed files were byte-compared with the validated exact checkout. |
+
 ## Decision log
 
 Append explicit scope changes, user-approved deferrals, or superseding decisions
@@ -550,8 +551,8 @@ here. Absence of an entry means the scope above still applies.
 
 ## Exact next action
 
-Complete `R12-DRAFTS.1`: append a bounded, scrollable saved-drafts list to the
-composer, expose deterministic fixture controls for its state/activation, and
-make successful deletion clear an active draft without hiding persistence
-errors. Exact-tree validate and commit that checkpoint before implementing the
-shared confirmation controller in `R12-DRAFTS.2`.
+Complete `R12-DRAFTS.2`: route dirty composer replacement/discard and every
+permanent active/named draft deletion through one typed confirmation controller,
+add deterministic pending/response fixture commands, and prove rejection and
+acceptance without partial field, active-state, recovery-byte, or persisted-byte
+mutation. Then exact-tree validate and commit the checkpoint.
