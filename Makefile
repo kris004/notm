@@ -2,12 +2,19 @@ PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 DATADIR ?= $(PREFIX)/share
 APPDIR ?= $(DATADIR)/applications
+ICONDIR ?= $(DATADIR)/icons/hicolor/scalable/apps
+METAINFODIR ?= $(DATADIR)/metainfo
 MANDIR ?= $(DATADIR)/man
 CARGO ?= cargo
 INSTALL ?= install
 RM ?= rm -f
+BINARY ?= target/release/notm
+DESKTOP_ID := dev.notm.Notm
+DESKTOP_FILE := $(DESKTOP_ID).desktop
+ICON_FILE := $(DESKTOP_ID).svg
+METAINFO_FILE := $(DESKTOP_ID).metainfo.xml
 
-.PHONY: all build install install-user install-man uninstall uninstall-user uninstall-man check test smoke clean
+.PHONY: all build install install-user install-man uninstall uninstall-user uninstall-man check check-packaging test smoke clean
 
 all: build
 
@@ -15,12 +22,17 @@ build:
 	$(CARGO) build --release -p notm-app
 
 install: build install-man
-	$(INSTALL) -Dm755 target/release/notm "$(DESTDIR)$(BINDIR)/notm"
+	$(INSTALL) -Dm755 "$(BINARY)" "$(DESTDIR)$(BINDIR)/notm"
 	$(INSTALL) -d target/install
 	sed -e 's|^Exec=.*|Exec=$(BINDIR)/notm launch|' \
 	    -e 's|^TryExec=.*|TryExec=$(BINDIR)/notm|' \
-	    packaging/notm.desktop > target/install/notm.desktop
-	$(INSTALL) -Dm644 target/install/notm.desktop "$(DESTDIR)$(APPDIR)/notm.desktop"
+	    "packaging/$(DESKTOP_FILE)" > "target/install/$(DESKTOP_FILE)"
+	$(RM) "$(DESTDIR)$(APPDIR)/notm.desktop"
+	$(INSTALL) -Dm644 "target/install/$(DESKTOP_FILE)" "$(DESTDIR)$(APPDIR)/$(DESKTOP_FILE)"
+	$(INSTALL) -Dm644 "packaging/icons/hicolor/scalable/apps/$(ICON_FILE)" \
+	    "$(DESTDIR)$(ICONDIR)/$(ICON_FILE)"
+	$(INSTALL) -Dm644 "packaging/$(METAINFO_FILE)" \
+	    "$(DESTDIR)$(METAINFODIR)/$(METAINFO_FILE)"
 
 install-man:
 	$(INSTALL) -Dm644 docs/man/notm.1 "$(DESTDIR)$(MANDIR)/man1/notm.1"
@@ -33,7 +45,10 @@ install-user:
 
 uninstall: uninstall-man
 	$(RM) "$(DESTDIR)$(BINDIR)/notm"
+	$(RM) "$(DESTDIR)$(APPDIR)/$(DESKTOP_FILE)"
 	$(RM) "$(DESTDIR)$(APPDIR)/notm.desktop"
+	$(RM) "$(DESTDIR)$(ICONDIR)/$(ICON_FILE)"
+	$(RM) "$(DESTDIR)$(METAINFODIR)/$(METAINFO_FILE)"
 
 uninstall-man:
 	$(RM) "$(DESTDIR)$(MANDIR)/man1/notm.1"
@@ -47,6 +62,9 @@ uninstall-user:
 check:
 	$(CARGO) fmt --all --check
 	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
+
+check-packaging:
+	./tests/packaging_install_smoke.sh
 
 test:
 	$(CARGO) test --workspace --all-targets --all-features

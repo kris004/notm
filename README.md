@@ -67,8 +67,14 @@ make install-user
 That installs:
 
 - `~/.local/bin/notm`
-- `~/.local/share/applications/notm.desktop`
+- `~/.local/share/applications/dev.notm.Notm.desktop`
+- `~/.local/share/icons/hicolor/scalable/apps/dev.notm.Notm.svg`
+- `~/.local/share/metainfo/dev.notm.Notm.metainfo.xml`
 - man pages under `~/.local/share/man/`
+
+The reverse-DNS name matches the GTK application ID. Installing or
+uninstalling also removes the legacy `~/.local/share/applications/notm.desktop`
+launcher so upgrades cannot leave a duplicate menu entry.
 
 For a system install, set `PREFIX`/`DESTDIR` as usual:
 
