@@ -240,11 +240,55 @@ Tags applied to indexed draft messages.  Defaults to:
 .B index_after_save
 Index explicit draft saves through libnotmuch.  Defaults to true.
 .SS [sync]
-Sync is disabled by default.  Set
+.TP
 .B enabled
-and the specific manual command settings only when notm should expose a manual
-Sync action.  Startup receive/index commands should remain disabled unless that
-behavior is intentionally desired.
+Master gate for manual and startup sync.  When false, notm hides the sidebar
+Sync action and runs no configured sync commands.  Defaults to false.
+.TP
+.B manual_action_label
+Text shown on the sidebar Sync action.  Defaults to
+.BR Sync .
+.TP
+.B external_receive_enabled
+Make the external receive command eligible for the manual Sync action and for
+startup sync when its other startup gates are satisfied.  Defaults to false.
+.TP
+.B external_receive_command
+Shell command used to fetch or synchronize mail.  It runs before the database
+update command.  Defaults to an empty string, which is not runnable.
+.TP
+.B external_receive_on_startup
+Allow the external receive command to run at startup when every other startup
+gate is satisfied.  This setting does not restrict the manual Sync action.
+Defaults to false.
+.TP
+.B notmuch_database_update_enabled
+Make the database update command eligible for the manual Sync action and for
+startup sync when its other startup gates are satisfied.  Defaults to false.
+.TP
+.B notmuch_database_update_command
+Shell command used to update the local Notmuch database, for example
+.BR "notmuch new" .
+It runs after the receive command.  Defaults to an empty string, which is not
+runnable.
+.TP
+.B notmuch_database_update_on_startup
+Allow the database update command to run at startup when every other startup
+gate is satisfied.  This setting does not restrict the manual Sync action.
+Defaults to false.
+.PP
+For the manual Sync action, each command requires
+.BR enabled ,
+its own
+.B *_enabled
+flag, and a nonblank
+.B *_command
+value.  At startup, each command runs only on a non-fixture launch when those
+three gates and its own
+.B *_on_startup
+flag are all true.  Eligible receive and database-update commands run in that
+order.  After the selected commands succeed, the current search is refreshed.
+Fixture mode never executes configured external sync commands.
 .SH TESTING AND DEBUGGING SECTIONS
 .SS [automation]
 The developer test harness is disabled by default.

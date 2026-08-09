@@ -12,7 +12,7 @@
 
 ## Runtime model
 
-The UI opens Notmuch read-only for search/view and read-write only for explicit tag mutation or explicitly configured indexing of sent/draft files. It never runs startup sync and never shells out to the `notmuch` CLI. Sending is delegated to a configured external transport or the fake capture transport used in tests.
+The UI opens Notmuch read-only for search/view and read-write only for explicit tag mutation or explicitly configured indexing of sent/draft files. Search, view, tag, and sent/draft indexing operations use `libnotmuch` instead of the `notmuch` CLI. Sync is disabled by default. On a non-fixture launch, a configured sync command runs at startup only when `[sync].enabled`, that command's `*_enabled` flag, a nonblank `*_command`, and its `*_on_startup` flag are all set. Eligible receive and database-update commands run in that order. After the selected commands succeed, the current search is refreshed. Fixture mode never executes configured external sync commands. Sending is delegated to a configured external transport or the fake capture transport used in tests.
 
 Search input is debounced and run through a background worker with stale-generation discard. Search results are paged (`ui.page_size`), expose a Load more action, auto-load the next page when the thread list is scrolled to the bottom, and are cached by database path, Notmuch UUID/revision, page size, excluded tags, query, and page offset. Thread UI details are cached by database path, revision, and thread id.
 

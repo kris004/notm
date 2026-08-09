@@ -29,15 +29,19 @@ GPL-family `libnotmuch`.
   suggestions from Notmuch headers, local draft recovery, explicit draft save,
   and configurable external sending.
 - Command palette, searchable shortcuts help, settings dialog, and optional
-  manual sync button when a receive/index command is explicitly configured.
+  manual or startup sync for explicitly configured receive/database-update
+  commands.
 
 ## Safety defaults
 
 `notm` is conservative by default:
 
-- no startup sync;
-- no automatic `notmuch new`;
-- no receive/sync commands unless configured and manually invoked;
+- no startup sync or automatic `notmuch new` with the default configuration;
+- receive/database-update commands run only when `[sync].enabled`, the
+  corresponding `*_enabled` flag, and a nonblank `*_command` are all configured;
+- startup execution additionally requires the command-specific `*_on_startup`
+  flag on a non-fixture launch; fixture mode never runs configured external
+  sync commands;
 - remote images disabled by default;
 - JavaScript and in-app navigation disabled in the visual HTML view;
 - trash, spam, and archive are tag operations, not file deletion;
@@ -125,8 +129,13 @@ Useful optional sections:
 - `[drafts]`: local Maildir draft location and tags.
 - `[send]`: external send command, timeout, sent-mail persistence, and sent
   indexing.
-- `[sync]`: disabled by default; opt into a manual receive/index command only if
-  you want `notm` to expose a Sync button.
+- `[sync]`: disabled by default. `enabled` is the master gate for the manual
+  Sync action and startup sync. Each command also needs its own `*_enabled` flag
+  and a nonblank `*_command`; startup additionally needs that command's
+  `*_on_startup` flag on a non-fixture launch. When both commands are eligible,
+  the receive command runs before the database-update command. After the
+  selected commands succeed, the current search is refreshed. Fixture mode
+  never runs configured external sync commands.
 
 Run `notm print-config` to see the effective configuration after default
 discovery. Secret-bearing values are redacted by default. The explicit

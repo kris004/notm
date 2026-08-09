@@ -18351,31 +18351,31 @@ fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions
     settings_section(&form, "Sync");
     settings_note(
         &form,
-        "Sync means: run the receive command you define, then run the database update command you define. Notm does not guess lieer/offlineimap/mbsync/notmuch new commands. Leave this off if another service already handles mail sync.",
+        "Sync runs only commands you define: receive first, then database update. After the selected commands succeed, the current search is refreshed. Enable sync is the master gate for the sidebar action and startup sync. Startup also requires the command's enable toggle, a nonblank command, and its startup toggle. Fixture mode never runs configured external sync commands. Leave sync disabled if another service already handles mail sync.",
     );
     let sync_enabled = settings_check_row(
         &form,
-        "Enable Sync button",
+        "Enable sync",
         options.sync_enabled,
-        "Show a Sync button in the sidebar. Pressing it runs the enabled commands below.",
+        "Master gate for manual and startup sync. Shows the sidebar Sync action; no sync command runs when this is off.",
     );
     let manual_sync_label = settings_entry_row(
         &form,
-        "Sync button label",
+        "Sync action label",
         &options.manual_sync_label,
-        "Text shown on the sidebar Sync button.",
+        "Text shown on the sidebar Sync action.",
     );
     let external_receive_enabled = settings_check_row(
         &form,
-        "Run receive command",
+        "Enable receive command",
         options.external_receive_enabled,
-        "When Sync runs, run the receive command below first.",
+        "Make the nonblank receive command eligible for manual Sync and, when its startup toggle is also on, startup sync. It runs before database update.",
     );
     let external_receive_on_startup = settings_check_row(
         &form,
-        "Run receive at startup",
+        "Run receive on startup",
         options.external_receive_on_startup,
-        "Also run the receive command when notm starts, then refresh the current search.",
+        "On a non-fixture launch, run receive at startup only when Enable sync and Enable receive command are on and Receive command is nonblank.",
     );
     let external_receive_command = settings_entry_row(
         &form,
@@ -18385,15 +18385,15 @@ fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions
     );
     let notmuch_database_update_enabled = settings_check_row(
         &form,
-        "Run update command",
+        "Enable database update command",
         options.notmuch_database_update_enabled,
-        "When Sync runs, run the database update command below after receive.",
+        "Make the nonblank database update command eligible for manual Sync and, when its startup toggle is also on, startup sync. It runs after receive.",
     );
     let notmuch_database_update_on_startup = settings_check_row(
         &form,
-        "Update at startup",
+        "Run database update on startup",
         options.notmuch_database_update_on_startup,
-        "Also run the database update command when notm starts, then refresh the current search.",
+        "On a non-fixture launch, run database update at startup only when Enable sync and Enable database update command are on and Database update command is nonblank.",
     );
     let notmuch_database_update_command = settings_entry_row(
         &form,
@@ -20421,6 +20421,33 @@ mod tests {
         assert_eq!(startup.len(), 2);
         assert_eq!(startup[0].name, "receive");
         assert_eq!(startup[1].name, "database_update");
+
+        options.external_receive_enabled = false;
+        assert_eq!(sync_command_specs(&options, SyncRunKind::Manual).len(), 1);
+        let startup = sync_command_specs(&options, SyncRunKind::Startup);
+        assert_eq!(startup.len(), 1);
+        assert_eq!(startup[0].name, "database_update");
+
+        options.external_receive_enabled = true;
+        options.external_receive_command = "   ".to_string();
+        assert_eq!(sync_command_specs(&options, SyncRunKind::Manual).len(), 1);
+        let startup = sync_command_specs(&options, SyncRunKind::Startup);
+        assert_eq!(startup.len(), 1);
+        assert_eq!(startup[0].name, "database_update");
+
+        options.external_receive_command = "lieer-sync".to_string();
+        options.notmuch_database_update_enabled = false;
+        assert_eq!(sync_command_specs(&options, SyncRunKind::Manual).len(), 1);
+        let startup = sync_command_specs(&options, SyncRunKind::Startup);
+        assert_eq!(startup.len(), 1);
+        assert_eq!(startup[0].name, "receive");
+
+        options.notmuch_database_update_enabled = true;
+        options.notmuch_database_update_command = "\t".to_string();
+        assert_eq!(sync_command_specs(&options, SyncRunKind::Manual).len(), 1);
+        let startup = sync_command_specs(&options, SyncRunKind::Startup);
+        assert_eq!(startup.len(), 1);
+        assert_eq!(startup[0].name, "receive");
     }
 
     #[test]

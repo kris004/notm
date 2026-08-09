@@ -87,11 +87,21 @@ is set.
 Fallback Notmuch configuration discovery path.
 .SH SAFETY
 .B notm
-does not run startup sync by default, does not run automatic
-.BR "notmuch new" ,
-and does not run receive/sync commands unless they are explicitly configured and
-manually invoked.  Archive, trash, and spam are tag operations; they do not
-delete ordinary message files.
+does not run startup sync or automatic
+.B "notmuch new"
+with the default configuration.  Sync commands are gated by
+.BR [sync].enabled ,
+their command-specific
+.B *_enabled
+flag, and a nonblank
+.B *_command
+value.  On a non-fixture launch, a command runs at startup only when its
+command-specific
+.B *_on_startup
+flag is also true.  Eligible receive and database-update commands run in that
+order.  After the selected commands succeed, the current search is refreshed.
+Fixture mode never runs configured external sync commands.  Archive, trash,
+and spam are tag operations; they do not delete ordinary message files.
 .SH SEE ALSO
 .BR notm-config (5),
 .BR notm-test-harness (7),
