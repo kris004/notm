@@ -25,7 +25,10 @@ use notm_mail::{
     ComposedMessage, ExternalCommandTransport, FakeSendTransport, ReplyKind, SendTransport,
     TransportMode,
     address::{dedupe_addresses, format_address, parse_address_list},
-    attachments::save_attachment_without_overwrite,
+    attachments::{
+        sanitize_attachment_filename, save_attachment_to_target_without_overwrite,
+        save_attachment_without_overwrite,
+    },
     build_reply,
     compose::{AttachmentInput, Identity},
     forward::{build_attachment_forward, build_inline_forward},
@@ -529,6 +532,9 @@ struct Widgets {
     attachment_list: gtk::ListBox,
     attachment_items: Rc<RefCell<Vec<ThreadAttachmentItem>>>,
     attachment_open_dir: PathBuf,
+    pending_attachment_save: Rc<RefCell<Option<PendingAttachmentSave>>>,
+    next_attachment_save_id: Rc<Cell<u64>>,
+    attachment_opener: AttachmentOpener,
     tag_search_box: gtk::Box,
     draft_path: PathBuf,
     legacy_draft_path: Option<PathBuf>,
@@ -724,6 +730,56 @@ struct ThreadAttachmentItem {
     filename: String,
     content_type: String,
     size: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachmentOrigin {
+    SelectedMessage,
+    Thread,
+}
+
+#[derive(Debug, Clone)]
+struct AttachmentPayload {
+    message: notm_notmuch::MessageSummary,
+    filename: String,
+    bytes: Vec<u8>,
+    origin: AttachmentOrigin,
+}
+
+struct PendingAttachmentSave {
+    id: u64,
+    suggested_name: String,
+    payload: AttachmentPayload,
+    dialog: gtk::glib::WeakRef<gtk::FileChooserNative>,
+}
+
+#[derive(Clone)]
+enum AttachmentOpener {
+    System,
+    Fixture(Rc<RefCell<Vec<PathBuf>>>),
+}
+
+impl AttachmentOpener {
+    fn open(&self, path: &Path) -> anyhow::Result<()> {
+        match self {
+            Self::System => {
+                let file = gtk::gio::File::for_path(path);
+                gtk::gio::AppInfo::launch_default_for_uri(
+                    &file.uri(),
+                    None::<&gtk::gio::AppLaunchContext>,
+                )?;
+            }
+            Self::Fixture(calls) => calls.borrow_mut().push(path.to_path_buf()),
+        }
+        Ok(())
+    }
+
+    fn fixture_calls(&self) -> Option<Vec<PathBuf>> {
+        match self {
+            Self::System => None,
+            Self::Fixture(calls) => Some(calls.borrow().clone()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1670,6 +1726,13 @@ fn build_ui(
         attachment_list,
         attachment_items: Rc::new(RefCell::new(Vec::new())),
         attachment_open_dir,
+        pending_attachment_save: Rc::new(RefCell::new(None)),
+        next_attachment_save_id: Rc::new(Cell::new(1)),
+        attachment_opener: if options.fixture_mode {
+            AttachmentOpener::Fixture(Rc::new(RefCell::new(Vec::new())))
+        } else {
+            AttachmentOpener::System
+        },
         tag_search_box,
         draft_path,
         legacy_draft_path,
@@ -8603,12 +8666,10 @@ fn attachment_content_type(path: &Path) -> String {
     .to_string()
 }
 
-fn save_selected_attachment(
-    widgets: &Widgets,
+fn selected_attachment_payload(
     state: &SharedState,
     index: usize,
-    dir: Option<&Path>,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<AttachmentPayload> {
     let message = state
         .borrow()
         .selected_message
@@ -8622,23 +8683,225 @@ fn save_selected_attachment(
     let attachment = report
         .attachments
         .get(index)
+        .cloned()
         .ok_or_else(|| anyhow::anyhow!("attachment index {index} not found"))?;
-    let target_dir = dir
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("artifacts/attachments"));
-    let path =
-        save_attachment_without_overwrite(&target_dir, &attachment.filename, &attachment.bytes)?;
+    Ok(AttachmentPayload {
+        message,
+        filename: attachment.filename,
+        bytes: attachment.bytes,
+        origin: AttachmentOrigin::SelectedMessage,
+    })
+}
+
+fn thread_attachment_payload(
+    state: &SharedState,
+    item: &ThreadAttachmentItem,
+) -> anyhow::Result<AttachmentPayload> {
+    let message = state
+        .borrow()
+        .messages
+        .get(item.message_index)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("attachment message index not found"))?;
+    let filename = message
+        .filenames
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("attachment message has no file"))?;
+    let report = extract_attachments_from_file_detailed(filename)?;
+    let attachment = report
+        .attachments
+        .into_iter()
+        .find(|attachment| attachment.part_index == item.attachment_index)
+        .ok_or_else(|| anyhow::anyhow!("attachment MIME part not found"))?;
+    Ok(AttachmentPayload {
+        message,
+        filename: attachment.filename,
+        bytes: attachment.bytes,
+        origin: AttachmentOrigin::Thread,
+    })
+}
+
+fn attachment_payload_at_index(
+    widgets: &Widgets,
+    state: &SharedState,
+    index: usize,
+) -> anyhow::Result<AttachmentPayload> {
+    let item = widgets.attachment_items.borrow().get(index).cloned();
+    match item {
+        Some(item) => thread_attachment_payload(state, &item),
+        None => selected_attachment_payload(state, index),
+    }
+}
+
+fn active_attachment_payload(
+    widgets: &Widgets,
+    state: &SharedState,
+) -> anyhow::Result<AttachmentPayload> {
+    match selected_thread_attachment(widgets) {
+        Some(item) => thread_attachment_payload(state, &item),
+        None => selected_attachment_payload(state, 0),
+    }
+}
+
+fn request_attachment_save(
+    widgets: &Widgets,
+    state: &SharedState,
+    payload: AttachmentPayload,
+) -> anyhow::Result<u64> {
+    anyhow::ensure!(
+        widgets.pending_attachment_save.borrow().is_none(),
+        "an attachment save chooser is already open"
+    );
+    let chooser_id = widgets.next_attachment_save_id.get();
+    let next_id = chooser_id
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("attachment save chooser id overflowed"))?;
+    widgets.next_attachment_save_id.set(next_id);
+
+    let suggested_name = sanitize_attachment_filename(&payload.filename);
+    let dialog = gtk::FileChooserNative::new(
+        Some("Save attachment"),
+        Some(&widgets.window),
+        gtk::FileChooserAction::Save,
+        Some("Save"),
+        Some("Cancel"),
+    );
+    dialog.set_current_name(&suggested_name);
+    let dialog_weak = dialog.downgrade();
+    *widgets.pending_attachment_save.borrow_mut() = Some(PendingAttachmentSave {
+        id: chooser_id,
+        suggested_name,
+        payload,
+        dialog: dialog_weak,
+    });
+
+    let w = widgets.clone();
+    let st = state.clone();
+    dialog.connect_response(move |dialog, response| {
+        let is_current = w
+            .pending_attachment_save
+            .borrow()
+            .as_ref()
+            .is_some_and(|pending| pending.id == chooser_id);
+        if !is_current {
+            return;
+        }
+        let accepted = response == gtk::ResponseType::Accept;
+        let target = accepted
+            .then(|| dialog.file().and_then(|file| file.path()))
+            .flatten();
+        if let Err(err) =
+            complete_pending_attachment_save(&w, &st, chooser_id, accepted, target.as_deref())
+        {
+            report_attachment_error(&w, &st, "Save attachment", &err);
+        }
+    });
+    dialog.show();
+    Ok(chooser_id)
+}
+
+fn complete_pending_attachment_save(
+    widgets: &Widgets,
+    state: &SharedState,
+    chooser_id: u64,
+    accepted: bool,
+    target: Option<&Path>,
+) -> anyhow::Result<Option<PathBuf>> {
+    let pending = {
+        let mut slot = widgets.pending_attachment_save.borrow_mut();
+        let pending = slot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no attachment save chooser is pending"))?;
+        anyhow::ensure!(
+            pending.id == chooser_id,
+            "attachment save chooser id does not match the pending chooser"
+        );
+        slot.take().expect("pending chooser checked above")
+    };
+
+    let result = if accepted {
+        let target = target.ok_or_else(|| {
+            anyhow::anyhow!("the attachment save chooser did not return a local target path")
+        });
+        target.and_then(|target| {
+            save_attachment_payload_to_target(widgets, state, &pending.payload, target).map(Some)
+        })
+    } else {
+        Ok(None)
+    };
+
+    if let Some(dialog) = pending.dialog.upgrade() {
+        dialog.hide();
+        dialog.destroy();
+    }
+    result
+}
+
+fn save_attachment_payload_to_target(
+    widgets: &Widgets,
+    state: &SharedState,
+    payload: &AttachmentPayload,
+    target: &Path,
+) -> anyhow::Result<PathBuf> {
+    let path = save_attachment_to_target_without_overwrite(target, &payload.bytes)?;
+    record_attachment_saved(widgets, state, payload, &path);
+    Ok(path)
+}
+
+fn save_attachment_payload_to_directory(
+    widgets: &Widgets,
+    state: &SharedState,
+    payload: &AttachmentPayload,
+    target_dir: &Path,
+) -> anyhow::Result<PathBuf> {
+    let path = save_attachment_without_overwrite(target_dir, &payload.filename, &payload.bytes)?;
+    record_attachment_saved(widgets, state, payload, &path);
+    Ok(path)
+}
+
+fn record_attachment_saved(
+    widgets: &Widgets,
+    state: &SharedState,
+    payload: &AttachmentPayload,
+    path: &Path,
+) {
     widgets
         .status_label
         .set_text(&format!("Attachment saved to {}", path.display()));
-    state.borrow_mut().last_operation = Some(format!(
-        "saved attachment {} from {} to {}",
-        attachment.filename,
-        message.message_id,
-        path.display()
-    ));
+    let operation = match payload.origin {
+        AttachmentOrigin::SelectedMessage => format!(
+            "saved attachment {} from {} to {}",
+            payload.filename,
+            payload.message.message_id,
+            path.display()
+        ),
+        AttachmentOrigin::Thread => format!(
+            "saved thread attachment {} from message {} to {}",
+            payload.filename,
+            payload.message.message_id,
+            path.display()
+        ),
+    };
+    {
+        let mut state = state.borrow_mut();
+        state.selected_message = Some(payload.message.clone());
+        state.last_operation = Some(operation);
+        state.last_error = None;
+    }
     update_debug(widgets, state);
-    Ok(path)
+}
+
+fn report_attachment_error(
+    widgets: &Widgets,
+    state: &SharedState,
+    action: &str,
+    error: &anyhow::Error,
+) {
+    state.borrow_mut().last_error = Some(error.to_string());
+    widgets
+        .status_label
+        .set_text(&format!("{action} failed: {error}"));
+    update_debug(widgets, state);
 }
 
 fn refresh_thread_attachment_list(widgets: &Widgets, state: &SharedState) {
@@ -8731,11 +8994,10 @@ fn connect_attachment_context_menu(
     let save_popover = popover.clone();
     save_button.connect_clicked(move |_| {
         save_popover.popdown();
-        if let Err(err) = save_thread_attachment(&w, &st, &save_item, None) {
-            st.borrow_mut().last_error = Some(err.to_string());
-            w.status_label
-                .set_text(&format!("Save attachment failed: {err}"));
-            update_debug(&w, &st);
+        let result = thread_attachment_payload(&st, &save_item)
+            .and_then(|payload| request_attachment_save(&w, &st, payload));
+        if let Err(err) = result {
+            report_attachment_error(&w, &st, "Save attachment", &err);
         }
     });
 
@@ -8745,7 +9007,9 @@ fn connect_attachment_context_menu(
     let open_item = item.clone();
     open_button.connect_clicked(move |_| {
         open_popover.popdown();
-        open_thread_attachment(&w, &st, &open_item);
+        if let Err(err) = open_thread_attachment(&w, &st, &open_item) {
+            report_attachment_error(&w, &st, "Open attachment", &err);
+        }
     });
 
     let open_click = gtk::GestureClick::new();
@@ -8763,7 +9027,9 @@ fn connect_attachment_context_menu(
         {
             list.select_row(Some(&open_row));
         }
-        open_thread_attachment(&w, &st, &open_item);
+        if let Err(err) = open_thread_attachment(&w, &st, &open_item) {
+            report_attachment_error(&w, &st, "Open attachment", &err);
+        }
     });
     row.add_controller(open_click);
 
@@ -8783,17 +9049,13 @@ fn connect_attachment_context_menu(
     row.add_controller(click);
 }
 
-fn open_thread_attachment(widgets: &Widgets, state: &SharedState, item: &ThreadAttachmentItem) {
-    match save_thread_attachment(widgets, state, item, None) {
-        Ok(path) => open_saved_attachment_path(widgets, state, path),
-        Err(err) => {
-            state.borrow_mut().last_error = Some(err.to_string());
-            widgets
-                .status_label
-                .set_text(&format!("Open attachment failed: {err}"));
-            update_debug(widgets, state);
-        }
-    }
+fn open_thread_attachment(
+    widgets: &Widgets,
+    state: &SharedState,
+    item: &ThreadAttachmentItem,
+) -> anyhow::Result<PathBuf> {
+    let payload = thread_attachment_payload(state, item)?;
+    open_attachment_payload(widgets, state, &payload)
 }
 
 fn selected_thread_attachment(widgets: &Widgets) -> Option<ThreadAttachmentItem> {
@@ -8805,45 +9067,25 @@ fn selected_thread_attachment(widgets: &Widgets) -> Option<ThreadAttachmentItem>
     widgets.attachment_items.borrow().get(index).cloned()
 }
 
-fn save_thread_attachment(
+fn open_attachment_payload(
     widgets: &Widgets,
     state: &SharedState,
-    item: &ThreadAttachmentItem,
-    dir: Option<&Path>,
+    payload: &AttachmentPayload,
 ) -> anyhow::Result<PathBuf> {
-    let message = state
-        .borrow()
-        .messages
-        .get(item.message_index)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("attachment message index not found"))?;
-    let filename = message
-        .filenames
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("attachment message has no file"))?;
-    let report = extract_attachments_from_file_detailed(filename)?;
-    let attachment = report
-        .attachments
-        .iter()
-        .find(|attachment| attachment.part_index == item.attachment_index)
-        .ok_or_else(|| anyhow::anyhow!("attachment MIME part not found"))?;
-    let target_dir = dir
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("artifacts/attachments"));
-    let path =
-        save_attachment_without_overwrite(&target_dir, &attachment.filename, &attachment.bytes)?;
+    let path = save_attachment_without_overwrite(
+        &widgets.attachment_open_dir,
+        &payload.filename,
+        &payload.bytes,
+    )?;
+    widgets.attachment_opener.open(&path)?;
     widgets
         .status_label
-        .set_text(&format!("Attachment saved to {}", path.display()));
+        .set_text(&format!("Opened attachment {}", path.display()));
     {
         let mut state = state.borrow_mut();
-        state.selected_message = Some(message.clone());
-        state.last_operation = Some(format!(
-            "saved thread attachment {} from message {} to {}",
-            attachment.filename,
-            message.message_id,
-            path.display()
-        ));
+        state.selected_message = Some(payload.message.clone());
+        state.last_operation = Some(format!("opened attachment {}", path.display()));
+        state.last_error = None;
     }
     update_debug(widgets, state);
     Ok(path)
@@ -9289,63 +9531,6 @@ fn message_has_html(message: &notm_notmuch::MessageSummary) -> bool {
         .ok()
         .and_then(|parsed| parsed.html_body)
         .is_some_and(|html| !html.trim().is_empty())
-}
-
-fn open_selected_attachment(widgets: &Widgets, state: &SharedState, index: usize) {
-    match save_selected_attachment(widgets, state, index, None) {
-        Ok(path) => {
-            let file = gtk::gio::File::for_path(&path);
-            match gtk::gio::AppInfo::launch_default_for_uri(
-                &file.uri(),
-                None::<&gtk::gio::AppLaunchContext>,
-            ) {
-                Ok(()) => {
-                    widgets
-                        .status_label
-                        .set_text(&format!("Opened attachment {}", path.display()));
-                    state.borrow_mut().last_operation =
-                        Some(format!("opened attachment {}", path.display()));
-                }
-                Err(err) => {
-                    widgets
-                        .status_label
-                        .set_text(&format!("Open attachment failed: {err}"));
-                    state.borrow_mut().last_error = Some(err.to_string());
-                }
-            }
-            update_debug(widgets, state);
-        }
-        Err(err) => {
-            state.borrow_mut().last_error = Some(err.to_string());
-            widgets
-                .status_label
-                .set_text(&format!("Open attachment failed: {err}"));
-            update_debug(widgets, state);
-        }
-    }
-}
-
-fn open_saved_attachment_path(widgets: &Widgets, state: &SharedState, path: PathBuf) {
-    let file = gtk::gio::File::for_path(&path);
-    match gtk::gio::AppInfo::launch_default_for_uri(
-        &file.uri(),
-        None::<&gtk::gio::AppLaunchContext>,
-    ) {
-        Ok(()) => {
-            widgets
-                .status_label
-                .set_text(&format!("Opened attachment {}", path.display()));
-            state.borrow_mut().last_operation =
-                Some(format!("opened attachment {}", path.display()));
-        }
-        Err(err) => {
-            widgets
-                .status_label
-                .set_text(&format!("Open attachment failed: {err}"));
-            state.borrow_mut().last_error = Some(err.to_string());
-        }
-    }
-    update_debug(widgets, state);
 }
 
 fn show_raw_source(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -16484,26 +16669,102 @@ fn handle_automation_request(
                 .get("dir")
                 .and_then(|v| v.as_str())
                 .map(PathBuf::from);
-            let result = widgets
-                .attachment_items
-                .borrow()
-                .get(index)
-                .cloned()
-                .map(|item| save_thread_attachment(widgets, state, &item, dir.as_deref()))
-                .unwrap_or_else(|| save_selected_attachment(widgets, state, index, dir.as_deref()));
-            match result {
-                Ok(path) => json!({"ok": true, "path": path}),
-                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            match attachment_payload_at_index(widgets, state, index) {
+                Ok(payload) => {
+                    let result = match dir.as_deref() {
+                        Some(dir) => save_attachment_payload_to_directory(
+                            widgets, state, &payload, dir,
+                        )
+                        .map(|path| json!({"ok": true, "pending": false, "path": path})),
+                        None => request_attachment_save(widgets, state, payload).map(|chooser_id| {
+                            json!({"ok": true, "pending": true, "chooser_id": chooser_id})
+                        }),
+                    };
+                    match result {
+                        Ok(response) => response,
+                        Err(err) => {
+                            report_attachment_error(widgets, state, "Save attachment", &err);
+                            json!({"ok": false, "error": err.to_string()})
+                        }
+                    }
+                }
+                Err(err) => {
+                    report_attachment_error(widgets, state, "Save attachment", &err);
+                    json!({"ok": false, "error": err.to_string()})
+                }
             }
         }
         "open_selected_attachment" | "open_attachment" => {
             let index = req.args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            if let Some(item) = widgets.attachment_items.borrow().get(index).cloned() {
-                open_thread_attachment(widgets, state, &item);
-            } else {
-                open_selected_attachment(widgets, state, index);
+            let result = attachment_payload_at_index(widgets, state, index)
+                .and_then(|payload| open_attachment_payload(widgets, state, &payload));
+            match result {
+                Ok(path) => json!({"ok": true, "path": path}),
+                Err(err) => {
+                    report_attachment_error(widgets, state, "Open attachment", &err);
+                    json!({"ok": false, "error": err.to_string()})
+                }
             }
-            json!({"ok": true, "last_error": state.borrow().last_error})
+        }
+        "attachment_test_state" => attachment_test_state_json(widgets),
+        "respond_attachment_save" => {
+            let response = req
+                .args
+                .get("response")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let chooser_id = req
+                .args
+                .get("id")
+                .and_then(|value| value.as_u64())
+                .or_else(|| {
+                    widgets
+                        .pending_attachment_save
+                        .borrow()
+                        .as_ref()
+                        .map(|pending| pending.id)
+                });
+            let result = (|| -> anyhow::Result<(bool, Option<PathBuf>)> {
+                let chooser_id = chooser_id
+                    .ok_or_else(|| anyhow::anyhow!("no attachment save chooser is pending"))?;
+                match response {
+                    "accept" => {
+                        let target = req
+                            .args
+                            .get("path")
+                            .and_then(|value| value.as_str())
+                            .map(Path::new)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("respond_attachment_save accept requires a path")
+                            })?;
+                        complete_pending_attachment_save(
+                            widgets,
+                            state,
+                            chooser_id,
+                            true,
+                            Some(target),
+                        )
+                        .map(|path| (true, path))
+                    }
+                    "cancel" => {
+                        complete_pending_attachment_save(widgets, state, chooser_id, false, None)
+                            .map(|path| (false, path))
+                    }
+                    _ => anyhow::bail!("respond_attachment_save response must be accept or cancel"),
+                }
+            })();
+            match result {
+                Ok((accepted, path)) => json!({
+                    "ok": true,
+                    "accepted": accepted,
+                    "pending": false,
+                    "path": path,
+                }),
+                Err(err) => {
+                    report_attachment_error(widgets, state, "Save attachment", &err);
+                    json!({"ok": false, "error": err.to_string()})
+                }
+            }
         }
         "get_logs" => {
             json!({"ok": true, "recent_error": state.borrow().last_error, "last_operation": state.borrow().last_operation})
@@ -16520,6 +16781,32 @@ fn automation_mutation_response(
 ) -> serde_json::Value {
     let error = (!ok).then(|| widgets.status_label.text().to_string());
     json!({"ok": ok, "error": error, "state": &*state.borrow()})
+}
+
+fn attachment_test_state_json(widgets: &Widgets) -> serde_json::Value {
+    let save_chooser = widgets
+        .pending_attachment_save
+        .borrow()
+        .as_ref()
+        .map(|pending| {
+            json!({
+                "id": pending.id,
+                "suggested_name": pending.suggested_name,
+                "visible": pending
+                    .dialog
+                    .upgrade()
+                    .is_some_and(|dialog| dialog.is_visible()),
+            })
+        });
+    let fake_opener_calls = widgets.attachment_opener.fixture_calls();
+    json!({
+        "ok": true,
+        "save_chooser": save_chooser,
+        "status_text": widgets.status_label.text().to_string(),
+        "open_temp_dir": widgets.attachment_open_dir,
+        "fake_opener": fake_opener_calls.is_some(),
+        "fake_opener_calls": fake_opener_calls.unwrap_or_default(),
+    })
 }
 
 fn standalone_message_windows_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
@@ -16583,6 +16870,7 @@ enum AutomationOperation {
     Send,
     Tag,
     ExternalSync,
+    FixtureOnly,
 }
 
 fn ensure_automation_request_allowed(
@@ -16606,6 +16894,9 @@ fn ensure_automation_request_allowed(
         | "remove_tag_selected"
         | "undo_last_tag" => Some(AutomationOperation::Tag),
         "run_manual_sync" => Some(AutomationOperation::ExternalSync),
+        "attachment_test_state" | "respond_attachment_save" => {
+            Some(AutomationOperation::FixtureOnly)
+        }
         "run_command" => args
             .get("command")
             .and_then(serde_json::Value::as_str)
@@ -16615,6 +16906,13 @@ fn ensure_automation_request_allowed(
     let Some(operation) = operation else {
         return Ok(());
     };
+    if operation == AutomationOperation::FixtureOnly {
+        anyhow::ensure!(
+            options.fixture_mode,
+            "attachment test controls are available only in fixture mode"
+        );
+        return Ok(());
+    }
     if options.fixture_mode {
         anyhow::ensure!(
             operation != AutomationOperation::ExternalSync,
@@ -16632,6 +16930,7 @@ fn ensure_automation_request_allowed(
             "live test-harness tag changes are disabled; set automation.allow_live_tag_test=true"
         ),
         AutomationOperation::ExternalSync => {}
+        AutomationOperation::FixtureOnly => unreachable!("fixture-only operation handled above"),
     }
     Ok(())
 }
@@ -16928,13 +17227,29 @@ fn run_named_command(
             set_thread_display_visible(widgets, state, ThreadDisplayToggle::Preview, false);
             json!({"ok": true, "show_thread_preview": state.borrow().show_thread_preview})
         }
-        "save_attachment" => match save_selected_attachment(widgets, state, 0, None) {
-            Ok(path) => json!({"ok": true, "path": path}),
-            Err(err) => json!({"ok": false, "error": err.to_string()}),
-        },
+        "save_attachment" => {
+            let result = active_attachment_payload(widgets, state)
+                .and_then(|payload| request_attachment_save(widgets, state, payload));
+            match result {
+                Ok(chooser_id) => {
+                    json!({"ok": true, "pending": true, "chooser_id": chooser_id})
+                }
+                Err(err) => {
+                    report_attachment_error(widgets, state, "Save attachment", &err);
+                    json!({"ok": false, "error": err.to_string()})
+                }
+            }
+        }
         "open_attachment" => {
-            open_selected_attachment(widgets, state, 0);
-            json!({"ok": true, "last_error": state.borrow().last_error})
+            let result = active_attachment_payload(widgets, state)
+                .and_then(|payload| open_attachment_payload(widgets, state, &payload));
+            match result {
+                Ok(path) => json!({"ok": true, "path": path}),
+                Err(err) => {
+                    report_attachment_error(widgets, state, "Open attachment", &err);
+                    json!({"ok": false, "error": err.to_string()})
+                }
+            }
         }
         "copy_message_id" => {
             copy_selected_message_id(widgets, state);
@@ -19630,6 +19945,24 @@ mod tests {
         )
         .expect_err("nested fixture sync should be blocked");
         assert!(nested.to_string().contains("disabled in fixture mode"));
+    }
+
+    #[test]
+    fn attachment_dialog_test_controls_are_fixture_only() {
+        let live_options = LaunchOptions::default();
+        let error =
+            ensure_automation_request_allowed(&live_options, "attachment_test_state", &json!({}))
+                .expect_err("live harness must not expose attachment dialog internals");
+        assert!(error.to_string().contains("available only in fixture mode"));
+
+        let fixture_options = LaunchOptions {
+            fixture_mode: true,
+            ..LaunchOptions::default()
+        };
+        ensure_automation_request_allowed(&fixture_options, "attachment_test_state", &json!({}))
+            .expect("fixture state inspection");
+        ensure_automation_request_allowed(&fixture_options, "respond_attachment_save", &json!({}))
+            .expect("fixture chooser response");
     }
 
     #[test]

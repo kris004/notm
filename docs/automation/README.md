@@ -63,9 +63,11 @@ rejected for non-fixture runs.
 - Non-fixture receive/sync commands still use the explicit `[sync]` enablement
   and command settings. Run them only when the user intentionally requested the
   configured path.
-- Draft save/delete and attachment operations use the configured local paths;
-  they are not covered by the live send/tag gates and should be driven only
-  when those local file changes are intentional.
+- Draft save/delete operations use configured local paths. Attachment Save uses
+  the GTK chooser and Attachment Open uses an application-owned private
+  temporary directory; both are outside the live send/tag gates. The harness's
+  explicit attachment `dir` bypass writes to that directory and should be used
+  only for intentional storage-level tests.
 - Screenshot and report artifacts are local validation outputs and are ignored by
   git except for `artifacts/logs/.gitkeep`.
 
@@ -96,7 +98,8 @@ Implemented test-harness commands include:
   `list_drafts`, `select_draft_by_index`, `load_selected_draft`,
   `delete_selected_draft`, `delete_active_draft`, `delete_local_draft`,
   `load_draft`, `clear_draft`, `save_selected_attachment`,
-  `open_selected_attachment`, `open_attachment`
+  `save_attachment`, `open_selected_attachment`, `open_attachment`,
+  `attachment_test_state`, `respond_attachment_save`
 - message actions: `show_raw_source`, `open_raw_source`, `show_full_headers`,
   `full_headers`, `show_text_thread`, `show_rendered_thread`,
   `toggle_text_visual`, `show_visual_html`, `show_html_visual`, `image_policy`,
@@ -115,6 +118,24 @@ Implemented test-harness commands include:
 mode. Tests that exercise keyboard editing should send the same `/`, `i`, or
 Enter transition that a user would use instead of relying on the harness to
 change modes implicitly.
+
+`save_selected_attachment` and its `save_attachment` compatibility spelling
+open the same GTK save chooser as the normal UI when `dir` is omitted. The
+fixture-only `attachment_test_state` reports the pending chooser ID, sanitized
+suggested name, visible status, private Open directory, and fake-opener calls.
+Respond deterministically with
+`respond_attachment_save {"id": ID, "response": "accept", "path":
+"/full/target"}` or with `"response": "cancel"`. Accept treats that complete
+target as authoritative and creates a numbered sibling rather than replacing
+an existing file; cancel is a successful no-op. Supplying an explicit `dir` to
+`save_selected_attachment` remains a synchronous storage-test bypass and does
+not exercise the chooser.
+
+Attachment Open writes a safely named file beneath a private, mode-0700
+application directory before launching it. Fixture mode records the path in a
+fake opener instead of starting an external application. The directory and its
+files remain available while the app runs and are removed when the process
+exits normally.
 
 `run_manual_sync` returns with `pending: true` after the configured commands
 have started in the background. Poll `app_state.state.sync_in_progress` until

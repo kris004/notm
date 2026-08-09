@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -1713,6 +1713,181 @@ fn fixture_attachment_save_keeps_existing_files() -> anyhow::Result<()> {
 }
 
 #[test]
+fn fixture_attachment_save_chooser_and_private_open_are_deterministic() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_attachment_save_chooser_and_private_open_are_deterministic: no DISPLAY \
+             or WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running attachment chooser/private-open UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-attachment-flow-ui-{run_id}"));
+    let downloads = work_dir.join("downloads");
+    fs::create_dir_all(&downloads)?;
+    let selected_target = downloads.join("renamed-download.txt");
+    fs::write(&selected_target, b"keep renamed target")?;
+    let collision_target = downloads.join("renamed-download (1).txt");
+    let cancelled_target = downloads.join("cancelled-download.txt");
+
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let artifacts_attachments = repository_root.join("artifacts/attachments");
+    let artifacts_before = directory_tree_snapshot(&artifacts_attachments)?;
+
+    let token = format!("notm-attachment-flow-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+    select_first_thread(&mut driver, "subject:\"Attachment message\"")?;
+
+    let save = driver.command("run_command", json!({"command": ":save_attachment"}))?;
+    assert_eq!(save["ok"], true, "save chooser did not open: {save}");
+    assert_eq!(
+        save["pending"], true,
+        "save completed without a chooser: {save}"
+    );
+    let chooser_id = save["chooser_id"]
+        .as_u64()
+        .with_context(|| format!("save chooser returned no id: {save}"))?;
+    let pending = driver.command("attachment_test_state", json!({}))?;
+    assert_eq!(
+        pending["save_chooser"]["id"], chooser_id,
+        "fixture did not expose the pending chooser: {pending}"
+    );
+    assert_eq!(
+        pending["save_chooser"]["suggested_name"], "note.txt",
+        "chooser did not propose the sanitized attachment name: {pending}"
+    );
+    assert_eq!(
+        pending["save_chooser"]["visible"], true,
+        "save chooser was pending but not visible: {pending}"
+    );
+    let open_temp_dir = pending["open_temp_dir"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("fixture did not report its private open directory: {pending}"))?;
+
+    let accepted = driver.command(
+        "respond_attachment_save",
+        json!({"id": chooser_id, "response": "accept", "path": selected_target}),
+    )?;
+    assert_eq!(accepted["ok"], true, "chooser accept failed: {accepted}");
+    assert_eq!(
+        accepted["path"],
+        collision_target.display().to_string(),
+        "chooser did not honor the renamed full target and collision policy: {accepted}"
+    );
+    assert_eq!(fs::read(&selected_target)?, b"keep renamed target");
+    ensure!(
+        String::from_utf8_lossy(&fs::read(&collision_target)?).contains("attached text"),
+        "accepted chooser target did not receive fixture attachment bytes"
+    );
+
+    let before_cancel_logs = driver.command("get_logs", json!({}))?;
+    let before_cancel_app_state = driver.command("app_state", json!({}))?;
+    let before_cancel_state = driver.command("attachment_test_state", json!({}))?;
+    let cancel_save = driver.command("run_command", json!({"command": ":save_attachment"}))?;
+    let cancel_id = cancel_save["chooser_id"]
+        .as_u64()
+        .with_context(|| format!("second save chooser returned no id: {cancel_save}"))?;
+    let cancelled = driver.command(
+        "respond_attachment_save",
+        json!({"id": cancel_id, "response": "cancel", "path": cancelled_target}),
+    )?;
+    assert_eq!(cancelled["ok"], true, "chooser cancel failed: {cancelled}");
+    assert_eq!(
+        cancelled["accepted"], false,
+        "cancel was reported as accept"
+    );
+    assert_eq!(cancelled["path"], Value::Null, "cancel returned a path");
+    ensure!(
+        !cancelled_target.exists(),
+        "cancelled chooser unexpectedly wrote {}",
+        cancelled_target.display()
+    );
+    let after_cancel_logs = driver.command("get_logs", json!({}))?;
+    let after_cancel_app_state = driver.command("app_state", json!({}))?;
+    let after_cancel_state = driver.command("attachment_test_state", json!({}))?;
+    assert_eq!(
+        after_cancel_logs, before_cancel_logs,
+        "cancel changed operation/error state"
+    );
+    assert_eq!(
+        after_cancel_app_state, before_cancel_app_state,
+        "cancel changed application state"
+    );
+    assert_eq!(
+        after_cancel_state["status_text"], before_cancel_state["status_text"],
+        "cancel changed the visible status"
+    );
+    assert_eq!(
+        after_cancel_state["save_chooser"],
+        Value::Null,
+        "cancel left a chooser pending: {after_cancel_state}"
+    );
+
+    let opened = driver.command("run_command", json!({"command": ":open_attachment"}))?;
+    assert_eq!(
+        opened["ok"], true,
+        "private attachment Open failed: {opened}"
+    );
+    let opened_path = opened["path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("Open returned no path: {opened}"))?;
+    assert_eq!(opened_path.parent(), Some(open_temp_dir.as_path()));
+    assert_eq!(
+        opened_path.file_name().and_then(|name| name.to_str()),
+        Some("note.txt")
+    );
+    ensure!(
+        String::from_utf8_lossy(&fs::read(&opened_path)?).contains("attached text"),
+        "private Open file did not contain fixture attachment bytes"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = fs::metadata(&open_temp_dir)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "private Open directory mode was {mode:o}");
+    }
+    let opened_state = driver.command("attachment_test_state", json!({}))?;
+    assert_eq!(
+        opened_state["fake_opener"], true,
+        "fixture did not use its fake opener: {opened_state}"
+    );
+    let opener_calls = json_array_at(&opened_state, &["fake_opener_calls"])?;
+    ensure!(
+        opener_calls.len() == 1 && opener_calls[0] == opened_path.display().to_string(),
+        "fixture opener did not receive exactly the private path: {opened_state}"
+    );
+    assert_eq!(
+        directory_tree_snapshot(&artifacts_attachments)?,
+        artifacts_before,
+        "attachment Open changed artifacts/attachments"
+    );
+
+    let closed = driver.command("close_main_window", json!({}))?;
+    assert_eq!(closed["ok"], true, "could not close fixture app: {closed}");
+    drop(driver);
+    let exit_status = app.wait_for_exit(STARTUP_TIMEOUT)?;
+    eprintln!("attachment chooser/private-open fixture exited with {exit_status}");
+    ensure!(
+        exit_status.success(),
+        "fixture app exited unsuccessfully with {exit_status}\n{}",
+        app.logs()
+    );
+    ensure!(
+        !open_temp_dir.exists(),
+        "application exit did not remove {}",
+        open_temp_dir.display()
+    );
+
+    Ok(())
+}
+
+#[test]
 fn fixture_malformed_text_shows_a_decode_warning() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
@@ -2809,6 +2984,39 @@ fn select_first_thread(driver: &mut UiDriver, query: &str) -> anyhow::Result<()>
         "could not select fixture thread: {selected}"
     );
     Ok(())
+}
+
+fn directory_tree_snapshot(root: &Path) -> anyhow::Result<BTreeMap<PathBuf, Option<Vec<u8>>>> {
+    fn visit(
+        root: &Path,
+        directory: &Path,
+        snapshot: &mut BTreeMap<PathBuf, Option<Vec<u8>>>,
+    ) -> anyhow::Result<()> {
+        for entry in fs::read_dir(directory)
+            .with_context(|| format!("reading directory snapshot {}", directory.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("snapshot entry is below its root")
+                .to_path_buf();
+            if entry.file_type()?.is_dir() {
+                snapshot.insert(relative, None);
+                visit(root, &path, snapshot)?;
+            } else {
+                snapshot.insert(relative, Some(fs::read(&path)?));
+            }
+        }
+        Ok(())
+    }
+
+    let mut snapshot = BTreeMap::new();
+    if root.exists() {
+        snapshot.insert(PathBuf::from("."), None);
+        visit(root, root, &mut snapshot)?;
+    }
+    Ok(snapshot)
 }
 
 fn message_tags(state: &Value) -> anyhow::Result<BTreeMap<String, BTreeSet<String>>> {
