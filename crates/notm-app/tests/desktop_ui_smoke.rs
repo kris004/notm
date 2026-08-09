@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TEST_HARNESS_APPLICATION_ID_ENV: &str = "NOTM_TEST_HARNESS_APPLICATION_ID";
+const REQUIRE_GTK_DISPLAY_ENV: &str = "NOTM_REQUIRE_GTK_DISPLAY";
 
 struct FixtureApp {
     child: Child,
@@ -279,7 +280,7 @@ impl Drop for FixtureApp {
 
 #[test]
 fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP fixture_app_serves_authenticated_desktop_harness: no DISPLAY or \
              WAYLAND_DISPLAY is available"
@@ -493,7 +494,7 @@ fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
 
 #[test]
 fn fixture_compose_attachment_headers_are_safe_and_round_trip() -> anyhow::Result<()> {
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP fixture_compose_attachment_headers_are_safe_and_round_trip: no DISPLAY or \
              WAYLAND_DISPLAY is available"
@@ -583,7 +584,7 @@ fn fixture_compose_attachment_headers_are_safe_and_round_trip() -> anyhow::Resul
 fn fixture_harness_quarantines_external_commands() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP fixture_harness_quarantines_external_commands: no DISPLAY or \
              WAYLAND_DISPLAY is available"
@@ -709,7 +710,7 @@ fn fixture_harness_quarantines_external_commands() -> anyhow::Result<()> {
 fn slow_manual_sync_keeps_desktop_responsive() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP slow_manual_sync_keeps_desktop_responsive: no DISPLAY or \
              WAYLAND_DISPLAY is available"
@@ -995,7 +996,7 @@ fn slow_manual_sync_keeps_desktop_responsive() -> anyhow::Result<()> {
 fn closing_main_window_waits_for_manual_sync() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP closing_main_window_waits_for_manual_sync: no DISPLAY or \
              WAYLAND_DISPLAY is available"
@@ -1069,7 +1070,7 @@ fn closing_main_window_waits_for_manual_sync() -> anyhow::Result<()> {
 fn live_harness_denies_ungated_mutations_and_reports_reply_noops() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP live_harness_denies_ungated_mutations_and_reports_reply_noops: no DISPLAY or \
              WAYLAND_DISPLAY is available"
@@ -1178,7 +1179,7 @@ fn live_harness_denies_ungated_mutations_and_reports_reply_noops() -> anyhow::Re
 #[cfg(unix)]
 #[test]
 fn default_draft_recovery_migrates_clears_and_reports_autosave_failures() -> anyhow::Result<()> {
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP default_draft_recovery_migrates_clears_and_reports_autosave_failures: no \
              DISPLAY or WAYLAND_DISPLAY is available"
@@ -1311,7 +1312,7 @@ fn default_draft_recovery_migrates_clears_and_reports_autosave_failures() -> any
 #[cfg(unix)]
 #[test]
 fn validated_config_launches_and_invalid_layout_requests_are_rejected() -> anyhow::Result<()> {
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP validated_config_launches_and_invalid_layout_requests_are_rejected: no DISPLAY or \
              WAYLAND_DISPLAY is available"
@@ -1433,7 +1434,7 @@ fn validated_config_launches_and_invalid_layout_requests_are_rejected() -> anyho
 #[cfg(unix)]
 #[test]
 fn invalid_config_exits_before_exposing_the_desktop_harness() -> anyhow::Result<()> {
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP invalid_config_exits_before_exposing_the_desktop_harness: no DISPLAY or \
              WAYLAND_DISPLAY is available"
@@ -1473,7 +1474,7 @@ fn invalid_config_exits_before_exposing_the_desktop_harness() -> anyhow::Result<
 
 #[test]
 fn fixture_cold_message_id_launch_preserves_target_and_startup_query() -> anyhow::Result<()> {
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP fixture_cold_message_id_launch_preserves_target_and_startup_query: no DISPLAY or \
              WAYLAND_DISPLAY is available"
@@ -1519,7 +1520,7 @@ fn fixture_cold_message_id_launch_preserves_target_and_startup_query() -> anyhow
 
 #[test]
 fn fixture_existing_instance_message_id_request_reaches_primary() -> anyhow::Result<()> {
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP fixture_existing_instance_message_id_request_reaches_primary: no DISPLAY or \
              WAYLAND_DISPLAY is available"
@@ -1584,7 +1585,7 @@ fn assert_target_message_rendered(driver: &mut UiDriver) -> anyhow::Result<()> {
 #[cfg(unix)]
 #[test]
 fn fixture_reply_all_preserves_quoted_names_and_flattens_groups() -> anyhow::Result<()> {
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP fixture_reply_all_preserves_quoted_names_and_flattens_groups: no DISPLAY or \
              WAYLAND_DISPLAY is available"
@@ -1636,7 +1637,7 @@ fn fixture_reply_all_preserves_quoted_names_and_flattens_groups() -> anyhow::Res
 
 #[test]
 fn fixture_attachment_save_keeps_existing_files() -> anyhow::Result<()> {
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP fixture_attachment_save_keeps_existing_files: no DISPLAY or \
              WAYLAND_DISPLAY is available"
@@ -1713,7 +1714,7 @@ fn fixture_attachment_save_keeps_existing_files() -> anyhow::Result<()> {
 
 #[test]
 fn fixture_malformed_text_shows_a_decode_warning() -> anyhow::Result<()> {
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP fixture_malformed_text_shows_a_decode_warning: no DISPLAY or \
              WAYLAND_DISPLAY is available"
@@ -1810,7 +1811,7 @@ fn fixture_malformed_text_shows_a_decode_warning() -> anyhow::Result<()> {
 fn external_file_arg_send_reports_existing_sent_copy() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP external_file_arg_send_reports_existing_sent_copy: no DISPLAY or \
              WAYLAND_DISPLAY is available"
@@ -1928,7 +1929,7 @@ fn external_file_arg_send_reports_existing_sent_copy() -> anyhow::Result<()> {
 fn timed_out_send_reports_failure_and_leaves_desktop_responsive() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP timed_out_send_reports_failure_and_leaves_desktop_responsive: no DISPLAY or \
              WAYLAND_DISPLAY is available"
@@ -2063,7 +2064,7 @@ fn timed_out_send_reports_failure_and_leaves_desktop_responsive() -> anyhow::Res
 fn slow_send_preserves_newer_composer_edits_and_serializes_writes() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP slow_send_preserves_newer_composer_edits_and_serializes_writes: no DISPLAY or \
              WAYLAND_DISPLAY is available"
@@ -2251,7 +2252,7 @@ fn slow_send_preserves_newer_composer_edits_and_serializes_writes() -> anyhow::R
 fn closing_main_window_waits_for_send_finalization() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP closing_main_window_waits_for_send_finalization: no DISPLAY or WAYLAND_DISPLAY \
              is available"
@@ -2366,7 +2367,7 @@ fn closing_main_window_waits_for_send_finalization() -> anyhow::Result<()> {
 fn reactivating_during_send_reuses_the_pending_window_session() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP reactivating_during_send_reuses_the_pending_window_session: no DISPLAY or \
              WAYLAND_DISPLAY is available"
@@ -2477,7 +2478,7 @@ fn reactivating_during_send_reuses_the_pending_window_session() -> anyhow::Resul
 fn accepted_send_aggregates_cleanup_failures_and_preserves_recovery() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP accepted_send_aggregates_cleanup_failures_and_preserves_recovery: no DISPLAY or \
              WAYLAND_DISPLAY is available"
@@ -2582,7 +2583,7 @@ fn accepted_send_aggregates_cleanup_failures_and_preserves_recovery() -> anyhow:
 
 #[test]
 fn fixture_standalone_message_window_keeps_its_thread_snapshot() -> anyhow::Result<()> {
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP fixture_standalone_message_window_keeps_its_thread_snapshot: no DISPLAY or \
              WAYLAND_DISPLAY is available"
@@ -2707,7 +2708,7 @@ fn fixture_standalone_message_window_keeps_its_thread_snapshot() -> anyhow::Resu
 
 #[test]
 fn fixture_tag_undo_restores_each_messages_original_tags() -> anyhow::Result<()> {
-    let Some(display) = gtk_display_environment() else {
+    let Some(display) = gtk_display_environment()? else {
         eprintln!(
             "SKIP fixture_tag_undo_restores_each_messages_original_tags: no DISPLAY or \
              WAYLAND_DISPLAY is available"
@@ -2838,8 +2839,21 @@ fn toml_path(path: &std::path::Path) -> String {
     toml::Value::String(path.display().to_string()).to_string()
 }
 
-fn gtk_display_environment() -> Option<String> {
-    display_environment_from(|name| std::env::var(name).ok())
+fn gtk_display_environment() -> anyhow::Result<Option<String>> {
+    let display = display_environment_from(|name| std::env::var(name).ok());
+    let required = std::env::var(REQUIRE_GTK_DISPLAY_ENV).is_ok_and(|value| value == "1");
+    enforce_required_display(display, required)
+}
+
+fn enforce_required_display(
+    display: Option<String>,
+    required: bool,
+) -> anyhow::Result<Option<String>> {
+    ensure!(
+        !required || display.is_some(),
+        "{REQUIRE_GTK_DISPLAY_ENV}=1 requires a non-empty DISPLAY or WAYLAND_DISPLAY"
+    );
+    Ok(display)
 }
 
 fn display_environment_from(
@@ -2884,6 +2898,26 @@ fn display_gate_requires_a_nonempty_display_name() {
             "DISPLAY" => Some(":42".to_string()),
             _ => None,
         }),
+        Some("DISPLAY=:42".to_string())
+    );
+}
+
+#[test]
+fn required_display_mode_fails_instead_of_skipping_without_display() {
+    let error = enforce_required_display(None, true)
+        .expect_err("required-display mode must reject an absent display");
+
+    assert!(
+        error.to_string().contains(REQUIRE_GTK_DISPLAY_ENV),
+        "required-display error did not name the opt-in: {error}"
+    );
+    assert_eq!(
+        enforce_required_display(None, false).expect("optional display gate"),
+        None
+    );
+    assert_eq!(
+        enforce_required_display(Some("DISPLAY=:42".to_string()), true)
+            .expect("present required display"),
         Some("DISPLAY=:42".to_string())
     );
 }
