@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+SPDX-FileCopyrightText: 2026 notm contributors
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="notm">
+  <defs>
+    <linearGradient id="background" x1="18" y1="14" x2="110" y2="114" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#476bdf"/>
+      <stop offset="1" stop-color="#243d99"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="25" fill="url(#background)"/>
+  <path d="M27 39h74a9 9 0 0 1 9 9v42a9 9 0 0 1-9 9H27a9 9 0 0 1-9-9V48a9 9 0 0 1 9-9Z" fill="#f7f8ff"/>
+  <path d="m24 46 40 31 40-31" fill="none" stroke="#243d99" stroke-linecap="round" stroke-linejoin="round" stroke-width="8"/>
+  <path d="M24 92 51 68m53 24L77 68" fill="none" stroke="#aebdf5" stroke-linecap="round" stroke-width="6"/>
+  <circle cx="101" cy="31" r="17" fill="#ef476f"/>
+  <path d="M96 31h10m-5-5v10" fill="none" stroke="#fff" stroke-linecap="round" stroke-width="4"/>
+</svg>
