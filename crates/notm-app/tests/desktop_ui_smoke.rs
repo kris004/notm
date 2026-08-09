@@ -1357,6 +1357,190 @@ fn default_draft_recovery_migrates_clears_and_reports_autosave_failures() -> any
 
 #[cfg(unix)]
 #[test]
+fn fixture_saved_drafts_are_visible_activatable_and_delete_safely() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_saved_drafts_are_visible_activatable_and_delete_safely: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running saved-draft list desktop UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-saved-draft-list-ui-{run_id}"));
+    let token = format!("notm-saved-draft-list-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir.clone(), &token)?;
+    let mut driver = app.connect(&token)?;
+
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
+    let empty = driver.command("draft_list_state", json!({}))?;
+    assert_eq!(
+        empty["section"]["mapped"], true,
+        "section was not rendered: {empty}"
+    );
+    assert_eq!(
+        empty["empty_state"]["text"], "No saved drafts",
+        "empty-state label was not explicit: {empty}"
+    );
+    assert_eq!(
+        empty["empty_state"]["mapped"], true,
+        "empty-state label was not rendered: {empty}"
+    );
+    assert_eq!(
+        empty["scroller"]["visible"], false,
+        "empty list scrolled: {empty}"
+    );
+    assert_eq!(
+        empty["delete_button"]["label"], "Delete selected draft",
+        "draft delete action was not clearly labeled: {empty}"
+    );
+    assert_eq!(
+        empty["delete_button"]["mapped"], true,
+        "draft delete action was not rendered: {empty}"
+    );
+    ensure!(
+        json_array_at(&empty, &["list", "rows"])?.is_empty(),
+        "empty composer exposed draft rows: {empty}"
+    );
+
+    for (command, value) in [
+        ("compose_set_to", "saved@example.test"),
+        ("compose_set_subject", "Visible named draft"),
+        (
+            "compose_set_body",
+            "This body must be restored by row activation.",
+        ),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(response["ok"], true, "{command} failed: {response}");
+    }
+    let saved = driver.command("save_draft", json!({}))?;
+    assert_eq!(saved["ok"], true, "draft save failed: {saved}");
+    let saved_path = saved["report"]["local_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("saved draft had no local path: {saved}"))?;
+    ensure!(saved_path.is_file(), "saved draft file is missing");
+
+    let visible = driver.command("draft_list_state", json!({}))?;
+    assert_eq!(
+        visible["empty_state"]["visible"], false,
+        "empty state remained visible beside a draft: {visible}"
+    );
+    assert_eq!(
+        visible["scroller"]["mapped"], true,
+        "saved-draft scroller was not rendered: {visible}"
+    );
+    assert_eq!(
+        visible["list"]["mapped"], true,
+        "draft list was not rendered: {visible}"
+    );
+    assert_eq!(visible["scroller"]["min_content_height"], 72);
+    assert_eq!(visible["scroller"]["max_content_height"], 160);
+    let rows = json_array_at(&visible, &["list", "rows"])?;
+    ensure!(
+        rows.len() == 1
+            && rows[0]["mapped"] == true
+            && rows[0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Visible named draft")),
+        "saved draft row was not visibly populated: {visible}"
+    );
+
+    let cleared = driver.command("clear_draft", json!({}))?;
+    assert_eq!(
+        cleared["ok"], true,
+        "closing active draft failed: {cleared}"
+    );
+    assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
+    let activated = driver.command("activate_draft_by_index", json!({"index": 0}))?;
+    assert_eq!(activated["ok"], true, "row activation failed: {activated}");
+    assert_eq!(activated["list"]["selected_index"], 0);
+    assert_eq!(
+        activated["compose_fields"]["subject"], "Visible named draft",
+        "row activation did not load the saved subject: {activated}"
+    );
+    assert_eq!(
+        activated["compose_fields"]["body"], "This body must be restored by row activation.",
+        "row activation did not load the saved body: {activated}"
+    );
+    assert_eq!(
+        activated["active_draft"]["path"],
+        saved_path.display().to_string(),
+        "activated row did not become the active draft: {activated}"
+    );
+    assert_eq!(
+        activated["delete_button"]["sensitive"], true,
+        "selected-draft delete action was not enabled: {activated}"
+    );
+
+    let saved_bytes = fs::read(&saved_path)?;
+    let recovery_path = activated["recovery_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("draft-list state had no recovery path: {activated}"))?;
+    let recovery_bytes = fs::read(&recovery_path)?;
+    let draft_dir = saved_path.parent().context("saved draft parent")?;
+    fs::set_permissions(draft_dir, fs::Permissions::from_mode(0o555))?;
+    let failed = driver.command("click_delete_selected_draft", json!({}));
+    fs::set_permissions(draft_dir, fs::Permissions::from_mode(0o755))?;
+    let failed = failed?;
+    assert_eq!(
+        failed["ok"], false,
+        "read-only draft deletion succeeded: {failed}"
+    );
+    ensure!(
+        failed["last_error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("Saved draft delete failed:")),
+        "failed persistence was not reported: {failed}"
+    );
+    assert_eq!(
+        failed["active_draft"]["path"],
+        saved_path.display().to_string(),
+        "failed deletion cleared the active draft: {failed}"
+    );
+    ensure!(
+        fs::read(&saved_path)? == saved_bytes && fs::read(&recovery_path)? == recovery_bytes,
+        "failed deletion changed persisted draft or recovery bytes"
+    );
+
+    let deleted = driver.command("click_delete_selected_draft", json!({}))?;
+    assert_eq!(deleted["ok"], true, "draft delete retry failed: {deleted}");
+    assert_eq!(
+        deleted["deleted"], true,
+        "draft file survived delete: {deleted}"
+    );
+    assert_eq!(
+        deleted["active_draft"],
+        Value::Null,
+        "successful deletion left the deleted draft active: {deleted}"
+    );
+    assert_eq!(
+        deleted["compose_fields"]["subject"], "Visible named draft",
+        "successful deletion unexpectedly cleared composer fields: {deleted}"
+    );
+    assert_eq!(
+        deleted["empty_state"]["mapped"], true,
+        "empty state did not return after deletion: {deleted}"
+    );
+    assert_eq!(deleted["scroller"]["visible"], false);
+    assert_eq!(deleted["delete_button"]["sensitive"], false);
+    assert_eq!(deleted["last_error"], Value::Null);
+    ensure!(
+        !saved_path.exists(),
+        "successful delete left {saved_path:?}"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn validated_config_launches_and_invalid_layout_requests_are_rejected() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(

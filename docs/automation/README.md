@@ -97,9 +97,10 @@ Implemented test-harness commands include:
   `attachment_list_items`, `select_attachment_by_index`, `save_draft`,
   `list_drafts`, `select_draft_by_index`, `load_selected_draft`,
   `delete_selected_draft`, `delete_active_draft`, `delete_local_draft`,
-  `load_draft`, `clear_draft`, `save_selected_attachment`,
-  `save_attachment`, `open_selected_attachment`, `open_attachment`,
-  `attachment_test_state`, `respond_attachment_save`
+  `load_draft`, `clear_draft`, `draft_list_state`,
+  `activate_draft_by_index`, `click_delete_selected_draft`,
+  `save_selected_attachment`, `save_attachment`, `open_selected_attachment`,
+  `open_attachment`, `attachment_test_state`, `respond_attachment_save`
 - message actions: `show_raw_source`, `open_raw_source`, `show_full_headers`,
   `full_headers`, `show_text_thread`, `show_rendered_thread`,
   `toggle_text_visual`, `show_visual_html`, `show_html_visual`, `image_policy`,
@@ -118,6 +119,16 @@ Implemented test-harness commands include:
 mode. Tests that exercise keyboard editing should send the same `/`, `i`, or
 Enter transition that a user would use instead of relying on the harness to
 change modes implicitly.
+
+In fixture mode, `draft_list_state` reports whether the rendered Saved drafts
+section, explicit empty state, bounded scroller, rows, and per-selection Delete
+button are mapped. It also reports the selected row, compose fields, active
+draft, and fixture persistence paths. `activate_draft_by_index` selects a row
+and emits the real list activation signal; `click_delete_selected_draft` emits
+the real Delete button click and reports whether its selected file was removed.
+These three UI-test controls are rejected outside fixture mode. The older
+`select_draft_by_index`, `load_selected_draft`, and `delete_selected_draft`
+commands remain direct compatibility controls.
 
 `save_selected_attachment` and its `save_attachment` compatibility spelling
 open the same GTK save chooser as the normal UI when `dir` is omitted. The

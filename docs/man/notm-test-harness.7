@@ -112,6 +112,19 @@ outstanding; non-fixture runs reject that test-only argument.
 .BR compose_set_body ,
 .BR compose_add_attachment ,
 .BR compose_send .
+.SS Drafts
+.BR save_draft ,
+.BR list_drafts ,
+.BR select_draft_by_index ,
+.BR load_selected_draft ,
+.BR delete_selected_draft ,
+.BR delete_active_draft ,
+.BR delete_local_draft ,
+.BR load_draft ,
+.BR clear_draft ,
+.BR draft_list_state ,
+.BR activate_draft_by_index ,
+.BR click_delete_selected_draft .
 .SS Replies and forwards
 .BR reply_selected ,
 .BR reply_all_selected ,
@@ -181,6 +194,20 @@ pending, the application remains alive until send finalization completes.
 .B close_main_window
 closes only the primary window after returning its response.  Standalone
 message windows are left open.
+.PP
+In fixture mode,
+.B draft_list_state
+reports whether the rendered Saved drafts section, explicit empty state,
+bounded scroller, rows, and per-selection Delete button are mapped.  It also
+reports the selected row, compose fields, active draft, and fixture persistence
+paths.
+.B activate_draft_by_index
+selects a row and emits the real list activation signal.
+.B click_delete_selected_draft
+emits the real Delete button click and reports whether the selected draft file
+was removed.  These three UI-test controls are rejected outside fixture mode;
+the older select, load, and delete commands remain direct compatibility
+controls.
 .PP
 .B save_selected_attachment
 and its

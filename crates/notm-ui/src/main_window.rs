@@ -590,7 +590,11 @@ struct Widgets {
     active_address_entry: Rc<RefCell<Option<gtk::Entry>>>,
     active_address_field: Rc<Cell<Option<RecipientField>>>,
     address_completion: Rc<RefCell<Option<AddressCompletionSession>>>,
+    draft_section: gtk::Box,
+    draft_empty_label: gtk::Label,
+    draft_scrolled: gtk::ScrolledWindow,
     draft_list: gtk::ListBox,
+    delete_selected_draft_button: gtk::Button,
     drafts_dir: PathBuf,
     legacy_drafts_dir: Option<PathBuf>,
     standalone_windows: Rc<RefCell<Vec<Rc<StandaloneMessageWindow>>>>,
@@ -894,6 +898,8 @@ const SIDEBAR_MIN_WIDTH: i32 = 136;
 const THREAD_LIST_MIN_WIDTH: i32 = 320;
 const COMPOSE_BODY_MIN_HEIGHT: i32 = 96;
 const COMPOSE_BODY_NATURAL_HEIGHT: i32 = 260;
+const DRAFT_LIST_MIN_HEIGHT: i32 = 72;
+const DRAFT_LIST_MAX_HEIGHT: i32 = 160;
 // GTK measures the message header at unbounded width during compact pane allocation.
 // Reserving multiple lines per metadata row can force the whole message pane taller
 // than the available window; full values stay available via selection and tooltip.
@@ -1648,9 +1654,50 @@ fn build_ui(
     composer_box.append(&compose_subject);
     composer_box.append(&scrolled_compose_body);
     composer_box.append(&compose_attachments);
+    let draft_section = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    draft_section.set_widget_name("notm-saved-drafts-section");
+    draft_section.set_hexpand(true);
+    let draft_header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    draft_header.set_hexpand(true);
+    let draft_title = gtk::Label::new(Some("Saved drafts"));
+    draft_title.set_widget_name("notm-saved-drafts-title");
+    draft_title.set_xalign(0.0);
+    draft_title.set_hexpand(true);
+    draft_title.add_css_class("heading");
+    let delete_selected_draft_button = gtk::Button::with_label("Delete selected draft");
+    delete_selected_draft_button.set_widget_name("notm-delete-selected-draft-button");
+    delete_selected_draft_button.add_css_class("destructive-action");
+    delete_selected_draft_button.set_sensitive(false);
+    draft_header.append(&draft_title);
+    draft_header.append(&delete_selected_draft_button);
+    draft_section.append(&draft_header);
+    let draft_empty_label = gtk::Label::new(Some("No saved drafts"));
+    draft_empty_label.set_widget_name("notm-saved-drafts-empty");
+    draft_empty_label.set_xalign(0.0);
+    draft_empty_label.add_css_class("dim-label");
+    draft_empty_label.set_margin_start(6);
+    draft_empty_label.set_margin_end(6);
+    draft_empty_label.set_margin_top(6);
+    draft_empty_label.set_margin_bottom(6);
+    draft_section.append(&draft_empty_label);
     let draft_list = gtk::ListBox::new();
     draft_list.set_widget_name("notm-draft-list");
     draft_list.set_selection_mode(gtk::SelectionMode::Single);
+    draft_list.set_activate_on_single_click(false);
+    draft_list.add_css_class("boxed-list");
+    let draft_scrolled = gtk::ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(false)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(false)
+        .min_content_height(DRAFT_LIST_MIN_HEIGHT)
+        .max_content_height(DRAFT_LIST_MAX_HEIGHT)
+        .child(&draft_list)
+        .build();
+    draft_scrolled.set_widget_name("notm-saved-drafts-scrolled");
+    draft_section.append(&draft_scrolled);
+    composer_box.append(&draft_section);
     composer_box.append(&composer_actions);
     message_stack.add_named(&composer_box, Some("compose"));
 
@@ -1847,7 +1894,11 @@ fn build_ui(
         active_address_entry,
         active_address_field,
         address_completion,
+        draft_section,
+        draft_empty_label,
+        draft_scrolled,
         draft_list,
+        delete_selected_draft_button,
         drafts_dir,
         legacy_drafts_dir,
         standalone_windows: Rc::new(RefCell::new(Vec::new())),
@@ -1921,6 +1972,7 @@ fn build_ui(
         &clear_draft_button,
         &delete_local_draft_button,
     );
+    connect_draft_list(&widgets, &state);
     connect_compose_vim_context(&options, &widgets, &state, &compose_vim_context);
     connect_message_actions(&options, &widgets, &state);
     connect_recipient_autocomplete(&widgets.compose_to, &widgets, &state);
@@ -3729,6 +3781,41 @@ fn connect_compose_helpers(
         });
         dialog.show();
     });
+}
+
+fn connect_draft_list(widgets: &Widgets, state: &SharedState) {
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets.draft_list.connect_row_selected(move |_, _| {
+        update_draft_action_buttons(&w, &st);
+    });
+
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets.draft_list.connect_row_activated(move |list, row| {
+        list.select_row(Some(row));
+        match load_selected_named_draft(&w, &st) {
+            Ok(path) => {
+                let message = format!("Loaded saved draft {}", path.display());
+                {
+                    let mut state = st.borrow_mut();
+                    state.last_error = None;
+                    state.last_operation = Some(message.clone());
+                }
+                w.status_label.set_text(&message);
+                update_debug(&w, &st);
+            }
+            Err(err) => report_draft_persistence_error(&w, &st, "Saved draft load failed", &err),
+        }
+    });
+
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets
+        .delete_selected_draft_button
+        .connect_clicked(move |_| {
+            delete_selected_named_draft_from_ui(&w, &st);
+        });
 }
 
 fn connect_message_actions(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -8052,6 +8139,9 @@ fn update_draft_action_buttons(widgets: &Widgets, state: &SharedState) {
     widgets
         .delete_local_draft_button
         .set_sensitive(!background_activity);
+    widgets
+        .delete_selected_draft_button
+        .set_sensitive(!background_activity && widgets.draft_list.selected_row().is_some());
     widgets.draft_list.set_sensitive(!send_in_progress);
     update_button_binding_labels(widgets, state);
 }
@@ -8426,11 +8516,9 @@ fn refresh_draft_list(widgets: &Widgets) {
     while let Some(child) = widgets.draft_list.first_child() {
         widgets.draft_list.remove(&child);
     }
-    for (index, (path, fields)) in
-        list_named_drafts(&widgets.drafts_dir, widgets.legacy_drafts_dir.as_deref())
-            .into_iter()
-            .enumerate()
-    {
+    let drafts = list_named_drafts(&widgets.drafts_dir, widgets.legacy_drafts_dir.as_deref());
+    let is_empty = drafts.is_empty();
+    for (index, (path, fields)) in drafts.into_iter().enumerate() {
         let row = gtk::ListBoxRow::new();
         row.set_widget_name(&format!("notm-draft-row-{index}"));
         let subject = if fields.subject.trim().is_empty() {
@@ -8457,6 +8545,9 @@ fn refresh_draft_list(widgets: &Widgets) {
         row.set_child(Some(&label));
         widgets.draft_list.append(&row);
     }
+    widgets.draft_empty_label.set_visible(is_empty);
+    widgets.draft_scrolled.set_visible(!is_empty);
+    widgets.delete_selected_draft_button.set_sensitive(false);
 }
 
 fn selected_named_draft(widgets: &Widgets) -> anyhow::Result<(PathBuf, ComposeFields)> {
@@ -8471,7 +8562,7 @@ fn selected_named_draft(widgets: &Widgets) -> anyhow::Result<(PathBuf, ComposeFi
         .ok_or_else(|| anyhow::anyhow!("no selected draft"))
 }
 
-fn load_selected_named_draft(widgets: &Widgets, state: &SharedState) -> anyhow::Result<()> {
+fn load_selected_named_draft(widgets: &Widgets, state: &SharedState) -> anyhow::Result<PathBuf> {
     ensure_user_operation_allowed(widgets, state, UserOperation::DraftLoad)?;
     let (path, fields) = selected_named_draft(widgets)?;
     apply_compose_fields(widgets, state, fields.clone());
@@ -8479,22 +8570,52 @@ fn load_selected_named_draft(widgets: &Widgets, state: &SharedState) -> anyhow::
         widgets,
         state,
         Some(ActiveDraft {
-            path,
+            path: path.clone(),
             message_id: None,
             indexed: false,
             saved_fields: fields,
         }),
     );
     show_compose_view(widgets);
-    Ok(())
+    Ok(path)
 }
 
-fn delete_selected_named_draft(widgets: &Widgets, state: &SharedState) -> anyhow::Result<()> {
+fn delete_selected_named_draft(widgets: &Widgets, state: &SharedState) -> anyhow::Result<PathBuf> {
     ensure_user_operation_allowed(widgets, state, UserOperation::DraftDelete)?;
     let (path, _) = selected_named_draft(widgets)?;
-    std::fs::remove_file(path)?;
+    std::fs::remove_file(&path)
+        .map_err(|err| anyhow::anyhow!("removing saved draft {}: {err}", path.display()))?;
+    let deleted_active_draft =
+        active_draft_matches_path(state.borrow().active_draft.as_ref(), &path);
+    if deleted_active_draft {
+        set_active_draft(widgets, state, None);
+    }
     refresh_draft_list(widgets);
-    Ok(())
+    Ok(path)
+}
+
+fn active_draft_matches_path(active_draft: Option<&ActiveDraft>, path: &Path) -> bool {
+    active_draft.is_some_and(|draft| draft.path == path)
+}
+
+fn delete_selected_named_draft_from_ui(widgets: &Widgets, state: &SharedState) -> bool {
+    match delete_selected_named_draft(widgets, state) {
+        Ok(path) => {
+            let message = format!("Deleted saved draft {}", path.display());
+            {
+                let mut state = state.borrow_mut();
+                state.last_error = None;
+                state.last_operation = Some(message.clone());
+            }
+            widgets.status_label.set_text(&message);
+            update_debug(widgets, state);
+            true
+        }
+        Err(err) => {
+            report_draft_persistence_error(widgets, state, "Saved draft delete failed", &err);
+            false
+        }
+    }
 }
 
 fn migrate_legacy_recovery_draft(path: &Path, legacy_path: &Path) -> anyhow::Result<bool> {
@@ -16527,14 +16648,51 @@ fn handle_automation_request(
                 json!({"ok": false, "error": "draft index not found"})
             }
         }
+        "draft_list_state" => {
+            spin_main_context_for(Duration::from_millis(75));
+            draft_list_state_json(widgets, state)
+        }
+        "activate_draft_by_index" => {
+            let index = req.args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
+            if let Some(row) = widgets.draft_list.row_at_index(index) {
+                widgets.draft_list.select_row(Some(&row));
+                widgets
+                    .draft_list
+                    .emit_by_name::<()>("row-activated", &[&row]);
+                spin_main_context_for(Duration::from_millis(25));
+                draft_list_state_json(widgets, state)
+            } else {
+                json!({"ok": false, "error": "draft index not found"})
+            }
+        }
+        "click_delete_selected_draft" => {
+            let selected = selected_named_draft(widgets).map(|(path, _)| path);
+            match selected {
+                Ok(path) => {
+                    let existed_before = path.exists();
+                    widgets.delete_selected_draft_button.emit_clicked();
+                    spin_main_context_for(Duration::from_millis(25));
+                    let deleted = existed_before && !path.exists();
+                    let mut response = draft_list_state_json(widgets, state);
+                    response["ok"] = json!(deleted);
+                    response["deleted"] = json!(deleted);
+                    response["path"] = json!(path);
+                    response
+                }
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            }
+        }
         "load_selected_draft" => match load_selected_named_draft(widgets, state) {
-            Ok(()) => json!({"ok": true, "compose_fields": state.borrow().compose_fields}),
+            Ok(path) => {
+                json!({"ok": true, "path": path, "compose_fields": state.borrow().compose_fields})
+            }
             Err(err) => json!({"ok": false, "error": err.to_string()}),
         },
-        "delete_selected_draft" => match delete_selected_named_draft(widgets, state) {
-            Ok(()) => json!({"ok": true}),
-            Err(err) => json!({"ok": false, "error": err.to_string()}),
-        },
+        "delete_selected_draft" => {
+            let ok = delete_selected_named_draft_from_ui(widgets, state);
+            let error = (!ok).then(|| widgets.status_label.text().to_string());
+            json!({"ok": ok, "error": error, "compose_fields": state.borrow().compose_fields, "active_draft": state.borrow().active_draft, "last_error": state.borrow().last_error})
+        }
         "delete_active_draft" | "delete_local_draft" => {
             let ok = delete_active_draft_from_ui(options, widgets, state);
             let error = (!ok).then(|| widgets.status_label.text().to_string());
@@ -16922,6 +17080,71 @@ fn attachment_test_state_json(widgets: &Widgets) -> serde_json::Value {
     })
 }
 
+fn draft_list_state_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
+    let selected_index = widgets.draft_list.selected_row().map(|row| row.index());
+    let mut rows = Vec::new();
+    let mut index = 0;
+    while let Some(row) = widgets.draft_list.row_at_index(index) {
+        let text = row
+            .child()
+            .and_then(|child| child.downcast::<gtk::Label>().ok())
+            .map(|label| label.text().to_string())
+            .unwrap_or_default();
+        rows.push(json!({
+            "index": index,
+            "widget_name": row.widget_name().to_string(),
+            "visible": row.is_visible(),
+            "mapped": row.is_mapped(),
+            "text": text,
+        }));
+        index += 1;
+    }
+    let adjustment = widgets.draft_scrolled.vadjustment();
+    let state = state.borrow();
+    json!({
+        "ok": true,
+        "section": {
+            "visible": widgets.draft_section.is_visible(),
+            "mapped": widgets.draft_section.is_mapped(),
+        },
+        "empty_state": {
+            "text": widgets.draft_empty_label.text().to_string(),
+            "visible": widgets.draft_empty_label.is_visible(),
+            "mapped": widgets.draft_empty_label.is_mapped(),
+        },
+        "scroller": {
+            "visible": widgets.draft_scrolled.is_visible(),
+            "mapped": widgets.draft_scrolled.is_mapped(),
+            "min_content_height": DRAFT_LIST_MIN_HEIGHT,
+            "max_content_height": DRAFT_LIST_MAX_HEIGHT,
+            "scroll_upper": adjustment.upper(),
+            "scroll_page_size": adjustment.page_size(),
+        },
+        "list": {
+            "visible": widgets.draft_list.is_visible(),
+            "mapped": widgets.draft_list.is_mapped(),
+            "selected_index": selected_index,
+            "rows": rows,
+        },
+        "delete_button": {
+            "label": widgets
+                .delete_selected_draft_button
+                .label()
+                .map(|label| label.to_string()),
+            "visible": widgets.delete_selected_draft_button.is_visible(),
+            "mapped": widgets.delete_selected_draft_button.is_mapped(),
+            "sensitive": widgets.delete_selected_draft_button.is_sensitive(),
+        },
+        "compose_fields": &state.compose_fields,
+        "active_draft": &state.active_draft,
+        "recovery_path": &widgets.draft_path,
+        "drafts_dir": &widgets.drafts_dir,
+        "last_error": &state.last_error,
+        "last_operation": &state.last_operation,
+        "status_text": widgets.status_label.text().to_string(),
+    })
+}
+
 fn rendered_thread_preview_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
     let root = widgets.thread_list.clone().upcast::<gtk::Widget>();
     let rendered = (0..state.borrow().thread_list_items.len()).find_map(|index| {
@@ -17151,6 +17374,9 @@ fn ensure_automation_request_allowed(
         "run_manual_sync" => Some(AutomationOperation::ExternalSync),
         "attachment_test_state"
         | "respond_attachment_save"
+        | "draft_list_state"
+        | "activate_draft_by_index"
+        | "click_delete_selected_draft"
         | "settings_test_state"
         | "respond_settings" => Some(AutomationOperation::FixtureOnly),
         "run_command" => args
@@ -20311,6 +20537,56 @@ mod tests {
             .expect("fixture state inspection");
         ensure_automation_request_allowed(&fixture_options, "respond_attachment_save", &json!({}))
             .expect("fixture chooser response");
+    }
+
+    #[test]
+    fn draft_list_test_controls_are_fixture_only() {
+        let live_options = LaunchOptions::default();
+        for command in [
+            "draft_list_state",
+            "activate_draft_by_index",
+            "click_delete_selected_draft",
+        ] {
+            let error = ensure_automation_request_allowed(&live_options, command, &json!({}))
+                .expect_err("live harness must not expose draft-list widget controls");
+            assert!(error.to_string().contains("available only in fixture mode"));
+        }
+
+        let fixture_options = LaunchOptions {
+            fixture_mode: true,
+            ..LaunchOptions::default()
+        };
+        for command in [
+            "draft_list_state",
+            "activate_draft_by_index",
+            "click_delete_selected_draft",
+        ] {
+            ensure_automation_request_allowed(&fixture_options, command, &json!({}))
+                .expect("fixture draft-list UI control");
+        }
+    }
+
+    #[test]
+    fn named_draft_delete_only_matches_the_same_active_path() {
+        let active = ActiveDraft {
+            path: PathBuf::from("/tmp/notm-active-draft.json"),
+            message_id: None,
+            indexed: false,
+            saved_fields: ComposeFields::default(),
+        };
+
+        assert!(active_draft_matches_path(
+            Some(&active),
+            Path::new("/tmp/notm-active-draft.json")
+        ));
+        assert!(!active_draft_matches_path(
+            Some(&active),
+            Path::new("/tmp/notm-other-draft.json")
+        ));
+        assert!(!active_draft_matches_path(
+            None,
+            Path::new("/tmp/notm-active-draft.json")
+        ));
     }
 
     #[test]
