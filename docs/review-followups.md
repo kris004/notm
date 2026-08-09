@@ -60,20 +60,19 @@ the active table; it is not a second status table.
 Update this block at every handoff; historical evidence remains append-only.
 
 - Captured: 2026-08-09.
-- Branch: `main`. Last implementation and tested-tree HEAD: `0bbddc4`; current
+- Branch: `main`. Last implementation and tested-tree HEAD: `92c01b6`; current
   HEAD is the tracker-only evidence commit containing this snapshot.
-- Active item/child checkpoint: `S02-CACHES.1`; the generic bounded-LRU module
-  and architecture text are present as unstaged worktree changes, while typed
-  key and production-cache integration has not started.
+- Active item/child checkpoint: `R12-DRAFTS.1`; add the visible saved-drafts
+  list and its deterministic fixture controls before unifying destructive
+  confirmation in `.2`.
 - Owner: Codex. Blockers: none recorded.
 - Unrelated dirty paths that must not be staged, overwritten, stashed, or reset:
   `Cargo.toml`, `Cargo.lock`, and
   `crates/notm-mail/src/html_sanitize.rs`.
 - Tracker baseline commit: `93bfe88`.
-- Exact next command: `git status --short --branch`, then implement the common
-  attachment payload/controller, GTK save chooser, private-store Open path,
-  fixture chooser/opener seams, named GTK smoke, and harness documentation for
-  `R07-ATTACHMENTS.2`.
+- Exact next command: `git status --short --branch`, then inspect the composer
+  draft persistence and fixture-harness paths before implementing
+  `R12-DRAFTS.1`.
 
 ## Completion protocol
 
@@ -123,7 +122,7 @@ scope of this work:
 | `R10-SETTINGS` | Make `ui.theme` and `ui.thread_preview_lines` functional rather than silently storing inert values. | `DONE` | Both `.1` preview/validation/runtime behavior and `.2` three-mode theme behavior were exact-tree validated at `0bbddc4`, including real Settings-dialog seams and non-skipping GTK proof. |
 | `R12-DRAFTS` | Make named drafts visible and confirm destructive draft actions. | `OPEN` | Durable persistence/error reporting exists, but `draft_list` is populated without being appended to the composer and discard/delete handlers mutate immediately. |
 | `S01-MODULES` | Incrementally extract composer, search, attachment, settings, and standalone-window controllers from `main_window.rs`. | `OPEN` | `main_window.rs` is 20,580 lines; all 11 existing `widgets/*.rs` leaf files contain only placeholder comments. |
-| `S02-CACHES` | Bound the search and thread-detail caches, including accumulation across database revisions. | `OPEN` | `SEARCH_CACHE` and `THREAD_DETAIL_CACHE` are unbounded `BTreeMap`s with no eviction; delimiter-formatted keys also permit excluded-tag collisions. |
+| `S02-CACHES` | Bound the search and thread-detail caches, including accumulation across database revisions. | `DONE` | Exact-tree validated at `92c01b6`: typed full-identity keys and true-LRU caches bound search pages to 64 and thread details to 4,096 entries, with local-instance capacity/recency/collision/isolation proofs. |
 | `S03-CI` | Add CI for formatting, Clippy, tests, and the real fixture-driven GTK smoke. | `IN PROGRESS` | `.1` is implemented and exact-tree validated at `dda9d45`; `.2` still requires the final integrated pushed SHA and green run URL. |
 | `S04-SYNC-DOCS` | Reconcile startup-sync documentation with the implemented opt-in startup settings. | `DONE` | Implemented and exact-tree validated at `4eb32d6`; current docs, Settings copy, sync selection tests, fixture gate, and non-skipping Wayland GTK smoke agree. |
 | `S05-PACKAGING` | Add an application icon and AppStream metadata, including installation support. | `DONE` | `.1` canonical assets were validated at `4f16123`; `.2` installation, migration, uninstall, and isolated packaging validation were exact-tree validated at `e942054`. |
@@ -538,6 +537,8 @@ Append entries; do not rewrite history.
 
 | 2026-08-09 | `R10-SETTINGS.1`, `R10-SETTINGS.2` | `IN PROGRESS` -> `DONE`. | implementation `0bbddc4`; tested tree `0bbddc4` | In the stable exact checkout, formatting, workspace Clippy with `-D warnings`, workspace all-target/all-feature tests, `fixture-smoke`, `probe-send`, 62 UI unit tests, 19 app/config unit tests, binary config-validation tests, both changed man-page lints, and `git diff --check` passed. `fixture_settings_preview_limits_apply_without_partial_persistence` passed on `WAYLAND_DISPLAY=wayland-1`, exit 0, with no `SKIP`, proving real-dialog 1/3-line Apply, hide precedence, Save, and nonnumeric/zero/21/unknown-theme rejection without runtime/rendered/config mutation. `fixture_theme_modes_follow_both_simulated_system_preferences` passed on the same backend, exit 0, with no `SKIP`; separate deterministic system-light and system-dark processes distinguished System/Light/Dark by resolved `theme_bg_color`, checked GTK 4.20 and legacy properties, proved System reset, and persisted a forced mode. Config-to-runtime propagation, direct invalid-launch rejection, bounded 1,024-character cached previews, serde compatibility defaults, UI text, man pages, harness docs, and the compatibility changelog note are covered. The committed files were byte-compared with the validated exact checkout. |
 
+| 2026-08-09 | `S02-CACHES.1` | `OPEN` -> `DONE`. | implementation `92c01b6`; tested tree `92c01b6` | In the stable exact checkout, formatting, workspace Clippy with `-D warnings`, workspace all-target/all-feature tests, `fixture-smoke`, `probe-send`, and `git diff --check` passed. The 74 UI unit tests include local 64-entry search and 4,096-entry detail caches that prove per-insert bounds, hit recency, replacement without growth, true-LRU eviction, overflow rebasing, new revision/UUID eviction, every typed key dimension, excluded-tag comma-collision and order isolation, and path/revision/thread isolation. Fixture/search database integration passed 3/3. `fixture_app_serves_authenticated_desktop_harness` and `validated_config_launches_and_invalid_layout_requests_are_rejected` passed on `WAYLAND_DISPLAY=wayland-1`, exit 0, with no `SKIP`, covering async search and configured paging. Lock scopes are restricted to lookup/insert, cached previews remain pre-display-limit, and the architecture documentation names both limits. The committed files were byte-compared with the validated exact checkout. |
+
 ## Decision log
 
 Append explicit scope changes, user-approved deferrals, or superseding decisions
@@ -549,8 +550,8 @@ here. Absence of an entry means the scope above still applies.
 
 ## Exact next action
 
-Complete `S02-CACHES.1`: integrate the bounded-LRU module into both production
-caches, replace formatted keys with full typed identities, snapshot runtime
-settings once per search, keep locks outside Notmuch/filesystem/MIME work, and
-add the full local-instance key/bound/recency tests. Then exact-tree validate and
-commit the cache checkpoint before starting draft work.
+Complete `R12-DRAFTS.1`: append a bounded, scrollable saved-drafts list to the
+composer, expose deterministic fixture controls for its state/activation, and
+make successful deletion clear an active draft without hiding persistence
+errors. Exact-tree validate and commit that checkpoint before implementing the
+shared confirmation controller in `R12-DRAFTS.2`.
