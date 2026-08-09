@@ -60,11 +60,11 @@ the active table; it is not a second status table.
 Update this block at every handoff; historical evidence remains append-only.
 
 - Captured: 2026-08-09.
-- Branch: `main`. Last implementation and tested-tree HEAD: `eb9113f`; current
+- Branch: `main`. Last implementation and tested-tree HEAD: `0bbddc4`; current
   HEAD is the tracker-only evidence commit containing this snapshot.
-- Active item/child checkpoint: `R10-SETTINGS.1`; validation/model/theme
-  foundation is present as unstaged worktree changes, while `main_window.rs`
-  propagation, rendering, dialog seams, and GTK proof have not started.
+- Active item/child checkpoint: `S02-CACHES.1`; the generic bounded-LRU module
+  and architecture text are present as unstaged worktree changes, while typed
+  key and production-cache integration has not started.
 - Owner: Codex. Blockers: none recorded.
 - Unrelated dirty paths that must not be staged, overwritten, stashed, or reset:
   `Cargo.toml`, `Cargo.lock`, and
@@ -120,7 +120,7 @@ scope of this work:
 | ID | Recommendation | State | Verified current evidence |
 | --- | --- | --- | --- |
 | `R07-ATTACHMENTS` | Use a save chooser for Save; use private temporary storage for Open. | `DONE` | `.1` storage/private-directory semantics were validated at `0bf9afd`; `.2` chooser/opener wiring, fixture seams, docs, and non-skipping GTK proof were exact-tree validated at `eb9113f`. |
-| `R10-SETTINGS` | Make `ui.theme` and `ui.thread_preview_lines` functional rather than silently storing inert values. | `IN PROGRESS` | Typed validation/theme foundation is present as unstaged work; runtime rendering, dialog behavior, persistence proof, and required-display GTK tests remain unfinished. |
+| `R10-SETTINGS` | Make `ui.theme` and `ui.thread_preview_lines` functional rather than silently storing inert values. | `DONE` | Both `.1` preview/validation/runtime behavior and `.2` three-mode theme behavior were exact-tree validated at `0bbddc4`, including real Settings-dialog seams and non-skipping GTK proof. |
 | `R12-DRAFTS` | Make named drafts visible and confirm destructive draft actions. | `OPEN` | Durable persistence/error reporting exists, but `draft_list` is populated without being appended to the composer and discard/delete handlers mutate immediately. |
 | `S01-MODULES` | Incrementally extract composer, search, attachment, settings, and standalone-window controllers from `main_window.rs`. | `OPEN` | `main_window.rs` is 20,580 lines; all 11 existing `widgets/*.rs` leaf files contain only placeholder comments. |
 | `S02-CACHES` | Bound the search and thread-detail caches, including accumulation across database revisions. | `OPEN` | `SEARCH_CACHE` and `THREAD_DETAIL_CACHE` are unbounded `BTreeMap`s with no eviction; delimiter-formatted keys also permit excluded-tag collisions. |
@@ -536,6 +536,8 @@ Append entries; do not rewrite history.
 
 | 2026-08-09 | `R07-ATTACHMENTS.2` | Parent `IN PROGRESS` -> `DONE`. | implementation `eb9113f`; tested tree `eb9113f` | In the stable exact checkout, formatting, workspace Clippy with `-D warnings`, workspace all-target/all-feature tests, `fixture-smoke`, `probe-send`, attachment unit tests (mail 7/7 and UI 3/3), `mandoc -T lint`, and `git diff --check` passed. `fixture_attachment_save_keeps_existing_files` and the new `fixture_attachment_save_chooser_and_private_open_are_deterministic` both passed on `WAYLAND_DISPLAY=wayland-1`, exit 0, with no `SKIP`; the latter recorded normal application exit status 0. The smoke proves sanitized chooser defaults, authoritative renamed targets, no-clobber collision numbering, cancellation with unchanged state/no write, private mode-0700 Open storage, fixture fake-opener bytes/path, no `artifacts/attachments` change, and normal-exit cleanup. All normal UI/command compatibility paths share the controller, the explicit `dir` bypass remains storage-only, and the seams are documented. The committed files were byte-compared with the validated exact checkout. |
 
+| 2026-08-09 | `R10-SETTINGS.1`, `R10-SETTINGS.2` | `IN PROGRESS` -> `DONE`. | implementation `0bbddc4`; tested tree `0bbddc4` | In the stable exact checkout, formatting, workspace Clippy with `-D warnings`, workspace all-target/all-feature tests, `fixture-smoke`, `probe-send`, 62 UI unit tests, 19 app/config unit tests, binary config-validation tests, both changed man-page lints, and `git diff --check` passed. `fixture_settings_preview_limits_apply_without_partial_persistence` passed on `WAYLAND_DISPLAY=wayland-1`, exit 0, with no `SKIP`, proving real-dialog 1/3-line Apply, hide precedence, Save, and nonnumeric/zero/21/unknown-theme rejection without runtime/rendered/config mutation. `fixture_theme_modes_follow_both_simulated_system_preferences` passed on the same backend, exit 0, with no `SKIP`; separate deterministic system-light and system-dark processes distinguished System/Light/Dark by resolved `theme_bg_color`, checked GTK 4.20 and legacy properties, proved System reset, and persisted a forced mode. Config-to-runtime propagation, direct invalid-launch rejection, bounded 1,024-character cached previews, serde compatibility defaults, UI text, man pages, harness docs, and the compatibility changelog note are covered. The committed files were byte-compared with the validated exact checkout. |
+
 ## Decision log
 
 Append explicit scope changes, user-approved deferrals, or superseding decisions
@@ -547,9 +549,8 @@ here. Absence of an entry means the scope above still applies.
 
 ## Exact next action
 
-Complete `R10-SETTINGS.1`: integrate the typed theme and preview-line settings
-through `LaunchOptions`, runtime state, initial build, live Apply/Save, bounded
-preview rendering, and strict dialog validation; add deterministic harness
-state/response seams and named non-skipping GTK preview coverage. Then exact-tree
-validate and commit `.1` before implementing the three-mode theme smoke in
-`R10-SETTINGS.2`.
+Complete `S02-CACHES.1`: integrate the bounded-LRU module into both production
+caches, replace formatted keys with full typed identities, snapshot runtime
+settings once per search, keep locks outside Notmuch/filesystem/MIME work, and
+add the full local-instance key/bound/recency tests. Then exact-tree validate and
+commit the cache checkpoint before starting draft work.
