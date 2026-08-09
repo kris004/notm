@@ -60,19 +60,19 @@ the active table; it is not a second status table.
 Update this block at every handoff; historical evidence remains append-only.
 
 - Captured: 2026-08-09.
-- Branch: `main`. Last implementation and tested-tree HEAD: `dda9d45`; current
+- Branch: `main`. Last implementation and tested-tree HEAD: `0bf9afd`; current
   HEAD is the tracker-only evidence commit containing this snapshot.
-- Active item/child checkpoint: `R07-ATTACHMENTS.1`; its implementation is
-  present in the worktree and requires exact-tree validation and an
-  implementation commit.
+- Active item/child checkpoint: `R07-ATTACHMENTS.2`; implementation has not
+  started.
 - Owner: Codex. Blockers: none recorded.
 - Unrelated dirty paths that must not be staged, overwritten, stashed, or reset:
   `Cargo.toml`, `Cargo.lock`, and
   `crates/notm-mail/src/html_sanitize.rs`.
 - Tracker baseline commit: `93bfe88`.
-- Exact next command: `git status --short --branch`, then export only the
-  `R07-ATTACHMENTS.1` storage/private-directory patch into the stable exact
-  checkout and run its targeted and baseline validation.
+- Exact next command: `git status --short --branch`, then implement the common
+  attachment payload/controller, GTK save chooser, private-store Open path,
+  fixture chooser/opener seams, named GTK smoke, and harness documentation for
+  `R07-ATTACHMENTS.2`.
 
 ## Completion protocol
 
@@ -118,7 +118,7 @@ scope of this work:
 
 | ID | Recommendation | State | Verified current evidence |
 | --- | --- | --- | --- |
-| `R07-ATTACHMENTS` | Use a save chooser for Save; use private temporary storage for Open. | `IN PROGRESS` | `.1` storage and private-directory changes are implemented but uncommitted in the worktree; `.2` chooser/opener wiring has not started. No completion credit yet. |
+| `R07-ATTACHMENTS` | Use a save chooser for Save; use private temporary storage for Open. | `IN PROGRESS` | `.1` storage/private-directory semantics are implemented and exact-tree validated at `0bf9afd`; `.2` chooser/opener wiring and GTK proof have not started. |
 | `R10-SETTINGS` | Make `ui.theme` and `ui.thread_preview_lines` functional rather than silently storing inert values. | `OPEN` | `bd9b8ac` added general validation, but these fields are absent from `LaunchOptions`/runtime rendering and `AppConfig::validate`; the dialog still uses `unwrap_or(2)`. |
 | `R12-DRAFTS` | Make named drafts visible and confirm destructive draft actions. | `OPEN` | Durable persistence/error reporting exists, but `draft_list` is populated without being appended to the composer and discard/delete handlers mutate immediately. |
 | `S01-MODULES` | Incrementally extract composer, search, attachment, settings, and standalone-window controllers from `main_window.rs`. | `OPEN` | `main_window.rs` is 20,580 lines; all 11 existing `widgets/*.rs` leaf files contain only placeholder comments. |
@@ -527,6 +527,7 @@ Append entries; do not rewrite history.
 | 2026-08-09 | `S04-SYNC-DOCS` | `OPEN` -> `DONE` | implementation `4eb32d6`; tested tree `4eb32d6` | In the stable clean checkout, `cargo fmt --all -- --check`, workspace Clippy with `-D warnings`, workspace all-target/all-feature tests, `fixture-smoke`, `probe-send`, `cargo test -p notm-ui sync -- --nocapture` (6 passed), the app fixture-side-effect test, `mandoc -Tlint`, the required contradiction `rg`, and `git diff --check` all passed. `fixture_harness_quarantines_external_commands` passed on `WAYLAND_DISPLAY=wayland-1` with exit 0 and no `SKIP`. A pre-existing startup label failure was first reproduced 0/20 and corrected by prerequisite commit `21b8565`; the immediate standalone GTK regression then passed 20/20 with no skips. The committed S04 files were byte-compared with the validated exact checkout. |
 | 2026-08-09 | `R07-ATTACHMENTS`, `S03-CI` | `OPEN` -> `IN PROGRESS` | pending | Their first checkpoints are present only as unstaged worktree changes. They remain unfinished until separately exact-tree validated, committed, and followed by tracker-only evidence; `R07-ATTACHMENTS.2` and `S03-CI.2` have not been completed. |
 | 2026-08-09 | `S03-CI.1` | Parent remains `IN PROGRESS` pending `.2`. | implementation `dda9d45`; tested tree `dda9d45` | `actionlint` 1.7.12 with ShellCheck, full-SHA action-pin assertions, formatting, workspace Clippy, workspace all-target/all-feature tests, `fixture-smoke`, baseline `probe-send`, disposable `/usr/bin/true` `probe-send`, and `git diff --check` passed in the stable exact checkout. The focused required-display predicate passed; an actual unset-display run failed with the named `NOTM_REQUIRE_GTK_DISPLAY=1` error and no `SKIP`. The complete `desktop_ui_smoke` target ran serially under a fresh D-Bus session on `WAYLAND_DISPLAY=wayland-1`: 24 passed, exit 0, no skips. Local Gentoo lacked Xvfb/Xauth, so the exact Xvfb wrapper remains delegated to the workflow, which installs and verifies both; the committed files were byte-compared with the validated checkout. `.2` still requires a green remote run on the final integrated SHA. |
+| 2026-08-09 | `R07-ATTACHMENTS.1` | Parent remains `IN PROGRESS` pending `.2`. | implementation `0bf9afd`; tested tree `0bf9afd` | In the stable exact checkout, formatting, workspace Clippy, workspace all-target/all-feature tests, `fixture-smoke`, `probe-send`, and `git diff --check` passed. Focused attachment storage tests passed 7/7, attachment-open tempdir tests passed 2/2, and `attachment_contract` passed 4/4. The required-display standalone GTK launch regression passed on `WAYLAND_DISPLAY=wayland-1` with exit 0 and no skip. Tests prove full-target authority/no-clobber numbering, sanitizer behavior, concurrent atomic reservation, mode 0700, and owner-drop cleanup. The committed files were byte-compared with the validated checkout. |
 
 ## Decision log
 
@@ -539,12 +540,12 @@ here. Absence of an entry means the scope above still applies.
 
 ## Exact next action
 
-Recheck `git status`, isolate only the `R07-ATTACHMENTS.1` changes in
-`crates/notm-mail/src/attachments.rs`, `crates/notm-ui/Cargo.toml`, and the
-private attachment-open directory ownership/plumbing/tests in
-`crates/notm-ui/src/main_window.rs`, and apply that patch to the stable clean
-exact checkout at `dda9d45`. Run the attachment storage/tempdir unit and
-contract tests plus the baseline suite. Then commit `.1` without the unrelated
-Cargo/HTML changes, verify the committed files against the tested checkout, and
-follow it with a tracker-only evidence commit; leave the parent `IN PROGRESS`
-for chooser/opener checkpoint `.2`.
+Implement `R07-ATTACHMENTS.2` from the acceptance criteria: route all normal
+Save entry points through one GTK save chooser using the full-target helper;
+route every Open entry point through the application-owned private directory;
+add fixture-only pending chooser responses and a fake opener; remove both
+normal `artifacts/attachments` fallbacks; document the seams; and add a named
+non-skipping GTK smoke that drives accept, collision, cancel, Open, mode 0700,
+and normal-exit cleanup. Preserve the explicit harness `dir` storage bypass.
+Then exact-tree validate, commit only `.2`, and follow it with tracker-only
+evidence before marking the parent `DONE`.
