@@ -1,4 +1,5 @@
 pub mod automation;
+mod cache;
 pub mod main_window;
 pub mod messages;
 pub mod model;

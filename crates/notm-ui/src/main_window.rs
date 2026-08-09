@@ -49,6 +49,7 @@ use webkit6::{
 
 use crate::{
     automation::{self, AutomationConfig, AutomationRequest},
+    cache::{BoundedLruCache, SEARCH_PAGE_CACHE_CAPACITY, THREAD_DETAIL_CACHE_CAPACITY},
     model::{
         ActiveDraft, ActivePane, ComposeFields, ContentLayout, InputMode, LayoutPreference,
         MAX_THREAD_PREVIEW_LINES, ThemePreference, ThreadUiDetails, UiState,
@@ -833,6 +834,25 @@ struct SearchData {
     cached: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SearchCacheKey {
+    database_path: String,
+    database_uuid: String,
+    database_revision: u64,
+    query: String,
+    offset: usize,
+    limit: usize,
+    excluded_tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ThreadDetailCacheKey {
+    database_path: String,
+    database_uuid: String,
+    database_revision: u64,
+    thread_id: String,
+}
+
 struct SearchResponse {
     generation: u64,
     result: anyhow::Result<SearchData>,
@@ -856,8 +876,19 @@ struct ThreadPageResponse {
     result: anyhow::Result<SearchData>,
 }
 
-static SEARCH_CACHE: OnceLock<Mutex<BTreeMap<String, SearchData>>> = OnceLock::new();
-static THREAD_DETAIL_CACHE: OnceLock<Mutex<BTreeMap<String, ThreadUiDetails>>> = OnceLock::new();
+static SEARCH_CACHE: OnceLock<Mutex<BoundedLruCache<SearchCacheKey, SearchData>>> = OnceLock::new();
+static THREAD_DETAIL_CACHE: OnceLock<
+    Mutex<BoundedLruCache<ThreadDetailCacheKey, ThreadUiDetails>>,
+> = OnceLock::new();
+
+fn search_cache() -> &'static Mutex<BoundedLruCache<SearchCacheKey, SearchData>> {
+    SEARCH_CACHE.get_or_init(|| Mutex::new(BoundedLruCache::new(SEARCH_PAGE_CACHE_CAPACITY)))
+}
+
+fn thread_detail_cache() -> &'static Mutex<BoundedLruCache<ThreadDetailCacheKey, ThreadUiDetails>> {
+    THREAD_DETAIL_CACHE
+        .get_or_init(|| Mutex::new(BoundedLruCache::new(THREAD_DETAIL_CACHE_CAPACITY)))
+}
 
 const SIDEBAR_MIN_WIDTH: i32 = 136;
 const THREAD_LIST_MIN_WIDTH: i32 = 320;
@@ -10823,26 +10854,34 @@ fn execute_search_page(
     query: &str,
     offset: usize,
 ) -> anyhow::Result<SearchData> {
+    let runtime = runtime_settings(options);
+    let limit = runtime.page_size.max(1);
+    let excluded_tags = runtime.excluded_tags;
     let db = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
     let revision = db.revision();
     let db_path = db.path();
-    let key = search_cache_key(options, query, &db_path, &revision, offset);
-    if let Some(mut cached) = SEARCH_CACHE
-        .get_or_init(Default::default)
-        .lock()
-        .expect("search cache lock")
-        .get(&key)
-        .cloned()
-    {
+    let key = search_cache_key(
+        query,
+        &db_path,
+        &revision,
+        offset,
+        limit,
+        excluded_tags.clone(),
+    );
+    let cached = {
+        let mut cache = search_cache().lock().expect("search cache lock");
+        cache.get(&key).cloned()
+    };
+    if let Some(mut cached) = cached {
         cached.cached = true;
         return Ok(cached);
     }
     let tags = db.all_tags();
     let opts = QueryOptions {
-        limit: runtime_page_size(options),
+        limit,
         offset,
         sort: SortOrder::NewestFirst,
-        excluded_tags: runtime_excluded_tags(options),
+        excluded_tags,
     };
     let threads = db.search_threads(query, &opts)?;
     let count = db
@@ -10855,14 +10894,13 @@ fn execute_search_page(
         details,
         count,
         offset,
-        limit: runtime_page_size(options),
+        limit,
         tags,
         database_path: db_path,
         revision,
         cached: false,
     };
-    SEARCH_CACHE
-        .get_or_init(Default::default)
+    search_cache()
         .lock()
         .expect("search cache lock")
         .insert(key, data.clone());
@@ -11193,22 +11231,22 @@ fn thread_window_status_from_parts(offset: usize, loaded: usize, total: usize) -
 }
 
 fn search_cache_key(
-    options: &LaunchOptions,
     query: &str,
     db_path: &str,
     revision: &notm_notmuch::Revision,
     offset: usize,
-) -> String {
-    format!(
-        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
-        db_path,
-        revision.uuid,
-        revision.revision,
-        runtime_page_size(options),
+    limit: usize,
+    excluded_tags: Vec<String>,
+) -> SearchCacheKey {
+    SearchCacheKey {
+        database_path: db_path.to_string(),
+        database_uuid: revision.uuid.clone(),
+        database_revision: revision.revision,
+        query: query.to_string(),
         offset,
-        runtime_excluded_tags(options).join(","),
-        query
-    )
+        limit,
+        excluded_tags,
+    }
 }
 
 fn apply_search_error(widgets: &Widgets, state: &SharedState, err: anyhow::Error) {
@@ -11700,14 +11738,14 @@ fn thread_details_for_threads(
 ) -> BTreeMap<String, ThreadUiDetails> {
     let mut out = BTreeMap::new();
     for thread in threads {
-        let cache_key = thread_detail_cache_key(database_path, Some(revision), &thread.thread_id);
-        if let Some(detail) = THREAD_DETAIL_CACHE
-            .get_or_init(Default::default)
-            .lock()
-            .expect("thread detail cache lock")
-            .get(&cache_key)
-            .cloned()
-        {
+        let cache_key = thread_detail_cache_key(database_path, revision, &thread.thread_id);
+        let cached = {
+            let mut cache = thread_detail_cache()
+                .lock()
+                .expect("thread detail cache lock");
+            cache.get(&cache_key).cloned()
+        };
+        if let Some(detail) = cached {
             out.insert(thread.thread_id.clone(), detail);
             continue;
         }
@@ -11715,8 +11753,7 @@ fn thread_details_for_threads(
             .thread_messages(&thread.thread_id)
             .map(|messages| compute_thread_detail(&messages))
             .unwrap_or_default();
-        THREAD_DETAIL_CACHE
-            .get_or_init(Default::default)
+        thread_detail_cache()
             .lock()
             .expect("thread detail cache lock")
             .insert(cache_key, detail.clone());
@@ -11727,13 +11764,15 @@ fn thread_details_for_threads(
 
 fn thread_detail_cache_key(
     db_path: &str,
-    revision: Option<&notm_notmuch::Revision>,
+    revision: &notm_notmuch::Revision,
     thread_id: &str,
-) -> String {
-    let (rev, uuid) = revision
-        .map(|revision| (revision.revision, revision.uuid.as_str()))
-        .unwrap_or_default();
-    format!("{db_path}\u{1f}{uuid}\u{1f}{rev}\u{1f}{thread_id}")
+) -> ThreadDetailCacheKey {
+    ThreadDetailCacheKey {
+        database_path: db_path.to_string(),
+        database_uuid: revision.uuid.clone(),
+        database_revision: revision.revision,
+        thread_id: thread_id.to_string(),
+    }
 }
 
 fn compute_thread_detail(messages: &[notm_notmuch::MessageSummary]) -> ThreadUiDetails {
@@ -20851,6 +20890,258 @@ mod tests {
         let long = body_preview(&"x".repeat(THREAD_PREVIEW_CACHE_MAX_CHARS + 50));
         assert_eq!(long.chars().count(), THREAD_PREVIEW_CACHE_MAX_CHARS);
         assert!(long.ends_with('…'));
+    }
+
+    fn test_revision(uuid: &str, revision: u64) -> notm_notmuch::Revision {
+        notm_notmuch::Revision {
+            uuid: uuid.to_string(),
+            revision,
+        }
+    }
+
+    #[test]
+    fn search_cache_key_preserves_every_dimension_and_tag_boundaries() {
+        let base_revision = test_revision("database-a", 7);
+        let base = search_cache_key(
+            "tag:inbox",
+            "/mail/a",
+            &base_revision,
+            25,
+            25,
+            vec!["a,b".to_string(), "c".to_string()],
+        );
+        let variants = [
+            (
+                "path",
+                search_cache_key(
+                    "tag:inbox",
+                    "/mail/b",
+                    &base_revision,
+                    25,
+                    25,
+                    vec!["a,b".to_string(), "c".to_string()],
+                ),
+            ),
+            (
+                "UUID",
+                search_cache_key(
+                    "tag:inbox",
+                    "/mail/a",
+                    &test_revision("database-b", 7),
+                    25,
+                    25,
+                    vec!["a,b".to_string(), "c".to_string()],
+                ),
+            ),
+            (
+                "revision",
+                search_cache_key(
+                    "tag:inbox",
+                    "/mail/a",
+                    &test_revision("database-a", 8),
+                    25,
+                    25,
+                    vec!["a,b".to_string(), "c".to_string()],
+                ),
+            ),
+            (
+                "query",
+                search_cache_key(
+                    "tag:sent",
+                    "/mail/a",
+                    &base_revision,
+                    25,
+                    25,
+                    vec!["a,b".to_string(), "c".to_string()],
+                ),
+            ),
+            (
+                "offset",
+                search_cache_key(
+                    "tag:inbox",
+                    "/mail/a",
+                    &base_revision,
+                    50,
+                    25,
+                    vec!["a,b".to_string(), "c".to_string()],
+                ),
+            ),
+            (
+                "limit",
+                search_cache_key(
+                    "tag:inbox",
+                    "/mail/a",
+                    &base_revision,
+                    25,
+                    50,
+                    vec!["a,b".to_string(), "c".to_string()],
+                ),
+            ),
+            (
+                "excluded tag boundaries",
+                search_cache_key(
+                    "tag:inbox",
+                    "/mail/a",
+                    &base_revision,
+                    25,
+                    25,
+                    vec!["a".to_string(), "b,c".to_string()],
+                ),
+            ),
+            (
+                "excluded tag order",
+                search_cache_key(
+                    "tag:inbox",
+                    "/mail/a",
+                    &base_revision,
+                    25,
+                    25,
+                    vec!["c".to_string(), "a,b".to_string()],
+                ),
+            ),
+        ];
+        let mut cache = BoundedLruCache::new(variants.len() + 1);
+        cache.insert(base.clone(), "base");
+        for (dimension, key) in &variants {
+            assert_ne!(&base, key, "{dimension} did not distinguish the key");
+            cache.insert(key.clone(), *dimension);
+        }
+
+        assert_eq!(cache.len(), variants.len() + 1);
+        assert_eq!(cache.get(&base), Some(&"base"));
+        for (dimension, key) in &variants {
+            assert_eq!(cache.get(key), Some(dimension));
+        }
+    }
+
+    #[test]
+    fn thread_detail_cache_key_isolates_path_uuid_revision_and_thread() {
+        let base_revision = test_revision("database-a", 7);
+        let base = thread_detail_cache_key("/mail/a", &base_revision, "thread-a");
+        let variants = [
+            (
+                "path",
+                thread_detail_cache_key("/mail/b", &base_revision, "thread-a"),
+            ),
+            (
+                "UUID",
+                thread_detail_cache_key("/mail/a", &test_revision("database-b", 7), "thread-a"),
+            ),
+            (
+                "revision",
+                thread_detail_cache_key("/mail/a", &test_revision("database-a", 8), "thread-a"),
+            ),
+            (
+                "thread ID",
+                thread_detail_cache_key("/mail/a", &base_revision, "thread-b"),
+            ),
+        ];
+        let mut cache = BoundedLruCache::new(variants.len() + 1);
+        cache.insert(base.clone(), "base");
+        for (dimension, key) in &variants {
+            assert_ne!(&base, key, "{dimension} did not distinguish the key");
+            cache.insert(key.clone(), *dimension);
+        }
+
+        assert_eq!(cache.len(), variants.len() + 1);
+        assert_eq!(cache.get(&base), Some(&"base"));
+        for (dimension, key) in &variants {
+            assert_eq!(cache.get(key), Some(dimension));
+        }
+    }
+
+    #[test]
+    fn newer_database_generations_evict_stale_search_entries_by_lru() {
+        let make_key = |revision| {
+            search_cache_key(
+                "tag:inbox",
+                "/mail/a",
+                &test_revision("database-a", revision),
+                0,
+                25,
+                vec!["deleted".to_string()],
+            )
+        };
+        let old = make_key(1);
+        let current = make_key(2);
+        let newest = make_key(3);
+        let mut cache = BoundedLruCache::new(2);
+        cache.insert(old.clone(), "old");
+        cache.insert(current.clone(), "current");
+        assert_eq!(cache.get(&current), Some(&"current"));
+
+        cache.insert(newest.clone(), "newest");
+
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get(&old), None);
+        assert_eq!(cache.get(&current), Some(&"current"));
+        assert_eq!(cache.get(&newest), Some(&"newest"));
+    }
+
+    #[test]
+    fn typed_search_cache_enforces_named_capacity_and_lru() {
+        let revision = test_revision("database-a", 7);
+        let keys = (0..SEARCH_PAGE_CACHE_CAPACITY)
+            .map(|offset| {
+                search_cache_key(
+                    "tag:inbox",
+                    "/mail/a",
+                    &revision,
+                    offset,
+                    1,
+                    vec!["deleted".to_string()],
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut cache = BoundedLruCache::new(SEARCH_PAGE_CACHE_CAPACITY);
+        for (value, key) in keys.iter().cloned().enumerate() {
+            cache.insert(key, value);
+            assert!(cache.len() <= SEARCH_PAGE_CACHE_CAPACITY);
+        }
+        assert_eq!(cache.len(), SEARCH_PAGE_CACHE_CAPACITY);
+
+        assert_eq!(cache.get(&keys[0]), Some(&0));
+        assert_eq!(cache.insert(keys[1].clone(), 101), Some(1));
+        assert_eq!(cache.len(), SEARCH_PAGE_CACHE_CAPACITY);
+        let new_generation = search_cache_key(
+            "tag:inbox",
+            "/mail/a",
+            &test_revision("database-a", 8),
+            0,
+            1,
+            vec!["deleted".to_string()],
+        );
+        cache.insert(new_generation.clone(), 1_000);
+
+        assert_eq!(cache.len(), SEARCH_PAGE_CACHE_CAPACITY);
+        assert_eq!(cache.get(&keys[2]), None);
+        assert_eq!(cache.get(&keys[0]), Some(&0));
+        assert_eq!(cache.get(&keys[1]), Some(&101));
+        assert_eq!(cache.get(&new_generation), Some(&1_000));
+    }
+
+    #[test]
+    fn typed_thread_detail_cache_enforces_named_capacity_and_lru() {
+        let revision = test_revision("database-a", 7);
+        let keys = (0..THREAD_DETAIL_CACHE_CAPACITY)
+            .map(|index| thread_detail_cache_key("/mail/a", &revision, &format!("thread-{index}")))
+            .collect::<Vec<_>>();
+        let mut cache = BoundedLruCache::new(THREAD_DETAIL_CACHE_CAPACITY);
+        for (value, key) in keys.iter().cloned().enumerate() {
+            cache.insert(key, value);
+            assert!(cache.len() <= THREAD_DETAIL_CACHE_CAPACITY);
+        }
+        assert_eq!(cache.len(), THREAD_DETAIL_CACHE_CAPACITY);
+
+        assert_eq!(cache.get(&keys[0]), Some(&0));
+        let new_generation =
+            thread_detail_cache_key("/mail/a", &test_revision("database-b", 8), "thread-0");
+        cache.insert(new_generation.clone(), 10_000);
+
+        assert_eq!(cache.len(), THREAD_DETAIL_CACHE_CAPACITY);
+        assert_eq!(cache.get(&keys[1]), None);
+        assert_eq!(cache.get(&keys[0]), Some(&0));
+        assert_eq!(cache.get(&new_generation), Some(&10_000));
     }
 
     #[test]
