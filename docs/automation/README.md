@@ -5,7 +5,7 @@ flags, config keys, and internal module names used the word "automation". The
 current user-facing name is **developer test harness**.
 
 This is not mail automation, filtering, or rules support. It is a local
-UI-driving test harness for developers and AI agents working on `notm`.
+UI-driving test harness for developers and automated checks working on `notm`.
 
 Normal users do not need the test harness enabled to use `notm`; the public
 README intentionally stays focused on the desktop mail experience.

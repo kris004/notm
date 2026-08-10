@@ -122,6 +122,6 @@ python3 -B tests/ui_text_focus_smoke.py --binary target/debug/notm
 ```
 
 Test-harness reports and screenshots are local validation artifacts under
-`artifacts/`; they are ignored by git except for `artifacts/logs/.gitkeep`. Keep
-long progress reports out of the root README and archive completed planning notes
-under `docs/archive/` when they are no longer current.
+`artifacts/`; they are ignored by git except for `artifacts/logs/.gitkeep`.
+Keep one-off progress reports and completed planning notes out of the public
+documentation tree.

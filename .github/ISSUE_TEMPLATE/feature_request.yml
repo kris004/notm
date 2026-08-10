@@ -1,0 +1,40 @@
+name: Feature request
+description: Suggest a focused improvement to notm
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Explain the mail workflow or problem first. A concrete use case is more
+        helpful than a proposed implementation alone.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or workflow
+      description: >-
+        What are you trying to do, and what makes it difficult today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Suggested behavior
+      description: >-
+        Describe the smallest useful change and any alternatives you
+        considered.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: >-
+        Optional screenshots or examples. Remove private mail and account data
+        first.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Request checks
+      options:
+        - label: I searched existing issues for similar requests.
+          required: true

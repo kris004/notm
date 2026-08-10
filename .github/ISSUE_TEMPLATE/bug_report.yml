@@ -1,0 +1,72 @@
+name: Bug report
+description: Report a reproducible problem in notm
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Use synthetic mail when possible, and
+        remove real addresses, subjects, message IDs, bodies, attachments,
+        paths, tokens, and command arguments from anything you share.
+
+        Report security issues through [private vulnerability
+        reporting](https://github.com/kris004/notm/security/advisories/new)
+        instead.
+  - type: input
+    id: version
+    attributes:
+      label: notm version
+      description: Paste `notm --version` or the commit SHA you built.
+      placeholder: notm 0.1.0 or abc1234
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: >-
+        Linux distribution, desktop/session, and relevant GTK, WebKitGTK, and
+        Notmuch versions.
+      placeholder: Gentoo, Sway/Wayland, GTK 4.x, WebKitGTK 6.x, Notmuch 0.x
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: >-
+        Give the shortest repeatable sequence and any required configuration,
+        with private values removed.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: >-
+        Optional. Redact private mail and configuration before attaching
+        anything.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Report checks
+      options:
+        - label: I searched existing issues for the same problem.
+          required: true
+        - label: >-
+            I removed private mail, credentials, tokens, and secret command
+            values from this report.
+          required: true
