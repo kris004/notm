@@ -38,7 +38,7 @@ chrono = { version = "0.4", features = ["serde", "clock"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 directories = "6.0"
 email_address = "0.2"
-html2text = "0.15"
+html2text = "0.16.5"
 ammonia = "4.1"
 libc = "0.2"
 mailparse = "0.16"

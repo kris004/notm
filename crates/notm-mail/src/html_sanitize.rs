@@ -120,7 +120,14 @@ fn font_size_value_is_safe(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_html;
+    use super::{html_to_safe_text, sanitize_html};
+
+    #[test]
+    fn html_to_text_handles_rowspan_with_empty_rows() {
+        let rendered = html_to_safe_text(r#"<table><td rowspan="8"><tr><tr>"#);
+
+        assert!(rendered.trim().is_empty());
+    }
 
     #[test]
     fn preserves_safe_email_inline_layout_styles() {
