@@ -115,6 +115,10 @@ jobs:
           cargo run -p notm-app -- --config "$probe_config" probe-send
 
       - name: Run the complete GTK smoke with a required display
+        # GitHub-hosted runners block the user namespace required by WebKitGTK's
+        # bubblewrap sandbox. This exception is scoped to disposable fixture UI tests.
+        env:
+          WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS: "1"
         shell: bash
         run: |
           set -euxo pipefail
