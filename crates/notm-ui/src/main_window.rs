@@ -7296,14 +7296,32 @@ fn update_attachment_label(widgets: &Widgets, attachments: &[String]) {
 }
 
 fn attachment_event_handler(widgets: &Widgets, state: &SharedState) -> AttachmentEventHandler {
-    let widgets = widgets.clone();
-    let state = state.clone();
-    Rc::new(move |event| match event {
-        AttachmentEvent::Completed(result) => {
-            apply_attachment_action_result(&widgets, &state, *result);
-        }
-        AttachmentEvent::Failed { action, error } => {
-            report_attachment_error(&widgets, &state, action, &error);
+    let status_label = widgets.status_label.downgrade();
+    let debug_view = widgets.debug_view.downgrade();
+    let state = Rc::downgrade(state);
+    Rc::new(move |event| {
+        let (Some(status_label), Some(debug_view), Some(state)) = (
+            status_label.upgrade(),
+            debug_view.upgrade(),
+            state.upgrade(),
+        ) else {
+            return;
+        };
+        match event {
+            AttachmentEvent::Completed(result) => {
+                status_label.set_text(&result.status);
+                record_attachment_action_result(
+                    &mut state.borrow_mut(),
+                    &result.message_id,
+                    result.operation,
+                );
+                update_debug_view(&debug_view, &state);
+            }
+            AttachmentEvent::Failed { action, error } => {
+                state.borrow_mut().last_error = Some(error.to_string());
+                status_label.set_text(&format!("{action} failed: {error}"));
+                update_debug_view(&debug_view, &state);
+            }
         }
     })
 }
@@ -14309,6 +14327,10 @@ fn run_named_command(
 }
 
 fn update_debug(widgets: &Widgets, state: &SharedState) {
+    update_debug_view(&widgets.debug_view, state);
+}
+
+fn update_debug_view(debug_view: &gtk::TextView, state: &SharedState) {
     let s = state.borrow();
     let text = format!(
         "query: {}\nselected_thread: {}\nselected_message: {}\nlayout: {} ({})\ndatabase_path: {}\ndatabase_revision: {}\nlast_operation: {}\nlast_error: {}\ntest_harness: {}\nsend_in_progress: {}\nsync_in_progress: {}\nlast_send: {}\n",
@@ -14338,7 +14360,7 @@ fn update_debug(widgets: &Widgets, state: &SharedState) {
             .map(|r| format!("accepted={} status={:?}", r.accepted, r.exit_status))
             .unwrap_or_default(),
     );
-    widgets.debug_view.buffer().set_text(&text);
+    debug_view.buffer().set_text(&text);
 }
 
 fn open_config(options: &LaunchOptions) -> OpenConfig {

@@ -83,7 +83,7 @@ struct PendingAttachmentSave {
     id: u64,
     suggested_name: String,
     payload: AttachmentPayload,
-    dialog: gtk::glib::WeakRef<gtk::FileChooserNative>,
+    dialog: gtk::FileChooserNative,
 }
 
 #[derive(Clone)]
@@ -346,18 +346,19 @@ impl AttachmentController {
             Some("Cancel"),
         );
         dialog.set_current_name(&suggested_name);
-        let dialog_weak = dialog.downgrade();
         self.pending_save.replace(Some(PendingAttachmentSave {
             id: chooser_id,
             suggested_name,
             payload,
-            dialog: dialog_weak,
+            dialog: dialog.clone(),
         }));
 
-        let controller = self.clone();
+        let pending_save = Rc::downgrade(&self.pending_save);
         dialog.connect_response(move |dialog, response| {
-            let is_current = controller
-                .pending_save
+            let Some(pending_save) = pending_save.upgrade() else {
+                return;
+            };
+            let is_current = pending_save
                 .borrow()
                 .as_ref()
                 .is_some_and(|pending| pending.id == chooser_id);
@@ -371,7 +372,12 @@ impl AttachmentController {
             emit_result(
                 &event_handler,
                 "Save attachment",
-                controller.complete_pending_save(chooser_id, accepted, target.as_deref()),
+                complete_pending_attachment_save(
+                    pending_save.as_ref(),
+                    chooser_id,
+                    accepted,
+                    target.as_deref(),
+                ),
             );
         });
         dialog.show();
@@ -384,32 +390,7 @@ impl AttachmentController {
         accepted: bool,
         target: Option<&Path>,
     ) -> anyhow::Result<Option<AttachmentActionResult>> {
-        let pending = {
-            let mut slot = self.pending_save.borrow_mut();
-            let pending = slot
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("no attachment save chooser is pending"))?;
-            anyhow::ensure!(
-                pending.id == chooser_id,
-                "attachment save chooser id does not match the pending chooser"
-            );
-            slot.take().expect("pending chooser checked above")
-        };
-
-        let result = if accepted {
-            let target = target.ok_or_else(|| {
-                anyhow::anyhow!("the attachment save chooser did not return a local target path")
-            });
-            target.and_then(|target| self.save_to_target(&pending.payload, target).map(Some))
-        } else {
-            Ok(None)
-        };
-
-        if let Some(dialog) = pending.dialog.upgrade() {
-            dialog.hide();
-            dialog.destroy();
-        }
-        result
+        complete_pending_attachment_save(self.pending_save.as_ref(), chooser_id, accepted, target)
     }
 
     pub(crate) fn save_to_directory(
@@ -449,10 +430,7 @@ impl AttachmentController {
             json!({
                 "id": pending.id,
                 "suggested_name": pending.suggested_name,
-                "visible": pending
-                    .dialog
-                    .upgrade()
-                    .is_some_and(|dialog| dialog.is_visible()),
+                "visible": pending.dialog.is_visible(),
             })
         });
         let fake_opener_calls = self.opener.fixture_calls();
@@ -595,15 +573,41 @@ impl AttachmentController {
         let payload = self.thread_payload(item)?;
         self.open(&payload)
     }
+}
 
-    fn save_to_target(
-        &self,
-        payload: &AttachmentPayload,
-        target: &Path,
-    ) -> anyhow::Result<AttachmentActionResult> {
-        let path = save_attachment_to_target_without_overwrite(target, &payload.bytes)?;
-        Ok(saved_action(payload, path))
-    }
+fn complete_pending_attachment_save(
+    pending_save: &RefCell<Option<PendingAttachmentSave>>,
+    chooser_id: u64,
+    accepted: bool,
+    target: Option<&Path>,
+) -> anyhow::Result<Option<AttachmentActionResult>> {
+    let pending = {
+        let mut slot = pending_save.borrow_mut();
+        let pending = slot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no attachment save chooser is pending"))?;
+        anyhow::ensure!(
+            pending.id == chooser_id,
+            "attachment save chooser id does not match the pending chooser"
+        );
+        slot.take().expect("pending chooser checked above")
+    };
+
+    let result = if accepted {
+        let target = target.ok_or_else(|| {
+            anyhow::anyhow!("the attachment save chooser did not return a local target path")
+        });
+        target.and_then(|target| {
+            let path = save_attachment_to_target_without_overwrite(target, &pending.payload.bytes)?;
+            Ok(Some(saved_action(&pending.payload, path)))
+        })
+    } else {
+        Ok(None)
+    };
+
+    pending.dialog.hide();
+    pending.dialog.destroy();
+    result
 }
 
 fn emit_result(
