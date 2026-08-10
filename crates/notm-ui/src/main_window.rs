@@ -466,6 +466,7 @@ struct Widgets {
     theme_background_probe: gtk::Label,
     pending_settings_dialog: Rc<RefCell<Option<PendingSettingsDialog>>>,
     next_settings_dialog_id: Rc<Cell<u64>>,
+    confirmation_controller: Rc<RefCell<ConfirmationController>>,
     overlay: gtk::Overlay,
     outer_paned: gtk::Paned,
     content_paned: gtk::Paned,
@@ -793,6 +794,117 @@ struct PendingSettingsDialog {
     theme: gtk::ComboBoxText,
     thread_preview_lines: gtk::Entry,
     show_thread_preview: gtk::CheckButton,
+}
+
+struct ConfirmationController {
+    next_id: u64,
+    pending: Option<PendingConfirmation>,
+    last_completion: Option<ConfirmationCompletion>,
+    allow_close_once: bool,
+}
+
+struct ConfirmationCompletion {
+    id: u64,
+    accepted: bool,
+    succeeded: bool,
+}
+
+struct PendingConfirmation {
+    id: u64,
+    action: PendingAction,
+    dialog: gtk::glib::WeakRef<gtk::Dialog>,
+}
+
+enum PendingAction {
+    ClearComposer,
+    ReplaceComposer(PreparedComposerReplacement),
+    DeleteActiveDraft(ActiveDraft),
+    DeleteNamedDraft(PathBuf),
+    SaveDraftReplacement {
+        fields: ComposeFields,
+        previous: ActiveDraft,
+    },
+    SendComposer {
+        fields: ComposeFields,
+        active: ActiveDraft,
+        generation: u64,
+    },
+    ShowSelectedMessage {
+        selection: MessageSelectionSnapshot,
+        rejection_restore: Option<MessageSelectionSnapshot>,
+        status: String,
+        active_pane: ActivePane,
+    },
+    CloseMainWindow,
+}
+
+struct PreparedComposerReplacement {
+    kind: ComposerReplacementKind,
+    payload: ComposerReplacementPayload,
+    selection: Option<MessageSelectionSnapshot>,
+    rejection_restore: Option<MessageSelectionSnapshot>,
+    status: String,
+    source_status: Option<gtk::Label>,
+    present_main_window: bool,
+    show_message_pane: bool,
+    active_pane: ActivePane,
+}
+
+#[derive(Clone)]
+struct MessageSelectionSnapshot {
+    selected_thread: Option<notm_notmuch::ThreadSummary>,
+    selected_thread_index: Option<usize>,
+    selected_message: Option<notm_notmuch::MessageSummary>,
+    messages: Vec<notm_notmuch::MessageSummary>,
+    active_pane: ActivePane,
+    last_operation: Option<String>,
+    last_error: Option<String>,
+}
+
+enum ComposerReplacementPayload {
+    Empty,
+    Message(Box<ComposedMessage>),
+    Draft(Box<PreparedDraftReplacement>),
+}
+
+struct PreparedDraftReplacement {
+    fields: ComposeFields,
+    active_source: Option<PreparedActiveDraft>,
+    attachment_inputs: Vec<AttachmentInput>,
+}
+
+struct PreparedActiveDraft {
+    path: PathBuf,
+    message_id: Option<String>,
+    indexed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerReplacementKind {
+    New,
+    Reply,
+    ReplyAll,
+    Forward,
+    ForwardAttachment,
+    StandaloneReply,
+    StandaloneReplyAll,
+    StandaloneForward,
+    StandaloneForwardAttachment,
+    NamedDraft,
+    RecoveryDraft,
+    IndexedDraft,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistedDraftDeletion {
+    ExplicitActive,
+    ExplicitNamed,
+    SaveReplacement,
+    AcceptedSendCleanup,
+}
+
+fn persisted_draft_deletion_requires_confirmation(_deletion: PersistedDraftDeletion) -> bool {
+    true
 }
 
 #[derive(Clone)]
@@ -1766,6 +1878,12 @@ fn build_ui(
         theme_background_probe,
         pending_settings_dialog: Rc::new(RefCell::new(None)),
         next_settings_dialog_id: Rc::new(Cell::new(1)),
+        confirmation_controller: Rc::new(RefCell::new(ConfirmationController {
+            next_id: 1,
+            pending: None,
+            last_completion: None,
+            allow_close_once: false,
+        })),
         overlay: overlay.clone(),
         outer_paned: outer_paned.clone(),
         content_paned: content_paned.clone(),
@@ -1972,7 +2090,7 @@ fn build_ui(
         &clear_draft_button,
         &delete_local_draft_button,
     );
-    connect_draft_list(&widgets, &state);
+    connect_draft_list(&options, &widgets, &state);
     connect_compose_vim_context(&options, &widgets, &state, &compose_vim_context);
     connect_message_actions(&options, &widgets, &state);
     connect_recipient_autocomplete(&widgets.compose_to, &widgets, &state);
@@ -1985,9 +2103,22 @@ fn build_ui(
     install_shortcuts(&options, &widgets, &state, &undo_state, &saved_search_store);
     connect_auto_load_more(&options, &widgets, &state);
     {
+        let opts = options.clone();
         let w = widgets.clone();
         let st = state.clone();
         window.connect_close_request(move |window| {
+            let allow_close_once = {
+                let mut controller = w.confirmation_controller.borrow_mut();
+                let allowed = controller.allow_close_once;
+                controller.allow_close_once = false;
+                allowed
+            };
+            if allow_close_once {
+                return gtk::glib::Propagation::Proceed;
+            }
+            if w.confirmation_controller.borrow().pending.is_some() {
+                return gtk::glib::Propagation::Stop;
+            }
             let background_activity = {
                 let state = st.borrow();
                 state.send_in_progress || state.sync_in_progress
@@ -1997,7 +2128,13 @@ fn build_ui(
                 window.set_visible(false);
                 gtk::glib::Propagation::Stop
             } else {
-                gtk::glib::Propagation::Proceed
+                let fields = compose_fields(&w, &st);
+                let active_draft = st.borrow().active_draft.clone();
+                if !composer_requires_confirmation(&fields, active_draft.as_ref()) {
+                    return gtk::glib::Propagation::Proceed;
+                }
+                let _ = request_pending_action(&opts, &w, &st, PendingAction::CloseMainWindow);
+                gtk::glib::Propagation::Stop
             }
         });
     }
@@ -2006,7 +2143,7 @@ fn build_ui(
         setup_automation(&options, &widgets, &state, &undo_state, &saved_search_store);
     }
 
-    restore_draft_if_present(&widgets, &state);
+    restore_draft_if_present(&options, &widgets, &state);
     migrate_legacy_named_drafts_from_ui(&widgets, &state);
     refresh_draft_list(&widgets);
     window.present();
@@ -3631,23 +3768,26 @@ fn connect_compose_vim_context(
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
-    vim_context.connect_write(move |_, _, path| match save_current_draft(&opts, &w, &st) {
-        Ok(report) => {
-            refresh_draft_list(&w);
-            let destination = report
-                .maildir_path
-                .as_ref()
-                .or(report.local_path.as_ref())
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "draft store".to_string());
-            let suffix = path
-                .map(|requested| format!("; ignored Vim file path {requested}"))
-                .unwrap_or_default();
-            w.status_label
-                .set_text(&format!("Vim :w saved draft to {destination}{suffix}"));
-        }
-        Err(err) => w.status_label.set_text(&format!("Vim :w failed: {err}")),
-    });
+    vim_context.connect_write(
+        move |_, _, path| match request_save_current_draft(&opts, &w, &st) {
+            Ok(Some(report)) => {
+                refresh_draft_list(&w);
+                let destination = report
+                    .maildir_path
+                    .as_ref()
+                    .or(report.local_path.as_ref())
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "draft store".to_string());
+                let suffix = path
+                    .map(|requested| format!("; ignored Vim file path {requested}"))
+                    .unwrap_or_default();
+                w.status_label
+                    .set_text(&format!("Vim :w saved draft to {destination}{suffix}"));
+            }
+            Ok(None) => {}
+            Err(err) => w.status_label.set_text(&format!("Vim :w failed: {err}")),
+        },
+    );
 }
 
 fn compose_vim_ready_for_app_escape(vim_context: &VimIMContext) -> bool {
@@ -3706,8 +3846,8 @@ fn connect_compose_helpers(
     let st = state.clone();
     let opts = options.clone();
     save_draft_button.connect_clicked(move |_| {
-        match save_current_draft(&opts, &w, &st) {
-            Ok(report) => {
+        match request_save_current_draft(&opts, &w, &st) {
+            Ok(Some(report)) => {
                 let destination = report
                     .maildir_path
                     .as_ref()
@@ -3716,11 +3856,8 @@ fn connect_compose_helpers(
                     .unwrap_or_else(|| "draft store".to_string());
                 w.status_label
                     .set_text(&format!("Draft saved to {destination}"));
-                if report.indexed_message_id.is_some() {
-                    let current = st.borrow().current_query.clone();
-                    run_search(&opts, &w, &st, &current);
-                }
             }
+            Ok(None) => {}
             Err(err) => w
                 .status_label
                 .set_text(&format!("Draft save failed: {err}")),
@@ -3732,23 +3869,7 @@ fn connect_compose_helpers(
     let w = widgets.clone();
     let st = state.clone();
     clear_draft_button.connect_clicked(move |_| {
-        let active_draft = st.borrow().active_draft.clone();
-        let has_unsaved_changes = active_draft
-            .as_ref()
-            .is_some_and(|draft| compose_fields(&w, &st) != draft.saved_fields);
-        match clear_current_draft_from_ui(&opts, &w, &st) {
-            Ok(()) => {
-                let status = match (active_draft.is_some(), has_unsaved_changes) {
-                    (true, true) => "Draft changes discarded",
-                    (true, false) => "Draft closed",
-                    (false, _) => "Draft discarded",
-                };
-                w.status_label.set_text(status);
-            }
-            Err(err) => w
-                .status_label
-                .set_text(&format!("Draft clear failed: {err}")),
-        }
+        let _ = clear_current_draft_from_ui(&opts, &w, &st);
     });
 
     let w = widgets.clone();
@@ -3783,7 +3904,7 @@ fn connect_compose_helpers(
     });
 }
 
-fn connect_draft_list(widgets: &Widgets, state: &SharedState) {
+fn connect_draft_list(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     let w = widgets.clone();
     let st = state.clone();
     widgets.draft_list.connect_row_selected(move |_, _| {
@@ -3792,33 +3913,30 @@ fn connect_draft_list(widgets: &Widgets, state: &SharedState) {
 
     let w = widgets.clone();
     let st = state.clone();
+    let opts = options.clone();
     widgets.draft_list.connect_row_activated(move |list, row| {
         list.select_row(Some(row));
-        match load_selected_named_draft(&w, &st) {
-            Ok(path) => {
-                let message = format!("Loaded saved draft {}", path.display());
-                {
-                    let mut state = st.borrow_mut();
-                    state.last_error = None;
-                    state.last_operation = Some(message.clone());
-                }
-                w.status_label.set_text(&message);
-                update_debug(&w, &st);
-            }
+        match load_selected_named_draft(&opts, &w, &st) {
+            Ok((true, _)) => {}
+            Ok((false, _)) => {}
             Err(err) => report_draft_persistence_error(&w, &st, "Saved draft load failed", &err),
         }
     });
 
     let w = widgets.clone();
     let st = state.clone();
+    let opts = options.clone();
     widgets
         .delete_selected_draft_button
         .connect_clicked(move |_| {
-            delete_selected_named_draft_from_ui(&w, &st);
+            delete_selected_named_draft_from_ui(&opts, &w, &st);
         });
 }
 
 fn connect_message_actions(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    // These view-mode actions are presentation-only: they retain composer fields, active-draft
+    // identity, and recovery bytes. Transitions that actually detach the composer from a selected
+    // message are routed through `request_show_selected_message` instead.
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
@@ -6941,7 +7059,7 @@ fn install_shortcuts(
             true
         } else if key == gtk::gdk::Key::c {
             clear_numeric_prefix(&numeric_prefix);
-            open_compose(&w, &st);
+            open_compose(&opts, &w, &st);
             true
         } else if key == gtk::gdk::Key::t {
             clear_numeric_prefix(&numeric_prefix);
@@ -7010,8 +7128,9 @@ fn install_shortcuts(
             true
         } else if key == gtk::gdk::Key::S && compose_view_is_visible(&w) {
             clear_numeric_prefix(&numeric_prefix);
-            match save_current_draft(&opts, &w, &st) {
-                Ok(_) => w.status_label.set_text("Draft saved"),
+            match request_save_current_draft(&opts, &w, &st) {
+                Ok(Some(_)) => w.status_label.set_text("Draft saved"),
+                Ok(None) => {}
                 Err(err) => w
                     .status_label
                     .set_text(&format!("Draft save failed: {err}")),
@@ -7020,12 +7139,7 @@ fn install_shortcuts(
             true
         } else if key == gtk::gdk::Key::x && compose_view_is_visible(&w) {
             clear_numeric_prefix(&numeric_prefix);
-            match clear_current_draft_from_ui(&opts, &w, &st) {
-                Ok(()) => w.status_label.set_text("Composer closed"),
-                Err(err) => {
-                    report_draft_persistence_error(&w, &st, "Draft clear failed", &err)
-                }
-            }
+            let _ = clear_current_draft_from_ui(&opts, &w, &st);
             true
         } else if key == gtk::gdk::Key::D && compose_view_is_visible(&w) {
             clear_numeric_prefix(&numeric_prefix);
@@ -8155,6 +8269,504 @@ fn fields_has_content(fields: &ComposeFields) -> bool {
         || !fields.attachments.is_empty()
 }
 
+fn composer_requires_confirmation(fields: &ComposeFields, active: Option<&ActiveDraft>) -> bool {
+    match active {
+        Some(active) => fields != &active.saved_fields,
+        None => fields_has_content(fields),
+    }
+}
+
+impl ComposerReplacementKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Reply => "reply",
+            Self::ReplyAll => "reply_all",
+            Self::Forward => "forward",
+            Self::ForwardAttachment => "forward_attachment",
+            Self::StandaloneReply => "standalone_reply",
+            Self::StandaloneReplyAll => "standalone_reply_all",
+            Self::StandaloneForward => "standalone_forward",
+            Self::StandaloneForwardAttachment => "standalone_forward_attachment",
+            Self::NamedDraft => "named_draft",
+            Self::RecoveryDraft => "recovery_draft",
+            Self::IndexedDraft => "indexed_draft",
+        }
+    }
+}
+
+impl PendingAction {
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::ClearComposer => "clear_composer",
+            Self::ReplaceComposer(replacement) => replacement.kind.name(),
+            Self::DeleteActiveDraft(_) => "delete_active_draft",
+            Self::DeleteNamedDraft(_) => "delete_named_draft",
+            Self::SaveDraftReplacement { .. } => "save_draft_replacement",
+            Self::SendComposer { .. } => "send_composer",
+            Self::ShowSelectedMessage { .. } => "show_selected_message",
+            Self::CloseMainWindow => "close_main_window",
+        }
+    }
+
+    fn operation(&self) -> UserOperation {
+        match self {
+            Self::ClearComposer => UserOperation::DraftClear,
+            Self::ReplaceComposer(replacement) => match replacement.kind {
+                ComposerReplacementKind::NamedDraft
+                | ComposerReplacementKind::RecoveryDraft
+                | ComposerReplacementKind::IndexedDraft => UserOperation::DraftLoad,
+                _ => UserOperation::ComposeReplace,
+            },
+            Self::DeleteActiveDraft(_) | Self::DeleteNamedDraft(_) => UserOperation::DraftDelete,
+            Self::SaveDraftReplacement { .. } => UserOperation::DraftSave,
+            Self::SendComposer { .. } => UserOperation::Send,
+            Self::ShowSelectedMessage { .. } | Self::CloseMainWindow => {
+                UserOperation::ComposeReplace
+            }
+        }
+    }
+
+    fn always_requires_confirmation(&self) -> bool {
+        let deletion = match self {
+            Self::DeleteActiveDraft(_) => Some(PersistedDraftDeletion::ExplicitActive),
+            Self::DeleteNamedDraft(_) => Some(PersistedDraftDeletion::ExplicitNamed),
+            Self::SaveDraftReplacement { .. } => Some(PersistedDraftDeletion::SaveReplacement),
+            Self::SendComposer { .. } => Some(PersistedDraftDeletion::AcceptedSendCleanup),
+            _ => None,
+        };
+        deletion.is_some_and(persisted_draft_deletion_requires_confirmation)
+    }
+
+    fn prompt(&self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::DeleteActiveDraft(_) => (
+                "Delete saved draft?",
+                "This permanently deletes the active saved draft.",
+                "Delete",
+            ),
+            Self::DeleteNamedDraft(_) => (
+                "Delete selected draft?",
+                "This permanently deletes the selected saved draft.",
+                "Delete",
+            ),
+            Self::SaveDraftReplacement { .. } => (
+                "Replace saved draft?",
+                "Saving these changes creates a replacement and permanently deletes the previous saved draft.",
+                "Replace",
+            ),
+            Self::SendComposer { .. } => (
+                "Send and delete saved draft?",
+                "If sending succeeds, this permanently deletes the active saved draft.",
+                "Send",
+            ),
+            Self::ClearComposer => (
+                "Discard composer changes?",
+                "The current composer has unsaved changes that will be discarded.",
+                "Discard",
+            ),
+            Self::ReplaceComposer(_) => (
+                "Replace composer contents?",
+                "The current composer has unsaved changes that will be replaced.",
+                "Replace",
+            ),
+            Self::ShowSelectedMessage { .. } => (
+                "Close composer and show message?",
+                "The current composer has unsaved changes. Showing the message detaches its active draft context; recovery data remains available.",
+                "Show message",
+            ),
+            Self::CloseMainWindow => (
+                "Close notm with composer changes?",
+                "The current composer has unsaved changes. Recovery data remains available on the next launch.",
+                "Close",
+            ),
+        }
+    }
+
+    fn rollback_preparation(
+        &self,
+        options: &LaunchOptions,
+        widgets: &Widgets,
+        state: &SharedState,
+    ) {
+        let restore = match self {
+            Self::ReplaceComposer(replacement) => replacement.rejection_restore.clone(),
+            Self::ShowSelectedMessage {
+                rejection_restore, ..
+            } => rejection_restore.clone(),
+            _ => None,
+        };
+        if let Some(restore) = restore {
+            apply_message_selection_snapshot(options, widgets, state, restore);
+        }
+    }
+}
+
+fn pending_action_requires_confirmation(
+    action: &PendingAction,
+    fields: &ComposeFields,
+    active: Option<&ActiveDraft>,
+) -> bool {
+    action.always_requires_confirmation() || composer_requires_confirmation(fields, active)
+}
+
+fn request_pending_action(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    action: PendingAction,
+) -> bool {
+    if let Err(err) = ensure_user_operation_allowed(widgets, state, action.operation()) {
+        action.rollback_preparation(options, widgets, state);
+        widgets.status_label.set_text(&err.to_string());
+        return false;
+    }
+    if widgets.confirmation_controller.borrow().pending.is_some() {
+        action.rollback_preparation(options, widgets, state);
+        let message = "Another confirmation is already pending";
+        widgets.status_label.set_text(message);
+        state.borrow_mut().last_error = Some(message.to_string());
+        update_debug(widgets, state);
+        return false;
+    }
+    let fields = compose_fields(widgets, state);
+    let active = state.borrow().active_draft.clone();
+    if !pending_action_requires_confirmation(&action, &fields, active.as_ref()) {
+        return execute_pending_action(options, widgets, state, action);
+    }
+
+    let (title, detail, confirm_label) = action.prompt();
+    let dialog = gtk::Dialog::builder()
+        .title(title)
+        .transient_for(&widgets.window)
+        .modal(true)
+        .default_width(480)
+        .build();
+    dialog.set_widget_name("notm-confirmation-dialog");
+    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+    let confirm = dialog.add_button(confirm_label, gtk::ResponseType::Accept);
+    confirm.add_css_class("destructive-action");
+    dialog.set_default_response(gtk::ResponseType::Cancel);
+    let area = dialog.content_area();
+    area.set_spacing(8);
+    area.set_margin_start(16);
+    area.set_margin_end(16);
+    area.set_margin_top(12);
+    area.set_margin_bottom(12);
+    let label = gtk::Label::new(Some(detail));
+    label.set_xalign(0.0);
+    label.set_wrap(true);
+    area.append(&label);
+
+    let id = {
+        let mut controller = widgets.confirmation_controller.borrow_mut();
+        let id = controller.next_id;
+        controller.next_id = controller.next_id.checked_add(1).unwrap_or(1);
+        controller.last_completion = None;
+        controller.pending = Some(PendingConfirmation {
+            id,
+            action,
+            dialog: dialog.downgrade(),
+        });
+        id
+    };
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    dialog.connect_response(move |dialog, response| {
+        complete_pending_confirmation(&opts, &w, &st, id, response == gtk::ResponseType::Accept);
+        dialog.destroy();
+    });
+    widgets
+        .status_label
+        .set_text(&format!("Confirmation required: {title}"));
+    dialog.present();
+    true
+}
+
+fn complete_pending_confirmation(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    id: u64,
+    accepted: bool,
+) -> bool {
+    let action = {
+        let mut controller = widgets.confirmation_controller.borrow_mut();
+        let Some(pending) = controller.pending.as_ref() else {
+            return false;
+        };
+        if pending.id != id {
+            return false;
+        }
+        controller
+            .pending
+            .take()
+            .expect("checked pending confirmation")
+            .action
+    };
+    if !accepted {
+        action.rollback_preparation(options, widgets, state);
+        widgets.status_label.set_text("Action cancelled");
+        update_debug(widgets, state);
+        widgets.confirmation_controller.borrow_mut().last_completion =
+            Some(ConfirmationCompletion {
+                id,
+                accepted: false,
+                succeeded: true,
+            });
+        return true;
+    }
+    if let Err(err) = ensure_user_operation_allowed(widgets, state, action.operation()) {
+        action.rollback_preparation(options, widgets, state);
+        let message = err.to_string();
+        widgets.status_label.set_text(&message);
+        {
+            let mut state = state.borrow_mut();
+            state.last_error = Some(message.clone());
+            state.last_operation = Some(message);
+        }
+        update_debug(widgets, state);
+        widgets.confirmation_controller.borrow_mut().last_completion =
+            Some(ConfirmationCompletion {
+                id,
+                accepted: true,
+                succeeded: false,
+            });
+        return false;
+    }
+    let succeeded = execute_pending_action(options, widgets, state, action);
+    widgets.confirmation_controller.borrow_mut().last_completion = Some(ConfirmationCompletion {
+        id,
+        accepted: true,
+        succeeded,
+    });
+    succeeded
+}
+
+fn execute_pending_action(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    action: PendingAction,
+) -> bool {
+    match action {
+        PendingAction::ClearComposer => clear_current_draft_immediately(options, widgets, state),
+        PendingAction::ReplaceComposer(replacement) => {
+            apply_prepared_composer_replacement(options, widgets, state, replacement)
+        }
+        PendingAction::DeleteActiveDraft(draft) => {
+            delete_captured_active_draft(options, widgets, state, draft)
+        }
+        PendingAction::DeleteNamedDraft(path) => delete_captured_named_draft(widgets, state, path),
+        PendingAction::SaveDraftReplacement { fields, previous } => {
+            match finish_captured_draft_save(options, widgets, state, fields, Some(previous)) {
+                Ok(_) => true,
+                Err(err) => {
+                    report_draft_persistence_error(widgets, state, "Draft save failed", &err);
+                    false
+                }
+            }
+        }
+        PendingAction::SendComposer {
+            fields,
+            active,
+            generation,
+        } => match start_captured_send(options, widgets, state, fields, Some(active), generation) {
+            Ok(()) => true,
+            Err(err) => {
+                let message = format!("Send failed to start: {err}");
+                widgets.status_label.set_text(&message);
+                let mut state = state.borrow_mut();
+                state.last_error = Some(err.to_string());
+                state.last_operation = Some(message);
+                false
+            }
+        },
+        PendingAction::ShowSelectedMessage {
+            selection,
+            status,
+            active_pane,
+            ..
+        } => {
+            apply_message_selection_snapshot(options, widgets, state, selection);
+            set_active_draft(widgets, state, None);
+            show_preferred_selected_message_view(options, widgets, state);
+            state.borrow_mut().active_pane = active_pane;
+            focus_active_pane(widgets, state);
+            widgets.status_label.set_text(&status);
+            true
+        }
+        PendingAction::CloseMainWindow => {
+            widgets
+                .confirmation_controller
+                .borrow_mut()
+                .allow_close_once = true;
+            widgets.window.close();
+            true
+        }
+    }
+}
+
+fn request_show_selected_message(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    active_pane: ActivePane,
+    status: String,
+    rejection_restore: Option<MessageSelectionSnapshot>,
+) -> bool {
+    let selection = capture_message_selection_snapshot(state);
+    if state.borrow().send_in_progress {
+        apply_message_selection_snapshot(options, widgets, state, selection);
+        show_preferred_selected_message_view(options, widgets, state);
+        state.borrow_mut().active_pane = active_pane;
+        focus_active_pane(widgets, state);
+        widgets.status_label.set_text(&status);
+        return true;
+    }
+    request_pending_action(
+        options,
+        widgets,
+        state,
+        PendingAction::ShowSelectedMessage {
+            selection,
+            rejection_restore,
+            status,
+            active_pane,
+        },
+    )
+}
+
+fn capture_message_selection_snapshot(state: &SharedState) -> MessageSelectionSnapshot {
+    let state = state.borrow();
+    let selected_thread_index = state.selected_thread.as_ref().and_then(|selected| {
+        state
+            .thread_list_items
+            .iter()
+            .position(|thread| thread.thread_id == selected.thread_id)
+    });
+    MessageSelectionSnapshot {
+        selected_thread: state.selected_thread.clone(),
+        selected_thread_index,
+        selected_message: state.selected_message.clone(),
+        messages: state.messages.clone(),
+        active_pane: state.active_pane,
+        last_operation: state.last_operation.clone(),
+        last_error: state.last_error.clone(),
+    }
+}
+
+fn apply_message_selection_snapshot(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    selection: MessageSelectionSnapshot,
+) {
+    let selected_thread_index = selection.selected_thread_index;
+    {
+        let mut state = state.borrow_mut();
+        state.selected_thread = selection.selected_thread;
+        state.selected_message = selection.selected_message;
+        state.messages = selection.messages;
+        state.active_pane = selection.active_pane;
+        state.last_operation = selection.last_operation;
+        state.last_error = selection.last_error;
+    }
+    if let Some(index) = selected_thread_index {
+        select_thread_index_for_open_message(widgets, index);
+    } else {
+        widgets.thread_selection_refreshing.set(true);
+        widgets
+            .thread_selection
+            .set_selected(gtk::INVALID_LIST_POSITION);
+        widgets.thread_selection_refreshing.set(false);
+    }
+    refresh_thread_attachment_list(widgets, state);
+    update_message_menu(options, widgets, state);
+    update_custom_tag_controls(widgets, state);
+    update_active_pane_visuals(widgets, state);
+    update_message_action_buttons(options, widgets, state);
+    update_debug(widgets, state);
+}
+
+fn apply_prepared_composer_replacement(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    replacement: PreparedComposerReplacement,
+) -> bool {
+    state.borrow_mut().last_error = None;
+    if let Some(selection) = replacement.selection {
+        apply_message_selection_snapshot(options, widgets, state, selection);
+    }
+    match replacement.payload {
+        ComposerReplacementPayload::Empty => {
+            let fields = ComposeFields {
+                from: widgets.compose_from.text().to_string(),
+                ..ComposeFields::default()
+            };
+            apply_compose_fields(widgets, state, fields);
+            set_active_draft(widgets, state, None);
+            show_compose_view(widgets);
+        }
+        ComposerReplacementPayload::Message(message) => fill_composer(widgets, state, *message),
+        ComposerReplacementPayload::Draft(draft) => {
+            let PreparedDraftReplacement {
+                mut fields,
+                active_source,
+                attachment_inputs,
+            } = *draft;
+            if !attachment_inputs.is_empty() {
+                let attachments = match cache_composer_attachments(&attachment_inputs) {
+                    Ok(attachments) => attachments,
+                    Err(err) => {
+                        report_draft_persistence_error(
+                            widgets,
+                            state,
+                            "Draft attachment load failed",
+                            &err,
+                        );
+                        return false;
+                    }
+                };
+                fields.attachments = attachments;
+            }
+            let active_draft = active_source.map(|source| ActiveDraft {
+                path: source.path,
+                message_id: source.message_id,
+                indexed: source.indexed,
+                saved_fields: fields.clone(),
+            });
+            apply_compose_fields(widgets, state, fields);
+            set_active_draft(widgets, state, active_draft);
+            show_compose_view(widgets);
+        }
+    }
+    if state.borrow().last_error.is_some() {
+        update_debug(widgets, state);
+        return false;
+    }
+    if replacement.show_message_pane {
+        set_pane_visibility(widgets, state, ActivePane::Message, true);
+    }
+    state.borrow_mut().active_pane = replacement.active_pane;
+    if state.borrow().input_mode == InputMode::Insert {
+        widgets.compose_to.grab_focus();
+    } else {
+        focus_active_pane(widgets, state);
+    }
+    widgets.status_label.set_text(&replacement.status);
+    if replacement.present_main_window {
+        widgets.window.present();
+    }
+    if let Some(source_status) = replacement.source_status {
+        source_status.set_text(&replacement.status);
+    }
+    update_debug(widgets, state);
+    true
+}
+
 fn xdg_home_path(
     configured_home: Option<&OsStr>,
     home: Option<&OsStr>,
@@ -8295,15 +8907,49 @@ struct DraftSaveReport {
     replaced_path: Option<PathBuf>,
 }
 
-fn save_current_draft(
+fn request_save_current_draft(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
-) -> anyhow::Result<DraftSaveReport> {
+) -> anyhow::Result<Option<DraftSaveReport>> {
     ensure_user_operation_allowed(widgets, state, UserOperation::DraftSave)?;
     let fields = compose_fields(widgets, state);
     anyhow::ensure!(fields_has_content(&fields), "draft has no content");
     let previous_draft = state.borrow().active_draft.clone();
+    if let Some(previous) = previous_draft.as_ref()
+        && fields == previous.saved_fields
+    {
+        return Ok(Some(DraftSaveReport {
+            local_path: (!previous.indexed).then(|| previous.path.clone()),
+            maildir_path: previous.indexed.then(|| previous.path.clone()),
+            indexed_message_id: previous.message_id.clone(),
+            replaced_path: None,
+        }));
+    }
+    if let Some(previous) = previous_draft {
+        let requested = request_pending_action(
+            options,
+            widgets,
+            state,
+            PendingAction::SaveDraftReplacement { fields, previous },
+        );
+        anyhow::ensure!(
+            requested,
+            "draft replacement confirmation could not be opened"
+        );
+        return Ok(None);
+    }
+    finish_captured_draft_save(options, widgets, state, fields, None).map(Some)
+}
+
+fn finish_captured_draft_save(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    fields: ComposeFields,
+    previous_draft: Option<ActiveDraft>,
+) -> anyhow::Result<DraftSaveReport> {
+    anyhow::ensure!(fields_has_content(&fields), "draft has no content");
     let persisted = if options.save_drafts_to_maildir {
         let message = composed_message_from_fields(&fields)?;
         persist_draft_message(options, &message)?
@@ -8331,36 +8977,60 @@ fn save_current_draft(
                 saved_fields: fields.clone(),
             })
         });
-    set_active_draft(widgets, state, active_draft);
+    let active_draft = active_draft.ok_or_else(|| anyhow::anyhow!("draft was not persisted"))?;
     let replaced_path = if let Some(previous) = previous_draft
-        && Some(&previous.path)
-            != persisted
-                .as_ref()
-                .map(|persisted| &persisted.path)
-                .or(local_path.as_ref())
+        && previous.path != active_draft.path
     {
-        delete_draft_source(options, &previous)?;
+        if let Err(delete_error) = delete_draft_source(options, &previous) {
+            let rollback_error = delete_draft_source(options, &active_draft).err();
+            let rollback_detail = rollback_error
+                .map(|err| format!("; replacement cleanup also failed: {err}"))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "deleting previous saved draft {}: {delete_error}{rollback_detail}",
+                previous.path.display()
+            );
+        }
         Some(previous.path)
     } else {
         None
     };
-    Ok(DraftSaveReport {
+    set_active_draft(widgets, state, Some(active_draft));
+    let report = DraftSaveReport {
         local_path,
         maildir_path: persisted.as_ref().map(|persisted| persisted.path.clone()),
         indexed_message_id: persisted.and_then(|persisted| persisted.indexed_message_id),
         replaced_path,
-    })
+    };
+    refresh_draft_list(widgets);
+    announce_draft_save(widgets, state, &report);
+    if report.indexed_message_id.is_some() {
+        let current = state.borrow().current_query.clone();
+        run_search(options, widgets, state, &current);
+    }
+    Ok(report)
+}
+
+fn announce_draft_save(widgets: &Widgets, state: &SharedState, report: &DraftSaveReport) {
+    let destination = report
+        .maildir_path
+        .as_ref()
+        .or(report.local_path.as_ref())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "draft store".to_string());
+    let message = format!("Draft saved to {destination}");
+    {
+        let mut state = state.borrow_mut();
+        state.last_error = None;
+        state.last_operation = Some(message.clone());
+    }
+    widgets.status_label.set_text(&message);
+    update_debug(widgets, state);
 }
 
 fn set_active_draft(widgets: &Widgets, state: &SharedState, active_draft: Option<ActiveDraft>) {
     state.borrow_mut().active_draft = active_draft;
     update_draft_action_buttons(widgets, state);
-}
-
-fn detach_active_draft_for_message_view(widgets: &Widgets, state: &SharedState) {
-    if !state.borrow().send_in_progress {
-        set_active_draft(widgets, state, None);
-    }
 }
 
 fn delete_draft_source(options: &LaunchOptions, draft: &ActiveDraft) -> anyhow::Result<()> {
@@ -8379,24 +9049,42 @@ fn delete_active_draft_from_ui(
     widgets: &Widgets,
     state: &SharedState,
 ) -> bool {
-    if ensure_user_operation_allowed(widgets, state, UserOperation::DraftDelete).is_err() {
-        return false;
-    }
     let Some(draft) = state.borrow().active_draft.clone() else {
         widgets
             .status_label
             .set_text("No saved local draft to delete");
         return false;
     };
+    request_pending_action(
+        options,
+        widgets,
+        state,
+        PendingAction::DeleteActiveDraft(draft),
+    )
+}
+
+fn delete_captured_active_draft(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    draft: ActiveDraft,
+) -> bool {
     match delete_draft_source(options, &draft) {
         Ok(()) => {
-            clear_draft_widgets(options, widgets, state);
-            if let Err(err) = clear_recovery_draft_files(
-                &widgets.draft_path,
-                widgets.legacy_draft_path.as_deref(),
-            ) {
-                report_draft_persistence_error(widgets, state, "Draft recovery clear failed", &err);
-                return false;
+            if state.borrow().active_draft.as_ref() == Some(&draft) {
+                clear_draft_widgets(options, widgets, state);
+                if let Err(err) = clear_recovery_draft_files(
+                    &widgets.draft_path,
+                    widgets.legacy_draft_path.as_deref(),
+                ) {
+                    report_draft_persistence_error(
+                        widgets,
+                        state,
+                        "Draft recovery clear failed",
+                        &err,
+                    );
+                    return false;
+                }
             }
             let current = state.borrow().current_query.clone();
             run_search(options, widgets, state, &current);
@@ -8562,45 +9250,73 @@ fn selected_named_draft(widgets: &Widgets) -> anyhow::Result<(PathBuf, ComposeFi
         .ok_or_else(|| anyhow::anyhow!("no selected draft"))
 }
 
-fn load_selected_named_draft(widgets: &Widgets, state: &SharedState) -> anyhow::Result<PathBuf> {
-    ensure_user_operation_allowed(widgets, state, UserOperation::DraftLoad)?;
+fn load_selected_named_draft(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) -> anyhow::Result<(bool, PathBuf)> {
     let (path, fields) = selected_named_draft(widgets)?;
-    apply_compose_fields(widgets, state, fields.clone());
-    set_active_draft(
+    let active_source = PreparedActiveDraft {
+        path: path.clone(),
+        message_id: None,
+        indexed: false,
+    };
+    let requested = request_pending_action(
+        options,
         widgets,
         state,
-        Some(ActiveDraft {
-            path: path.clone(),
-            message_id: None,
-            indexed: false,
-            saved_fields: fields,
+        PendingAction::ReplaceComposer(PreparedComposerReplacement {
+            kind: ComposerReplacementKind::NamedDraft,
+            payload: ComposerReplacementPayload::Draft(Box::new(PreparedDraftReplacement {
+                fields,
+                active_source: Some(active_source),
+                attachment_inputs: Vec::new(),
+            })),
+            selection: None,
+            rejection_restore: None,
+            status: format!("Loaded saved draft {}", path.display()),
+            source_status: None,
+            present_main_window: false,
+            show_message_pane: false,
+            active_pane: ActivePane::Message,
         }),
     );
-    show_compose_view(widgets);
-    Ok(path)
-}
-
-fn delete_selected_named_draft(widgets: &Widgets, state: &SharedState) -> anyhow::Result<PathBuf> {
-    ensure_user_operation_allowed(widgets, state, UserOperation::DraftDelete)?;
-    let (path, _) = selected_named_draft(widgets)?;
-    std::fs::remove_file(&path)
-        .map_err(|err| anyhow::anyhow!("removing saved draft {}: {err}", path.display()))?;
-    let deleted_active_draft =
-        active_draft_matches_path(state.borrow().active_draft.as_ref(), &path);
-    if deleted_active_draft {
-        set_active_draft(widgets, state, None);
-    }
-    refresh_draft_list(widgets);
-    Ok(path)
+    Ok((requested, path))
 }
 
 fn active_draft_matches_path(active_draft: Option<&ActiveDraft>, path: &Path) -> bool {
     active_draft.is_some_and(|draft| draft.path == path)
 }
 
-fn delete_selected_named_draft_from_ui(widgets: &Widgets, state: &SharedState) -> bool {
-    match delete_selected_named_draft(widgets, state) {
-        Ok(path) => {
+fn delete_selected_named_draft_from_ui(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) -> bool {
+    let path = match selected_named_draft(widgets) {
+        Ok((path, _)) => path,
+        Err(err) => {
+            report_draft_persistence_error(widgets, state, "Saved draft delete failed", &err);
+            return false;
+        }
+    };
+    request_pending_action(
+        options,
+        widgets,
+        state,
+        PendingAction::DeleteNamedDraft(path),
+    )
+}
+
+fn delete_captured_named_draft(widgets: &Widgets, state: &SharedState, path: PathBuf) -> bool {
+    match std::fs::remove_file(&path)
+        .map_err(|err| anyhow::anyhow!("removing saved draft {}: {err}", path.display()))
+    {
+        Ok(()) => {
+            if active_draft_matches_path(state.borrow().active_draft.as_ref(), &path) {
+                set_active_draft(widgets, state, None);
+            }
+            refresh_draft_list(widgets);
             let message = format!("Deleted saved draft {}", path.display());
             {
                 let mut state = state.borrow_mut();
@@ -8618,6 +9334,7 @@ fn delete_selected_named_draft_from_ui(widgets: &Widgets, state: &SharedState) -
     }
 }
 
+#[cfg(test)]
 fn migrate_legacy_recovery_draft(path: &Path, legacy_path: &Path) -> anyhow::Result<bool> {
     if path.exists() || !legacy_path.exists() {
         return Ok(false);
@@ -8628,19 +9345,11 @@ fn migrate_legacy_recovery_draft(path: &Path, legacy_path: &Path) -> anyhow::Res
     Ok(true)
 }
 
-fn restore_draft_if_present(widgets: &Widgets, state: &SharedState) -> bool {
-    if ensure_user_operation_allowed(widgets, state, UserOperation::DraftLoad).is_err() {
-        return false;
-    }
-    let migration = widgets
-        .legacy_draft_path
-        .as_deref()
-        .map(|legacy_path| migrate_legacy_recovery_draft(&widgets.draft_path, legacy_path))
-        .transpose();
-    let (migrated, migration_error) = match migration {
-        Ok(migrated) => (migrated.unwrap_or(false), None),
-        Err(err) => (false, Some(err)),
-    };
+fn restore_draft_if_present(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) -> bool {
     let source_path = if widgets.draft_path.exists() {
         Some(widgets.draft_path.as_path())
     } else {
@@ -8650,10 +9359,6 @@ fn restore_draft_if_present(widgets: &Widgets, state: &SharedState) -> bool {
             .filter(|legacy_path| legacy_path.exists())
     };
     let Some(source_path) = source_path else {
-        if let Some(err) = migration_error {
-            report_draft_persistence_error(widgets, state, "Draft recovery migration failed", &err);
-            return false;
-        }
         return true;
     };
     let fields = match std::fs::read(source_path)
@@ -8667,34 +9372,36 @@ fn restore_draft_if_present(widgets: &Widgets, state: &SharedState) -> bool {
         }
     };
     if !fields_has_content(&fields) {
-        if let Err(err) =
-            clear_recovery_draft_files(&widgets.draft_path, widgets.legacy_draft_path.as_deref())
-        {
-            report_draft_persistence_error(widgets, state, "Draft recovery clear failed", &err);
-            return false;
-        }
         return true;
     }
-    apply_compose_fields(widgets, state, fields);
-    show_compose_view(widgets);
-    if let Some(err) = migration_error {
-        report_draft_persistence_error(
-            widgets,
-            state,
-            "Recovered draft, but legacy migration failed",
-            &err,
-        );
-    } else if migrated {
-        widgets.status_label.set_text(&format!(
+    let status = if source_path == widgets.draft_path {
+        format!("Recovered draft from {}", source_path.display())
+    } else {
+        format!(
             "Recovered draft from {} (migrated from legacy cache)",
             widgets.draft_path.display()
-        ));
-    } else {
-        widgets
-            .status_label
-            .set_text(&format!("Recovered draft from {}", source_path.display()));
-    }
-    true
+        )
+    };
+    request_pending_action(
+        options,
+        widgets,
+        state,
+        PendingAction::ReplaceComposer(PreparedComposerReplacement {
+            kind: ComposerReplacementKind::RecoveryDraft,
+            payload: ComposerReplacementPayload::Draft(Box::new(PreparedDraftReplacement {
+                fields,
+                active_source: None,
+                attachment_inputs: Vec::new(),
+            })),
+            selection: None,
+            rejection_restore: None,
+            status,
+            source_status: None,
+            present_main_window: false,
+            show_message_pane: false,
+            active_pane: ActivePane::Message,
+        }),
+    )
 }
 
 fn remove_file_if_present(path: &Path) -> anyhow::Result<()> {
@@ -8722,10 +9429,25 @@ fn clear_current_draft_from_ui(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
-) -> anyhow::Result<()> {
-    ensure_user_operation_allowed(widgets, state, UserOperation::DraftClear)?;
+) -> bool {
+    request_pending_action(options, widgets, state, PendingAction::ClearComposer)
+}
+
+fn clear_current_draft_immediately(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) -> bool {
+    if let Err(err) =
+        clear_recovery_draft_files(&widgets.draft_path, widgets.legacy_draft_path.as_deref())
+    {
+        report_draft_persistence_error(widgets, state, "Draft recovery clear failed", &err);
+        return false;
+    }
     clear_draft_widgets(options, widgets, state);
-    clear_recovery_draft_files(&widgets.draft_path, widgets.legacy_draft_path.as_deref())
+    widgets.status_label.set_text("Composer closed");
+    state.borrow_mut().last_error = None;
+    true
 }
 
 fn clear_draft_widgets(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -9888,8 +10610,14 @@ fn is_draft_message(options: &LaunchOptions, message: &notm_notmuch::MessageSumm
         .any(|draft_tag| message.tags.iter().any(|tag| tag == draft_tag))
 }
 
-fn open_selected_draft_message(widgets: &Widgets, state: &SharedState) -> anyhow::Result<()> {
-    ensure_user_operation_allowed(widgets, state, UserOperation::DraftLoad)?;
+fn open_selected_draft_message(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    active_pane: ActivePane,
+    status: String,
+    rejection_restore: Option<MessageSelectionSnapshot>,
+) -> anyhow::Result<bool> {
     let message = state
         .borrow()
         .selected_message
@@ -9899,33 +10627,44 @@ fn open_selected_draft_message(widgets: &Widgets, state: &SharedState) -> anyhow
         .filenames
         .first()
         .ok_or_else(|| anyhow::anyhow!("selected draft has no file"))?;
-    let fields = draft_fields_from_message_file(filename)?;
-    apply_compose_fields(widgets, state, fields.clone());
-    set_active_draft(
+    let (fields, attachment_inputs) = prepare_draft_fields_from_message_file(filename)?;
+    let active_source = PreparedActiveDraft {
+        path: PathBuf::from(filename),
+        message_id: Some(message.message_id.clone()),
+        indexed: true,
+    };
+    Ok(request_pending_action(
+        options,
         widgets,
         state,
-        Some(ActiveDraft {
-            path: PathBuf::from(filename),
-            message_id: Some(message.message_id.clone()),
-            indexed: true,
-            saved_fields: fields,
+        PendingAction::ReplaceComposer(PreparedComposerReplacement {
+            kind: ComposerReplacementKind::IndexedDraft,
+            payload: ComposerReplacementPayload::Draft(Box::new(PreparedDraftReplacement {
+                fields,
+                active_source: Some(active_source),
+                attachment_inputs,
+            })),
+            selection: Some(capture_message_selection_snapshot(state)),
+            rejection_restore,
+            status,
+            source_status: None,
+            present_main_window: false,
+            show_message_pane: false,
+            active_pane,
         }),
-    );
-    show_compose_view(widgets);
-    {
-        let mut state = state.borrow_mut();
-        state.active_pane = ActivePane::Message;
-        state.last_operation = Some(format!("opened draft {} for editing", message.message_id));
-    }
-    if state.borrow().input_mode == InputMode::Insert {
-        widgets.compose_to.grab_focus();
-    } else {
-        focus_active_pane(widgets, state);
-    }
-    Ok(())
+    ))
 }
 
+#[cfg(test)]
 fn draft_fields_from_message_file(path: impl AsRef<Path>) -> anyhow::Result<ComposeFields> {
+    let (mut fields, attachment_inputs) = prepare_draft_fields_from_message_file(path)?;
+    fields.attachments = cache_composer_attachments(&attachment_inputs)?;
+    Ok(fields)
+}
+
+fn prepare_draft_fields_from_message_file(
+    path: impl AsRef<Path>,
+) -> anyhow::Result<(ComposeFields, Vec<AttachmentInput>)> {
     let path = path.as_ref();
     let parsed = parse_file(path)?;
     let attachment_inputs = extract_attachments_from_file(path)?
@@ -9937,25 +10676,27 @@ fn draft_fields_from_message_file(path: impl AsRef<Path>) -> anyhow::Result<Comp
             source_path: None,
         })
         .collect::<Vec<_>>();
-    let attachments = cache_composer_attachments(&attachment_inputs)?;
     let body = if parsed.text_body.trim().is_empty() {
         parsed.safe_body
     } else {
         parsed.text_body
     };
-    Ok(ComposeFields {
-        from: parsed.from,
-        to: parsed.to,
-        cc: parsed.cc,
-        bcc: header_value(&parsed.headers, "Bcc"),
-        subject: parsed.subject,
-        body,
-        attachments,
-        in_reply_to: nonempty_string(parsed.in_reply_to),
-        references: references_from_header(&parsed.references),
-        text_reply_quote: None,
-        html_reply_quote: None,
-    })
+    Ok((
+        ComposeFields {
+            from: parsed.from,
+            to: parsed.to,
+            cc: parsed.cc,
+            bcc: header_value(&parsed.headers, "Bcc"),
+            subject: parsed.subject,
+            body,
+            attachments: Vec::new(),
+            in_reply_to: nonempty_string(parsed.in_reply_to),
+            references: references_from_header(&parsed.references),
+            text_reply_quote: None,
+            html_reply_quote: None,
+        },
+        attachment_inputs,
+    ))
 }
 
 fn header_value(headers: &BTreeMap<String, String>, name: &str) -> String {
@@ -10746,10 +11487,11 @@ fn connect_actions(
         w.undo_tag_button.popdown();
     });
 
+    let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
     compose_button.connect_clicked(move |_| {
-        let _ = open_compose(&w, &st);
+        let _ = open_compose(&opts, &w, &st);
     });
 
     let opts = options.clone();
@@ -12007,6 +12749,7 @@ fn select_thread_by_index(
         open_thread_by_index(options, widgets, state, index);
         return;
     }
+    let rejection_restore = capture_message_selection_snapshot(state);
     let preserve_search_focus = widget_contains_focus(widgets.search_entry.upcast_ref());
 
     let result = (|| -> anyhow::Result<()> {
@@ -12028,16 +12771,17 @@ fn select_thread_by_index(
             refresh_thread_attachment_list(widgets, state);
             update_message_menu(options, widgets, state);
             if selected_message_is_draft(options, state) {
-                match open_selected_draft_message(widgets, state) {
-                    Ok(()) => {
-                        state.borrow_mut().active_pane = ActivePane::Threads;
-                        focus_after_thread_preview(widgets, state, preserve_search_focus);
-                        widgets.status_label.set_text(&message_position_status(
-                            state,
-                            index,
-                            "Selected draft",
-                        ));
-                    }
+                let status = message_position_status(state, index, "Selected draft");
+                match open_selected_draft_message(
+                    options,
+                    widgets,
+                    state,
+                    ActivePane::Threads,
+                    status,
+                    Some(rejection_restore.clone()),
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {}
                     Err(err) => {
                         state.borrow_mut().last_error = Some(err.to_string());
                         widgets
@@ -12046,13 +12790,18 @@ fn select_thread_by_index(
                     }
                 }
             } else {
-                detach_active_draft_for_message_view(widgets, state);
-                show_preferred_selected_message_view(options, widgets, state);
-                state.borrow_mut().active_pane = ActivePane::Threads;
-                focus_after_thread_preview(widgets, state, preserve_search_focus);
-                widgets
-                    .status_label
-                    .set_text(&message_position_status(state, index, "Selected"));
+                let status = message_position_status(state, index, "Selected");
+                let _ = request_show_selected_message(
+                    options,
+                    widgets,
+                    state,
+                    ActivePane::Threads,
+                    status,
+                    Some(rejection_restore.clone()),
+                );
+                if widgets.confirmation_controller.borrow().pending.is_none() {
+                    focus_after_thread_preview(widgets, state, preserve_search_focus);
+                }
             }
         }
         Err(err) => {
@@ -12110,6 +12859,7 @@ fn open_loaded_thread_at_message(
     state: &SharedState,
     message_id: &str,
 ) -> bool {
+    let rejection_restore = capture_message_selection_snapshot(state);
     let threads = state.borrow().thread_list_items.clone();
     for (index, thread) in threads.iter().enumerate() {
         let result = (|| -> anyhow::Result<Option<usize>> {
@@ -12139,10 +12889,16 @@ fn open_loaded_thread_at_message(
                 refresh_thread_attachment_list(widgets, state);
                 update_message_menu(options, widgets, state);
                 if selected_message_is_draft(options, state) {
-                    match open_selected_draft_message(widgets, state) {
-                        Ok(()) => widgets
-                            .status_label
-                            .set_text(&format!("Opened draft message {}", message_id)),
+                    match open_selected_draft_message(
+                        options,
+                        widgets,
+                        state,
+                        ActivePane::Message,
+                        format!("Opened draft message {message_id}"),
+                        Some(rejection_restore.clone()),
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {}
                         Err(err) => {
                             state.borrow_mut().last_error = Some(err.to_string());
                             widgets
@@ -12151,14 +12907,20 @@ fn open_loaded_thread_at_message(
                         }
                     }
                 } else {
-                    detach_active_draft_for_message_view(widgets, state);
-                    show_preferred_selected_message_view(options, widgets, state);
-                    widgets.status_label.set_text(&format!(
+                    let status = format!(
                         "Opened message {} ({}/{})",
                         message_id,
                         message_index + 1,
                         state.borrow().messages.len()
-                    ));
+                    );
+                    let _ = request_show_selected_message(
+                        options,
+                        widgets,
+                        state,
+                        ActivePane::Message,
+                        status,
+                        Some(rejection_restore.clone()),
+                    );
                 }
                 scroll_thread_index_into_view(widgets, index);
                 update_custom_tag_controls(widgets, state);
@@ -12194,6 +12956,7 @@ fn open_thread_by_index(
     let Some(thread) = state.borrow().thread_list_items.get(index).cloned() else {
         return;
     };
+    let rejection_restore = capture_message_selection_snapshot(state);
     let destination = thread_open_destination(pane_is_visible(widgets, ActivePane::Message));
     let result = (|| -> anyhow::Result<(Vec<notm_notmuch::MessageSummary>, usize)> {
         let db = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
@@ -12238,12 +13001,17 @@ fn open_thread_by_index(
                     }
                 }
             } else if selected_message_is_draft(options, state) {
-                match open_selected_draft_message(widgets, state) {
-                    Ok(()) => widgets.status_label.set_text(&message_position_status(
-                        state,
-                        index,
-                        "Opened draft",
-                    )),
+                let status = message_position_status(state, index, "Opened draft");
+                match open_selected_draft_message(
+                    options,
+                    widgets,
+                    state,
+                    ActivePane::Message,
+                    status,
+                    Some(rejection_restore.clone()),
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {}
                     Err(err) => {
                         state.borrow_mut().last_error = Some(err.to_string());
                         widgets
@@ -12252,11 +13020,15 @@ fn open_thread_by_index(
                     }
                 }
             } else {
-                detach_active_draft_for_message_view(widgets, state);
-                show_preferred_selected_message_view(options, widgets, state);
-                widgets
-                    .status_label
-                    .set_text(&message_position_status(state, index, "Opened"));
+                let status = message_position_status(state, index, "Opened");
+                let _ = request_show_selected_message(
+                    options,
+                    widgets,
+                    state,
+                    ActivePane::Message,
+                    status,
+                    Some(rejection_restore.clone()),
+                );
             }
         }
         Err(err) => {
@@ -13404,10 +14176,6 @@ fn run_standalone_response_action(
     standalone: &StandaloneMessageWindow,
     action: StandaloneResponseAction,
 ) -> bool {
-    if let Err(err) = ensure_user_operation_allowed(widgets, state, UserOperation::ComposeReplace) {
-        standalone.status_label.set_text(&err.to_string());
-        return false;
-    }
     let Some(message) = standalone_current_message(standalone) else {
         standalone.status_label.set_text("No message selected");
         return false;
@@ -13426,12 +14194,34 @@ fn run_standalone_response_action(
     };
     match result {
         Ok((message, status)) => {
-            set_pane_visibility(widgets, state, ActivePane::Message, true);
-            fill_composer(widgets, state, message);
-            widgets.status_label.set_text(status);
-            widgets.window.present();
-            standalone.status_label.set_text(status);
-            true
+            let kind = match action {
+                StandaloneResponseAction::Reply(ReplyKind::Sender) => {
+                    ComposerReplacementKind::StandaloneReply
+                }
+                StandaloneResponseAction::Reply(ReplyKind::All) => {
+                    ComposerReplacementKind::StandaloneReplyAll
+                }
+                StandaloneResponseAction::Forward => ComposerReplacementKind::StandaloneForward,
+                StandaloneResponseAction::ForwardAttachment => {
+                    ComposerReplacementKind::StandaloneForwardAttachment
+                }
+            };
+            request_pending_action(
+                options,
+                widgets,
+                state,
+                PendingAction::ReplaceComposer(PreparedComposerReplacement {
+                    kind,
+                    payload: ComposerReplacementPayload::Message(Box::new(message)),
+                    selection: None,
+                    rejection_restore: None,
+                    status: status.to_string(),
+                    source_status: Some(standalone.status_label.clone()),
+                    present_main_window: true,
+                    show_message_pane: true,
+                    active_pane: ActivePane::Message,
+                }),
+            )
         }
         Err(err) => {
             state.borrow_mut().last_error = Some(err.to_string());
@@ -13449,7 +14239,8 @@ fn composed_reply_for_message(
     kind: ReplyKind,
 ) -> anyhow::Result<ComposedMessage> {
     let path = message_filename(message)?;
-    let identity = identity(options).ok_or_else(|| anyhow::anyhow!("no identity configured"))?;
+    let identity =
+        identity(options).ok_or_else(|| anyhow::anyhow!("No identity configured for reply"))?;
     let parsed = parse_file(path)?;
     let mut own = options.other_email.clone();
     if let Some(email) = &options.primary_email {
@@ -13463,7 +14254,8 @@ fn composed_inline_forward_for_message(
     message: &notm_notmuch::MessageSummary,
 ) -> anyhow::Result<ComposedMessage> {
     let path = message_filename(message)?;
-    let identity = identity(options).ok_or_else(|| anyhow::anyhow!("no identity configured"))?;
+    let identity =
+        identity(options).ok_or_else(|| anyhow::anyhow!("No identity configured for forward"))?;
     Ok(build_inline_forward(&parse_file(path)?, &identity))
 }
 
@@ -13472,7 +14264,8 @@ fn composed_attachment_forward_for_message(
     message: &notm_notmuch::MessageSummary,
 ) -> anyhow::Result<ComposedMessage> {
     let path = message_filename(message)?;
-    let identity = identity(options).ok_or_else(|| anyhow::anyhow!("no identity configured"))?;
+    let identity =
+        identity(options).ok_or_else(|| anyhow::anyhow!("No identity configured for forward"))?;
     let raw = std::fs::read(path)?;
     let parsed = notm_mail::mime::parse_rfc5322(&raw)?;
     Ok(build_attachment_forward(&parsed, &identity, raw))
@@ -13720,6 +14513,15 @@ fn ensure_user_operation_allowed(
     state: &SharedState,
     operation: UserOperation,
 ) -> anyhow::Result<()> {
+    if operation == UserOperation::Send
+        && widgets.confirmation_controller.borrow().pending.is_some()
+    {
+        let message = "sending is unavailable while a confirmation is pending";
+        widgets.status_label.set_text(message);
+        state.borrow_mut().last_operation = Some(message.to_string());
+        update_debug(widgets, state);
+        anyhow::bail!(message);
+    }
     let message = {
         let state = state.borrow();
         background_activity_block_reason(state.sync_in_progress, state.send_in_progress, operation)
@@ -14081,6 +14883,7 @@ fn select_message_by_index(
     state: &SharedState,
     index: usize,
 ) {
+    let rejection_restore = capture_message_selection_snapshot(state);
     let message = state.borrow().messages.get(index).cloned();
     if message.is_none() {
         widgets.status_label.set_text("Message index not found");
@@ -14099,8 +14902,16 @@ fn select_message_by_index(
     }
     update_message_menu(options, widgets, state);
     if selected_message_is_draft(options, state) {
-        match open_selected_draft_message(widgets, state) {
-            Ok(()) => widgets.status_label.set_text("Opened draft for editing"),
+        match open_selected_draft_message(
+            options,
+            widgets,
+            state,
+            ActivePane::Message,
+            "Opened draft for editing".to_string(),
+            Some(rejection_restore.clone()),
+        ) {
+            Ok(true) => {}
+            Ok(false) => {}
             Err(err) => {
                 state.borrow_mut().last_error = Some(err.to_string());
                 widgets
@@ -14109,8 +14920,14 @@ fn select_message_by_index(
             }
         }
     } else {
-        detach_active_draft_for_message_view(widgets, state);
-        show_preferred_selected_message_view(options, widgets, state);
+        let _ = request_show_selected_message(
+            options,
+            widgets,
+            state,
+            ActivePane::Message,
+            "Opened selected message".to_string(),
+            Some(rejection_restore),
+        );
     }
 }
 
@@ -14964,30 +15781,23 @@ fn sync_command_specs(options: &LaunchOptions, kind: SyncRunKind) -> Vec<SyncCom
     commands
 }
 
-fn open_compose(widgets: &Widgets, state: &SharedState) -> bool {
-    if ensure_user_operation_allowed(widgets, state, UserOperation::ComposeReplace).is_err() {
-        return false;
-    }
-    show_compose_view(widgets);
-    set_active_draft(widgets, state, None);
-    move_compose_cursor_to_start(widgets);
-    {
-        let mut state = state.borrow_mut();
-        state.active_pane = ActivePane::Message;
-        state.compose_fields.in_reply_to = None;
-        state.compose_fields.references.clear();
-        state.compose_fields.text_reply_quote = None;
-        state.compose_fields.html_reply_quote = None;
-        state.compose_generation = state.compose_generation.saturating_add(1);
-        state.last_operation = Some("opened composer".to_string());
-    }
-    if state.borrow().input_mode == InputMode::Insert {
-        widgets.compose_to.grab_focus();
-    } else {
-        focus_active_pane(widgets, state);
-    }
-    update_debug(widgets, state);
-    true
+fn open_compose(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) -> bool {
+    request_pending_action(
+        options,
+        widgets,
+        state,
+        PendingAction::ReplaceComposer(PreparedComposerReplacement {
+            kind: ComposerReplacementKind::New,
+            payload: ComposerReplacementPayload::Empty,
+            selection: None,
+            rejection_restore: None,
+            status: "New composer opened".to_string(),
+            source_status: None,
+            present_main_window: false,
+            show_message_pane: false,
+            active_pane: ActivePane::Message,
+        }),
+    )
 }
 
 fn reply_selected(
@@ -14996,42 +15806,37 @@ fn reply_selected(
     state: &SharedState,
     kind: ReplyKind,
 ) -> bool {
-    if ensure_user_operation_allowed(widgets, state, UserOperation::ComposeReplace).is_err() {
-        return false;
-    }
     let Some(message) = state.borrow().selected_message.clone() else {
         widgets
             .status_label
             .set_text("No selected message to reply to");
         return false;
     };
-    let Some(path) = message.filenames.first() else {
-        widgets
-            .status_label
-            .set_text("Selected message has no filename");
-        return false;
-    };
-    let Some(id) = identity(options) else {
-        widgets
-            .status_label
-            .set_text("No identity configured for reply");
-        return false;
-    };
-    let replied = match parse_file(path) {
-        Ok(parsed) => {
-            let mut own = options.other_email.clone();
-            if let Some(email) = &options.primary_email {
-                own.push(email.clone());
-            }
-            let reply = build_reply(&parsed, &id, &own, kind);
-            fill_composer(widgets, state, reply);
-            widgets.status_label.set_text("Reply composer opened");
-            true
-        }
+    let replied = match composed_reply_for_message(options, &message, kind) {
+        Ok(message) => request_pending_action(
+            options,
+            widgets,
+            state,
+            PendingAction::ReplaceComposer(PreparedComposerReplacement {
+                kind: if kind == ReplyKind::All {
+                    ComposerReplacementKind::ReplyAll
+                } else {
+                    ComposerReplacementKind::Reply
+                },
+                payload: ComposerReplacementPayload::Message(Box::new(message)),
+                selection: None,
+                rejection_restore: None,
+                status: "Reply composer opened".to_string(),
+                source_status: None,
+                present_main_window: false,
+                show_message_pane: false,
+                active_pane: ActivePane::Message,
+            }),
+        ),
         Err(err) => {
             widgets
                 .status_label
-                .set_text(&format!("Reply parse failed: {err}"));
+                .set_text(&format!("Reply failed: {err}"));
             false
         }
     };
@@ -15040,36 +15845,33 @@ fn reply_selected(
 }
 
 fn forward_selected(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) -> bool {
-    if ensure_user_operation_allowed(widgets, state, UserOperation::ComposeReplace).is_err() {
-        return false;
-    }
     let Some(message) = state.borrow().selected_message.clone() else {
         widgets
             .status_label
             .set_text("No selected message to forward");
         return false;
     };
-    let Some(path) = message.filenames.first() else {
-        widgets
-            .status_label
-            .set_text("Selected message has no filename");
-        return false;
-    };
-    let Some(id) = identity(options) else {
-        widgets
-            .status_label
-            .set_text("No identity configured for forward");
-        return false;
-    };
-    let forwarded = match parse_file(path) {
-        Ok(parsed) => {
-            fill_composer(widgets, state, build_inline_forward(&parsed, &id));
-            true
-        }
+    let forwarded = match composed_inline_forward_for_message(options, &message) {
+        Ok(message) => request_pending_action(
+            options,
+            widgets,
+            state,
+            PendingAction::ReplaceComposer(PreparedComposerReplacement {
+                kind: ComposerReplacementKind::Forward,
+                payload: ComposerReplacementPayload::Message(Box::new(message)),
+                selection: None,
+                rejection_restore: None,
+                status: "Forward composer opened".to_string(),
+                source_status: None,
+                present_main_window: false,
+                show_message_pane: false,
+                active_pane: ActivePane::Message,
+            }),
+        ),
         Err(err) => {
             widgets
                 .status_label
-                .set_text(&format!("Forward parse failed: {err}"));
+                .set_text(&format!("Forward failed: {err}"));
             false
         }
     };
@@ -15082,40 +15884,29 @@ fn forward_as_attachment_selected(
     widgets: &Widgets,
     state: &SharedState,
 ) -> bool {
-    if ensure_user_operation_allowed(widgets, state, UserOperation::ComposeReplace).is_err() {
-        return false;
-    }
     let Some(message) = state.borrow().selected_message.clone() else {
         widgets
             .status_label
             .set_text("No selected message to forward");
         return false;
     };
-    let Some(path) = message.filenames.first() else {
-        widgets
-            .status_label
-            .set_text("Selected message has no filename");
-        return false;
-    };
-    let Some(id) = identity(options) else {
-        widgets
-            .status_label
-            .set_text("No identity configured for forward");
-        return false;
-    };
-    let result = (|| -> anyhow::Result<ComposedMessage> {
-        let raw = std::fs::read(path)?;
-        let parsed = notm_mail::mime::parse_rfc5322(&raw)?;
-        Ok(build_attachment_forward(&parsed, &id, raw))
-    })();
-    let forwarded = match result {
-        Ok(message) => {
-            fill_composer(widgets, state, message);
-            widgets
-                .status_label
-                .set_text("Forward-as-attachment composer opened");
-            true
-        }
+    let forwarded = match composed_attachment_forward_for_message(options, &message) {
+        Ok(message) => request_pending_action(
+            options,
+            widgets,
+            state,
+            PendingAction::ReplaceComposer(PreparedComposerReplacement {
+                kind: ComposerReplacementKind::ForwardAttachment,
+                payload: ComposerReplacementPayload::Message(Box::new(message)),
+                selection: None,
+                rejection_restore: None,
+                status: "Forward-as-attachment composer opened".to_string(),
+                source_status: None,
+                present_main_window: false,
+                show_message_pane: false,
+                active_pane: ActivePane::Message,
+            }),
+        ),
         Err(err) => {
             state.borrow_mut().last_error = Some(err.to_string());
             widgets
@@ -15259,26 +16050,61 @@ struct PendingSend {
     application_hold: gtk::gio::ApplicationHoldGuard,
 }
 
+enum SendStart {
+    Started,
+    ConfirmationPending,
+}
+
 fn send_compose(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<SendStart> {
     ensure_user_operation_allowed(widgets, state, UserOperation::Send)?;
-    let application_hold = widgets
-        .window
-        .application()
-        .ok_or_else(|| anyhow::anyhow!("main window is not attached to the GTK application"))?
-        .hold();
     let sent_fields = compose_fields(widgets, state);
     let (sent_generation, sent_draft) = {
         let state = state.borrow();
         (state.compose_generation, state.active_draft.clone())
     };
+    if let Some(active) = sent_draft {
+        let requested = request_pending_action(
+            options,
+            widgets,
+            state,
+            PendingAction::SendComposer {
+                fields: sent_fields,
+                active,
+                generation: sent_generation,
+            },
+        );
+        if requested {
+            return Ok(SendStart::ConfirmationPending);
+        }
+        anyhow::bail!(widgets.status_label.text().to_string());
+    }
+    start_captured_send(options, widgets, state, sent_fields, None, sent_generation)?;
+    Ok(SendStart::Started)
+}
+
+fn start_captured_send(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    sent_fields: ComposeFields,
+    sent_draft: Option<ActiveDraft>,
+    sent_generation: u64,
+) -> anyhow::Result<()> {
+    let application_hold = widgets
+        .window
+        .application()
+        .ok_or_else(|| anyhow::anyhow!("main window is not attached to the GTK application"))?
+        .hold();
     let rx = spawn_send(options.clone(), sent_fields.clone())?;
     {
         let mut state = state.borrow_mut();
-        state.compose_fields = sent_fields.clone();
+        if state.compose_generation == sent_generation {
+            state.compose_fields = sent_fields.clone();
+        }
         state.send_in_progress = true;
         state.last_send_report = None;
         state.last_error = None;
@@ -15327,10 +16153,22 @@ fn send_start_response(
     state: &SharedState,
 ) -> serde_json::Value {
     match send_compose(options, widgets, state) {
-        Ok(()) => json!({"ok": true, "pending": true, "state": &*state.borrow()}),
+        Ok(SendStart::Started) => json!({
+            "ok": true,
+            "pending": true,
+            "pending_confirmation": false,
+            "state": &*state.borrow(),
+        }),
+        Ok(SendStart::ConfirmationPending) => json!({
+            "ok": true,
+            "pending": false,
+            "pending_confirmation": true,
+            "state": &*state.borrow(),
+        }),
         Err(err) => json!({
             "ok": false,
             "pending": false,
+            "pending_confirmation": widgets.confirmation_controller.borrow().pending.is_some(),
             "error": err.to_string(),
             "state": &*state.borrow(),
         }),
@@ -15895,7 +16733,41 @@ fn handle_automation_request(
     saved_store: &SavedSearchStore,
     req: AutomationRequest,
 ) {
+    let pending_block = {
+        let controller = widgets.confirmation_controller.borrow();
+        controller.pending.as_ref().and_then(|pending| {
+            (!automation_command_allowed_while_confirmation_pending(&req.command)).then(|| {
+                json!({
+                    "ok": false,
+                    "error": "automation mutation is unavailable while a confirmation is pending",
+                    "pending_confirmation": true,
+                    "pending": {
+                        "id": pending.id,
+                        "kind": pending.action.kind_name(),
+                    },
+                })
+            })
+        })
+    };
+    if let Some(response) = pending_block {
+        let _ = req.response.send(response);
+        return;
+    }
     if let Err(err) = ensure_automation_request_allowed(options, &req.command, &req.args) {
+        let _ = req
+            .response
+            .send(json!({"ok": false, "error": err.to_string()}));
+        return;
+    }
+    let confirmation_control = {
+        let controller = widgets.confirmation_controller.borrow();
+        ensure_confirmation_control_allowed(
+            options,
+            controller.pending.as_ref().map(|pending| &pending.action),
+            req.command.as_str(),
+        )
+    };
+    if let Err(err) = confirmation_control {
         let _ = req
             .response
             .send(json!({"ok": false, "error": err.to_string()}));
@@ -16537,7 +17409,7 @@ fn handle_automation_request(
         }
         "run_manual_sync" => manual_sync_response(options, widgets, state, &req.args),
         "open_compose" => {
-            let opened = open_compose(widgets, state);
+            let opened = open_compose(options, widgets, state);
             automation_reply_response(opened, widgets, state)
         }
         "compose_set_from"
@@ -16615,8 +17487,8 @@ fn handle_automation_request(
             record_compose_edit(state, compose_fields(widgets, state));
             json!({"ok": completed, "compose_fields": state.borrow().compose_fields})
         }
-        "save_draft" => match save_current_draft(options, widgets, state) {
-            Ok(report) => {
+        "save_draft" => match request_save_current_draft(options, widgets, state) {
+            Ok(Some(report)) => {
                 refresh_draft_list(widgets);
                 let destination = report
                     .maildir_path
@@ -16629,6 +17501,11 @@ fn handle_automation_request(
                     .set_text(&format!("Draft saved to {destination}"));
                 json!({"ok": true, "report": report})
             }
+            Ok(None) => json!({
+                "ok": true,
+                "pending_confirmation": true,
+                "state": &*state.borrow(),
+            }),
             Err(err) => json!({"ok": false, "error": err.to_string()}),
         },
         "list_drafts" => {
@@ -16652,6 +17529,14 @@ fn handle_automation_request(
             spin_main_context_for(Duration::from_millis(75));
             draft_list_state_json(widgets, state)
         }
+        "pending_confirmation" => {
+            spin_main_context_for(Duration::from_millis(25));
+            pending_confirmation_state_json(widgets, state)
+        }
+        "respond_confirmation" => match respond_pending_confirmation(widgets, state, &req.args) {
+            Ok(response) => response,
+            Err(err) => json!({"ok": false, "error": err.to_string()}),
+        },
         "activate_draft_by_index" => {
             let index = req.args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
             if let Some(row) = widgets.draft_list.row_at_index(index) {
@@ -16674,40 +17559,42 @@ fn handle_automation_request(
                     spin_main_context_for(Duration::from_millis(25));
                     let deleted = existed_before && !path.exists();
                     let mut response = draft_list_state_json(widgets, state);
-                    response["ok"] = json!(deleted);
+                    response["ok"] = json!(true);
                     response["deleted"] = json!(deleted);
+                    response["pending_confirmation"] =
+                        json!(widgets.confirmation_controller.borrow().pending.is_some());
                     response["path"] = json!(path);
                     response
                 }
                 Err(err) => json!({"ok": false, "error": err.to_string()}),
             }
         }
-        "load_selected_draft" => match load_selected_named_draft(widgets, state) {
-            Ok(path) => {
-                json!({"ok": true, "path": path, "compose_fields": state.borrow().compose_fields})
+        "load_selected_draft" => match load_selected_named_draft(options, widgets, state) {
+            Ok((requested, path)) => {
+                let error = (!requested).then(|| widgets.status_label.text().to_string());
+                json!({"ok": requested, "path": path, "pending_confirmation": widgets.confirmation_controller.borrow().pending.is_some(), "error": error, "compose_fields": state.borrow().compose_fields})
             }
             Err(err) => json!({"ok": false, "error": err.to_string()}),
         },
         "delete_selected_draft" => {
-            let ok = delete_selected_named_draft_from_ui(widgets, state);
+            let ok = delete_selected_named_draft_from_ui(options, widgets, state);
             let error = (!ok).then(|| widgets.status_label.text().to_string());
-            json!({"ok": ok, "error": error, "compose_fields": state.borrow().compose_fields, "active_draft": state.borrow().active_draft, "last_error": state.borrow().last_error})
+            json!({"ok": ok, "pending_confirmation": widgets.confirmation_controller.borrow().pending.is_some(), "error": error, "compose_fields": state.borrow().compose_fields, "active_draft": state.borrow().active_draft, "last_error": state.borrow().last_error})
         }
         "delete_active_draft" | "delete_local_draft" => {
             let ok = delete_active_draft_from_ui(options, widgets, state);
             let error = (!ok).then(|| widgets.status_label.text().to_string());
-            json!({"ok": ok, "error": error, "compose_fields": state.borrow().compose_fields, "active_draft": state.borrow().active_draft, "last_error": state.borrow().last_error})
+            json!({"ok": ok, "pending_confirmation": widgets.confirmation_controller.borrow().pending.is_some(), "error": error, "compose_fields": state.borrow().compose_fields, "active_draft": state.borrow().active_draft, "last_error": state.borrow().last_error})
         }
         "load_draft" => {
-            let loaded = restore_draft_if_present(widgets, state);
+            let loaded = restore_draft_if_present(options, widgets, state);
             automation_reply_response(loaded, widgets, state)
         }
-        "clear_draft" => match clear_current_draft_from_ui(options, widgets, state) {
-            Ok(()) => json!({"ok": true, "compose_fields": state.borrow().compose_fields}),
-            Err(err) => {
-                json!({"ok": false, "error": err.to_string(), "compose_fields": state.borrow().compose_fields})
-            }
-        },
+        "clear_draft" => {
+            let ok = clear_current_draft_from_ui(options, widgets, state);
+            let error = (!ok).then(|| widgets.status_label.text().to_string());
+            json!({"ok": ok, "pending_confirmation": widgets.confirmation_controller.borrow().pending.is_some(), "error": error, "compose_fields": state.borrow().compose_fields, "active_draft": state.borrow().active_draft})
+        }
         "compose_send" => send_start_response(options, widgets, state),
         "reply_selected" => automation_reply_response(
             reply_selected(options, widgets, state, ReplyKind::Sender),
@@ -17045,6 +17932,42 @@ fn handle_automation_request(
     let _ = req.response.send(result);
 }
 
+fn automation_command_allowed_while_confirmation_pending(command: &str) -> bool {
+    matches!(
+        command,
+        "health"
+            | "app_state"
+            | "search_status"
+            | "entry_state"
+            | "thread_page_info"
+            | "thread_selection_view_state"
+            | "selection_view_state"
+            | "thread_row_layout"
+            | "custom_saved_searches"
+            | "pane_visibility"
+            | "message_action_labels"
+            | "layout_state"
+            | "standalone_message_windows"
+            | "undo_tag_actions"
+            | "get_address_suggestions"
+            | "list_drafts"
+            | "draft_list_state"
+            | "pending_confirmation"
+            | "respond_confirmation"
+            | "html_scroll_state"
+            | "trusted_image_senders"
+            | "html_view_state"
+            | "message_view_text"
+            | "thread_ui_details"
+            | "thread_list_rows"
+            | "command_completion"
+            | "settings_test_state"
+            | "attachment_list_items"
+            | "attachment_test_state"
+            | "get_logs"
+    )
+}
+
 fn automation_mutation_response(
     ok: bool,
     widgets: &Widgets,
@@ -17143,6 +18066,89 @@ fn draft_list_state_json(widgets: &Widgets, state: &SharedState) -> serde_json::
         "last_operation": &state.last_operation,
         "status_text": widgets.status_label.text().to_string(),
     })
+}
+
+fn pending_confirmation_state_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
+    let controller = widgets.confirmation_controller.borrow();
+    let pending = controller.pending.as_ref().map(|pending| {
+        let (title, _, confirm_label) = pending.action.prompt();
+        json!({
+            "id": pending.id,
+            "kind": pending.action.kind_name(),
+            "title": title,
+            "confirm_label": confirm_label,
+            "visible": pending
+                .dialog
+                .upgrade()
+                .is_some_and(|dialog| dialog.is_visible()),
+        })
+    });
+    let completion = controller.last_completion.as_ref().map(|completion| {
+        json!({
+            "id": completion.id,
+            "accepted": completion.accepted,
+            "succeeded": completion.succeeded,
+        })
+    });
+    drop(controller);
+    let state = state.borrow();
+    json!({
+        "ok": true,
+        "pending": pending,
+        "last_completion": completion,
+        "compose_fields": &state.compose_fields,
+        "active_draft": &state.active_draft,
+        "recovery_path": &widgets.draft_path,
+        "drafts_dir": &widgets.drafts_dir,
+        "last_error": &state.last_error,
+        "last_operation": &state.last_operation,
+        "status_text": widgets.status_label.text().to_string(),
+    })
+}
+
+fn respond_pending_confirmation(
+    widgets: &Widgets,
+    state: &SharedState,
+    args: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let response_name = args
+        .get("response")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("reject");
+    let response = match response_name {
+        "accept" => gtk::ResponseType::Accept,
+        "reject" | "cancel" => gtk::ResponseType::Cancel,
+        _ => anyhow::bail!("response must be accept or reject"),
+    };
+    let (pending_id, dialog) = {
+        let controller = widgets.confirmation_controller.borrow();
+        let pending = controller
+            .pending
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no confirmation is pending"))?;
+        let requested_id = args
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(pending.id);
+        anyhow::ensure!(requested_id == pending.id, "confirmation id does not match");
+        let dialog = pending
+            .dialog
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("pending confirmation dialog is unavailable"))?;
+        (pending.id, dialog)
+    };
+    dialog.response(response);
+    spin_main_context_for(Duration::from_millis(75));
+    let mut result = pending_confirmation_state_json(widgets, state);
+    let succeeded = widgets
+        .confirmation_controller
+        .borrow()
+        .last_completion
+        .as_ref()
+        .is_some_and(|completion| completion.id == pending_id && completion.succeeded);
+    result["ok"] = json!(succeeded);
+    result["response"] = json!(response_name);
+    Ok(result)
 }
 
 fn rendered_thread_preview_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
@@ -17349,6 +18355,7 @@ enum AutomationOperation {
     Tag,
     ExternalSync,
     FixtureOnly,
+    ConfirmationControl,
 }
 
 fn ensure_automation_request_allowed(
@@ -17379,6 +18386,9 @@ fn ensure_automation_request_allowed(
         | "click_delete_selected_draft"
         | "settings_test_state"
         | "respond_settings" => Some(AutomationOperation::FixtureOnly),
+        "pending_confirmation" | "respond_confirmation" => {
+            Some(AutomationOperation::ConfirmationControl)
+        }
         "run_command" => args
             .get("command")
             .and_then(serde_json::Value::as_str)
@@ -17392,6 +18402,13 @@ fn ensure_automation_request_allowed(
         anyhow::ensure!(
             options.fixture_mode,
             "fixture UI controls are available only in fixture mode"
+        );
+        return Ok(());
+    }
+    if operation == AutomationOperation::ConfirmationControl {
+        anyhow::ensure!(
+            options.fixture_mode || options.allow_live_send_test,
+            "confirmation controls require fixture mode or automation.allow_live_send_test=true"
         );
         return Ok(());
     }
@@ -17413,7 +18430,31 @@ fn ensure_automation_request_allowed(
         ),
         AutomationOperation::ExternalSync => {}
         AutomationOperation::FixtureOnly => unreachable!("fixture-only operation handled above"),
+        AutomationOperation::ConfirmationControl => {
+            unreachable!("confirmation control handled above")
+        }
     }
+    Ok(())
+}
+
+fn ensure_confirmation_control_allowed(
+    options: &LaunchOptions,
+    pending_action: Option<&PendingAction>,
+    command: &str,
+) -> anyhow::Result<()> {
+    if !matches!(command, "pending_confirmation" | "respond_confirmation") || options.fixture_mode {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        options.allow_live_send_test,
+        "confirmation controls require automation.allow_live_send_test=true"
+    );
+    let send_pending =
+        pending_action.is_some_and(|action| matches!(action, PendingAction::SendComposer { .. }));
+    anyhow::ensure!(
+        send_pending,
+        "live confirmation controls are available only for a pending saved-draft Send"
+    );
     Ok(())
 }
 
@@ -17432,7 +18473,11 @@ fn automation_reply_response(
     state: &SharedState,
 ) -> serde_json::Value {
     if replied {
-        json!({"ok": true, "compose_fields": state.borrow().compose_fields})
+        json!({
+            "ok": true,
+            "pending_confirmation": widgets.confirmation_controller.borrow().pending.is_some(),
+            "compose_fields": state.borrow().compose_fields,
+        })
     } else {
         json!({
             "ok": false,
@@ -17481,7 +18526,7 @@ fn run_named_command(
             json!({"ok": true, "state": &*state.borrow()})
         }
         "compose" => {
-            let opened = open_compose(widgets, state);
+            let opened = open_compose(options, widgets, state);
             automation_reply_response(opened, widgets, state)
         }
         "reply" => automation_reply_response(
@@ -18120,6 +19165,9 @@ fn show_command_palette(
         let command = normalize_command_input(&entry.text());
         close_command_palette(&w, &st);
         let result = run_named_command(&command, &opts, &w, &st, &undo);
+        if w.confirmation_controller.borrow().pending.is_some() {
+            return;
+        }
         if result
             .get("ok")
             .and_then(|ok| ok.as_bool())
@@ -20540,7 +21588,7 @@ mod tests {
     }
 
     #[test]
-    fn draft_list_test_controls_are_fixture_only() {
+    fn draft_list_and_confirmation_test_controls_are_narrowly_gated() {
         let live_options = LaunchOptions::default();
         for command in [
             "draft_list_state",
@@ -20551,6 +21599,49 @@ mod tests {
                 .expect_err("live harness must not expose draft-list widget controls");
             assert!(error.to_string().contains("available only in fixture mode"));
         }
+        for command in ["pending_confirmation", "respond_confirmation"] {
+            let error = ensure_automation_request_allowed(&live_options, command, &json!({}))
+                .expect_err("live confirmation controls must require the send gate");
+            assert!(error.to_string().contains("allow_live_send_test=true"));
+        }
+
+        let live_send_options = LaunchOptions {
+            allow_live_send_test: true,
+            ..LaunchOptions::default()
+        };
+        for command in ["pending_confirmation", "respond_confirmation"] {
+            ensure_automation_request_allowed(&live_send_options, command, &json!({}))
+                .expect("the dispatch layer performs the exact pending-Send check");
+        }
+        let fields = ComposeFields::default();
+        let send = PendingAction::SendComposer {
+            fields: fields.clone(),
+            active: ActiveDraft {
+                path: PathBuf::from("/tmp/gated-send-draft.json"),
+                message_id: None,
+                indexed: false,
+                saved_fields: fields,
+            },
+            generation: 1,
+        };
+        for command in ["pending_confirmation", "respond_confirmation"] {
+            ensure_confirmation_control_allowed(&live_send_options, Some(&send), command)
+                .expect("gated live controls should drive the exact pending Send");
+            let no_pending = ensure_confirmation_control_allowed(&live_send_options, None, command)
+                .expect_err("gated controls must not inspect an absent live confirmation");
+            assert!(no_pending.to_string().contains("pending saved-draft Send"));
+            let wrong_action = ensure_confirmation_control_allowed(
+                &live_send_options,
+                Some(&PendingAction::ClearComposer),
+                command,
+            )
+            .expect_err("gated controls must not drive a non-Send confirmation");
+            assert!(
+                wrong_action
+                    .to_string()
+                    .contains("pending saved-draft Send")
+            );
+        }
 
         let fixture_options = LaunchOptions {
             fixture_mode: true,
@@ -20560,10 +21651,254 @@ mod tests {
             "draft_list_state",
             "activate_draft_by_index",
             "click_delete_selected_draft",
+            "pending_confirmation",
+            "respond_confirmation",
         ] {
             ensure_automation_request_allowed(&fixture_options, command, &json!({}))
                 .expect("fixture draft-list UI control");
         }
+    }
+
+    #[test]
+    fn pending_confirmation_automation_gate_is_read_only_except_for_its_response() {
+        for command in [
+            "health",
+            "app_state",
+            "draft_list_state",
+            "pending_confirmation",
+            "respond_confirmation",
+            "html_view_state",
+            "attachment_test_state",
+        ] {
+            assert!(
+                automation_command_allowed_while_confirmation_pending(command),
+                "{command} should remain available while inspecting the modal"
+            );
+        }
+        for command in [
+            "compose_set_subject",
+            "compose_add_attachment",
+            "save_draft",
+            "load_draft",
+            "delete_active_draft",
+            "clear_draft",
+            "compose_send",
+            "reply_selected",
+            "tag_selected",
+            "run_manual_sync",
+            "respond_settings",
+            "close_main_window",
+            "run_command",
+        ] {
+            assert!(
+                !automation_command_allowed_while_confirmation_pending(command),
+                "{command} must not bypass GTK modality through the harness"
+            );
+        }
+    }
+
+    #[test]
+    fn confirmation_policy_matches_transient_and_saved_composer_state() {
+        let replacement = |kind| {
+            PendingAction::ReplaceComposer(PreparedComposerReplacement {
+                kind,
+                payload: ComposerReplacementPayload::Empty,
+                selection: None,
+                rejection_restore: None,
+                status: String::new(),
+                source_status: None,
+                present_main_window: false,
+                show_message_pane: false,
+                active_pane: ActivePane::Message,
+            })
+        };
+        let blank = ComposeFields {
+            from: "Me <me@example.test>".to_string(),
+            ..ComposeFields::default()
+        };
+        assert!(!fields_has_content(&blank));
+        assert!(!pending_action_requires_confirmation(
+            &replacement(ComposerReplacementKind::New),
+            &blank,
+            None
+        ));
+
+        for fields in [
+            ComposeFields {
+                to: "you@example.test".to_string(),
+                ..blank.clone()
+            },
+            ComposeFields {
+                cc: "you@example.test".to_string(),
+                ..blank.clone()
+            },
+            ComposeFields {
+                bcc: "you@example.test".to_string(),
+                ..blank.clone()
+            },
+            ComposeFields {
+                subject: "subject".to_string(),
+                ..blank.clone()
+            },
+            ComposeFields {
+                body: "body".to_string(),
+                ..blank.clone()
+            },
+            ComposeFields {
+                attachments: vec!["/tmp/attachment".to_string()],
+                ..blank.clone()
+            },
+        ] {
+            assert!(fields_has_content(&fields));
+            assert!(pending_action_requires_confirmation(
+                &replacement(ComposerReplacementKind::Reply),
+                &fields,
+                None
+            ));
+        }
+
+        let active = ActiveDraft {
+            path: PathBuf::from("/tmp/saved-draft.json"),
+            message_id: None,
+            indexed: false,
+            saved_fields: blank.clone(),
+        };
+        assert!(!pending_action_requires_confirmation(
+            &PendingAction::ClearComposer,
+            &blank,
+            Some(&active)
+        ));
+        assert!(!pending_action_requires_confirmation(
+            &replacement(ComposerReplacementKind::NamedDraft),
+            &blank,
+            Some(&active)
+        ));
+        assert!(!pending_action_requires_confirmation(
+            &PendingAction::CloseMainWindow,
+            &blank,
+            Some(&active)
+        ));
+        let changed = ComposeFields {
+            body: "changed".to_string(),
+            ..blank.clone()
+        };
+        assert!(pending_action_requires_confirmation(
+            &PendingAction::ClearComposer,
+            &changed,
+            Some(&active)
+        ));
+        let show_message = PendingAction::ShowSelectedMessage {
+            selection: MessageSelectionSnapshot {
+                selected_thread: None,
+                selected_thread_index: None,
+                selected_message: None,
+                messages: Vec::new(),
+                active_pane: ActivePane::Message,
+                last_operation: None,
+                last_error: None,
+            },
+            rejection_restore: None,
+            status: String::new(),
+            active_pane: ActivePane::Message,
+        };
+        assert!(pending_action_requires_confirmation(
+            &show_message,
+            &changed,
+            Some(&active)
+        ));
+        assert!(pending_action_requires_confirmation(
+            &PendingAction::CloseMainWindow,
+            &changed,
+            Some(&active)
+        ));
+    }
+
+    #[test]
+    fn permanent_draft_actions_always_confirm_and_keep_distinct_types() {
+        let fields = ComposeFields::default();
+        let active = ActiveDraft {
+            path: PathBuf::from("/tmp/saved-draft.json"),
+            message_id: None,
+            indexed: false,
+            saved_fields: fields.clone(),
+        };
+        let actions = [
+            PendingAction::DeleteActiveDraft(active.clone()),
+            PendingAction::DeleteNamedDraft(PathBuf::from("/tmp/named-draft.json")),
+            PendingAction::SaveDraftReplacement {
+                fields: fields.clone(),
+                previous: active.clone(),
+            },
+            PendingAction::SendComposer {
+                fields: fields.clone(),
+                active: active.clone(),
+                generation: 7,
+            },
+        ];
+        let kinds = actions
+            .iter()
+            .map(PendingAction::kind_name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                "delete_active_draft",
+                "delete_named_draft",
+                "save_draft_replacement",
+                "send_composer",
+            ]
+        );
+        for action in &actions {
+            assert!(action.always_requires_confirmation());
+            assert!(pending_action_requires_confirmation(
+                action,
+                &fields,
+                Some(&active)
+            ));
+        }
+        assert_eq!(actions[3].operation(), UserOperation::Send);
+        assert!(
+            background_activity_block_reason(true, false, actions[3].operation()).is_some(),
+            "accepting a pending saved-draft Send must revalidate a newly started sync"
+        );
+        assert!(persisted_draft_deletion_requires_confirmation(
+            PersistedDraftDeletion::ExplicitActive
+        ));
+        assert!(persisted_draft_deletion_requires_confirmation(
+            PersistedDraftDeletion::ExplicitNamed
+        ));
+        assert!(persisted_draft_deletion_requires_confirmation(
+            PersistedDraftDeletion::SaveReplacement
+        ));
+        assert!(persisted_draft_deletion_requires_confirmation(
+            PersistedDraftDeletion::AcceptedSendCleanup
+        ));
+    }
+
+    #[test]
+    fn every_compose_replacement_kind_has_a_stable_distinct_harness_name() {
+        let kinds = [
+            ComposerReplacementKind::New,
+            ComposerReplacementKind::Reply,
+            ComposerReplacementKind::ReplyAll,
+            ComposerReplacementKind::Forward,
+            ComposerReplacementKind::ForwardAttachment,
+            ComposerReplacementKind::StandaloneReply,
+            ComposerReplacementKind::StandaloneReplyAll,
+            ComposerReplacementKind::StandaloneForward,
+            ComposerReplacementKind::StandaloneForwardAttachment,
+            ComposerReplacementKind::NamedDraft,
+            ComposerReplacementKind::RecoveryDraft,
+            ComposerReplacementKind::IndexedDraft,
+        ];
+        let names = kinds.map(ComposerReplacementKind::name);
+        assert_eq!(
+            names
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            kinds.len()
+        );
     }
 
     #[test]

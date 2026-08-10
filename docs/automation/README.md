@@ -99,6 +99,7 @@ Implemented test-harness commands include:
   `delete_selected_draft`, `delete_active_draft`, `delete_local_draft`,
   `load_draft`, `clear_draft`, `draft_list_state`,
   `activate_draft_by_index`, `click_delete_selected_draft`,
+  `pending_confirmation`, `respond_confirmation`,
   `save_selected_attachment`, `save_attachment`, `open_selected_attachment`,
   `open_attachment`, `attachment_test_state`, `respond_attachment_save`
 - message actions: `show_raw_source`, `open_raw_source`, `show_full_headers`,
@@ -128,7 +129,50 @@ and emits the real list activation signal; `click_delete_selected_draft` emits
 the real Delete button click and reports whether its selected file was removed.
 These three UI-test controls are rejected outside fixture mode. The older
 `select_draft_by_index`, `load_selected_draft`, and `delete_selected_draft`
-commands remain direct compatibility controls.
+commands remain compatibility controls; load and delete still use the same
+confirmation policy as their rendered UI routes.
+
+### Confirmation dialog seam
+
+Destructive actions and actions that replace the composer can defer instead of
+running immediately. This includes draft discard and permanent deletion, dirty
+composer replacement by New/reply/forward/draft-load actions, and other routes
+such as window close. A command that starts this flow
+reports `pending_confirmation: true` where applicable; use
+`pending_confirmation` as the authoritative state check. Sending an active
+saved draft is also a typed `send_composer` confirmation because transport
+acceptance will permanently delete that draft. Unsaved sends still start
+directly. Accepted cleanup retains the existing draft-identity and
+composer-generation checks.
+
+`pending_confirmation` reports either `pending: null` or the captured action's
+`id`, typed `kind`, dialog `title`, confirmation-button label, and current GTK
+visibility. Its response also includes `last_completion` plus the current
+compose fields, active draft, recovery and named-draft paths, visible status,
+and last operation/error so a smoke can compare state across a response. Only
+one action can be pending at a time.
+
+Drive the real modal dialog with `respond_confirmation`. Set `response` to
+`accept` or `reject`; optional `id` defaults to the current pending action and
+guards against responding to a different dialog. For example:
+
+```json
+{"token":"dev-token","command":"respond_confirmation","args":{"id":1,"response":"reject"}}
+```
+
+The command emits the real GTK dialog response rather than calling the action
+directly. Reject cancels without executing the captured replacement or
+destructive action. Accept first revalidates current send/sync eligibility and
+then executes that captured action once; the returned `last_completion` reports
+its `accepted` and `succeeded` state. While a confirmation is pending, harness
+mutations are rejected without changing its ID, dialog, compose state, recovery
+bytes, or persisted drafts; read-only queries remain available.
+
+Both confirmation commands are normally fixture-only. A non-fixture harness
+with `automation.allow_live_send_test=true` may use them only while the pending
+action is exactly `send_composer`; this narrow gate lets custom-transport smokes
+drive the real saved-draft Send modal and does not expose other live
+confirmations.
 
 `save_selected_attachment` and its `save_attachment` compatibility spelling
 open the same GTK save chooser as the normal UI when `dir` is omitted. The
@@ -175,14 +219,15 @@ Non-fixture harness checks may pass `test_refresh_delay_ms` (maximum 5000) to
 keep that refresh pending while they exercise responsiveness and cancellation
 behavior; normal UI and command-palette syncs never add this delay.
 
-`compose_send` returns with `pending: true` after the composed snapshot has been
-queued. Poll `app_state.state.send_in_progress` until it becomes false before
-checking `last_send_report`, `last_error`, or send-related file changes. If the
-primary window closes while a send is pending, the application remains alive
-until send finalization completes.
+`compose_send` normally returns with `pending: true` after the composed snapshot
+has been queued. Poll `app_state.state.send_in_progress` until it becomes false
+before checking `last_send_report`, `last_error`, or send-related file changes.
+If the primary window closes while a send is pending, the application remains
+alive until send finalization completes.
 
-`close_main_window` closes only the primary window after returning its response.
-Standalone message windows, if any, are left open.
+`close_main_window` closes only the primary window after returning its response,
+unless dirty compose state first defers it behind a confirmation. Standalone
+message windows, if any, are left open.
 
 `set_layout` accepts `auto`, `columns` (with `three_pane` kept as a
 compatibility spelling), and `stacked`. `toggle_layout` cycles through columns,

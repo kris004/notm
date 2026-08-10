@@ -98,6 +98,21 @@ state. The second starts separate deterministic system-light and system-dark
 processes, exercises System/Light/Dark plus Save, and checks the resolved GTK
 theme background rather than trusting the requested enum.
 
+The draft confirmation flow also has a named, fixture-backed GTK smoke. It
+drives the real modal through `pending_confirmation` and
+`respond_confirmation`, covers reject and accept paths, blocks harness
+mutations while a modal is pending, and compares compose, active-draft,
+recovery-file, and persisted-draft state across a rejection. Those controls are
+fixture-only except for the narrowly gated saved-draft Send flow documented in
+`docs/automation/README.md`:
+
+```sh
+NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
+  cargo test -p notm-app --test desktop_ui_smoke \
+  fixture_draft_confirmations_preserve_rejected_state \
+  -- --exact --nocapture --test-threads=1
+```
+
 The focused-text shortcut regression has a self-contained headless Sway check.
 It requires `dbus-run-session`, `sway`, `swaymsg`, and `wtype`:
 

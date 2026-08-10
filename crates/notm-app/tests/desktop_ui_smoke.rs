@@ -827,6 +827,7 @@ fn slow_manual_sync_keeps_desktop_responsive() -> anyhow::Result<()> {
         .as_str()
         .map(PathBuf::from)
         .with_context(|| format!("saved draft has no local path: {saved_draft}"))?;
+    let saved_draft_bytes = fs::read(&saved_draft_path)?;
 
     let started = Instant::now();
     let response = driver.command("run_manual_sync", json!({"test_refresh_delay_ms": 1200}))?;
@@ -928,6 +929,22 @@ fn slow_manual_sync_keeps_desktop_responsive() -> anyhow::Result<()> {
         "blocked send still executed its helper"
     );
 
+    let restored = driver.command(
+        "compose_set_subject",
+        json!({"value": "Sync overlap draft"}),
+    )?;
+    assert_eq!(
+        restored["ok"], true,
+        "composer writing stayed blocked during sync: {restored}"
+    );
+    let closed = driver.command("clear_draft", json!({}))?;
+    assert_eq!(
+        closed["ok"], true,
+        "unchanged active draft did not close during sync: {closed}"
+    );
+    assert_eq!(closed["pending_confirmation"], false);
+    assert_eq!(closed["active_draft"], Value::Null);
+
     let refresh_search = driver.command("run_search", json!({"query": "tag:sync-refresh"}))?;
     assert_eq!(
         refresh_search["scheduled"], true,
@@ -1023,14 +1040,9 @@ fn slow_manual_sync_keeps_desktop_responsive() -> anyhow::Result<()> {
         post_sync_tag["ok"], true,
         "tagging stayed blocked after sync: {post_sync_tag}"
     );
-    let delete_draft = driver.command("delete_selected_draft", json!({}))?;
-    assert_eq!(
-        delete_draft["ok"], true,
-        "draft deletion stayed blocked after sync: {delete_draft}"
-    );
     ensure!(
-        !saved_draft_path.exists(),
-        "post-sync draft deletion left {} behind",
+        fs::read(&saved_draft_path)? == saved_draft_bytes,
+        "sync overlap mutated the persisted draft at {}",
         saved_draft_path.display()
     );
 
@@ -1200,7 +1212,17 @@ fn live_harness_denies_ungated_mutations_and_reports_reply_noops() -> anyhow::Re
     );
     ensure!(!marker.exists(), "ungated send helper was executed");
 
-    select_first_thread(&mut driver, "subject:\"Unread inbox message\"")?;
+    for (command, value) in [
+        ("compose_set_to", ""),
+        ("compose_set_subject", ""),
+        ("compose_set_body", ""),
+    ] {
+        let cleared = driver.command(command, json!({"value": value}))?;
+        assert_eq!(
+            cleared["ok"], true,
+            "could not clear the gated-send fixture: {cleared}"
+        );
+    }
     for (command, args) in [
         ("reply_selected", json!({})),
         ("reply_all_selected", json!({})),
@@ -1255,7 +1277,7 @@ fn default_draft_recovery_migrates_clears_and_reports_autosave_failures() -> any
     fs::write(
         &config_path,
         format!(
-            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:notm-recovery-smoke-empty\"\n\
              \n[identity]\nname = \"Fixture User\"\nprimary_email = \"fixture@example.test\"\n\
              \n[drafts]\nsave_maildir = false\nindex_after_save = false\n",
             toml_path(&fixture.root),
@@ -1371,13 +1393,60 @@ fn fixture_saved_drafts_are_visible_activatable_and_delete_safely() -> anyhow::R
 
     let run_id = unique_run_id()?;
     let work_dir = std::env::temp_dir().join(format!("notm-saved-draft-list-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        "[ui]\nlayout = \"columns\"\nstart_maximized = true\nshow_sidebar = false\n\
+         show_message_list = false\nshow_message_view = true\n",
+    )?;
     let token = format!("notm-saved-draft-list-ui-{run_id}");
-    let mut app = FixtureApp::spawn(work_dir.clone(), &token)?;
+    let mut app = FixtureApp::spawn_fixture_with_config(work_dir.clone(), &token, &config_path)?;
     let mut driver = app.connect(&token)?;
 
     driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let selection_deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let startup = driver.command("app_state", json!({}))?;
+        let selection = driver.command("thread_selection_view_state", json!({}))?;
+        let selection_settled = !startup["state"]["selected_thread"].is_null()
+            && startup["state"]["last_operation"]
+                .as_str()
+                .is_some_and(|operation| operation.starts_with("previewed thread "))
+            && selection["selected_local"].as_u64() == Some(0);
+        if selection_settled {
+            break;
+        }
+        ensure!(
+            Instant::now() < selection_deadline,
+            "startup thread selection did not settle: state={startup}, selection={selection}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
     assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
-    let empty = driver.command("draft_list_state", json!({}))?;
+    let compose_deadline = Instant::now() + STARTUP_TIMEOUT;
+    let empty = loop {
+        let state = driver.command("draft_list_state", json!({}))?;
+        if state["section"]["mapped"] == true {
+            break state;
+        }
+        ensure!(
+            Instant::now() < compose_deadline,
+            "composer draft section did not map: {state}\n{}",
+            app.logs()
+        );
+        let reopened = driver.command("open_compose", json!({}))?;
+        assert_eq!(
+            reopened["ok"], true,
+            "could not reassert the composer after startup selection: {reopened}"
+        );
+        assert_eq!(
+            reopened["pending_confirmation"], false,
+            "blank startup composer unexpectedly required confirmation: {reopened}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
     assert_eq!(
         empty["section"]["mapped"], true,
         "section was not rendered: {empty}"
@@ -1486,7 +1555,20 @@ fn fixture_saved_drafts_are_visible_activatable_and_delete_safely() -> anyhow::R
     let recovery_bytes = fs::read(&recovery_path)?;
     let draft_dir = saved_path.parent().context("saved draft parent")?;
     fs::set_permissions(draft_dir, fs::Permissions::from_mode(0o555))?;
-    let failed = driver.command("click_delete_selected_draft", json!({}));
+    let requested = driver.command("click_delete_selected_draft", json!({}))?;
+    assert_eq!(
+        requested["ok"], true,
+        "draft delete confirmation was not requested: {requested}"
+    );
+    assert_eq!(requested["deleted"], false);
+    assert_eq!(requested["pending_confirmation"], true);
+    let pending = driver.command("pending_confirmation", json!({}))?;
+    assert_eq!(pending["pending"]["kind"], "delete_named_draft");
+    assert_eq!(pending["pending"]["visible"], true);
+    let failed = driver.command(
+        "respond_confirmation",
+        json!({"response": "accept", "id": pending["pending"]["id"]}),
+    );
     fs::set_permissions(draft_dir, fs::Permissions::from_mode(0o755))?;
     let failed = failed?;
     assert_eq!(
@@ -1509,16 +1591,23 @@ fn fixture_saved_drafts_are_visible_activatable_and_delete_safely() -> anyhow::R
         "failed deletion changed persisted draft or recovery bytes"
     );
 
-    let deleted = driver.command("click_delete_selected_draft", json!({}))?;
-    assert_eq!(deleted["ok"], true, "draft delete retry failed: {deleted}");
+    let retried = driver.command("click_delete_selected_draft", json!({}))?;
     assert_eq!(
-        deleted["deleted"], true,
-        "draft file survived delete: {deleted}"
+        retried["pending_confirmation"], true,
+        "draft delete retry did not request confirmation: {retried}"
     );
+    let deleted = driver.command("respond_confirmation", json!({"response": "accept"}))?;
+    assert_eq!(deleted["ok"], true, "draft delete retry failed: {deleted}");
+    let deleted = driver.command("draft_list_state", json!({}))?;
     assert_eq!(
         deleted["active_draft"],
         Value::Null,
         "successful deletion left the deleted draft active: {deleted}"
+    );
+    assert_eq!(
+        json_array_at(&deleted, &["list", "rows"])?.len(),
+        0,
+        "draft row survived confirmed deletion: {deleted}"
     );
     assert_eq!(
         deleted["compose_fields"]["subject"], "Visible named draft",
@@ -1534,6 +1623,400 @@ fn fixture_saved_drafts_are_visible_activatable_and_delete_safely() -> anyhow::R
     ensure!(
         !saved_path.exists(),
         "successful delete left {saved_path:?}"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[derive(Debug, PartialEq)]
+struct DraftConfirmationSnapshot {
+    compose_fields: Value,
+    active_draft: Value,
+    recovery_bytes: Option<Vec<u8>>,
+    persisted_draft_bytes: BTreeMap<PathBuf, Vec<u8>>,
+}
+
+#[cfg(unix)]
+fn read_optional_file(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+#[cfg(unix)]
+fn capture_draft_confirmation_snapshot(
+    driver: &mut UiDriver,
+    recovery_path: &Path,
+    persisted_drafts: &[PathBuf],
+) -> anyhow::Result<DraftConfirmationSnapshot> {
+    let state = driver.command("pending_confirmation", json!({}))?;
+    let persisted_draft_bytes = persisted_drafts
+        .iter()
+        .map(|path| Ok((path.clone(), fs::read(path)?)))
+        .collect::<anyhow::Result<_>>()?;
+    Ok(DraftConfirmationSnapshot {
+        compose_fields: state["compose_fields"].clone(),
+        active_draft: state["active_draft"].clone(),
+        recovery_bytes: read_optional_file(recovery_path)?,
+        persisted_draft_bytes,
+    })
+}
+
+#[cfg(unix)]
+fn pending_confirmation_id(driver: &mut UiDriver, kind: &str) -> anyhow::Result<u64> {
+    let pending = driver.command("pending_confirmation", json!({}))?;
+    assert_eq!(pending["ok"], true, "pending-state query failed: {pending}");
+    assert_eq!(
+        pending["pending"]["kind"], kind,
+        "unexpected confirmation action: {pending}"
+    );
+    assert_eq!(
+        pending["pending"]["visible"], true,
+        "real confirmation dialog was not visible: {pending}"
+    );
+    pending["pending"]["id"]
+        .as_u64()
+        .with_context(|| format!("confirmation had no numeric id: {pending}"))
+}
+
+#[cfg(unix)]
+fn accept_send_confirmation(driver: &mut UiDriver) -> anyhow::Result<Value> {
+    let id = pending_confirmation_id(driver, "send_composer")?;
+    let accepted = driver.command(
+        "respond_confirmation",
+        json!({"response": "accept", "id": id}),
+    )?;
+    assert_eq!(
+        accepted["ok"], true,
+        "saved-draft Send confirmation failed: {accepted}"
+    );
+    assert_eq!(accepted["last_completion"]["id"], id);
+    assert_eq!(accepted["last_completion"]["accepted"], true);
+    assert_eq!(accepted["last_completion"]["succeeded"], true);
+    Ok(accepted)
+}
+
+#[cfg(unix)]
+fn reject_confirmation_unchanged(
+    driver: &mut UiDriver,
+    id: u64,
+    recovery_path: &Path,
+    persisted_drafts: &[PathBuf],
+    before: &DraftConfirmationSnapshot,
+) -> anyhow::Result<Value> {
+    let rejected = driver.command(
+        "respond_confirmation",
+        json!({"response": "reject", "id": id}),
+    )?;
+    assert_eq!(
+        rejected["ok"], true,
+        "confirmation rejection failed: {rejected}"
+    );
+    assert_eq!(rejected["pending"], Value::Null);
+    assert_eq!(rejected["last_completion"]["id"], id);
+    assert_eq!(rejected["last_completion"]["accepted"], false);
+    assert_eq!(rejected["last_completion"]["succeeded"], true);
+    let after = capture_draft_confirmation_snapshot(driver, recovery_path, persisted_drafts)?;
+    ensure!(
+        after == *before,
+        "rejected confirmation mutated draft state\nbefore: {before:#?}\nafter: {after:#?}"
+    );
+    Ok(rejected)
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_draft_confirmations_preserve_rejected_state() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_draft_confirmations_preserve_rejected_state: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running draft-confirmation desktop UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-draft-confirmation-ui-{run_id}"));
+    let token = format!("notm-draft-confirmation-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+
+    assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
+    for (command, value) in [
+        ("compose_set_to", "first@example.test"),
+        ("compose_set_subject", "First persisted draft"),
+        ("compose_set_body", "Original persisted body"),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(response["ok"], true, "{command} failed: {response}");
+    }
+    let first_saved = driver.command("save_draft", json!({}))?;
+    assert_eq!(first_saved["ok"], true, "draft save failed: {first_saved}");
+    let first_path = first_saved["report"]["local_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("saved draft had no path: {first_saved}"))?;
+    let list_state = driver.command("draft_list_state", json!({}))?;
+    let recovery_path = list_state["recovery_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("draft state had no recovery path: {list_state}"))?;
+
+    let dirtied = driver.command(
+        "compose_set_subject",
+        json!({"value": "Dirty replacement must be confirmed"}),
+    )?;
+    assert_eq!(dirtied["ok"], true, "composer edit failed: {dirtied}");
+    let before_replacement = capture_draft_confirmation_snapshot(
+        &mut driver,
+        &recovery_path,
+        std::slice::from_ref(&first_path),
+    )?;
+    let replacement = driver.command("open_compose", json!({}))?;
+    assert_eq!(replacement["ok"], true);
+    assert_eq!(replacement["pending_confirmation"], true);
+    let replacement_id = pending_confirmation_id(&mut driver, "new")?;
+
+    for (command, args) in [
+        (
+            "compose_set_subject",
+            json!({"value": "must not replace pending bytes"}),
+        ),
+        ("save_draft", json!({})),
+        ("clear_draft", json!({})),
+        ("compose_send", json!({})),
+        ("run_manual_sync", json!({})),
+        ("close_main_window", json!({})),
+        ("run_command", json!({"command": ":new"})),
+    ] {
+        let blocked = driver.command(command, args)?;
+        assert_eq!(
+            blocked["ok"], false,
+            "{command} was accepted while a modal was pending: {blocked}"
+        );
+        ensure!(
+            blocked["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("confirmation is pending")),
+            "{command} did not report the pending modal: {blocked}"
+        );
+    }
+    let still_pending = driver.command("pending_confirmation", json!({}))?;
+    assert_eq!(still_pending["pending"]["id"], replacement_id);
+    assert_eq!(still_pending["pending"]["kind"], "new");
+    let after_blocked_mutations = capture_draft_confirmation_snapshot(
+        &mut driver,
+        &recovery_path,
+        std::slice::from_ref(&first_path),
+    )?;
+    assert_eq!(
+        after_blocked_mutations, before_replacement,
+        "blocked harness mutations changed pending composer or persisted bytes"
+    );
+    reject_confirmation_unchanged(
+        &mut driver,
+        replacement_id,
+        &recovery_path,
+        std::slice::from_ref(&first_path),
+        &before_replacement,
+    )?;
+
+    let replacement = driver.command("open_compose", json!({}))?;
+    assert_eq!(replacement["pending_confirmation"], true);
+    let replacement_id = pending_confirmation_id(&mut driver, "new")?;
+    let accepted = driver.command(
+        "respond_confirmation",
+        json!({"response": "accept", "id": replacement_id}),
+    )?;
+    assert_eq!(accepted["ok"], true, "replacement failed: {accepted}");
+    assert_eq!(accepted["last_completion"]["accepted"], true);
+    assert_eq!(accepted["compose_fields"]["subject"], "");
+    assert_eq!(accepted["compose_fields"]["body"], "");
+    assert_eq!(accepted["active_draft"], Value::Null);
+    ensure!(
+        !recovery_path.exists() && first_path.is_file(),
+        "accepted New did not clear recovery while preserving the named draft"
+    );
+
+    for (command, value) in [
+        ("compose_set_subject", "Transient discard must be confirmed"),
+        (
+            "compose_set_body",
+            "Transient recovery bytes must survive rejection",
+        ),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(response["ok"], true, "{command} failed: {response}");
+    }
+    let before_discard = capture_draft_confirmation_snapshot(
+        &mut driver,
+        &recovery_path,
+        std::slice::from_ref(&first_path),
+    )?;
+    let discard = driver.command("clear_draft", json!({}))?;
+    assert_eq!(discard["pending_confirmation"], true);
+    let discard_id = pending_confirmation_id(&mut driver, "clear_composer")?;
+    reject_confirmation_unchanged(
+        &mut driver,
+        discard_id,
+        &recovery_path,
+        std::slice::from_ref(&first_path),
+        &before_discard,
+    )?;
+
+    let discard = driver.command("clear_draft", json!({}))?;
+    assert_eq!(discard["pending_confirmation"], true);
+    let discard_id = pending_confirmation_id(&mut driver, "clear_composer")?;
+    let accepted = driver.command(
+        "respond_confirmation",
+        json!({"response": "accept", "id": discard_id}),
+    )?;
+    assert_eq!(accepted["ok"], true, "discard failed: {accepted}");
+    assert_eq!(accepted["compose_fields"]["subject"], "");
+    assert_eq!(accepted["active_draft"], Value::Null);
+    ensure!(
+        !recovery_path.exists(),
+        "accepted discard left recovery data"
+    );
+
+    let activated = driver.command("activate_draft_by_index", json!({"index": 0}))?;
+    assert_eq!(
+        activated["ok"], true,
+        "draft activation failed: {activated}"
+    );
+    assert_eq!(
+        activated["active_draft"]["path"],
+        first_path.display().to_string()
+    );
+    let before_active_delete = capture_draft_confirmation_snapshot(
+        &mut driver,
+        &recovery_path,
+        std::slice::from_ref(&first_path),
+    )?;
+    let send = driver.command("compose_send", json!({}))?;
+    assert_eq!(
+        send["pending_confirmation"], true,
+        "sending an active persisted draft did not require confirmation: {send}"
+    );
+    assert_eq!(send["pending"], false);
+    let send_id = pending_confirmation_id(&mut driver, "send_composer")?;
+    reject_confirmation_unchanged(
+        &mut driver,
+        send_id,
+        &recovery_path,
+        std::slice::from_ref(&first_path),
+        &before_active_delete,
+    )?;
+
+    let active_delete = driver.command("delete_active_draft", json!({}))?;
+    assert_eq!(active_delete["ok"], true);
+    let active_delete_id = pending_confirmation_id(&mut driver, "delete_active_draft")?;
+    reject_confirmation_unchanged(
+        &mut driver,
+        active_delete_id,
+        &recovery_path,
+        std::slice::from_ref(&first_path),
+        &before_active_delete,
+    )?;
+
+    let active_delete = driver.command("delete_active_draft", json!({}))?;
+    assert_eq!(active_delete["ok"], true);
+    let active_delete_id = pending_confirmation_id(&mut driver, "delete_active_draft")?;
+    let accepted = driver.command(
+        "respond_confirmation",
+        json!({"response": "accept", "id": active_delete_id}),
+    )?;
+    assert_eq!(accepted["ok"], true, "active delete failed: {accepted}");
+    assert_eq!(accepted["active_draft"], Value::Null);
+    ensure!(
+        !first_path.exists() && !recovery_path.exists(),
+        "accepted active deletion left persisted draft state"
+    );
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+
+    for (command, value) in [
+        ("compose_set_to", "named@example.test"),
+        ("compose_set_subject", "Named deletion target"),
+        (
+            "compose_set_body",
+            "Named draft bytes must survive rejection",
+        ),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(response["ok"], true, "{command} failed: {response}");
+    }
+    let named_saved = driver.command("save_draft", json!({}))?;
+    assert_eq!(named_saved["ok"], true, "draft save failed: {named_saved}");
+    let named_path = named_saved["report"]["local_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("saved draft had no path: {named_saved}"))?;
+    let closed = driver.command("clear_draft", json!({}))?;
+    assert_eq!(
+        closed["ok"], true,
+        "unchanged draft did not close: {closed}"
+    );
+    assert_eq!(closed["pending_confirmation"], false);
+    let closed_state = driver.command("pending_confirmation", json!({}))?;
+    assert_eq!(closed_state["pending"], Value::Null);
+    assert_eq!(closed_state["active_draft"], Value::Null);
+
+    let selected = driver.command("select_draft_by_index", json!({"index": 0}))?;
+    assert_eq!(
+        selected["ok"], true,
+        "named draft was not selectable: {selected}"
+    );
+    for (command, value) in [
+        ("compose_set_subject", "Unrelated transient composer"),
+        (
+            "compose_set_body",
+            "Named deletion must not mutate these recovery bytes",
+        ),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(response["ok"], true, "{command} failed: {response}");
+    }
+    let before_named_delete = capture_draft_confirmation_snapshot(
+        &mut driver,
+        &recovery_path,
+        std::slice::from_ref(&named_path),
+    )?;
+    let named_delete = driver.command("click_delete_selected_draft", json!({}))?;
+    assert_eq!(named_delete["pending_confirmation"], true);
+    let named_delete_id = pending_confirmation_id(&mut driver, "delete_named_draft")?;
+    reject_confirmation_unchanged(
+        &mut driver,
+        named_delete_id,
+        &recovery_path,
+        std::slice::from_ref(&named_path),
+        &before_named_delete,
+    )?;
+
+    let named_delete = driver.command("click_delete_selected_draft", json!({}))?;
+    assert_eq!(named_delete["pending_confirmation"], true);
+    let named_delete_id = pending_confirmation_id(&mut driver, "delete_named_draft")?;
+    let accepted = driver.command(
+        "respond_confirmation",
+        json!({"response": "accept", "id": named_delete_id}),
+    )?;
+    assert_eq!(accepted["ok"], true, "named delete failed: {accepted}");
+    ensure!(
+        !named_path.exists(),
+        "accepted named deletion left its file"
+    );
+    let after_named_delete = capture_draft_confirmation_snapshot(&mut driver, &recovery_path, &[])?;
+    assert_eq!(
+        after_named_delete.compose_fields, before_named_delete.compose_fields,
+        "named deletion changed unrelated composer fields"
+    );
+    assert_eq!(
+        after_named_delete.recovery_bytes, before_named_delete.recovery_bytes,
+        "named deletion changed unrelated recovery bytes"
     );
 
     Ok(())
@@ -2241,7 +2724,7 @@ fn external_file_arg_send_reports_existing_sent_copy() -> anyhow::Result<()> {
     fs::write(
         &config_path,
         format!(
-            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:notm-external-send-empty\"\n\
              \n[identity]\nname = \"Fixture Sender\"\nprimary_email = \"sender@example.test\"\n\
              \n[send]\nenabled = true\ntransport = \"external\"\ncommand = {}\nargs = [{}]\nmode = \"file_arg\"\ntimeout_seconds = 5\nsave_sent = true\nsent_maildir = {}\nindex_sent_after_send = false\n\
              \n[drafts]\nsave_maildir = false\nindex_after_save = false\n\
@@ -2257,6 +2740,7 @@ fn external_file_arg_send_reports_existing_sent_copy() -> anyhow::Result<()> {
     let token = format!("notm-sent-copy-ui-{run_id}");
     let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
     let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
     let health = driver.command("health", json!({}))?;
     assert_eq!(health["ok"], true, "unhealthy configured app: {health}");
 
@@ -2358,7 +2842,7 @@ fn timed_out_send_reports_failure_and_leaves_desktop_responsive() -> anyhow::Res
     fs::write(
         &config_path,
         format!(
-            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:notm-timeout-send-empty\"\n\
              \n[identity]\nname = \"Fixture Sender\"\nprimary_email = \"sender@example.test\"\n\
              \n[send]\nenabled = true\ncommand = {}\nargs = [{}]\nmode = \"stdin_rfc5322\"\ntimeout_seconds = 1\nsave_sent = false\n\
              \n[drafts]\nsave_maildir = false\nindex_after_save = false\n\
@@ -2373,6 +2857,7 @@ fn timed_out_send_reports_failure_and_leaves_desktop_responsive() -> anyhow::Res
     let token = format!("notm-send-timeout-ui-{run_id}");
     let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
     let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
     let health = driver.command("health", json!({}))?;
     assert_eq!(health["ok"], true, "unhealthy configured app: {health}");
 
@@ -2500,7 +2985,7 @@ fn slow_send_preserves_newer_composer_edits_and_serializes_writes() -> anyhow::R
     fs::write(
         &config_path,
         format!(
-            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:notm-slow-send-empty\"\n\
              \n[identity]\nname = \"Fixture Sender\"\nprimary_email = \"sender@example.test\"\n\
              \n[send]\nenabled = true\ncommand = {}\nargs = [{}]\nmode = \"stdin_rfc5322\"\ntimeout_seconds = 10\nsave_sent = false\n\
              \n[drafts]\nsave_maildir = false\nindex_after_save = false\n\
@@ -2538,10 +3023,20 @@ fn slow_send_preserves_newer_composer_edits_and_serializes_writes() -> anyhow::R
 
     let send_started_at = Instant::now();
     let started = driver.command("compose_send", json!({}))?;
-    assert_eq!(started["ok"], true, "slow send did not start: {started}");
     assert_eq!(
-        started["pending"], true,
-        "slow send was not pending: {started}"
+        started["ok"], true,
+        "slow send confirmation was not requested: {started}"
+    );
+    assert_eq!(
+        started["pending_confirmation"], true,
+        "saved-draft send did not require confirmation: {started}"
+    );
+    assert_eq!(started["pending"], false);
+    accept_send_confirmation(&mut driver)?;
+    let sending = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        sending["state"]["send_in_progress"], true,
+        "accepted send confirmation did not start transport: {sending}"
     );
     ensure!(
         send_started_at.elapsed() < Duration::from_millis(750),
@@ -2679,7 +3174,7 @@ fn closing_main_window_waits_for_send_finalization() -> anyhow::Result<()> {
     fs::write(
         &config_path,
         format!(
-            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:notm-close-send-empty\"\n\
              \n[identity]\nname = \"Fixture Sender\"\nprimary_email = \"sender@example.test\"\n\
              \n[send]\nenabled = true\ncommand = {}\nargs = [{}]\nmode = \"stdin_rfc5322\"\ntimeout_seconds = 10\nsave_sent = true\nsent_maildir = {}\nindex_sent_after_send = false\n\
              \n[drafts]\nsave_maildir = false\nindex_after_save = false\n\
@@ -2695,6 +3190,7 @@ fn closing_main_window_waits_for_send_finalization() -> anyhow::Result<()> {
     let token = format!("notm-send-lifetime-ui-{run_id}");
     let mut app = FixtureApp::spawn_with_config(work_dir.clone(), &token, &config_path)?;
     let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
     assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
     for (command, value) in [
         ("compose_set_from", "Fixture Sender <sender@example.test>"),
@@ -2716,8 +3212,13 @@ fn closing_main_window_waits_for_send_finalization() -> anyhow::Result<()> {
     ensure!(saved_draft_path.is_file() && recovery_path.is_file());
 
     let started = driver.command("compose_send", json!({}))?;
-    assert_eq!(started["ok"], true, "send did not start: {started}");
-    assert_eq!(started["pending"], true, "send was not pending: {started}");
+    assert_eq!(
+        started["ok"], true,
+        "send confirmation was not requested: {started}"
+    );
+    assert_eq!(started["pending_confirmation"], true);
+    assert_eq!(started["pending"], false);
+    accept_send_confirmation(&mut driver)?;
     let close = driver.command("close_main_window", json!({}))?;
     assert_eq!(close["ok"], true, "main-window close failed: {close}");
     drop(driver);
@@ -2793,7 +3294,7 @@ fn reactivating_during_send_reuses_the_pending_window_session() -> anyhow::Resul
     fs::write(
         &config_path,
         format!(
-            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:notm-reactivate-send-empty\"\n\
              \n[identity]\nname = \"Fixture Sender\"\nprimary_email = \"sender@example.test\"\n\
              \n[send]\nenabled = true\ncommand = {}\nargs = [{}]\nmode = \"stdin_rfc5322\"\ntimeout_seconds = 10\nsave_sent = false\n\
              \n[drafts]\nsave_maildir = false\nindex_after_save = false\n\
@@ -2814,6 +3315,7 @@ fn reactivating_during_send_reuses_the_pending_window_session() -> anyhow::Resul
         &application_id,
     )?;
     let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
     assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
     for (command, value) in [
         ("compose_set_from", "Fixture Sender <sender@example.test>"),
@@ -2905,7 +3407,7 @@ fn accepted_send_aggregates_cleanup_failures_and_preserves_recovery() -> anyhow:
     fs::write(
         &config_path,
         format!(
-            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:notm-cleanup-send-empty\"\n\
              \n[identity]\nname = \"Fixture Sender\"\nprimary_email = \"sender@example.test\"\n\
              \n[send]\nenabled = true\ncommand = {}\nmode = \"stdin_rfc5322\"\ntimeout_seconds = 10\nsave_sent = true\nsent_maildir = {}\nindex_sent_after_send = false\n\
              \n[drafts]\nsave_maildir = false\nindex_after_save = false\n\
@@ -2920,6 +3422,7 @@ fn accepted_send_aggregates_cleanup_failures_and_preserves_recovery() -> anyhow:
     let token = format!("notm-send-cleanup-ui-{run_id}");
     let mut app = FixtureApp::spawn_with_config(work_dir.clone(), &token, &config_path)?;
     let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
     assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
     for (command, value) in [
         ("compose_set_from", "Fixture Sender <sender@example.test>"),
@@ -2941,7 +3444,13 @@ fn accepted_send_aggregates_cleanup_failures_and_preserves_recovery() -> anyhow:
     fs::set_permissions(draft_dir, fs::Permissions::from_mode(0o555))?;
 
     let started = driver.command("compose_send", json!({}))?;
-    assert_eq!(started["ok"], true, "send did not start: {started}");
+    assert_eq!(
+        started["ok"], true,
+        "send confirmation was not requested: {started}"
+    );
+    assert_eq!(started["pending_confirmation"], true);
+    assert_eq!(started["pending"], false);
+    accept_send_confirmation(&mut driver)?;
     let recovery_path = work_dir.join("state/notm/draft.json");
     fs::remove_file(&recovery_path)?;
     fs::create_dir(&recovery_path)?;
@@ -3536,12 +4045,15 @@ fn fixture_theme_modes_follow_both_simulated_system_preferences() -> anyhow::Res
 }
 
 fn select_first_thread(driver: &mut UiDriver, query: &str) -> anyhow::Result<()> {
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    driver.command("thread_selection_view_state", json!({}))?;
     let scheduled = driver.command("run_search", json!({"query": query}))?;
     ensure!(
         scheduled["scheduled"] == true,
         "fixture search was not scheduled: {scheduled}"
     );
     let search = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    driver.command("thread_selection_view_state", json!({}))?;
     let rows = json_array_at(&search, &["state", "thread_list_items"])?;
     ensure!(rows.len() == 1, "expected one fixture thread: {search}");
     let selected = driver.command("select_thread_by_index", json!({"index": 0}))?;

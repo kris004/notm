@@ -124,7 +124,9 @@ outstanding; non-fixture runs reject that test-only argument.
 .BR clear_draft ,
 .BR draft_list_state ,
 .BR activate_draft_by_index ,
-.BR click_delete_selected_draft .
+.BR click_delete_selected_draft ,
+.BR pending_confirmation ,
+.BR respond_confirmation .
 .SS Replies and forwards
 .BR reply_selected ,
 .BR reply_all_selected ,
@@ -181,19 +183,29 @@ cancellation behavior.  Normal UI and command-palette syncs do not add this
 delay.
 .PP
 .B compose_send
-returns with
+normally returns with
 .B pending
 set to true after the composed snapshot is queued.  Poll
 .B app_state.state.send_in_progress
 until it becomes false before checking
 .BR last_send_report ,
 .BR last_error ,
-or send-related file changes.  If the primary window closes while a send is
-pending, the application remains alive until send finalization completes.
+or send-related file changes.  If sending would permanently remove an active
+saved draft,
+.B compose_send
+instead reports
+.B pending_confirmation
+and waits for the typed
+.B send_composer
+dialog.  Unsaved sends still start directly.  Accepted cleanup retains the
+existing draft-identity and composer-generation checks.  If the primary window
+closes while a send is pending, the application remains alive until send
+finalization completes.
 .PP
 .B close_main_window
-closes only the primary window after returning its response.  Standalone
-message windows are left open.
+closes only the primary window after returning its response, unless dirty
+compose state first defers the close behind a confirmation.  Standalone message
+windows are left open.
 .PP
 In fixture mode,
 .B draft_list_state
@@ -206,8 +218,69 @@ selects a row and emits the real list activation signal.
 .B click_delete_selected_draft
 emits the real Delete button click and reports whether the selected draft file
 was removed.  These three UI-test controls are rejected outside fixture mode;
-the older select, load, and delete commands remain direct compatibility
-controls.
+the older select, load, and delete commands remain compatibility controls.
+Load and delete still use the same confirmation policy as their rendered UI
+routes.
+.SS Confirmation dialog seam
+Destructive actions and actions that replace the composer can defer instead of
+running immediately.  This includes draft discard and permanent deletion,
+dirty composer replacement by New, reply, forward, or draft-load actions, and
+other routes such as window close.  A command that
+starts this flow reports
+.B pending_confirmation
+set to true where applicable.  The
+.B pending_confirmation
+command is the authoritative state check.
+.PP
+Sending an active saved draft is a typed
+.B send_composer
+confirmation because accepted transport cleanup permanently deletes that
+draft.  Unsaved sends do not add this confirmation.
+.PP
+.B pending_confirmation
+reports either a null
+.B pending
+value or the captured action's identifier, typed kind, dialog title,
+confirmation-button label, and current GTK visibility.  It also reports
+.B last_completion
+and the current compose fields, active draft, recovery and named-draft paths,
+visible status, and last operation or error.  Only one action can be pending at
+a time.
+.PP
+Drive the real modal dialog with
+.BR respond_confirmation .
+Its
+.B response
+argument must be
+.B accept
+or
+.BR reject ;
+the optional
+.B id
+defaults to the current pending action and protects against responding to a
+different dialog.  For example:
+.PP
+.nf
+{"command":"respond_confirmation","args":{"id":1,"response":"reject"}}
+.fi
+.PP
+The command emits the real GTK dialog response rather than calling the action
+directly.  Reject cancels without executing the captured replacement or
+destructive action.  Accept revalidates current send or sync eligibility, then
+executes that captured action once.  The returned
+.B last_completion
+reports whether it was accepted and whether it succeeded.  While a
+confirmation is pending, harness mutations are rejected without changing its
+identifier, dialog, compose state, recovery bytes, or persisted draft bytes;
+read-only queries remain available.
+.PP
+Confirmation inspection and response are normally fixture-only.  A
+non-fixture harness with
+.B automation.allow_live_send_test=true
+may use them only while the pending action is exactly
+.BR send_composer .
+This narrow exception lets custom-transport tests drive the real saved-draft
+Send modal without exposing other live confirmations.
 .PP
 .B save_selected_attachment
 and its
