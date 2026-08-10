@@ -6,6 +6,7 @@ pub mod message_view;
 pub mod saved_searches;
 pub mod search_bar;
 pub mod settings;
+pub mod standalone_message;
 pub mod status_bar;
 pub mod tag_editor;
 pub mod thread_list;
