@@ -555,6 +555,11 @@ fn fixture_visual_selection_navigation_keeps_thread_list_responsive() -> anyhow:
     let mut app = FixtureApp::spawn(work_dir, &token)?;
     let mut driver = app.connect(&token)?;
 
+    let scheduled = driver.command("run_search", json!({"query": "tag:inbox"}))?;
+    assert_eq!(
+        scheduled["scheduled"], true,
+        "visual-selection fixture search was not scheduled: {scheduled}"
+    );
     let initial = driver.wait_for_search(STARTUP_TIMEOUT)?;
     let rows = json_array_at(&initial, &["state", "thread_list_items"])?;
     ensure!(
