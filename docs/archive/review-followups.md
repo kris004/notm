@@ -1,6 +1,6 @@
 # July 2026 Review Follow-ups
 
-Status: **ACTIVE -- implementation is not complete**
+Status: **COMPLETE -- review implementation complete**
 
 This is the durable source of truth for recommendations left unfinished by the
 July 2026 project review. It is intentionally self-contained: a future session
@@ -59,19 +59,17 @@ the active table; it is not a second status table.
 
 Update this block at every handoff; historical evidence remains append-only.
 
-- Captured: 2026-08-09.
-- Branch: `main`. Last implementation and tested-tree HEAD: `62b93c8`; current
-  HEAD is the tracker-only evidence commit containing this snapshot.
-- Active item/child checkpoint: `S03-CI.2`; run the final integrated gate,
-  push that exact SHA, and record its green workflow URL.
-- Owner: Codex. Blockers: none recorded.
-- Unrelated dirty paths that must not be staged, overwritten, stashed, or reset:
-  `Cargo.toml`, `Cargo.lock`, and
-  `crates/notm-mail/src/html_sanitize.rs`.
+- Captured: 2026-08-10.
+- Branch: `main`. Final implementation and tested-tree HEAD:
+  `bce1876f1e539b47edd351663d8d00fbecc6491a`.
+- Active item/child checkpoint: none; all eight parent IDs are `DONE`.
+- Owner: none. Blockers: none.
+- Dirty paths: none. The previously unrelated `Cargo.toml`, `Cargo.lock`, and
+  `crates/notm-mail/src/html_sanitize.rs` changes were explicitly approved for
+  inclusion and committed separately as `5524238`.
 - Tracker baseline commit: `93bfe88`.
-- Exact next command: `git status --short --branch`, then update the stable
-  exact checkout to this tracker-only commit and run the complete final
-  integrated completion gate below.
+- Exact next command: none for this review; this completed tracker is archived
+  by a separate evidence-only commit.
 
 ## Completion protocol
 
@@ -122,7 +120,7 @@ scope of this work:
 | `R12-DRAFTS` | Make named drafts visible and confirm destructive draft actions. | `DONE` | `.1` visible saved-draft list, activation, safe deletion, fixture seams, and non-skipping GTK proof were exact-tree validated at `a534c58`; `.2` routes destructive/replacement paths through one typed confirmation controller and was exact-tree validated at `9b679b1`. |
 | `S01-MODULES` | Incrementally extract composer, search, attachment, settings, and standalone-window controllers from `main_window.rs`. | `DONE` | `.1` attachment extraction was exact-tree validated at `f62cc54`; `.2` search-bar/thread-list at `e36cff4`; `.3` composer at `fb90953`; `.4` settings at `d7b42ea`; and `.5` standalone-window at `62b93c8`. `main_window.rs` is 16,435 lines. |
 | `S02-CACHES` | Bound the search and thread-detail caches, including accumulation across database revisions. | `DONE` | Exact-tree validated at `92c01b6`: typed full-identity keys and true-LRU caches bound search pages to 64 and thread details to 4,096 entries, with local-instance capacity/recency/collision/isolation proofs. |
-| `S03-CI` | Add CI for formatting, Clippy, tests, and the real fixture-driven GTK smoke. | `IN PROGRESS` | `.1` is implemented and exact-tree validated at `dda9d45`; `.2` still requires the final integrated pushed SHA and green run URL. |
+| `S03-CI` | Add CI for formatting, Clippy, tests, and the real fixture-driven GTK smoke. | `DONE` | `.1` was implemented and exact-tree validated at `dda9d45`. `.2` passed on final integrated implementation/tested-tree SHA `bce1876f1e539b47edd351663d8d00fbecc6491a`; GitHub Actions run [31410685319](https://github.com/kris004/notm/actions/runs/31410685319) was green, including the complete required-display GTK smoke. |
 | `S04-SYNC-DOCS` | Reconcile startup-sync documentation with the implemented opt-in startup settings. | `DONE` | Implemented and exact-tree validated at `4eb32d6`; current docs, Settings copy, sync selection tests, fixture gate, and non-skipping Wayland GTK smoke agree. |
 | `S05-PACKAGING` | Add an application icon and AppStream metadata, including installation support. | `DONE` | `.1` canonical assets were validated at `4f16123`; `.2` installation, migration, uninstall, and isolated packaging validation were exact-tree validated at `e942054`. |
 
@@ -558,6 +556,8 @@ Append entries; do not rewrite history.
 | 2026-08-09 | `S01-MODULES.4` | Evidence correction; no state change. | implementation `d7b42ea`; tested tree `d7b42ea` | The preceding row's `2026-08-10` date was a handoff typo; validation occurred on 2026-08-09. Root independently reran formatting, workspace Clippy with `-D warnings`, workspace all-target/all-feature tests, `fixture-smoke`, `probe-send`, focused settings/config tests, the three named required-display GTK smokes, and the complete serial required-display `desktop_ui_smoke` target: 29/29 passed on `WAYLAND_DISPLAY=wayland-1`, exit 0, with no `SKIP`. Two independent read-only audits found no ownership, persistence, validation-order, lifecycle, or harness-compatibility defect. |
 | 2026-08-09 | `S05-PACKAGING` | Evidence clarification; remains `DONE`. | implementations `4f16123`, `e942054` | The current acceptance and final-gate commands now state the same strict/pedantic offline AppStream validation already used by the implementation, packaging smoke, and earlier evidence. The accurate homepage and bug-tracker URLs are for a private repository and return unauthenticated 404s; `--no-net` validates the metadata structure without weakening it or substituting inaccurate public URLs. |
 | 2026-08-09 | `S01-MODULES.5`, `S01-MODULES` | Child checkpoint completed; parent `IN PROGRESS` -> `DONE`. | implementation `62b93c8`; tested tree `62b93c8` | In the stable exact prospective checkout, formatting, workspace Clippy with `-D warnings`, workspace all-target/all-feature tests, `fixture-smoke`, `probe-send`, 96 UI unit tests, the two standalone-filtered unit tests, and scoped diff checks passed; the committed files were byte-compared with that tree. `fixture_standalone_message_window_keeps_its_thread_snapshot`, `fixture_malformed_text_shows_a_decode_warning`, `fixture_reply_all_preserves_quoted_names_and_flattens_groups`, and `fixture_draft_confirmations_preserve_rejected_state` each passed on `WAYLAND_DISPLAY=wayland-1`, exit 0, with required-display mode and no `SKIP`; the complete required-display desktop target then passed serially 29/29 in 69.28 seconds. The new 1,690-line `StandaloneMessageController` module owns its registry/IDs, cloned thread snapshots, window construction/lifecycle, rendering, navigation, menus, shortcuts, response requests, and harness snapshots without importing `Widgets`, `SharedState`, `UiState`, or `LaunchOptions`; main retains typed policy/render/response adapters and cross-controller confirmation composition. Two independent diff/semantics audits found no behavior or lifecycle regression. `main_window.rs` is 16,435 lines. |
+| 2026-08-10 | all | No review state change; a previously separate startup-crash fix was approved for inclusion in the final integrated series. | implementation `5524238`; tested tree `5524238` | The focused malformed-table regression passed with `html2text` 0.16.5 and reproduced the subtraction-overflow panic with 0.15.5. Formatting, workspace Clippy with `-D warnings`, workspace all-target/all-feature tests, `fixture-smoke`, `probe-send`, the complete required-display GTK target, focused Sway smoke, packaging checks, man-page lints, documentation scan, and diff check passed. The rebuilt installed binary matched the validated release binary and resolved `html2text` 0.16.5. |
+| 2026-08-10 | `S03-CI.2`, `S03-CI` | Parent `IN PROGRESS` -> `DONE`; final integrated gate completed. | final implementation/tested tree `bce1876f1e539b47edd351663d8d00fbecc6491a`; supporting fixes `2e729c0`, `cc2d2ef`, `bce1876` | On the exact final SHA, formatting, workspace Clippy with `-D warnings`, workspace all-target/all-feature tests, `fixture-smoke`, `probe-send`, `desktop-file-validate`, strict/pedantic offline AppStream validation, the isolated install/uninstall packaging smoke, ShellCheck, all man-page lints, reviewed startup-sync search hits, and `git diff --check` passed. The complete required-display desktop target passed 29/29 on `WAYLAND_DISPLAY=wayland-1`, exit 0, with no `SKIP`; the focused headless-Sway text/tag-editor smoke printed `PASS`. Remote run [31410685319](https://github.com/kris004/notm/actions/runs/31410685319) was green for the same SHA: format, Clippy, workspace tests, fixture smoke, disposable send probe, and the complete serial Xvfb GTK smoke all passed. Earlier remote runs exposed Ubuntu's pre-0.40 libnotmuch API, WebKitGTK sandbox restrictions on the hosted runner, and a real weak-only native-chooser lifetime defect; `2e729c0` added generated-binding compatibility, `cc2d2ef` scoped the documented sandbox exception to disposable fixture UI tests, and `bce1876` retained the chooser strongly while using weak callback captures to avoid a controller cycle. |
 
 ## Decision log
 
@@ -567,11 +567,13 @@ here. Absence of an entry means the scope above still applies.
 | Date | ID | Decision | Approved by |
 | --- | --- | --- | --- |
 | 2026-08-09 | all | Preserve all original unfinished recommendations; no deferrals approved. | user |
+| 2026-08-10 | all | Include the pre-existing `html2text` crash fix in the final integrated series, install the resulting build for testing, and push the completed work. | user |
+| 2026-08-10 | `S03-CI` | Keep the full real GTK target in CI. Scope WebKitGTK's sandbox-disable environment variable only to the disposable fixture UI step, then fix rather than skip the native-chooser lifetime failure exposed by Xvfb. | user |
 
 ## Exact next action
 
-Complete `S03-CI.2`: validate this tracker-only commit as the exact integrated
-tree with every baseline, required-display GTK, focused headless-Sway,
-packaging, and startup-documentation gate; push that same SHA; wait for its
-green `CI` run; then append the run URL, mark the final row `DONE`, and archive
-this file intact.
+None. All eight parent IDs are `DONE`; final integrated implementation SHA
+`bce1876f1e539b47edd351663d8d00fbecc6491a` passed the local completion gate
+and green GitHub Actions run
+[31410685319](https://github.com/kris004/notm/actions/runs/31410685319).
+This tracker is archived intact by the separate evidence-only closure commit.
