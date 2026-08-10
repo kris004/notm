@@ -1,3 +1,4 @@
+pub mod attachments;
 pub mod command_palette;
 pub mod composer;
 pub mod debug_panel;

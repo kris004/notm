@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     fs::OpenOptions,
-    io::{self, Write},
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
     rc::Rc,
@@ -13,9 +13,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 use chrono::Utc;
 use gtk::glib::variant::{StaticVariantType, ToVariant};
@@ -25,15 +22,11 @@ use notm_mail::{
     ComposedMessage, ExternalCommandTransport, FakeSendTransport, ReplyKind, SendTransport,
     TransportMode,
     address::{dedupe_addresses, format_address, parse_address_list},
-    attachments::{
-        sanitize_attachment_filename, save_attachment_to_target_without_overwrite,
-        save_attachment_without_overwrite,
-    },
     build_reply,
     compose::{AttachmentInput, Identity},
     forward::{build_attachment_forward, build_inline_forward},
     html_sanitize::sanitize_html,
-    mime::{extract_attachments_from_file, extract_attachments_from_file_detailed, parse_file},
+    mime::parse_file,
 };
 use notm_notmuch::{
     Database, DatabaseMode, MessageTagMutation, OpenConfig, QueryOptions, SortOrder, TagMutation,
@@ -55,6 +48,10 @@ use crate::{
         MAX_THREAD_PREVIEW_LINES, ThemePreference, ThreadUiDetails, UiState,
     },
     screenshot, theme,
+    widgets::attachments::{
+        self, AttachmentActionResult, AttachmentController, AttachmentEvent,
+        AttachmentEventHandler, AttachmentOpenStore,
+    },
 };
 
 const NORMAL_APPLICATION_ID: &str = "dev.notm.Notm";
@@ -239,8 +236,8 @@ impl Default for LaunchOptions {
 pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
     validate_launch_options(&options)?;
     sync_runtime_settings_from_launch_options(&options);
-    let attachment_open_tempdir = create_attachment_open_tempdir()?;
-    let attachment_open_dir = attachment_open_tempdir.path().to_path_buf();
+    let attachment_open_store = AttachmentOpenStore::create()?;
+    let attachment_open_dir = attachment_open_store.path().to_path_buf();
     let app_builder = gtk::Application::builder()
         .application_id(application_id_for_launch(&options)?)
         .flags(application_flags_for_launch(&options));
@@ -279,24 +276,13 @@ pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
     }
 
     app.run_with_args(&["notm"]);
-    attachment_open_tempdir.close()?;
+    attachment_open_store.close()?;
     Ok(())
 }
 
 fn validate_launch_options(options: &LaunchOptions) -> anyhow::Result<()> {
     validate_thread_preview_lines(options.thread_preview_lines)?;
     Ok(())
-}
-
-fn create_attachment_open_tempdir() -> io::Result<tempfile::TempDir> {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("notm-open-attachments-");
-    #[cfg(unix)]
-    builder.permissions(std::fs::Permissions::from_mode(0o700));
-    let directory = builder.tempdir()?;
-    #[cfg(unix)]
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
-    Ok(directory)
 }
 
 fn application_id_for_launch(options: &LaunchOptions) -> anyhow::Result<String> {
@@ -558,14 +544,7 @@ struct Widgets {
     copy_cc_email_button: gtk::Button,
     copy_subject_button: gtk::Button,
     quote_collapse: Rc<Cell<bool>>,
-    attachment_title: gtk::Label,
-    attachment_scrolled: gtk::ScrolledWindow,
-    attachment_list: gtk::ListBox,
-    attachment_items: Rc<RefCell<Vec<ThreadAttachmentItem>>>,
-    attachment_open_dir: PathBuf,
-    pending_attachment_save: Rc<RefCell<Option<PendingAttachmentSave>>>,
-    next_attachment_save_id: Rc<Cell<u64>>,
-    attachment_opener: AttachmentOpener,
+    attachments: AttachmentController,
     tag_search_box: gtk::Box,
     draft_path: PathBuf,
     legacy_draft_path: Option<PathBuf>,
@@ -756,38 +735,6 @@ enum StandaloneCopyField {
     Subject,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ThreadAttachmentItem {
-    message_index: usize,
-    /// Stable depth-first attachment MIME-part index within the message.
-    attachment_index: usize,
-    message_id: String,
-    filename: String,
-    content_type: String,
-    size: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttachmentOrigin {
-    SelectedMessage,
-    Thread,
-}
-
-#[derive(Debug, Clone)]
-struct AttachmentPayload {
-    message: notm_notmuch::MessageSummary,
-    filename: String,
-    bytes: Vec<u8>,
-    origin: AttachmentOrigin,
-}
-
-struct PendingAttachmentSave {
-    id: u64,
-    suggested_name: String,
-    payload: AttachmentPayload,
-    dialog: gtk::glib::WeakRef<gtk::FileChooserNative>,
-}
-
 struct PendingSettingsDialog {
     id: u64,
     dialog: gtk::glib::WeakRef<gtk::Dialog>,
@@ -905,35 +852,6 @@ enum PersistedDraftDeletion {
 
 fn persisted_draft_deletion_requires_confirmation(_deletion: PersistedDraftDeletion) -> bool {
     true
-}
-
-#[derive(Clone)]
-enum AttachmentOpener {
-    System,
-    Fixture(Rc<RefCell<Vec<PathBuf>>>),
-}
-
-impl AttachmentOpener {
-    fn open(&self, path: &Path) -> anyhow::Result<()> {
-        match self {
-            Self::System => {
-                let file = gtk::gio::File::for_path(path);
-                gtk::gio::AppInfo::launch_default_for_uri(
-                    &file.uri(),
-                    None::<&gtk::gio::AppLaunchContext>,
-                )?;
-            }
-            Self::Fixture(calls) => calls.borrow_mut().push(path.to_path_buf()),
-        }
-        Ok(())
-    }
-
-    fn fixture_calls(&self) -> Option<Vec<PathBuf>> {
-        match self {
-            Self::System => None,
-            Self::Fixture(calls) => Some(calls.borrow().clone()),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1614,22 +1532,9 @@ fn build_ui(
     message_actions.append(&copy_menu_button);
     right.append(&message_actions);
 
-    let attachment_title = gtk::Label::new(Some("Attachments in thread"));
-    attachment_title.set_xalign(0.0);
-    attachment_title.add_css_class("dim-label");
-    attachment_title.set_visible(false);
-    right.append(&attachment_title);
-    let attachment_list = gtk::ListBox::new();
-    attachment_list.set_widget_name("notm-attachment-list");
-    attachment_list.set_selection_mode(gtk::SelectionMode::Single);
-    attachment_list.add_css_class("boxed-list");
-    let scrolled_attachments = gtk::ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(false)
-        .child(&attachment_list)
-        .build();
-    scrolled_attachments.set_visible(false);
-    right.append(&scrolled_attachments);
+    let attachments = AttachmentController::new(&window, attachment_open_dir, options.fixture_mode);
+    right.append(&attachments.title_widget());
+    right.append(&attachments.scrolled_widget());
 
     let html_policy_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     html_policy_row.set_widget_name("notm-html-policy-row");
@@ -1975,18 +1880,7 @@ fn build_ui(
         copy_cc_email_button,
         copy_subject_button,
         quote_collapse,
-        attachment_title,
-        attachment_scrolled: scrolled_attachments,
-        attachment_list,
-        attachment_items: Rc::new(RefCell::new(Vec::new())),
-        attachment_open_dir,
-        pending_attachment_save: Rc::new(RefCell::new(None)),
-        next_attachment_save_id: Rc::new(Cell::new(1)),
-        attachment_opener: if options.fixture_mode {
-            AttachmentOpener::Fixture(Rc::new(RefCell::new(Vec::new())))
-        } else {
-            AttachmentOpener::System
-        },
+        attachments,
         tag_search_box,
         draft_path,
         legacy_draft_path,
@@ -2023,7 +1917,7 @@ fn build_ui(
         standalone_next_id: Rc::new(Cell::new(1)),
     };
     debug_assert!(
-        widgets.attachment_open_dir.is_dir(),
+        widgets.attachments.open_dir().is_dir(),
         "application attachment-open directory must exist while the UI is running"
     );
     apply_content_layout(&widgets, &state, initial_layout, false);
@@ -9473,8 +9367,7 @@ fn restore_message_view_after_compose(
     } else {
         widgets.message_stack.set_visible_child_name("text");
         widgets.message_header_box.set_visible(false);
-        widgets.attachment_title.set_visible(false);
-        widgets.attachment_scrolled.set_visible(false);
+        widgets.attachments.hide();
     }
 }
 
@@ -9523,35 +9416,7 @@ fn add_attachment_path(widgets: &Widgets, state: &SharedState, path: PathBuf) {
 }
 
 fn update_attachment_label(widgets: &Widgets, attachments: &[String]) {
-    if attachments.is_empty() {
-        widgets.compose_attachments.set_text("No attachments");
-    } else {
-        widgets
-            .compose_attachments
-            .set_text(&format!("Attachments: {}", attachments.join(", ")));
-    }
-}
-
-fn load_compose_attachments(fields: &ComposeFields) -> anyhow::Result<Vec<AttachmentInput>> {
-    fields
-        .attachments
-        .iter()
-        .map(|path| {
-            let path = PathBuf::from(path);
-            let bytes = std::fs::read(&path)?;
-            let filename = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("attachment.bin")
-                .to_string();
-            Ok(AttachmentInput {
-                filename,
-                content_type: attachment_content_type(&path),
-                bytes,
-                source_path: Some(path),
-            })
-        })
-        .collect()
+    attachments::set_compose_attachment_label(&widgets.compose_attachments, attachments);
 }
 
 fn composed_message_from_fields(fields: &ComposeFields) -> anyhow::Result<ComposedMessage> {
@@ -9576,251 +9441,55 @@ fn composed_message_from_fields(fields: &ComposeFields) -> anyhow::Result<Compos
         .collect();
     message.text_reply_quote = fields.text_reply_quote.clone();
     message.html_reply_quote = fields.html_reply_quote.clone();
-    message.attachments = load_compose_attachments(fields)?;
+    message.attachments = attachments::load_compose_attachments(fields)?;
     Ok(message)
 }
 
-fn attachment_content_type(path: &Path) -> String {
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("eml") => "message/rfc822",
-        Some("txt") | Some("text") => "text/plain",
-        Some("html") | Some("htm") => "text/html",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("png") => "image/png",
-        Some("pdf") => "application/pdf",
-        _ => "application/octet-stream",
-    }
-    .to_string()
-}
-
-fn selected_attachment_payload(
-    state: &SharedState,
-    index: usize,
-) -> anyhow::Result<AttachmentPayload> {
-    let message = state
-        .borrow()
-        .selected_message
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("no selected message"))?;
-    let filename = message
-        .filenames
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("selected message has no file"))?;
-    let report = extract_attachments_from_file_detailed(filename)?;
-    let attachment = report
-        .attachments
-        .get(index)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("attachment index {index} not found"))?;
-    Ok(AttachmentPayload {
-        message,
-        filename: attachment.filename,
-        bytes: attachment.bytes,
-        origin: AttachmentOrigin::SelectedMessage,
+fn attachment_event_handler(widgets: &Widgets, state: &SharedState) -> AttachmentEventHandler {
+    let widgets = widgets.clone();
+    let state = state.clone();
+    Rc::new(move |event| match event {
+        AttachmentEvent::Completed(result) => {
+            apply_attachment_action_result(&widgets, &state, *result);
+        }
+        AttachmentEvent::Failed { action, error } => {
+            report_attachment_error(&widgets, &state, action, &error);
+        }
     })
 }
 
-fn thread_attachment_payload(
-    state: &SharedState,
-    item: &ThreadAttachmentItem,
-) -> anyhow::Result<AttachmentPayload> {
-    let message = state
-        .borrow()
-        .messages
-        .get(item.message_index)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("attachment message index not found"))?;
-    let filename = message
-        .filenames
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("attachment message has no file"))?;
-    let report = extract_attachments_from_file_detailed(filename)?;
-    let attachment = report
-        .attachments
-        .into_iter()
-        .find(|attachment| attachment.part_index == item.attachment_index)
-        .ok_or_else(|| anyhow::anyhow!("attachment MIME part not found"))?;
-    Ok(AttachmentPayload {
-        message,
-        filename: attachment.filename,
-        bytes: attachment.bytes,
-        origin: AttachmentOrigin::Thread,
-    })
-}
-
-fn attachment_payload_at_index(
+fn apply_attachment_action_result(
     widgets: &Widgets,
     state: &SharedState,
-    index: usize,
-) -> anyhow::Result<AttachmentPayload> {
-    let item = widgets.attachment_items.borrow().get(index).cloned();
-    match item {
-        Some(item) => thread_attachment_payload(state, &item),
-        None => selected_attachment_payload(state, index),
-    }
-}
-
-fn active_attachment_payload(
-    widgets: &Widgets,
-    state: &SharedState,
-) -> anyhow::Result<AttachmentPayload> {
-    match selected_thread_attachment(widgets) {
-        Some(item) => thread_attachment_payload(state, &item),
-        None => selected_attachment_payload(state, 0),
-    }
-}
-
-fn request_attachment_save(
-    widgets: &Widgets,
-    state: &SharedState,
-    payload: AttachmentPayload,
-) -> anyhow::Result<u64> {
-    anyhow::ensure!(
-        widgets.pending_attachment_save.borrow().is_none(),
-        "an attachment save chooser is already open"
-    );
-    let chooser_id = widgets.next_attachment_save_id.get();
-    let next_id = chooser_id
-        .checked_add(1)
-        .ok_or_else(|| anyhow::anyhow!("attachment save chooser id overflowed"))?;
-    widgets.next_attachment_save_id.set(next_id);
-
-    let suggested_name = sanitize_attachment_filename(&payload.filename);
-    let dialog = gtk::FileChooserNative::new(
-        Some("Save attachment"),
-        Some(&widgets.window),
-        gtk::FileChooserAction::Save,
-        Some("Save"),
-        Some("Cancel"),
-    );
-    dialog.set_current_name(&suggested_name);
-    let dialog_weak = dialog.downgrade();
-    *widgets.pending_attachment_save.borrow_mut() = Some(PendingAttachmentSave {
-        id: chooser_id,
-        suggested_name,
-        payload,
-        dialog: dialog_weak,
-    });
-
-    let w = widgets.clone();
-    let st = state.clone();
-    dialog.connect_response(move |dialog, response| {
-        let is_current = w
-            .pending_attachment_save
-            .borrow()
-            .as_ref()
-            .is_some_and(|pending| pending.id == chooser_id);
-        if !is_current {
-            return;
-        }
-        let accepted = response == gtk::ResponseType::Accept;
-        let target = accepted
-            .then(|| dialog.file().and_then(|file| file.path()))
-            .flatten();
-        if let Err(err) =
-            complete_pending_attachment_save(&w, &st, chooser_id, accepted, target.as_deref())
-        {
-            report_attachment_error(&w, &st, "Save attachment", &err);
-        }
-    });
-    dialog.show();
-    Ok(chooser_id)
-}
-
-fn complete_pending_attachment_save(
-    widgets: &Widgets,
-    state: &SharedState,
-    chooser_id: u64,
-    accepted: bool,
-    target: Option<&Path>,
-) -> anyhow::Result<Option<PathBuf>> {
-    let pending = {
-        let mut slot = widgets.pending_attachment_save.borrow_mut();
-        let pending = slot
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no attachment save chooser is pending"))?;
-        anyhow::ensure!(
-            pending.id == chooser_id,
-            "attachment save chooser id does not match the pending chooser"
-        );
-        slot.take().expect("pending chooser checked above")
-    };
-
-    let result = if accepted {
-        let target = target.ok_or_else(|| {
-            anyhow::anyhow!("the attachment save chooser did not return a local target path")
-        });
-        target.and_then(|target| {
-            save_attachment_payload_to_target(widgets, state, &pending.payload, target).map(Some)
-        })
-    } else {
-        Ok(None)
-    };
-
-    if let Some(dialog) = pending.dialog.upgrade() {
-        dialog.hide();
-        dialog.destroy();
-    }
-    result
-}
-
-fn save_attachment_payload_to_target(
-    widgets: &Widgets,
-    state: &SharedState,
-    payload: &AttachmentPayload,
-    target: &Path,
-) -> anyhow::Result<PathBuf> {
-    let path = save_attachment_to_target_without_overwrite(target, &payload.bytes)?;
-    record_attachment_saved(widgets, state, payload, &path);
-    Ok(path)
-}
-
-fn save_attachment_payload_to_directory(
-    widgets: &Widgets,
-    state: &SharedState,
-    payload: &AttachmentPayload,
-    target_dir: &Path,
-) -> anyhow::Result<PathBuf> {
-    let path = save_attachment_without_overwrite(target_dir, &payload.filename, &payload.bytes)?;
-    record_attachment_saved(widgets, state, payload, &path);
-    Ok(path)
-}
-
-fn record_attachment_saved(
-    widgets: &Widgets,
-    state: &SharedState,
-    payload: &AttachmentPayload,
-    path: &Path,
+    result: AttachmentActionResult,
 ) {
-    widgets
-        .status_label
-        .set_text(&format!("Attachment saved to {}", path.display()));
-    let operation = match payload.origin {
-        AttachmentOrigin::SelectedMessage => format!(
-            "saved attachment {} from {} to {}",
-            payload.filename,
-            payload.message.message_id,
-            path.display()
-        ),
-        AttachmentOrigin::Thread => format!(
-            "saved thread attachment {} from message {} to {}",
-            payload.filename,
-            payload.message.message_id,
-            path.display()
-        ),
-    };
-    {
-        let mut state = state.borrow_mut();
-        state.selected_message = Some(payload.message.clone());
-        state.last_operation = Some(operation);
-        state.last_error = None;
-    }
+    widgets.status_label.set_text(&result.status);
+    record_attachment_action_result(
+        &mut state.borrow_mut(),
+        &result.message_id,
+        result.operation,
+    );
     update_debug(widgets, state);
+}
+
+fn record_attachment_action_result(state: &mut UiState, message_id: &str, operation: String) {
+    let current_message = state
+        .messages
+        .iter()
+        .find(|message| message.message_id == message_id)
+        .cloned()
+        .or_else(|| {
+            state
+                .selected_message
+                .as_ref()
+                .filter(|message| message.message_id == message_id)
+                .cloned()
+        });
+    if let Some(message) = current_message {
+        state.selected_message = Some(message);
+    }
+    state.last_operation = Some(operation);
+    state.last_error = None;
 }
 
 fn report_attachment_error(
@@ -9837,190 +9506,10 @@ fn report_attachment_error(
 }
 
 fn refresh_thread_attachment_list(widgets: &Widgets, state: &SharedState) {
-    while let Some(child) = widgets.attachment_list.first_child() {
-        widgets.attachment_list.remove(&child);
-    }
-    widgets.attachment_items.borrow_mut().clear();
     let messages = state.borrow().messages.clone();
-    for (message_index, message) in messages.iter().enumerate() {
-        let Some(filename) = message.filenames.first() else {
-            continue;
-        };
-        let Ok(report) = extract_attachments_from_file_detailed(filename) else {
-            continue;
-        };
-        for attachment in report.attachments {
-            let item = ThreadAttachmentItem {
-                message_index,
-                attachment_index: attachment.part_index,
-                message_id: message.message_id.clone(),
-                filename: attachment.filename,
-                content_type: attachment.content_type,
-                size: attachment.bytes.len(),
-            };
-            let row_index = widgets.attachment_items.borrow().len();
-            let row = gtk::ListBoxRow::new();
-            row.set_widget_name(&format!("notm-attachment-row-{row_index}"));
-            let label = gtk::Label::new(Some(&format!(
-                "Message {}: {} ({}, {} bytes)",
-                item.message_index + 1,
-                item.filename,
-                item.content_type,
-                item.size
-            )));
-            label.set_xalign(0.0);
-            label.set_wrap(true);
-            label.set_margin_start(6);
-            label.set_margin_end(6);
-            label.set_margin_top(3);
-            label.set_margin_bottom(3);
-            row.set_child(Some(&label));
-            connect_attachment_context_menu(widgets, state, &row, item.clone());
-            widgets.attachment_list.append(&row);
-            widgets.attachment_items.borrow_mut().push(item);
-        }
-    }
-    let attachment_count = widgets.attachment_items.borrow().len();
-    let has_attachments = attachment_count > 0;
-    widgets.attachment_title.set_visible(has_attachments);
-    widgets.attachment_scrolled.set_visible(has_attachments);
-    if has_attachments {
-        widgets.attachment_title.set_text(&format!(
-            "{} attachment{} in thread",
-            attachment_count,
-            if attachment_count == 1 { "" } else { "s" }
-        ));
-        let visible_rows = attachment_count.min(4) as i32;
-        let row_height = 34;
-        let height = visible_rows * row_height;
-        widgets.attachment_scrolled.set_min_content_height(height);
-        widgets.attachment_scrolled.set_max_content_height(height);
-    }
-    if let Some(row) = widgets.attachment_list.row_at_index(0) {
-        widgets.attachment_list.select_row(Some(&row));
-    }
-}
-
-fn connect_attachment_context_menu(
-    widgets: &Widgets,
-    state: &SharedState,
-    row: &gtk::ListBoxRow,
-    item: ThreadAttachmentItem,
-) {
-    let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let save_button = gtk::Button::with_label("Save attachment");
-    save_button.set_widget_name("notm-attachment-menu-save");
-    let open_button = gtk::Button::with_label("Open attachment");
-    open_button.set_widget_name("notm-attachment-menu-open");
-    menu.append(&save_button);
-    menu.append(&open_button);
-
-    let popover = gtk::Popover::new();
-    popover.set_has_arrow(false);
-    popover.set_child(Some(&menu));
-    popover.set_parent(row);
-
-    let w = widgets.clone();
-    let st = state.clone();
-    let save_item = item.clone();
-    let save_popover = popover.clone();
-    save_button.connect_clicked(move |_| {
-        save_popover.popdown();
-        let result = thread_attachment_payload(&st, &save_item)
-            .and_then(|payload| request_attachment_save(&w, &st, payload));
-        if let Err(err) = result {
-            report_attachment_error(&w, &st, "Save attachment", &err);
-        }
-    });
-
-    let w = widgets.clone();
-    let st = state.clone();
-    let open_popover = popover.clone();
-    let open_item = item.clone();
-    open_button.connect_clicked(move |_| {
-        open_popover.popdown();
-        if let Err(err) = open_thread_attachment(&w, &st, &open_item) {
-            report_attachment_error(&w, &st, "Open attachment", &err);
-        }
-    });
-
-    let open_click = gtk::GestureClick::new();
-    open_click.set_button(1);
-    let w = widgets.clone();
-    let st = state.clone();
-    let open_item = item.clone();
-    let open_row = row.clone();
-    open_click.connect_pressed(move |_, n_press, _, _| {
-        if n_press != 2 {
-            return;
-        }
-        if let Some(parent) = open_row.parent()
-            && let Ok(list) = parent.downcast::<gtk::ListBox>()
-        {
-            list.select_row(Some(&open_row));
-        }
-        if let Err(err) = open_thread_attachment(&w, &st, &open_item) {
-            report_attachment_error(&w, &st, "Open attachment", &err);
-        }
-    });
-    row.add_controller(open_click);
-
-    let click = gtk::GestureClick::new();
-    click.set_button(3);
-    let menu_popover = popover.clone();
-    let menu_row = row.clone();
-    click.connect_pressed(move |_, _, x, y| {
-        if let Some(parent) = menu_row.parent()
-            && let Ok(list) = parent.downcast::<gtk::ListBox>()
-        {
-            list.select_row(Some(&menu_row));
-        }
-        menu_popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-        menu_popover.popup();
-    });
-    row.add_controller(click);
-}
-
-fn open_thread_attachment(
-    widgets: &Widgets,
-    state: &SharedState,
-    item: &ThreadAttachmentItem,
-) -> anyhow::Result<PathBuf> {
-    let payload = thread_attachment_payload(state, item)?;
-    open_attachment_payload(widgets, state, &payload)
-}
-
-fn selected_thread_attachment(widgets: &Widgets) -> Option<ThreadAttachmentItem> {
-    let index = widgets
-        .attachment_list
-        .selected_row()
-        .map(|row| row.index() as usize)
-        .unwrap_or(0);
-    widgets.attachment_items.borrow().get(index).cloned()
-}
-
-fn open_attachment_payload(
-    widgets: &Widgets,
-    state: &SharedState,
-    payload: &AttachmentPayload,
-) -> anyhow::Result<PathBuf> {
-    let path = save_attachment_without_overwrite(
-        &widgets.attachment_open_dir,
-        &payload.filename,
-        &payload.bytes,
-    )?;
-    widgets.attachment_opener.open(&path)?;
     widgets
-        .status_label
-        .set_text(&format!("Opened attachment {}", path.display()));
-    {
-        let mut state = state.borrow_mut();
-        state.selected_message = Some(payload.message.clone());
-        state.last_operation = Some(format!("opened attachment {}", path.display()));
-        state.last_error = None;
-    }
-    update_debug(widgets, state);
-    Ok(path)
+        .attachments
+        .refresh(&messages, attachment_event_handler(widgets, state));
 }
 
 fn show_rendered_selected_thread(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -10667,15 +10156,7 @@ fn prepare_draft_fields_from_message_file(
 ) -> anyhow::Result<(ComposeFields, Vec<AttachmentInput>)> {
     let path = path.as_ref();
     let parsed = parse_file(path)?;
-    let attachment_inputs = extract_attachments_from_file(path)?
-        .into_iter()
-        .map(|attachment| AttachmentInput {
-            filename: attachment.filename,
-            content_type: attachment.content_type,
-            bytes: attachment.bytes,
-            source_path: None,
-        })
-        .collect::<Vec<_>>();
+    let attachment_inputs = attachments::attachment_inputs_from_file(path)?;
     let body = if parsed.text_body.trim().is_empty() {
         parsed.safe_body
     } else {
@@ -10732,8 +10213,7 @@ fn show_compose_view(widgets: &Widgets) {
     widgets.address_suggestions_list.set_visible(false);
     widgets.html_policy_row.set_visible(false);
     widgets.message_header_box.set_visible(false);
-    widgets.attachment_title.set_visible(false);
-    widgets.attachment_scrolled.set_visible(false);
+    widgets.attachments.hide();
     widgets.message_stack.set_visible_child_name("compose");
 }
 
@@ -11343,21 +10823,6 @@ fn header_emails(value: &str) -> String {
 fn copy_to_clipboard(text: &str) {
     if let Some(display) = gtk::gdk::Display::default() {
         display.clipboard().set_text(text);
-    }
-}
-
-fn safe_filename(filename: &str) -> String {
-    let cleaned = filename
-        .chars()
-        .map(|ch| match ch {
-            '/' | '\\' | '\0' => '_',
-            _ => ch,
-        })
-        .collect::<String>();
-    if cleaned.trim().is_empty() {
-        "attachment.bin".to_string()
-    } else {
-        cleaned
     }
 }
 
@@ -14890,16 +14355,7 @@ fn select_message_by_index(
         return;
     }
     state.borrow_mut().selected_message = message;
-    if let Some((attachment_row, _)) = widgets
-        .attachment_items
-        .borrow()
-        .iter()
-        .enumerate()
-        .find(|(_, item)| item.message_index == index)
-        && let Some(row) = widgets.attachment_list.row_at_index(attachment_row as i32)
-    {
-        widgets.attachment_list.select_row(Some(&row));
-    }
+    widgets.attachments.select_first_for_message(index);
     update_message_menu(options, widgets, state);
     if selected_message_is_draft(options, state) {
         match open_selected_draft_message(
@@ -15957,28 +15413,11 @@ fn fill_composer(widgets: &Widgets, state: &SharedState, message: ComposedMessag
 }
 
 fn cache_composer_attachments(attachments: &[AttachmentInput]) -> anyhow::Result<Vec<String>> {
-    if attachments.is_empty() {
-        return Ok(Vec::new());
-    }
-    let dir = default_compose_attachment_dir();
-    std::fs::create_dir_all(&dir)?;
-    attachments
-        .iter()
-        .map(|attachment| {
-            if let Some(source_path) = &attachment.source_path
-                && source_path.exists()
-            {
-                return Ok(source_path.display().to_string());
-            }
-            let path = dir.join(format!(
-                "{}-{}",
-                Uuid::new_v4(),
-                safe_filename(&attachment.filename)
-            ));
-            atomic_write_durable(&path, &attachment.bytes)?;
-            Ok(path.display().to_string())
-        })
-        .collect()
+    attachments::cache_composer_attachments(
+        attachments,
+        &default_compose_attachment_dir(),
+        atomic_write_durable,
+    )
 }
 
 fn default_compose_attachment_dir() -> PathBuf {
@@ -17809,15 +17248,13 @@ fn handle_automation_request(
             run_named_command(command, options, widgets, state, undo_state)
         }
         "attachment_list_items" => {
-            json!({"ok": true, "attachments": &*widgets.attachment_items.borrow()})
+            json!({"ok": true, "attachments": widgets.attachments.items()})
         }
         "select_attachment_by_index" => {
-            let index = req.args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
-            if let Some(row) = widgets.attachment_list.row_at_index(index) {
-                widgets.attachment_list.select_row(Some(&row));
-                json!({"ok": true, "selected": selected_thread_attachment(widgets)})
-            } else {
-                json!({"ok": false, "error": "attachment index not found"})
+            let index = req.args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            match widgets.attachments.select_index(index) {
+                Some(selected) => json!({"ok": true, "selected": selected}),
+                None => json!({"ok": false, "error": "attachment index not found"}),
             }
         }
         "save_selected_attachment" | "save_attachment" => {
@@ -17827,16 +17264,26 @@ fn handle_automation_request(
                 .get("dir")
                 .and_then(|v| v.as_str())
                 .map(PathBuf::from);
-            match attachment_payload_at_index(widgets, state, index) {
+            let selected_message = state.borrow().selected_message.clone();
+            match widgets
+                .attachments
+                .payload_at_index(selected_message, index)
+            {
                 Ok(payload) => {
                     let result = match dir.as_deref() {
-                        Some(dir) => save_attachment_payload_to_directory(
-                            widgets, state, &payload, dir,
-                        )
-                        .map(|path| json!({"ok": true, "pending": false, "path": path})),
-                        None => request_attachment_save(widgets, state, payload).map(|chooser_id| {
-                            json!({"ok": true, "pending": true, "chooser_id": chooser_id})
-                        }),
+                        Some(dir) => widgets.attachments.save_to_directory(&payload, dir).map(
+                            |result| {
+                                let path = result.path.clone();
+                                apply_attachment_action_result(widgets, state, result);
+                                json!({"ok": true, "pending": false, "path": path})
+                            },
+                        ),
+                        None => widgets
+                            .attachments
+                            .request_save(payload, attachment_event_handler(widgets, state))
+                            .map(|chooser_id| {
+                                json!({"ok": true, "pending": true, "chooser_id": chooser_id})
+                            }),
                     };
                     match result {
                         Ok(response) => response,
@@ -17854,17 +17301,26 @@ fn handle_automation_request(
         }
         "open_selected_attachment" | "open_attachment" => {
             let index = req.args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let result = attachment_payload_at_index(widgets, state, index)
-                .and_then(|payload| open_attachment_payload(widgets, state, &payload));
+            let selected_message = state.borrow().selected_message.clone();
+            let result = widgets
+                .attachments
+                .payload_at_index(selected_message, index)
+                .and_then(|payload| widgets.attachments.open(&payload));
             match result {
-                Ok(path) => json!({"ok": true, "path": path}),
+                Ok(result) => {
+                    let path = result.path.clone();
+                    apply_attachment_action_result(widgets, state, result);
+                    json!({"ok": true, "path": path})
+                }
                 Err(err) => {
                     report_attachment_error(widgets, state, "Open attachment", &err);
                     json!({"ok": false, "error": err.to_string()})
                 }
             }
         }
-        "attachment_test_state" => attachment_test_state_json(widgets),
+        "attachment_test_state" => widgets
+            .attachments
+            .test_state_json(&widgets.status_label.text()),
         "respond_attachment_save" => {
             let response = req
                 .args
@@ -17875,13 +17331,7 @@ fn handle_automation_request(
                 .args
                 .get("id")
                 .and_then(|value| value.as_u64())
-                .or_else(|| {
-                    widgets
-                        .pending_attachment_save
-                        .borrow()
-                        .as_ref()
-                        .map(|pending| pending.id)
-                });
+                .or_else(|| widgets.attachments.pending_save_id());
             let result = (|| -> anyhow::Result<(bool, Option<PathBuf>)> {
                 let chooser_id = chooser_id
                     .ok_or_else(|| anyhow::anyhow!("no attachment save chooser is pending"))?;
@@ -17895,18 +17345,26 @@ fn handle_automation_request(
                             .ok_or_else(|| {
                                 anyhow::anyhow!("respond_attachment_save accept requires a path")
                             })?;
-                        complete_pending_attachment_save(
-                            widgets,
-                            state,
+                        let result = widgets.attachments.complete_pending_save(
                             chooser_id,
                             true,
                             Some(target),
-                        )
-                        .map(|path| (true, path))
+                        )?;
+                        let path = result.as_ref().map(|result| result.path.clone());
+                        if let Some(result) = result {
+                            apply_attachment_action_result(widgets, state, result);
+                        }
+                        Ok((true, path))
                     }
                     "cancel" => {
-                        complete_pending_attachment_save(widgets, state, chooser_id, false, None)
-                            .map(|path| (false, path))
+                        let result = widgets
+                            .attachments
+                            .complete_pending_save(chooser_id, false, None)?;
+                        let path = result.as_ref().map(|result| result.path.clone());
+                        if let Some(result) = result {
+                            apply_attachment_action_result(widgets, state, result);
+                        }
+                        Ok((false, path))
                     }
                     _ => anyhow::bail!("respond_attachment_save response must be accept or cancel"),
                 }
@@ -17975,32 +17433,6 @@ fn automation_mutation_response(
 ) -> serde_json::Value {
     let error = (!ok).then(|| widgets.status_label.text().to_string());
     json!({"ok": ok, "error": error, "state": &*state.borrow()})
-}
-
-fn attachment_test_state_json(widgets: &Widgets) -> serde_json::Value {
-    let save_chooser = widgets
-        .pending_attachment_save
-        .borrow()
-        .as_ref()
-        .map(|pending| {
-            json!({
-                "id": pending.id,
-                "suggested_name": pending.suggested_name,
-                "visible": pending
-                    .dialog
-                    .upgrade()
-                    .is_some_and(|dialog| dialog.is_visible()),
-            })
-        });
-    let fake_opener_calls = widgets.attachment_opener.fixture_calls();
-    json!({
-        "ok": true,
-        "save_chooser": save_chooser,
-        "status_text": widgets.status_label.text().to_string(),
-        "open_temp_dir": widgets.attachment_open_dir,
-        "fake_opener": fake_opener_calls.is_some(),
-        "fake_opener_calls": fake_opener_calls.unwrap_or_default(),
-    })
 }
 
 fn draft_list_state_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
@@ -18755,8 +18187,15 @@ fn run_named_command(
             json!({"ok": true, "show_thread_preview": state.borrow().show_thread_preview})
         }
         "save_attachment" => {
-            let result = active_attachment_payload(widgets, state)
-                .and_then(|payload| request_attachment_save(widgets, state, payload));
+            let selected_message = state.borrow().selected_message.clone();
+            let result = widgets
+                .attachments
+                .active_payload(selected_message)
+                .and_then(|payload| {
+                    widgets
+                        .attachments
+                        .request_save(payload, attachment_event_handler(widgets, state))
+                });
             match result {
                 Ok(chooser_id) => {
                     json!({"ok": true, "pending": true, "chooser_id": chooser_id})
@@ -18768,10 +18207,17 @@ fn run_named_command(
             }
         }
         "open_attachment" => {
-            let result = active_attachment_payload(widgets, state)
-                .and_then(|payload| open_attachment_payload(widgets, state, &payload));
+            let selected_message = state.borrow().selected_message.clone();
+            let result = widgets
+                .attachments
+                .active_payload(selected_message)
+                .and_then(|payload| widgets.attachments.open(&payload));
             match result {
-                Ok(path) => json!({"ok": true, "path": path}),
+                Ok(result) => {
+                    let path = result.path.clone();
+                    apply_attachment_action_result(widgets, state, result);
+                    json!({"ok": true, "path": path})
+                }
                 Err(err) => {
                     report_attachment_error(widgets, state, "Open attachment", &err);
                     json!({"ok": false, "error": err.to_string()})
@@ -21462,35 +20908,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn attachment_open_tempdir_is_removed_when_owner_drops() {
-        let directory = create_attachment_open_tempdir().expect("attachment-open temp directory");
-        let path = directory.path().to_path_buf();
-        std::fs::write(path.join("attachment.txt"), b"attachment")
-            .expect("write temporary attachment");
-
-        drop(directory);
-
-        assert!(
-            !path.exists(),
-            "dropping the application-owned TempDir must remove {}",
-            path.display()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn attachment_open_tempdir_has_private_unix_permissions() {
-        let directory = create_attachment_open_tempdir().expect("attachment-open temp directory");
-        let mode = std::fs::metadata(directory.path())
-            .expect("attachment-open directory metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-
-        assert_eq!(mode, 0o700);
-    }
-
-    #[test]
     fn message_header_values_stay_single_line_for_compact_pane_height() {
         assert_eq!(MESSAGE_HEADER_VALUE_LINES, 1);
     }
@@ -21585,6 +21002,60 @@ mod tests {
             .expect("fixture state inspection");
         ensure_automation_request_allowed(&fixture_options, "respond_attachment_save", &json!({}))
             .expect("fixture chooser response");
+    }
+
+    #[test]
+    fn attachment_result_preserves_current_tags_after_local_mutation() {
+        let message = notm_notmuch::MessageSummary {
+            message_id: "attachment-message@example.test".to_string(),
+            thread_id: "attachment-thread".to_string(),
+            date: 0,
+            from: "Sender <sender@example.test>".to_string(),
+            to: "Recipient <recipient@example.test>".to_string(),
+            cc: String::new(),
+            subject: "Attachment".to_string(),
+            tags: vec!["inbox".to_string(), "unread".to_string()],
+            filenames: vec!["/tmp/attachment-message.eml".to_string()],
+        };
+        let result = AttachmentActionResult {
+            message_id: message.message_id.clone(),
+            path: PathBuf::from("/tmp/saved-attachment.txt"),
+            status: "Attachment saved".to_string(),
+            operation: "saved attachment".to_string(),
+        };
+        let mut state = UiState {
+            messages: vec![message.clone()],
+            selected_message: Some(message),
+            ..UiState::default()
+        };
+        let mutation = TagMutation {
+            add: vec!["flagged".to_string()],
+            remove: vec!["unread".to_string()],
+            sync_maildir_flags: false,
+        };
+        apply_tag_mutation_to_tags(&mut state.messages[0].tags, &mutation);
+        apply_tag_mutation_to_tags(
+            &mut state
+                .selected_message
+                .as_mut()
+                .expect("selected attachment message")
+                .tags,
+            &mutation,
+        );
+        let expected_tags = state.messages[0].tags.clone();
+
+        record_attachment_action_result(&mut state, &result.message_id, result.operation);
+
+        assert_eq!(
+            state
+                .selected_message
+                .as_ref()
+                .expect("attachment action keeps the selected message")
+                .tags,
+            expected_tags
+        );
+        assert_eq!(state.last_error, None);
+        assert_eq!(state.last_operation.as_deref(), Some("saved attachment"));
     }
 
     #[test]
