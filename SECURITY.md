@@ -2,9 +2,9 @@
 
 ## Supported versions
 
-`notm` is still pre-1.0 and does not yet have a stable release line. Security
-fixes are made on the `main` branch. Once tagged releases are available, only
-the latest release line will receive fixes unless a release note says otherwise.
+`notm` has not published a tagged release yet. Once releases begin, only the
+latest release series will receive security updates. Older release series will
+not receive backported fixes unless a release note explicitly says otherwise.
 
 ## Reporting a vulnerability
 
