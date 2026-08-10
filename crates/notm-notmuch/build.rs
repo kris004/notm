@@ -2,6 +2,7 @@ use std::{env, path::PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
+    println!("cargo:rustc-check-cfg=cfg(notmuch_has_iterator_status)");
 
     let mut clang_args = Vec::new();
     match pkg_config::Config::new().probe("notmuch") {
@@ -33,12 +34,26 @@ fn main() {
 
     let bindings = clang_args
         .into_iter()
-        .fold(bindings, |builder, arg| builder.clang_arg(arg));
+        .fold(bindings, |builder, arg| builder.clang_arg(arg))
+        .generate()
+        .expect("generate notmuch bindings");
+
+    // Detect the API from the generated bindings rather than assuming a package
+    // version: distributions may backport it, and the fallback path has no .pc
+    // metadata. Notmuch 0.40 introduced both status functions and enum values.
+    let has_iterator_status = {
+        let source = bindings.to_string();
+        source.contains("pub fn notmuch_threads_status")
+            && source.contains("pub fn notmuch_messages_status")
+            && source.contains("NOTMUCH_STATUS_ITERATOR_EXHAUSTED")
+            && source.contains("NOTMUCH_STATUS_OPERATION_INVALIDATED")
+    };
+    if has_iterator_status {
+        println!("cargo:rustc-cfg=notmuch_has_iterator_status");
+    }
 
     let out_path = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR set"));
     bindings
-        .generate()
-        .expect("generate notmuch bindings")
         .write_to_file(out_path.join("bindings.rs"))
         .expect("write notmuch bindings");
 }

@@ -216,12 +216,7 @@ impl Database {
             }
             unsafe { ffi::notmuch_threads_move_to_next(threads) };
         }
-        let iter_status = unsafe { ffi::notmuch_threads_status(threads) };
-        if iter_status != ffi::notmuch_status_t::NOTMUCH_STATUS_SUCCESS
-            && iter_status != ffi::notmuch_status_t::NOTMUCH_STATUS_ITERATOR_EXHAUSTED
-        {
-            check(iter_status, self.status_string())?;
-        }
+        check_threads_iterator(threads, self.status_string())?;
         Ok(out)
     }
 
@@ -321,12 +316,7 @@ impl Database {
                 }
                 unsafe { ffi::notmuch_messages_move_to_next(messages) };
             }
-            let iter_status = unsafe { ffi::notmuch_messages_status(messages) };
-            if iter_status != ffi::notmuch_status_t::NOTMUCH_STATUS_SUCCESS
-                && iter_status != ffi::notmuch_status_t::NOTMUCH_STATUS_ITERATOR_EXHAUSTED
-            {
-                check(iter_status, self.status_string())?;
-            }
+            check_messages_iterator(messages, self.status_string())?;
             Ok(())
         })();
         let end = unsafe { ffi::notmuch_database_end_atomic(self.ptr.as_ptr()) };
@@ -437,12 +427,7 @@ impl Database {
                 unsafe { ffi::notmuch_threads_move_to_next(threads) };
             }
             if index < end {
-                let iter_status = unsafe { ffi::notmuch_threads_status(threads) };
-                if iter_status != ffi::notmuch_status_t::NOTMUCH_STATUS_SUCCESS
-                    && iter_status != ffi::notmuch_status_t::NOTMUCH_STATUS_ITERATOR_EXHAUSTED
-                {
-                    check(iter_status, self.status_string())?;
-                }
+                check_threads_iterator(threads, self.status_string())?;
             }
             Ok(())
         })();
@@ -512,12 +497,7 @@ impl Database {
             }
             unsafe { ffi::notmuch_messages_move_to_next(messages) };
         }
-        let iter_status = unsafe { ffi::notmuch_messages_status(messages) };
-        if iter_status != ffi::notmuch_status_t::NOTMUCH_STATUS_SUCCESS
-            && iter_status != ffi::notmuch_status_t::NOTMUCH_STATUS_ITERATOR_EXHAUSTED
-        {
-            check(iter_status, self.status_string())?;
-        }
+        check_messages_iterator(messages, self.status_string())?;
         Ok(out)
     }
 }
@@ -620,13 +600,55 @@ fn mutate_thread_messages(
         }
         unsafe { ffi::notmuch_messages_move_to_next(messages) };
     }
-    let iter_status = unsafe { ffi::notmuch_messages_status(messages) };
-    if iter_status != ffi::notmuch_status_t::NOTMUCH_STATUS_SUCCESS
-        && iter_status != ffi::notmuch_status_t::NOTMUCH_STATUS_ITERATOR_EXHAUSTED
-    {
-        check(iter_status, detail.to_string())?;
-    }
+    check_messages_iterator(messages, detail.to_string())?;
     Ok(changed)
+}
+
+#[cfg(notmuch_has_iterator_status)]
+fn check_threads_iterator(
+    threads: *mut ffi::notmuch_threads_t,
+    detail: impl Into<String>,
+) -> Result<()> {
+    let status = unsafe { ffi::notmuch_threads_status(threads) };
+    check_iterator_status(status, detail)
+}
+
+#[cfg(not(notmuch_has_iterator_status))]
+fn check_threads_iterator(
+    _threads: *mut ffi::notmuch_threads_t,
+    _detail: impl Into<String>,
+) -> Result<()> {
+    // Before Notmuch 0.40, validity was the only available iterator signal.
+    Ok(())
+}
+
+#[cfg(notmuch_has_iterator_status)]
+fn check_messages_iterator(
+    messages: *mut ffi::notmuch_messages_t,
+    detail: impl Into<String>,
+) -> Result<()> {
+    let status = unsafe { ffi::notmuch_messages_status(messages) };
+    check_iterator_status(status, detail)
+}
+
+#[cfg(not(notmuch_has_iterator_status))]
+fn check_messages_iterator(
+    _messages: *mut ffi::notmuch_messages_t,
+    _detail: impl Into<String>,
+) -> Result<()> {
+    // Before Notmuch 0.40, validity was the only available iterator signal.
+    Ok(())
+}
+
+#[cfg(notmuch_has_iterator_status)]
+fn check_iterator_status(status: ffi::notmuch_status_t, detail: impl Into<String>) -> Result<()> {
+    if status == ffi::notmuch_status_t::NOTMUCH_STATUS_SUCCESS
+        || status == ffi::notmuch_status_t::NOTMUCH_STATUS_ITERATOR_EXHAUSTED
+    {
+        Ok(())
+    } else {
+        check(status, detail)
+    }
 }
 
 unsafe fn collect_tags(tags: *mut ffi::notmuch_tags_t) -> Vec<String> {
