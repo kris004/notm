@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     rc::Rc,
-    sync::{Arc, Mutex, OnceLock, mpsc},
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -42,15 +42,26 @@ use webkit6::{
 
 use crate::{
     automation::{self, AutomationConfig, AutomationRequest},
-    cache::{BoundedLruCache, SEARCH_PAGE_CACHE_CAPACITY, THREAD_DETAIL_CACHE_CAPACITY},
     model::{
         ActiveDraft, ActivePane, ComposeFields, ContentLayout, InputMode, LayoutPreference,
-        MAX_THREAD_PREVIEW_LINES, ThemePreference, ThreadUiDetails, UiState,
+        MAX_THREAD_PREVIEW_LINES, ThemePreference, UiState,
     },
     screenshot, theme,
     widgets::attachments::{
         self, AttachmentActionResult, AttachmentController, AttachmentEvent,
         AttachmentEventHandler, AttachmentOpenStore,
+    },
+    widgets::search_bar::{
+        self, SearchActivityState, SearchBarController, SearchHarnessPolicy, SearchInputEvent,
+        SearchWorkerRequest, begin_search_activity, cancel_search_activity, finish_search_activity,
+    },
+    widgets::thread_list::{
+        self, AppendSearchOutcome, LoadMoreDecision, LocatePagePlan, ReplaceSearchOutcome,
+        SearchErrorOutcome, SearchPageCoordinator, SearchPageRequest, SearchPageResponse,
+        SearchRuntimeSnapshot, ThreadDisplayToggle, ThreadListController, ThreadListDisplay,
+        ThreadModelSnapshot, ThreadModelUpdate, ThreadPagingSnapshot, ThreadRowSnapshot,
+        ThreadSearchStateSnapshot, ThreadSearchStateUpdate, format_count, format_thread_list_date,
+        thread_window_status as thread_window_status_from_parts,
     },
 };
 
@@ -465,24 +476,12 @@ struct Widgets {
     saved_query_entry: gtk::Entry,
     save_search_button: gtk::Button,
     custom_tag_entry: gtk::Entry,
-    search_entry: gtk::Entry,
-    search_button: gtk::Button,
-    search_generation: Rc<Cell<u64>>,
+    search_bar: SearchBarController,
     sync_refresh_generation: Rc<Cell<Option<u64>>>,
-    requested_search_query: Rc<RefCell<String>>,
     input_mode_generation: Rc<Cell<u64>>,
-    search_suggestions_list: gtk::ListBox,
-    search_completion: Rc<RefCell<Option<SearchCompletionSession>>>,
     hidden_tag_searches: HiddenTagSearchStore,
-    thread_list: gtk::ListView,
-    thread_model: gtk::StringList,
-    thread_selection: gtk::SingleSelection,
-    thread_selection_refreshing: Rc<Cell<bool>>,
-    thread_scroll_generation: Rc<Cell<u64>>,
-    thread_result_label: gtk::Label,
-    load_more_button: gtk::Button,
+    thread_list: ThreadListController,
     manual_sync_button: Option<gtk::Button>,
-    thread_scrolled: gtk::ScrolledWindow,
     compose_button: gtk::Button,
     debug_button: gtk::Button,
     palette_button: gtk::Button,
@@ -586,6 +585,28 @@ type UndoState = Rc<RefCell<Vec<UndoTagAction>>>;
 type SavedSearchStore = Rc<RefCell<Vec<SavedSearch>>>;
 type HiddenTagSearchStore = Rc<RefCell<BTreeSet<String>>>;
 
+impl SearchActivityState for UiState {
+    fn search_generation(&self) -> u64 {
+        self.search_generation
+    }
+
+    fn set_search_generation(&mut self, generation: u64) {
+        self.search_generation = generation;
+    }
+
+    fn set_search_loading(&mut self, loading: bool) {
+        self.search_loading = loading;
+    }
+
+    fn set_pending_search_query(&mut self, query: Option<String>) {
+        self.pending_search_query = query;
+    }
+
+    fn set_search_error(&mut self, error: Option<String>) {
+        self.search_error = error;
+    }
+}
+
 #[derive(Clone)]
 struct MainWindowHandle {
     window: gtk::ApplicationWindow,
@@ -604,16 +625,6 @@ enum RecipientField {
 struct AddressCompletionSession {
     field: RecipientField,
     base: String,
-    suggestions: Vec<String>,
-    next_index: usize,
-    generated_text: Option<String>,
-    suppress_next_change: bool,
-}
-
-#[derive(Debug, Clone)]
-struct SearchCompletionSession {
-    base: String,
-    cursor_position: i32,
     suggestions: Vec<String>,
     next_index: usize,
     generated_text: Option<String>,
@@ -854,74 +865,8 @@ fn persisted_draft_deletion_requires_confirmation(_deletion: PersistedDraftDelet
     true
 }
 
-#[derive(Debug, Clone)]
-struct SearchData {
-    query: String,
-    threads: Vec<notm_notmuch::ThreadSummary>,
-    details: BTreeMap<String, ThreadUiDetails>,
-    count: u32,
-    offset: usize,
-    limit: usize,
-    tags: Vec<String>,
-    database_path: String,
-    revision: notm_notmuch::Revision,
-    cached: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SearchCacheKey {
-    database_path: String,
-    database_uuid: String,
-    database_revision: u64,
-    query: String,
-    offset: usize,
-    limit: usize,
-    excluded_tags: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ThreadDetailCacheKey {
-    database_path: String,
-    database_uuid: String,
-    database_revision: u64,
-    thread_id: String,
-}
-
-struct SearchResponse {
-    generation: u64,
-    result: anyhow::Result<SearchData>,
-}
-
-struct SearchWorkerRequest {
-    query: String,
-    generation: u64,
-    select_first: bool,
-    delay: Duration,
-}
-
 struct AddressSuggestionsResponse {
     result: anyhow::Result<Vec<String>>,
-}
-
-struct ThreadPageResponse {
-    generation: u64,
-    target_index: usize,
-    visual_anchor_index: Option<usize>,
-    result: anyhow::Result<SearchData>,
-}
-
-static SEARCH_CACHE: OnceLock<Mutex<BoundedLruCache<SearchCacheKey, SearchData>>> = OnceLock::new();
-static THREAD_DETAIL_CACHE: OnceLock<
-    Mutex<BoundedLruCache<ThreadDetailCacheKey, ThreadUiDetails>>,
-> = OnceLock::new();
-
-fn search_cache() -> &'static Mutex<BoundedLruCache<SearchCacheKey, SearchData>> {
-    SEARCH_CACHE.get_or_init(|| Mutex::new(BoundedLruCache::new(SEARCH_PAGE_CACHE_CAPACITY)))
-}
-
-fn thread_detail_cache() -> &'static Mutex<BoundedLruCache<ThreadDetailCacheKey, ThreadUiDetails>> {
-    THREAD_DETAIL_CACHE
-        .get_or_init(|| Mutex::new(BoundedLruCache::new(THREAD_DETAIL_CACHE_CAPACITY)))
 }
 
 const SIDEBAR_MIN_WIDTH: i32 = 136;
@@ -930,6 +875,7 @@ const COMPOSE_BODY_MIN_HEIGHT: i32 = 96;
 const COMPOSE_BODY_NATURAL_HEIGHT: i32 = 260;
 const DRAFT_LIST_MIN_HEIGHT: i32 = 72;
 const DRAFT_LIST_MAX_HEIGHT: i32 = 160;
+const MAX_SYNC_REFRESH_DELAY: Duration = Duration::from_secs(5);
 // GTK measures the message header at unbounded width during compact pane allocation.
 // Reserving multiple lines per metadata row can force the whole message pane taller
 // than the available window; full values stay available via selection and tooltip.
@@ -939,10 +885,6 @@ const STATUS_BAR_MAX_WIDTH_CHARS: i32 = 120;
 const HTML_LINK_STATUS_URI_MAX_CHARS: usize = 96;
 // Cache enough normalized content for visual preview limits without keying the
 // thread-detail cache by a presentation setting.
-const THREAD_PREVIEW_CACHE_MAX_CHARS: usize = 1024;
-const THREAD_ROW_PREFIX: &str = "thread";
-const THREAD_STATUS_PREFIX: &str = "status";
-const MAX_FIXTURE_SEARCH_DELAY: Duration = Duration::from_secs(5);
 const AUTO_STACKED_BELOW_WIDTH: i32 = 1280;
 const AUTO_THREE_PANE_ABOVE_WIDTH: i32 = 1360;
 const MESSAGE_VIEW_MIN_WIDTH: i32 = 280;
@@ -1014,38 +956,6 @@ fn auto_content_layout(width: i32, _height: i32, current: ContentLayout) -> Cont
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ThreadListDisplay {
-    numbers: bool,
-    dates: bool,
-    tags: bool,
-    preview: bool,
-    preview_lines: usize,
-}
-
-impl ThreadListDisplay {
-    fn from_state(state: &UiState) -> Self {
-        Self {
-            numbers: state.show_thread_numbers,
-            dates: state.show_thread_dates,
-            tags: state.show_thread_tags,
-            preview: state.show_thread_preview,
-            preview_lines: state.thread_preview_lines,
-        }
-    }
-
-    fn token_bits(self) -> String {
-        format!(
-            "{}{}{}{}-{}",
-            if self.numbers { 1 } else { 0 },
-            if self.dates { 1 } else { 0 },
-            if self.tags { 1 } else { 0 },
-            if self.preview { 1 } else { 0 },
-            self.preview_lines,
-        )
-    }
-}
-
 fn build_ui(
     app: &gtk::Application,
     options: LaunchOptions,
@@ -1089,7 +999,6 @@ fn build_ui(
     };
     let state = Rc::new(RefCell::new(initial_state));
     let undo_state: UndoState = Rc::new(RefCell::new(load_undo_tag_actions()));
-    let search_generation = Rc::new(Cell::new(0_u64));
     let sync_refresh_generation = Rc::new(Cell::new(None));
     let hidden_tag_searches: HiddenTagSearchStore = Rc::new(RefCell::new(
         options.hidden_tag_searches.iter().cloned().collect(),
@@ -1257,35 +1166,9 @@ fn build_ui(
     controls_box.set_halign(gtk::Align::Fill);
     middle.append(&controls_box);
 
-    let search_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let search_entry = gtk::Entry::new();
-    search_entry.set_widget_name("notm-search-entry");
-    search_entry.set_hexpand(true);
-    search_entry.set_text(&options.default_query);
-    search_entry.set_placeholder_text(Some(
-        "Notmuch query, e.g. tag:inbox and not tag:trash and not tag:spam",
-    ));
-    let search_suggestions_list = gtk::ListBox::new();
-    search_suggestions_list.set_widget_name("notm-search-suggestions-list");
-    search_suggestions_list.set_selection_mode(gtk::SelectionMode::Single);
-    search_suggestions_list.add_css_class("boxed-list");
-    search_suggestions_list.set_hexpand(true);
-    search_suggestions_list.set_focusable(false);
-    search_suggestions_list.set_visible(false);
-    let search_completion = Rc::new(RefCell::new(None::<SearchCompletionSession>));
-    let search_button = gtk::Button::with_label("Search");
-    search_button.set_widget_name("notm-search-button");
-    search_row.append(&search_entry);
-    search_row.append(&search_button);
-    search_row.append(&custom_search_button);
-    controls_box.append(&search_row);
-    controls_box.append(&search_suggestions_list);
-    let helper = gtk::Label::new(Some(
-        "Syntax: tag:inbox, from:alice, subject:report, thread:<id>, *",
-    ));
-    helper.set_xalign(0.0);
-    helper.add_css_class("dim-label");
-    controls_box.append(&helper);
+    let search_bar = SearchBarController::new(&options.default_query, &custom_search_button);
+    let search_button = search_bar.button();
+    controls_box.append(&search_bar.root());
 
     let action_outer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     action_outer.set_hexpand(true);
@@ -1416,35 +1299,13 @@ fn build_ui(
     controls_box.append(&single_tag_editor_box);
     controls_box.append(&tag_command_editor_box);
 
-    let thread_model = gtk::StringList::new(&[]);
-    let thread_selection = gtk::SingleSelection::new(Some(thread_model.clone()));
-    thread_selection.set_autoselect(false);
-    thread_selection.set_can_unselect(true);
-    let thread_selection_refreshing = Rc::new(Cell::new(false));
-    let thread_scroll_generation = Rc::new(Cell::new(0_u64));
-    let thread_factory = thread_list_factory(&state);
-    let thread_list = gtk::ListView::new(Some(thread_selection.clone()), Some(thread_factory));
-    thread_list.set_widget_name("notm-thread-list");
-    thread_list.set_single_click_activate(false);
-    thread_list.set_hexpand(true);
-    thread_list.set_vexpand(true);
-    let scrolled_threads = gtk::ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .child(&thread_list)
-        .build();
-    middle.append(&scrolled_threads);
-    let thread_result_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let thread_result_label = gtk::Label::new(Some("No results loaded"));
-    thread_result_label.set_widget_name("notm-thread-result-label");
-    thread_result_label.set_xalign(0.0);
-    thread_result_label.set_hexpand(true);
-    let load_more_button = gtk::Button::with_label("Load more");
-    load_more_button.set_widget_name("notm-load-more-threads-button");
-    load_more_button.set_sensitive(false);
-    thread_result_row.append(&thread_result_label);
-    thread_result_row.append(&load_more_button);
-    middle.append(&thread_result_row);
+    let row_state = state.clone();
+    let row_provider = Rc::new(move |index| thread_row_snapshot(&row_state, index));
+    let multi_state = state.clone();
+    let multi_select =
+        Rc::new(move |thread_id: &str| toggle_thread_multi_selection(&multi_state, thread_id));
+    let thread_list = ThreadListController::new(row_provider, multi_select);
+    middle.append(&thread_list.root());
 
     let right = gtk::Box::new(gtk::Orientation::Vertical, 6);
     right.set_widget_name("notm-message-pane");
@@ -1801,24 +1662,12 @@ fn build_ui(
         saved_query_entry,
         save_search_button: save_search_button.clone(),
         custom_tag_entry,
-        search_entry,
-        search_button: search_button.clone(),
-        search_generation,
+        search_bar,
         sync_refresh_generation,
-        requested_search_query: Rc::new(RefCell::new(options.default_query.clone())),
         input_mode_generation: Rc::new(Cell::new(0)),
-        search_suggestions_list,
-        search_completion,
         hidden_tag_searches,
         thread_list,
-        thread_model,
-        thread_selection,
-        thread_selection_refreshing,
-        thread_scroll_generation,
-        thread_result_label,
-        load_more_button,
         manual_sync_button: manual_sync_button.clone(),
-        thread_scrolled: scrolled_threads,
         compose_button: compose_button.clone(),
         debug_button: debug_button.clone(),
         palette_button: palette_button.clone(),
@@ -1991,8 +1840,7 @@ fn build_ui(
     connect_recipient_autocomplete(&widgets.compose_cc, &widgets, &state);
     connect_recipient_autocomplete(&widgets.compose_bcc, &widgets, &state);
     connect_address_suggestion_list(&widgets, &state);
-    connect_search_debounce(&options, &widgets, &state);
-    connect_search_autocomplete(&widgets, &state);
+    connect_search_bar(&options, &widgets, &state);
     connect_input_mode_focus(&widgets, &state);
     install_shortcuts(&options, &widgets, &state, &undo_state, &saved_search_store);
     connect_auto_load_more(&options, &widgets, &state);
@@ -2053,8 +1901,8 @@ fn build_ui(
         .status_label
         .set_text("Starting notm; loading mail…");
     widgets
-        .thread_result_label
-        .set_text("Loading initial search…");
+        .thread_list
+        .set_result_label("Loading initial search…");
     show_thread_list_loading(&widgets, "Loading initial search…");
     {
         let opts = options.clone();
@@ -2289,7 +2137,7 @@ fn activate_saved_search(
     state.borrow_mut().visible_saved_search = Some(name.to_string());
     widgets.saved_name_entry.set_text(name);
     widgets.saved_query_entry.set_text(query);
-    widgets.search_entry.set_text(query);
+    widgets.search_bar.set_query(query);
     run_search(options, widgets, state, query);
 }
 
@@ -2709,7 +2557,8 @@ fn connect_saved_search_editor(
         let store = saved_store.clone();
         popover.connect_show(move |_| {
             w.saved_name_entry.set_text("");
-            w.saved_query_entry.set_text(w.search_entry.text().trim());
+            w.saved_query_entry
+                .set_text(w.search_bar.entry().text().trim());
             update_saved_search_editor_actions(&w, &st, &store);
             set_input_mode(
                 &w,
@@ -2781,7 +2630,7 @@ fn update_saved_search_editor_actions(
     saved_store: &SavedSearchStore,
 ) {
     let name = widgets.saved_name_entry.text().trim().to_string();
-    let query = widgets.search_entry.text().trim().to_string();
+    let query = widgets.search_bar.entry().text().trim().to_string();
     let has_values = !name.is_empty() && !query.is_empty();
     let built_in_name = built_in_saved_searches()
         .iter()
@@ -2801,7 +2650,7 @@ fn save_custom_search_from_current_query(
     state: &SharedState,
     saved_store: &SavedSearchStore,
 ) -> anyhow::Result<()> {
-    let query = widgets.search_entry.text().trim().to_string();
+    let query = widgets.search_bar.entry().text().trim().to_string();
     anyhow::ensure!(!query.is_empty(), "search query is empty");
     widgets.saved_query_entry.set_text(&query);
     save_custom_search_from_entries(options, widgets, state, saved_store)
@@ -2812,7 +2661,7 @@ fn open_save_current_search_prompt(
     state: &SharedState,
     saved_store: &SavedSearchStore,
 ) {
-    let query = widgets.search_entry.text().trim().to_string();
+    let query = widgets.search_bar.entry().text().trim().to_string();
     if query.is_empty() {
         widgets.status_label.set_text("Search query is empty");
         return;
@@ -2892,7 +2741,7 @@ fn save_custom_search_from_entries(
         persist_custom_saved_searches(options, &searches)?;
     }
     refresh_saved_searches(options, widgets, state, saved_store);
-    widgets.search_entry.set_text(&query);
+    widgets.search_bar.set_query(&query);
     state.borrow_mut().visible_saved_search = Some(name);
     update_saved_search_editor_actions(widgets, state, saved_store);
     run_search(options, widgets, state, &query);
@@ -4028,18 +3877,12 @@ fn connect_address_suggestion_list(widgets: &Widgets, state: &SharedState) {
         });
 }
 
-fn connect_search_debounce(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+fn connect_search_bar(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
-    let debounce_generation = Rc::new(Cell::new(0_u64));
-    let active_debounce_generation = debounce_generation.clone();
-    widgets.search_entry.connect_changed(move |entry| {
-        let query = entry.text().to_string();
-        let generation = active_debounce_generation.get().saturating_add(1);
-        active_debounce_generation.set(generation);
-        if query.trim().is_empty() {
-            w.requested_search_query.borrow_mut().clear();
+    let handler = Rc::new(move |event| match event {
+        SearchInputEvent::Cleared => {
             if st.borrow().sync_in_progress
                 && w.sync_refresh_generation.get() == Some(st.borrow().search_generation)
             {
@@ -4051,8 +3894,8 @@ fn connect_search_debounce(options: &LaunchOptions, widgets: &Widgets, state: &S
                 let state = st.borrow();
                 state.sync_in_progress && state.search_loading
             };
-            let search_generation = reserve_search_generation(&w);
-            cancel_search_activity(&mut st.borrow_mut(), search_generation);
+            let generation = reserve_search_generation(&w);
+            cancel_search_activity(&mut st.borrow_mut(), generation);
             if replace_cancelled_search {
                 let refresh_query = st.borrow().current_query.clone();
                 let fallback_generation = reserve_search_generation(&w);
@@ -4062,10 +3905,7 @@ fn connect_search_debounce(options: &LaunchOptions, widgets: &Widgets, state: &S
                     fallback_generation,
                     &refresh_query,
                 );
-                let opts = opts.clone();
-                let w = w.clone();
-                let st = st.clone();
-                launch_search_worker(
+                start_full_search(
                     &opts,
                     &w,
                     &st,
@@ -4081,391 +3921,18 @@ fn connect_search_debounce(options: &LaunchOptions, widgets: &Widgets, state: &S
                 update_thread_result_label(&w, &st);
                 update_debug(&w, &st);
             }
-            return;
         }
-        let search_generation = reserve_search_generation(&w);
-        prepare_search_activity(&w, &st, search_generation, &query);
-        let opts = opts.clone();
-        let w = w.clone();
-        let st = st.clone();
-        let active_debounce_generation = active_debounce_generation.clone();
-        gtk::glib::timeout_add_local_once(Duration::from_millis(350), move || {
-            if generation != active_debounce_generation.get()
-                || search_generation != w.search_generation.get()
-            {
-                return;
-            }
-            let select_first = !widget_contains_focus(w.search_entry.upcast_ref());
-            launch_search_worker(
-                &opts,
-                &w,
-                &st,
-                SearchWorkerRequest {
-                    query,
-                    generation: search_generation,
-                    select_first,
-                    delay: Duration::ZERO,
-                },
-            );
-        });
+        SearchInputEvent::Reserved { query, generation } => {
+            prepare_search_activity(&w, &st, generation, &query);
+        }
+        SearchInputEvent::Dispatch(request) => start_full_search(&opts, &w, &st, request),
     });
-}
+    widgets.search_bar.connect_debounce(handler);
 
-fn connect_search_autocomplete(widgets: &Widgets, state: &SharedState) {
-    let completion_active = Rc::new(Cell::new(false));
-    let focus_generation = Rc::new(Cell::new(0_u64));
-    let w = widgets.clone();
     let st = state.clone();
-    let active = completion_active.clone();
-    widgets.search_entry.connect_changed(move |entry| {
-        let text = entry.text().to_string();
-        {
-            let mut session_ref = w.search_completion.borrow_mut();
-            if let Some(session) = session_ref.as_mut()
-                && session.suppress_next_change
-            {
-                if session.generated_text.as_deref() == Some(text.as_str()) {
-                    session.suppress_next_change = false;
-                    return;
-                }
-                if text.is_empty() && session.generated_text.is_some() {
-                    return;
-                }
-            }
-        }
-        if search_completion_current_matches(&w, &text) {
-            return;
-        }
-        reset_search_completion(&w);
-        if active.get() {
-            update_search_suggestions(&w, &st, &text, entry.position());
-        } else {
-            hide_search_suggestions(&w);
-        }
-    });
-
-    let controller = gtk::EventControllerKey::new();
-    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let entry = widgets.search_entry.clone();
-    let w = widgets.clone();
-    let st = state.clone();
-    let active = completion_active.clone();
-    controller.connect_key_pressed(move |_, key, _, _| {
-        active.set(true);
-        if key == gtk::gdk::Key::Tab && apply_next_search_completion(&entry, &w, &st) {
-            return gtk::glib::Propagation::Stop;
-        }
-        if key == gtk::gdk::Key::Escape {
-            reset_search_completion(&w);
-            hide_search_suggestions(&w);
-        }
-        gtk::glib::Propagation::Proceed
-    });
-    widgets.search_entry.add_controller(controller);
-
-    let w = widgets.clone();
-    let focus = gtk::EventControllerFocus::new();
-    let st = state.clone();
-    let active = completion_active.clone();
-    let generation = focus_generation.clone();
-    focus.connect_enter(move |_| {
-        active.set(true);
-        generation.set(generation.get().saturating_add(1));
-        update_search_suggestions(&w, &st, &w.search_entry.text(), w.search_entry.position());
-    });
-    let w = widgets.clone();
-    let active = completion_active.clone();
-    let generation = focus_generation.clone();
-    focus.connect_leave(move |_| {
-        let leave_generation = generation.get().saturating_add(1);
-        generation.set(leave_generation);
-        let w = w.clone();
-        let active = active.clone();
-        let generation = generation.clone();
-        gtk::glib::timeout_add_local_once(Duration::from_millis(150), move || {
-            if generation.get() == leave_generation {
-                active.set(false);
-                hide_search_suggestions(&w);
-            }
-        });
-    });
-    widgets.search_entry.add_controller(focus);
-
-    let w = widgets.clone();
     widgets
-        .search_suggestions_list
-        .connect_row_activated(move |_, row| {
-            let Some(child) = row.child() else {
-                return;
-            };
-            let Ok(label) = child.downcast::<gtk::Label>() else {
-                return;
-            };
-            apply_search_completion(&w.search_entry, &label.text());
-            reset_search_completion(&w);
-            hide_search_suggestions(&w);
-        });
-}
-
-fn update_search_suggestions(
-    widgets: &Widgets,
-    state: &SharedState,
-    input: &str,
-    cursor_position: i32,
-) {
-    let suggestions = matching_search_suggestions(input, cursor_position, state, 8);
-    if suggestions.is_empty() {
-        hide_search_suggestions(widgets);
-    } else {
-        *widgets.search_completion.borrow_mut() = Some(SearchCompletionSession {
-            base: input.to_string(),
-            cursor_position,
-            suggestions: suggestions.clone(),
-            next_index: 0,
-            generated_text: None,
-            suppress_next_change: false,
-        });
-        populate_search_suggestions_list(widgets, &suggestions);
-        let width = widgets.search_entry.width().max(360);
-        widgets.search_suggestions_list.set_size_request(width, -1);
-        widgets.search_suggestions_list.set_visible(true);
-    }
-}
-
-fn hide_search_suggestions(widgets: &Widgets) {
-    populate_search_suggestions_list(widgets, &[]);
-    widgets.search_suggestions_list.set_visible(false);
-}
-
-fn reset_search_completion(widgets: &Widgets) {
-    *widgets.search_completion.borrow_mut() = None;
-}
-
-fn populate_search_suggestions_list(widgets: &Widgets, suggestions: &[String]) {
-    while let Some(child) = widgets.search_suggestions_list.first_child() {
-        widgets.search_suggestions_list.remove(&child);
-    }
-    for suggestion in suggestions {
-        let row = gtk::ListBoxRow::new();
-        row.set_widget_name(&format!(
-            "notm-search-suggestion-{}",
-            widget_token(suggestion)
-        ));
-        row.set_focusable(false);
-        let label = gtk::Label::new(Some(suggestion));
-        label.set_xalign(0.0);
-        label.set_margin_start(6);
-        label.set_margin_end(6);
-        label.set_margin_top(3);
-        label.set_margin_bottom(3);
-        row.set_child(Some(&label));
-        widgets.search_suggestions_list.append(&row);
-    }
-}
-
-fn apply_search_completion(entry: &gtk::Entry, replacement: &str) {
-    let current = entry.text().to_string();
-    let (next, next_cursor) = search_completion_text(&current, entry.position(), replacement);
-    entry.set_text(&next);
-    entry.set_position(next_cursor);
-}
-
-fn apply_next_search_completion(
-    entry: &gtk::Entry,
-    widgets: &Widgets,
-    state: &SharedState,
-) -> bool {
-    let current = entry.text().to_string();
-    let reuse_session = widgets
-        .search_completion
-        .borrow()
-        .as_ref()
-        .is_some_and(|session| search_session_matches_current(session, &current));
-    if !reuse_session {
-        let suggestions = matching_search_suggestions(&current, entry.position(), state, 20);
-        if suggestions.is_empty() {
-            hide_search_suggestions(widgets);
-            return false;
-        }
-        *widgets.search_completion.borrow_mut() = Some(SearchCompletionSession {
-            base: current.clone(),
-            cursor_position: entry.position(),
-            suggestions,
-            next_index: 0,
-            generated_text: None,
-            suppress_next_change: false,
-        });
-    }
-
-    let (next, next_cursor, index, suggestions) = {
-        let mut session_ref = widgets.search_completion.borrow_mut();
-        let Some(session) = session_ref.as_mut() else {
-            return false;
-        };
-        if session.suggestions.is_empty() {
-            *session_ref = None;
-            return false;
-        }
-        if let Some(current_index) = search_generated_index(session, &current) {
-            session.next_index = current_index.saturating_add(1);
-        }
-        let index = session.next_index % session.suggestions.len();
-        let (next, next_cursor) = search_completion_text(
-            &session.base,
-            session.cursor_position,
-            &session.suggestions[index],
-        );
-        session.generated_text = Some(next.clone());
-        session.suppress_next_change = true;
-        session.next_index = index + 1;
-        (next, next_cursor, index, session.suggestions.clone())
-    };
-
-    entry.set_text(&next);
-    entry.set_position(next_cursor);
-    populate_search_suggestions_list(widgets, &suggestions);
-    widgets.search_suggestions_list.set_visible(true);
-    if let Some(row) = widgets.search_suggestions_list.row_at_index(index as i32) {
-        widgets.search_suggestions_list.select_row(Some(&row));
-    }
-    true
-}
-
-fn search_completion_current_matches(widgets: &Widgets, text: &str) -> bool {
-    widgets
-        .search_completion
-        .borrow()
-        .as_ref()
-        .is_some_and(|session| search_session_matches_current(session, text))
-}
-
-fn search_session_matches_current(session: &SearchCompletionSession, current: &str) -> bool {
-    session.base == current
-        || session.generated_text.as_deref() == Some(current)
-        || search_generated_index(session, current).is_some()
-}
-
-fn search_generated_index(session: &SearchCompletionSession, current: &str) -> Option<usize> {
-    session.suggestions.iter().position(|suggestion| {
-        search_completion_text(&session.base, session.cursor_position, suggestion).0 == current
-    })
-}
-
-fn search_completion_text(current: &str, cursor_position: i32, replacement: &str) -> (String, i32) {
-    let cursor = char_index_to_byte(current, cursor_position.max(0) as usize);
-    let (start, end) = search_token_bounds(current, cursor);
-    let replacement = if replacement.ends_with(' ') || replacement.ends_with(':') {
-        replacement.to_string()
-    } else {
-        format!("{replacement} ")
-    };
-    let next = format!("{}{}{}", &current[..start], replacement, &current[end..]);
-    let next_cursor = start + replacement.len();
-    (next.clone(), byte_index_to_char(&next, next_cursor))
-}
-
-fn matching_search_suggestions(
-    input: &str,
-    cursor_position: i32,
-    state: &SharedState,
-    limit: usize,
-) -> Vec<String> {
-    let cursor = char_index_to_byte(input, cursor_position.max(0) as usize);
-    let (start, end) = search_token_bounds(input, cursor);
-    let token = input[start..end].trim();
-    if token.is_empty() {
-        return Vec::new();
-    }
-    let token_lower = token.to_lowercase();
-    let mut candidates = Vec::new();
-    if let Some(tag_prefix) = token_lower.strip_prefix("tag:") {
-        let raw_prefix = tag_prefix.trim_matches('"').trim_matches('\'');
-        let tags = state.borrow().visible_tags.clone();
-        for tag in tags {
-            let tag_lower = tag.to_lowercase();
-            if raw_prefix.is_empty()
-                || tag_lower.starts_with(raw_prefix)
-                || tag_lower.contains(raw_prefix)
-            {
-                candidates.push(format!("tag:{}", quote_notmuch_value(&tag)));
-            }
-        }
-    } else {
-        candidates.extend(
-            [
-                "tag:",
-                "from:",
-                "to:",
-                "cc:",
-                "subject:",
-                "thread:",
-                "id:",
-                "date:",
-                "folder:",
-                "path:",
-                "property:",
-                "and",
-                "or",
-                "not",
-                "*",
-            ]
-            .into_iter()
-            .filter(|candidate| candidate.starts_with(&token_lower))
-            .map(str::to_string),
-        );
-        for tag in state.borrow().visible_tags.iter() {
-            if tag.to_lowercase().starts_with(&token_lower) {
-                candidates.push(format!("tag:{}", quote_notmuch_value(tag)));
-            }
-        }
-    }
-    candidates.sort();
-    candidates.dedup();
-    candidates.truncate(limit);
-    candidates
-}
-
-fn search_token_bounds(input: &str, cursor: usize) -> (usize, usize) {
-    let cursor = cursor.min(input.len());
-    let start = input[..cursor]
-        .char_indices()
-        .rev()
-        .find(|(_, ch)| search_token_separator(*ch))
-        .map(|(index, ch)| index + ch.len_utf8())
-        .unwrap_or(0);
-    let end = input[cursor..]
-        .char_indices()
-        .find(|(_, ch)| search_token_separator(*ch))
-        .map(|(index, _)| cursor + index)
-        .unwrap_or(input.len());
-    (start, end)
-}
-
-fn search_token_separator(ch: char) -> bool {
-    ch.is_whitespace() || matches!(ch, '(' | ')')
-}
-
-fn char_index_to_byte(input: &str, char_index: usize) -> usize {
-    input
-        .char_indices()
-        .nth(char_index)
-        .map(|(index, _)| index)
-        .unwrap_or(input.len())
-}
-
-fn byte_index_to_char(input: &str, byte_index: usize) -> i32 {
-    input[..byte_index.min(input.len())].chars().count() as i32
-}
-
-fn quote_notmuch_value(value: &str) -> String {
-    if value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '@'))
-    {
-        value.to_string()
-    } else {
-        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-    }
+        .search_bar
+        .connect_autocomplete(Rc::new(move || st.borrow().visible_tags.clone()));
 }
 
 fn set_input_mode(widgets: &Widgets, state: &SharedState, mode: InputMode, status: &str) {
@@ -4502,7 +3969,7 @@ fn enter_insert_mode_for_search(widgets: &Widgets, state: &SharedState) {
         InputMode::Insert,
         "Insert mode: search (Esc for normal)",
     );
-    widgets.search_entry.grab_focus();
+    widgets.search_bar.focus();
 }
 
 fn enter_insert_mode_for_active_pane(widgets: &Widgets, state: &SharedState) {
@@ -4516,7 +3983,7 @@ fn enter_insert_mode_for_active_pane(widgets: &Widgets, state: &SharedState) {
     match active_pane {
         ActivePane::Sidebar => focus_sidebar_insert_target(widgets),
         ActivePane::Threads => {
-            widgets.search_entry.grab_focus();
+            widgets.search_bar.focus();
         }
         ActivePane::Message if compose_view_is_visible(widgets) => {
             focus_composer_insert_target(widgets)
@@ -4535,7 +4002,7 @@ fn focus_active_pane(widgets: &Widgets, state: &SharedState) {
             focus_sidebar_default(widgets);
         }
         ActivePane::Threads => {
-            widgets.thread_list.grab_focus();
+            widgets.thread_list.focus();
         }
         ActivePane::Message => {
             if compose_view_is_visible(widgets) {
@@ -5385,7 +4852,7 @@ fn active_message_scrolled(widgets: &Widgets) -> gtk::ScrolledWindow {
 fn vim_scroll_lines(widgets: &Widgets, state: &SharedState, lines: f64) {
     match state.borrow().active_pane {
         ActivePane::Threads => {}
-        ActivePane::Sidebar => scroll_window_lines(&widgets.thread_scrolled, lines),
+        ActivePane::Sidebar => scroll_window_lines(&widgets.thread_list.scrolled(), lines),
         ActivePane::Message if html_view_is_visible(widgets) => {
             scroll_html_view_lines(widgets, lines)
         }
@@ -5396,7 +4863,7 @@ fn vim_scroll_lines(widgets: &Widgets, state: &SharedState, lines: f64) {
 fn vim_scroll_pages(widgets: &Widgets, state: &SharedState, pages: f64) {
     match state.borrow().active_pane {
         ActivePane::Threads => {}
-        ActivePane::Sidebar => scroll_window_pages(&widgets.thread_scrolled, pages),
+        ActivePane::Sidebar => scroll_window_pages(&widgets.thread_list.scrolled(), pages),
         ActivePane::Message if html_view_is_visible(widgets) => {
             scroll_html_view_pages(widgets, pages)
         }
@@ -5407,7 +4874,7 @@ fn vim_scroll_pages(widgets: &Widgets, state: &SharedState, pages: f64) {
 fn vim_scroll_to_edge(widgets: &Widgets, state: &SharedState, bottom: bool) {
     match state.borrow().active_pane {
         ActivePane::Threads => {}
-        ActivePane::Sidebar => scroll_window_to_edge(&widgets.thread_scrolled, bottom),
+        ActivePane::Sidebar => scroll_window_to_edge(&widgets.thread_list.scrolled(), bottom),
         ActivePane::Message if html_view_is_visible(widgets) => {
             scroll_html_view_to_edge(widgets, bottom)
         }
@@ -5696,7 +5163,7 @@ fn select_thread_index_clamped(
         return;
     }
     let index = index.min(len - 1);
-    if index >= widgets.thread_model.n_items() as usize {
+    if index >= widgets.thread_list.model_len() {
         return;
     }
     let already_selected = selected_thread_index(widgets) == Some(index);
@@ -5719,281 +5186,141 @@ fn load_thread_page_containing_index(
             .set_text("Wait for the current search before loading another page");
         return;
     }
-    let visual_anchor_index = visual_selection_anchor_index(widgets, state);
-    let target_number = target_index + 1;
-    let page_size = runtime_page_size(options);
-    let offset = (target_index / page_size) * page_size;
-    let page_start = offset + 1;
-    let page_end = offset + page_size;
-    set_thread_loading_indicator(
-        widgets,
-        &format!(
-            "Loading message {} (page {}-{})…",
-            format_count(target_number),
-            format_count(page_start),
-            format_count(page_end)
-        ),
+    let plan = LocatePagePlan::new(
+        query,
+        target_index,
+        runtime_page_size(options),
+        visual_selection_anchor_index(widgets, state),
     );
+    set_thread_loading_indicator(widgets, &plan.loading_status());
 
-    let (tx, rx) = mpsc::channel::<ThreadPageResponse>();
-    let opts = options.clone();
-    let query = query.to_string();
-    let generation = widgets.search_generation.get().saturating_add(1);
-    widgets.search_generation.set(generation);
-    begin_search_activity(&mut state.borrow_mut(), generation, &query);
-    widgets.thread_result_label.set_text("Loading thread page…");
-    thread::spawn(move || {
-        let result = execute_search_page(&opts, &query, offset);
-        let _ = tx.send(ThreadPageResponse {
-            generation,
-            target_index,
-            visual_anchor_index,
-            result,
-        });
-    });
-
+    let generation = reserve_search_generation(widgets);
+    begin_search_activity(&mut state.borrow_mut(), generation, &plan.query);
+    widgets.thread_list.set_result_label("Loading thread page…");
+    let request = SearchPageRequest {
+        query: plan.query.clone(),
+        generation,
+        offset: plan.offset,
+        select_first: false,
+        delay: Duration::ZERO,
+    };
+    let coordinator = search_page_coordinator(options);
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
-    gtk::glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
-        Ok(response) => {
-            if complete_search_activity(&w, &st, response.generation) {
-                match response.result {
-                    Ok(data) => {
-                        let keep_visual = response.visual_anchor_index.is_some()
-                            && st.borrow().visual_select_mode
-                            && st.borrow().current_query == data.query;
-                        apply_search_data(&opts, &w, &st, data, false);
-                        if keep_visual {
-                            let mut state = st.borrow_mut();
-                            state.visual_select_mode = true;
-                            state.visual_select_anchor = response.visual_anchor_index;
-                        }
-                        let local_index = response
-                            .target_index
-                            .saturating_sub(st.borrow().thread_window_offset);
-                        select_thread_index_clamped(&opts, &w, &st, local_index);
-                        update_thread_result_label(&w, &st);
-                    }
-                    Err(err) => apply_search_error(&w, &st, err),
-                }
-            }
-            gtk::glib::ControlFlow::Break
+    coordinator.launch(request, "thread page load cancelled", move |response| {
+        if !accept_search_page_response(&w, &st, &response) {
+            return;
         }
-        Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
-        Err(mpsc::TryRecvError::Disconnected) => {
-            if complete_search_activity(&w, &st, generation) {
-                apply_search_error(&w, &st, anyhow::anyhow!("thread page load cancelled"));
+        match response.result {
+            Ok(data) => {
+                let outcome = thread_list::reduce_replace_search(data);
+                let keep_visual = plan.visual_anchor_index.is_some()
+                    && st.borrow().visual_select_mode
+                    && st.borrow().current_query == outcome.update.current_query;
+                finish_replaced_search(&opts, &w, &st, outcome, false);
+                if keep_visual {
+                    let mut state = st.borrow_mut();
+                    state.visual_select_mode = true;
+                    state.visual_select_anchor = plan.visual_anchor_index;
+                }
+                let local_index = plan
+                    .target_index
+                    .saturating_sub(st.borrow().thread_window_offset);
+                select_thread_index_clamped(&opts, &w, &st, local_index);
+                update_thread_result_label(&w, &st);
             }
-            gtk::glib::ControlFlow::Break
+            Err(err) => {
+                let has_threads = !st.borrow().thread_list_items.is_empty();
+                finish_search_error(&w, &st, thread_list::reduce_search_error(err, has_threads));
+            }
         }
     });
 }
 
 fn set_thread_loading_indicator(widgets: &Widgets, message: &str) {
     widgets.status_label.set_text(message);
-    widgets.load_more_button.set_label("Loading…");
-    widgets.load_more_button.set_sensitive(false);
+    widgets.thread_list.set_load_more_state("Loading…", false);
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ThreadModelRow {
-    Thread { index: usize },
-    Status { message: String, spinning: bool },
+fn thread_list_display(state: &UiState) -> ThreadListDisplay {
+    ThreadListDisplay {
+        numbers: state.show_thread_numbers,
+        dates: state.show_thread_dates,
+        tags: state.show_thread_tags,
+        preview: state.show_thread_preview,
+        preview_lines: state.thread_preview_lines,
+    }
 }
 
-fn thread_list_factory(state: &SharedState) -> gtk::SignalListItemFactory {
-    let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(|_, item| {
-        let Some(list_item) = item.downcast_ref::<gtk::ListItem>() else {
-            return;
-        };
-        list_item.set_selectable(true);
-        list_item.set_activatable(true);
-    });
-
-    let st = state.clone();
-    factory.connect_bind(move |_, item| {
-        let Some(list_item) = item.downcast_ref::<gtk::ListItem>() else {
-            return;
-        };
-        let token = list_item
-            .item()
-            .and_downcast::<gtk::StringObject>()
-            .map(|item| item.string().to_string())
-            .unwrap_or_default();
-        match parse_thread_model_row(&token) {
-            Some(ThreadModelRow::Thread { index }) => {
-                if let Some(child) = thread_row_widget_for_index(&st, index) {
-                    list_item.set_selectable(true);
-                    list_item.set_activatable(true);
-                    list_item.set_child(Some(&child));
-                } else {
-                    list_item.set_selectable(false);
-                    list_item.set_activatable(false);
-                    list_item.set_child(Some(&thread_status_widget(
-                        "Message row is no longer available.",
-                        false,
-                    )));
-                }
-            }
-            Some(ThreadModelRow::Status { message, spinning }) => {
-                list_item.set_selectable(false);
-                list_item.set_activatable(false);
-                list_item.set_child(Some(&thread_status_widget(&message, spinning)));
-            }
-            None => {
-                list_item.set_selectable(false);
-                list_item.set_activatable(false);
-                list_item.set_child(Some(&thread_status_widget("Invalid message row.", false)));
-            }
-        }
-    });
-    factory
-}
-
-fn thread_row_widget_for_index(state: &SharedState, index: usize) -> Option<gtk::Widget> {
-    let (thread, detail, absolute_index, display, visual_selected) = {
-        let state = state.borrow();
-        let thread = state.thread_list_items.get(index)?.clone();
-        let detail = state
-            .thread_details
-            .get(&thread.thread_id)
-            .cloned()
-            .unwrap_or_default();
-        let absolute_index = state.thread_window_offset + index;
-        let display = ThreadListDisplay::from_state(&state);
-        let visual_selected = visual_selection_range_from_state(&state)
-            .is_some_and(|(start, end)| (start..=end).contains(&absolute_index))
-            || state.multi_selected_threads.contains(&thread.thread_id);
-        (thread, detail, absolute_index, display, visual_selected)
-    };
-    let row = thread_row_widget(
-        index,
-        absolute_index,
-        display,
-        &thread,
-        &detail,
-        visual_selected,
-    );
-    connect_thread_row_multi_select(&row, state, &thread.thread_id);
-    Some(row.upcast::<gtk::Widget>())
-}
-
-fn thread_row_is_marked_selected(
-    state: &UiState,
-    index: usize,
-    range: Option<(usize, usize)>,
-) -> bool {
-    let Some(thread) = state.thread_list_items.get(index) else {
-        return false;
-    };
+fn thread_row_snapshot(state: &SharedState, index: usize) -> Option<ThreadRowSnapshot> {
+    let state = state.borrow();
+    let thread = state.thread_list_items.get(index)?.clone();
+    let detail = state
+        .thread_details
+        .get(&thread.thread_id)
+        .cloned()
+        .unwrap_or_default();
     let absolute_index = state.thread_window_offset + index;
-    range.is_some_and(|(start, end)| (start..=end).contains(&absolute_index))
-        || state.multi_selected_threads.contains(&thread.thread_id)
+    let visual_selected = visual_selection_range_from_state(&state)
+        .is_some_and(|(start, end)| (start..=end).contains(&absolute_index))
+        || state.multi_selected_threads.contains(&thread.thread_id);
+    Some(ThreadRowSnapshot {
+        thread,
+        detail,
+        absolute_index,
+        display: thread_list_display(&state),
+        visual_selected,
+    })
+}
+
+fn thread_model_snapshot(state: &SharedState) -> ThreadModelSnapshot {
+    let state = state.borrow();
+    let range = visual_selection_range_from_state(&state);
+    let marked_indices = state
+        .thread_list_items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, thread)| {
+            let absolute = state.thread_window_offset + index;
+            (range.is_some_and(|(start, end)| (start..=end).contains(&absolute))
+                || state.multi_selected_threads.contains(&thread.thread_id))
+            .then_some(index)
+        })
+        .collect();
+    ThreadModelSnapshot {
+        len: state.thread_list_items.len(),
+        display: thread_list_display(&state),
+        marked_indices,
+    }
+}
+
+fn toggle_thread_multi_selection(state: &SharedState, thread_id: &str) -> bool {
+    let mut state = state.borrow_mut();
+    state.visual_select_mode = false;
+    state.visual_select_anchor = None;
+    state.visual_select_cursor = None;
+    state.visual_selected_threads.clear();
+    state.visual_selection_pending_range = None;
+    if state.multi_selected_threads.contains(thread_id) {
+        state.multi_selected_threads.remove(thread_id);
+        false
+    } else {
+        state.multi_selected_threads.insert(thread_id.to_string());
+        true
+    }
 }
 
 fn show_thread_list_loading(widgets: &Widgets, message: &str) {
-    set_thread_list_status_row(widgets, message, true);
+    widgets.thread_list.show_loading(message);
 }
 
 fn show_thread_list_message(widgets: &Widgets, message: &str) {
-    set_thread_list_status_row(widgets, message, false);
-}
-
-fn set_thread_list_status_row(widgets: &Widgets, message: &str, spinning: bool) {
-    clear_thread_model(widgets);
-    let token = thread_status_token(message, spinning);
-    widgets.thread_model.append(&token);
-    widgets
-        .thread_selection
-        .set_selected(gtk::INVALID_LIST_POSITION);
-}
-
-fn thread_status_widget(message: &str, spinning: bool) -> gtk::Box {
-    let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    box_.set_widget_name(if spinning {
-        "notm-thread-loading-row"
-    } else {
-        "notm-thread-message-row"
-    });
-    box_.set_hexpand(true);
-    box_.set_halign(gtk::Align::Fill);
-    box_.set_margin_start(12);
-    box_.set_margin_end(12);
-    box_.set_margin_top(12);
-    box_.set_margin_bottom(12);
-    box_.set_valign(gtk::Align::Center);
-
-    if spinning {
-        let spinner = gtk::Spinner::new();
-        spinner.set_widget_name("notm-thread-loading-spinner");
-        spinner.start();
-        box_.append(&spinner);
-    }
-
-    let label = gtk::Label::new(Some(message));
-    label.set_widget_name("notm-thread-loading-label");
-    label.set_xalign(0.0);
-    label.set_wrap(true);
-    label.add_css_class("dim-label");
-    box_.append(&label);
-
-    box_
-}
-
-fn clear_thread_model(widgets: &Widgets) {
-    let count = widgets.thread_model.n_items();
-    if count > 0 {
-        widgets.thread_model.splice(0, count, &[]);
-    }
-}
-
-fn thread_row_token(index: usize, visual_selected: bool, display: ThreadListDisplay) -> String {
-    format!(
-        "{THREAD_ROW_PREFIX}|{index}|{}|{}",
-        if visual_selected { 1 } else { 0 },
-        display.token_bits()
-    )
-}
-
-fn thread_status_token(message: &str, spinning: bool) -> String {
-    format!(
-        "{THREAD_STATUS_PREFIX}|{}|{message}",
-        if spinning { 1 } else { 0 }
-    )
-}
-
-fn parse_thread_model_row(token: &str) -> Option<ThreadModelRow> {
-    let mut parts = token.splitn(4, '|');
-    match parts.next()? {
-        THREAD_ROW_PREFIX => {
-            let index = parts.next()?.parse::<usize>().ok()?;
-            let _visual_selected = parts.next();
-            let _display_bits = parts.next();
-            Some(ThreadModelRow::Thread { index })
-        }
-        THREAD_STATUS_PREFIX => {
-            let spinning = parts.next().is_some_and(|value| value == "1");
-            let message = parts.next().unwrap_or_default().to_string();
-            Some(ThreadModelRow::Status { message, spinning })
-        }
-        _ => None,
-    }
-}
-
-fn thread_index_from_model_token(token: &str) -> Option<usize> {
-    match parse_thread_model_row(token)? {
-        ThreadModelRow::Thread { index } => Some(index),
-        ThreadModelRow::Status { .. } => None,
-    }
+    widgets.thread_list.show_message(message);
 }
 
 fn visible_thread_row_count(widgets: &Widgets) -> isize {
-    let row_height = 64.0;
-    (widgets.thread_scrolled.vadjustment().page_size() / row_height)
-        .floor()
-        .max(1.0) as isize
+    widgets.thread_list.visible_row_count()
 }
 
 fn select_thread_page(
@@ -6007,7 +5334,7 @@ fn select_thread_page(
 }
 
 fn focus_thread_list(widgets: &Widgets) {
-    widgets.thread_list.grab_focus();
+    widgets.thread_list.focus();
 }
 
 fn key_to_digit(key: gtk::gdk::Key) -> Option<u8> {
@@ -6076,8 +5403,13 @@ fn update_button_binding_labels(widgets: &Widgets, state: &SharedState) {
     set_button_label(&widgets.settings_button, "Settings", ",", state);
     set_button_label(&widgets.help_button, "Help", "?", state);
     update_layout_toggle_button(widgets, state);
-    set_button_label(&widgets.search_button, "Search", "/", state);
-    set_button_label(&widgets.load_more_button, "Load more", "Ctrl+f", state);
+    set_button_label(&widgets.search_bar.button(), "Search", "/", state);
+    set_button_label(
+        &widgets.thread_list.load_more_button(),
+        "Load more",
+        "Ctrl+f",
+        state,
+    );
     set_button_label(&widgets.archive_button, "Archive", "a", state);
     let read_base = strip_binding_suffix(&widgets.read_toggle_button.label().unwrap_or_default());
     set_button_label(&widgets.read_toggle_button, &read_base, "u", state);
@@ -6254,7 +5586,12 @@ fn connect_input_mode_focus(widgets: &Widgets, state: &SharedState) {
         state,
         ActivePane::Threads,
     );
-    connect_text_focus(&widgets.search_entry, widgets, state, ActivePane::Threads);
+    connect_text_focus(
+        &widgets.search_bar.entry(),
+        widgets,
+        state,
+        ActivePane::Threads,
+    );
     connect_text_focus(&widgets.compose_from, widgets, state, ActivePane::Message);
     connect_text_focus(&widgets.compose_to, widgets, state, ActivePane::Message);
     connect_text_focus(&widgets.compose_cc, widgets, state, ActivePane::Message);
@@ -6298,7 +5635,7 @@ fn main_text_entry_has_focus(widgets: &Widgets) -> bool {
         &widgets.saved_query_entry,
         &widgets.custom_tag_entry,
         &widgets.tag_command_entry,
-        &widgets.search_entry,
+        &widgets.search_bar.entry(),
         &widgets.compose_from,
         &widgets.compose_to,
         &widgets.compose_cc,
@@ -7251,46 +6588,27 @@ fn connect_dropdown_sequence_keys(
 }
 
 fn connect_auto_load_more(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
-    let adjustment = widgets.thread_scrolled.vadjustment();
+    let state_for_check = state.clone();
+    let search = widgets.search_bar.clone();
+    let pending_widgets = widgets.clone();
+    let pending_state = state.clone();
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
-    let last_auto_load = Rc::new(Cell::new((u64::MAX, usize::MAX)));
-    let auto_load_scheduled = Rc::new(Cell::new(false));
-    adjustment.connect_value_changed(move |adjustment| {
-        let upper = adjustment.upper();
-        let page = adjustment.page_size();
-        let value = adjustment.value();
-        let at_bottom = upper <= page + 24.0 || value + page + 24.0 >= upper;
-        if !at_bottom {
-            return;
-        }
-        let (can_load_more, offset) = {
-            let state = st.borrow();
+    widgets.thread_list.connect_auto_load_more(
+        move || {
+            let state = state_for_check.borrow();
             (
                 state.can_load_more_threads && !state.search_loading,
+                search.current_generation(),
                 state.thread_window_offset + state.thread_list_items.len(),
             )
-        };
-        let load_key = (w.search_generation.get(), offset);
-        if !can_load_more || last_auto_load.get() == load_key {
-            return;
-        }
-        if auto_load_scheduled.get() {
-            return;
-        }
-        last_auto_load.set(load_key);
-        auto_load_scheduled.set(true);
-        widgets_set_pending_load_more(&w, &st);
-        let opts = opts.clone();
-        let w = w.clone();
-        let st = st.clone();
-        let scheduled = auto_load_scheduled.clone();
-        gtk::glib::timeout_add_local_once(Duration::from_millis(120), move || {
-            scheduled.set(false);
+        },
+        move || widgets_set_pending_load_more(&pending_widgets, &pending_state),
+        move || {
             load_more_threads(&opts, &w, &st, false);
-        });
-    });
+        },
+    );
 }
 
 fn widgets_set_pending_load_more(widgets: &Widgets, state: &SharedState) {
@@ -7303,272 +6621,37 @@ fn widgets_set_pending_load_more(widgets: &Widgets, state: &SharedState) {
         })
         .unwrap_or_else(|| "Bottom reached; loading more messages…".to_string());
     widgets.status_label.set_text(&status);
-    widgets.load_more_button.set_label("Loading…");
-    widgets.load_more_button.set_sensitive(false);
+    widgets.thread_list.set_load_more_state("Loading…", false);
 }
 
 fn selected_thread_index(widgets: &Widgets) -> Option<usize> {
-    if let Some(position) = selected_thread_position(widgets) {
-        return thread_index_at_model_position(widgets, position);
-    }
-    widgets
-        .thread_selection
-        .selected_item()
-        .and_downcast::<gtk::StringObject>()
-        .and_then(|item| thread_index_from_model_token(&item.string()))
-}
-
-fn selected_thread_position(widgets: &Widgets) -> Option<u32> {
-    let position = widgets.thread_selection.selected();
-    (position != gtk::INVALID_LIST_POSITION && position < widgets.thread_model.n_items())
-        .then_some(position)
-}
-
-fn thread_index_at_model_position(widgets: &Widgets, position: u32) -> Option<usize> {
-    widgets
-        .thread_model
-        .string(position)
-        .and_then(|token| thread_index_from_model_token(&token))
+    widgets.thread_list.selected_index()
 }
 
 fn select_thread_index_in_list(widgets: &Widgets, index: usize) {
-    if index >= widgets.thread_model.n_items() as usize {
-        return;
-    }
-    widgets.thread_selection.set_selected(index as u32);
-    scroll_thread_index_into_view(widgets, index);
-    focus_thread_list(widgets);
+    widgets.thread_list.select(index);
 }
 
 fn select_thread_index_for_open_message(widgets: &Widgets, index: usize) {
-    if index >= widgets.thread_model.n_items() as usize {
-        return;
-    }
-    widgets.thread_selection_refreshing.set(true);
-    widgets.thread_selection.set_selected(index as u32);
-    widgets.thread_selection_refreshing.set(false);
-    scroll_thread_index_into_view(widgets, index);
+    widgets.thread_list.select_silently(index);
 }
 
 fn scroll_thread_index_into_view(widgets: &Widgets, index: usize) {
-    if index >= widgets.thread_model.n_items() as usize {
-        return;
-    }
-    let generation = widgets.thread_scroll_generation.get().saturating_add(1);
-    widgets.thread_scroll_generation.set(generation);
-    scroll_thread_index_into_view_once(&widgets.thread_list, index);
-    let scrolled = widgets.thread_scrolled.clone();
-    let list = widgets.thread_list.clone();
-    let scroll_generation = widgets.thread_scroll_generation.clone();
-    gtk::glib::idle_add_local_once(move || {
-        if scroll_generation.get() != generation {
-            return;
-        }
-        scroll_thread_index_into_view_once(&list, index);
-        for delay_ms in [25_u64, 75, 160] {
-            let scrolled = scrolled.clone();
-            let list = list.clone();
-            let scroll_generation = scroll_generation.clone();
-            gtk::glib::timeout_add_local_once(Duration::from_millis(delay_ms), move || {
-                if scroll_generation.get() != generation {
-                    return;
-                }
-                scroll_thread_index_into_view_once(&list, index);
-                nudge_realized_thread_row_into_view(&scrolled, &list, index);
-            });
-        }
-    });
-}
-
-fn scroll_thread_index_into_view_once(list: &gtk::ListView, index: usize) {
-    list.scroll_to(index as u32, gtk::ListScrollFlags::NONE, None);
-}
-
-fn nudge_realized_thread_row_into_view(
-    scrolled: &gtk::ScrolledWindow,
-    list: &gtk::ListView,
-    index: usize,
-) {
-    let relative_to = scrolled.clone().upcast::<gtk::Widget>();
-    let Some((top, bottom)) = realized_thread_row_bounds_relative(list, &relative_to, index) else {
-        return;
-    };
-    let adjustment = scrolled.vadjustment();
-    let lower = adjustment.lower();
-    let page = visible_adjustment_page_size(&adjustment, scrolled);
-    let max_value = (adjustment.upper() - page).max(lower);
-    if max_value <= lower {
-        return;
-    }
-    let value = adjustment.value();
-    let visible_top = 0.0;
-    let visible_bottom = page;
-    let padding = 12.0;
-    let delta = if top < visible_top + padding {
-        top - visible_top - padding
-    } else if bottom > visible_bottom - padding {
-        bottom - visible_bottom + padding
-    } else {
-        return;
-    };
-    adjustment.set_value((value + delta).clamp(lower, max_value));
-}
-
-fn visible_adjustment_page_size(
-    adjustment: &gtk::Adjustment,
-    scrolled: &gtk::ScrolledWindow,
-) -> f64 {
-    let page = adjustment.page_size();
-    if page > 0.0 {
-        page
-    } else {
-        scrolled.height().max(0) as f64
-    }
-}
-
-fn realized_thread_row_bounds_relative(
-    list: &gtk::ListView,
-    relative_to: &gtk::Widget,
-    index: usize,
-) -> Option<(f64, f64)> {
-    let target_name = format!("notm-thread-row-{index}");
-    let root = list.clone().upcast::<gtk::Widget>();
-    let row = find_widget_by_name(&root, &target_name)?;
-    let bounds = row.compute_bounds(relative_to)?;
-    let top = bounds.y() as f64;
-    let bottom = top + bounds.height() as f64;
-    (bottom > top).then_some((top, bottom))
+    widgets.thread_list.scroll_into_view(index);
 }
 
 fn find_widget_by_name(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
-    if root.widget_name().as_str() == name {
-        return Some(root.clone());
-    }
-    let mut child = root.first_child();
-    while let Some(widget) = child {
-        if let Some(found) = find_widget_by_name(&widget, name) {
-            return Some(found);
-        }
-        child = widget.next_sibling();
-    }
-    None
+    thread_list::find_widget_by_name(root, name)
 }
 
 fn thread_selection_view_state(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
-    let adjustment = widgets.thread_scrolled.vadjustment();
-    let value = adjustment.value();
-    let page = visible_adjustment_page_size(&adjustment, &widgets.thread_scrolled);
-    let selected_local = selected_thread_index(widgets);
-    let selected_absolute = selected_local.map(|index| state.borrow().thread_window_offset + index);
-    let relative_to = widgets.thread_scrolled.clone().upcast::<gtk::Widget>();
-    let bounds = selected_local.and_then(|index| {
-        realized_thread_row_bounds_relative(&widgets.thread_list, &relative_to, index)
-    });
-    let (row_top, row_bottom, row_visible) = if let Some((top, bottom)) = bounds {
-        (
-            Some(top),
-            Some(bottom),
-            Some(top >= -1.0 && bottom <= page + 1.0),
-        )
-    } else {
-        (None, None, None)
-    };
-    json!({
-        "ok": true,
-        "selected_local": selected_local,
-        "selected_abs": selected_absolute,
-        "scroll_value": value,
-        "scroll_upper": adjustment.upper(),
-        "scroll_page_size": page,
-        "row_top": row_top,
-        "row_bottom": row_bottom,
-        "row_visible": row_visible,
-    })
+    widgets
+        .thread_list
+        .selection_view_state(state.borrow().thread_window_offset)
 }
 
 fn thread_row_layout_state(widgets: &Widgets, index: usize) -> serde_json::Value {
-    let adjustment = widgets.thread_scrolled.vadjustment();
-    let viewport_height = visible_adjustment_page_size(&adjustment, &widgets.thread_scrolled);
-    let viewport_width = widgets.thread_scrolled.width().max(0) as f64;
-    let relative_to = widgets.thread_scrolled.clone().upcast::<gtk::Widget>();
-    let root = widgets.thread_list.clone().upcast::<gtk::Widget>();
-    json!({
-        "ok": true,
-        "index": index,
-        "viewport_width": viewport_width,
-        "viewport_height": viewport_height,
-        "row": named_widget_bounds_json(
-            &root,
-            &relative_to,
-            &format!("notm-thread-row-{index}"),
-            viewport_width,
-            viewport_height,
-        ),
-        "number": named_widget_bounds_json(
-            &root,
-            &relative_to,
-            &format!("notm-thread-number-{index}"),
-            viewport_width,
-            viewport_height,
-        ),
-        "title": named_widget_bounds_json(
-            &root,
-            &relative_to,
-            &format!("notm-thread-title-{index}"),
-            viewport_width,
-            viewport_height,
-        ),
-        "date": named_widget_bounds_json(
-            &root,
-            &relative_to,
-            &format!("notm-thread-date-{index}"),
-            viewport_width,
-            viewport_height,
-        ),
-        "meta": named_widget_bounds_json(
-            &root,
-            &relative_to,
-            &format!("notm-thread-meta-{index}"),
-            viewport_width,
-            viewport_height,
-        ),
-        "preview": named_widget_bounds_json(
-            &root,
-            &relative_to,
-            &format!("notm-thread-preview-{index}"),
-            viewport_width,
-            viewport_height,
-        ),
-    })
-}
-
-fn named_widget_bounds_json(
-    root: &gtk::Widget,
-    relative_to: &gtk::Widget,
-    name: &str,
-    viewport_width: f64,
-    viewport_height: f64,
-) -> Option<serde_json::Value> {
-    let widget = find_widget_by_name(root, name)?;
-    let bounds = widget.compute_bounds(relative_to)?;
-    let x = bounds.x() as f64;
-    let y = bounds.y() as f64;
-    let width = bounds.width() as f64;
-    let height = bounds.height() as f64;
-    let right = x + width;
-    let bottom = y + height;
-    Some(json!({
-        "x": x,
-        "y": y,
-        "width": width,
-        "height": height,
-        "right": right,
-        "bottom": bottom,
-        "fully_visible": x >= -1.0
-            && y >= -1.0
-            && right <= viewport_width + 1.0
-            && bottom <= viewport_height + 1.0,
-    }))
+    widgets.thread_list.row_layout_state(index)
 }
 
 fn open_saved_search_name(
@@ -7578,7 +6661,7 @@ fn open_saved_search_name(
     name: &str,
 ) {
     let query = saved_search_query(name);
-    widgets.search_entry.set_text(query);
+    widgets.search_bar.set_query(query);
     state.borrow_mut().visible_saved_search = Some(name.to_string());
     run_search(options, widgets, state, query);
 }
@@ -7627,7 +6710,7 @@ fn select_relative_thread(
     };
     if (window_offset..window_offset + len).contains(&target_abs) {
         let next = target_abs - window_offset;
-        if next >= widgets.thread_model.n_items() as usize {
+        if next >= widgets.thread_list.model_len() {
             return;
         }
         let already_selected = selected_thread_index(widgets) == Some(next);
@@ -8570,11 +7653,7 @@ fn apply_message_selection_snapshot(
     if let Some(index) = selected_thread_index {
         select_thread_index_for_open_message(widgets, index);
     } else {
-        widgets.thread_selection_refreshing.set(true);
-        widgets
-            .thread_selection
-            .set_selected(gtk::INVALID_LIST_POSITION);
-        widgets.thread_selection_refreshing.set(false);
+        widgets.thread_list.clear_selection_silently();
     }
     refresh_thread_attachment_list(widgets, state);
     update_message_menu(options, widgets, state);
@@ -10855,44 +9934,41 @@ fn connect_actions(
     let w = widgets.clone();
     let st = state.clone();
     search_button.connect_clicked(move |_| {
-        let query = w.search_entry.text().to_string();
+        let query = w.search_bar.entry().text().to_string();
         run_search(&opts, &w, &st, &query);
     });
 
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
-    widgets.load_more_button.connect_clicked(move |_| {
+    widgets.thread_list.connect_load_more(move || {
         load_more_threads(&opts, &w, &st, true);
     });
 
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
-    widgets.search_entry.connect_activate(move |entry| {
+    widgets.search_bar.entry().connect_activate(move |entry| {
         run_search(&opts, &w, &st, &entry.text());
     });
 
     let w = widgets.clone();
     let st = state.clone();
     let opts = options.clone();
-    widgets.thread_list.connect_activate(move |_, position| {
-        if let Some(index) = thread_index_at_model_position(&w, position) {
-            open_thread_by_index(&opts, &w, &st, index);
-        }
+    widgets.thread_list.connect_activate(move |index| {
+        open_thread_by_index(&opts, &w, &st, index);
     });
 
     let w = widgets.clone();
     let st = state.clone();
     let opts = options.clone();
-    widgets.thread_selection.connect_selected_notify(move |_| {
-        if w.thread_selection_refreshing.get() {
-            return;
-        }
-        if let Some(index) = selected_thread_index(&w) {
-            select_thread_by_index(&opts, &w, &st, index, false);
-        }
-    });
+    widgets
+        .thread_list
+        .connect_selection_changed(move |selected| {
+            if let Some(index) = selected {
+                select_thread_by_index(&opts, &w, &st, index, false);
+            }
+        });
 
     connect_tag_button(
         archive_button,
@@ -11045,6 +10121,78 @@ fn connect_tag_button(
     });
 }
 
+fn search_page_coordinator(options: &LaunchOptions) -> SearchPageCoordinator {
+    let runtime_settings = options.runtime_settings.clone();
+    SearchPageCoordinator::new(
+        open_config(options),
+        Arc::new(move || {
+            let runtime = runtime_settings
+                .lock()
+                .expect("runtime settings lock")
+                .clone();
+            SearchRuntimeSnapshot {
+                page_size: runtime.page_size,
+                excluded_tags: runtime.excluded_tags,
+            }
+        }),
+    )
+}
+
+fn thread_paging_snapshot(state: &SharedState) -> ThreadPagingSnapshot {
+    let state = state.borrow();
+    ThreadPagingSnapshot {
+        search_loading: state.search_loading,
+        current_query: state.current_query.clone(),
+        window_offset: state.thread_window_offset,
+        loaded_count: state.thread_list_items.len(),
+        can_load_more: state.can_load_more_threads,
+    }
+}
+
+fn thread_search_state_snapshot(
+    widgets: &Widgets,
+    state: &SharedState,
+) -> ThreadSearchStateSnapshot {
+    let state = state.borrow();
+    ThreadSearchStateSnapshot {
+        window_offset: state.thread_window_offset,
+        threads: state.thread_list_items.clone(),
+        details: state.thread_details.clone(),
+        selected_thread_id: state
+            .selected_thread
+            .as_ref()
+            .map(|thread| thread.thread_id.clone()),
+        selected_index: selected_thread_index(widgets),
+    }
+}
+
+fn apply_thread_search_state_update(state: &SharedState, update: ThreadSearchStateUpdate) {
+    let mut state = state.borrow_mut();
+    state.current_query = update.current_query;
+    state.thread_window_offset = update.window_offset;
+    state.thread_list_items = update.threads;
+    state.thread_total_count = update.total_count;
+    state.thread_loaded_count = update.loaded_count;
+    state.thread_page_size = update.page_size;
+    state.can_load_more_threads = update.can_load_more;
+    state.thread_details = update.details;
+    state.visible_tags = update.visible_tags;
+    state.database_path = Some(update.database_path);
+    state.database_revision = Some(update.revision);
+    state.last_operation = Some(update.operation);
+    state.last_error = None;
+    state.search_error = None;
+}
+
+fn accept_search_page_response(
+    widgets: &Widgets,
+    state: &SharedState,
+    response: &SearchPageResponse,
+) -> bool {
+    widgets.search_bar.current_generation() == response.generation
+        && finish_search_activity(&mut state.borrow_mut(), response.generation)
+}
+
 fn run_search(options: &LaunchOptions, widgets: &Widgets, state: &SharedState, query: &str) -> u64 {
     schedule_search(options, widgets, state, query, true, Duration::ZERO)
 }
@@ -11059,7 +10207,7 @@ fn schedule_search(
 ) -> u64 {
     let generation = reserve_search_generation(widgets);
     prepare_search_activity(widgets, state, generation, query);
-    launch_search_worker(
+    start_full_search(
         options,
         widgets,
         state,
@@ -11074,13 +10222,13 @@ fn schedule_search(
 }
 
 fn reserve_search_generation(widgets: &Widgets) -> u64 {
-    let generation = widgets.search_generation.get().saturating_add(1);
-    widgets.search_generation.set(generation);
+    let generation = widgets.search_bar.current_generation().saturating_add(1);
+    widgets.search_bar.set_generation(generation);
     generation
 }
 
 fn prepare_search_activity(widgets: &Widgets, state: &SharedState, generation: u64, query: &str) {
-    *widgets.requested_search_query.borrow_mut() = query.to_string();
+    widgets.search_bar.set_requested_query(query);
     prepare_search_activity_preserving_request(widgets, state, generation, query);
 }
 
@@ -11094,51 +10242,52 @@ fn prepare_search_activity_preserving_request(
     widgets
         .status_label
         .set_text(&format!("Loading search `{query}`…"));
-    widgets.thread_result_label.set_text("Loading search…");
-    widgets.load_more_button.set_sensitive(false);
+    widgets.thread_list.set_result_label("Loading search…");
+    widgets.thread_list.set_load_more_sensitive(false);
 }
 
-fn launch_search_worker(
+fn start_full_search(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
     request: SearchWorkerRequest,
 ) {
-    let (tx, rx) = mpsc::channel::<SearchResponse>();
-    let opts = options.clone();
-    let generation = request.generation;
-    let select_first = request.select_first;
-    thread::spawn(move || {
-        if !request.delay.is_zero() {
-            thread::sleep(request.delay);
-        }
-        let result = execute_search_page(&opts, &request.query, 0);
-        let _ = tx.send(SearchResponse { generation, result });
-    });
-
+    let coordinator = search_page_coordinator(options);
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
-    gtk::glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
-        Ok(response) => {
-            if complete_search_activity(&w, &st, response.generation) {
+    coordinator.launch(
+        SearchPageRequest {
+            query: request.query,
+            generation: request.generation,
+            offset: 0,
+            select_first: request.select_first,
+            delay: request.delay,
+        },
+        "search cancelled",
+        move |response| {
+            if accept_search_page_response(&w, &st, &response) {
                 match response.result {
-                    Ok(data) => apply_search_data(&opts, &w, &st, data, select_first),
-                    Err(err) => apply_search_error(&w, &st, err),
+                    Ok(data) => finish_replaced_search(
+                        &opts,
+                        &w,
+                        &st,
+                        thread_list::reduce_replace_search(data),
+                        response.select_first,
+                    ),
+                    Err(err) => {
+                        let has_threads = !st.borrow().thread_list_items.is_empty();
+                        finish_search_error(
+                            &w,
+                            &st,
+                            thread_list::reduce_search_error(err, has_threads),
+                        );
+                    }
                 }
                 record_full_search_outcome(&st, response.generation);
             }
-            gtk::glib::ControlFlow::Break
-        }
-        Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
-        Err(mpsc::TryRecvError::Disconnected) => {
-            if complete_search_activity(&w, &st, generation) {
-                apply_search_error(&w, &st, anyhow::anyhow!("search cancelled"));
-                record_full_search_outcome(&st, generation);
-            }
-            gtk::glib::ControlFlow::Break
-        }
-    });
+        },
+    );
 }
 
 fn record_full_search_outcome(state: &SharedState, generation: u64) {
@@ -11147,207 +10296,97 @@ fn record_full_search_outcome(state: &SharedState, generation: u64) {
     state.full_search_outcome_error = state.search_error.clone();
 }
 
-fn begin_search_activity(state: &mut UiState, generation: u64, query: &str) {
-    state.search_loading = true;
-    state.search_generation = generation;
-    state.pending_search_query = Some(query.to_string());
-    state.search_error = None;
-}
-
-fn finish_search_activity(state: &mut UiState, generation: u64) -> bool {
-    if state.search_generation != generation {
-        return false;
-    }
-    state.search_loading = false;
-    state.pending_search_query = None;
-    true
-}
-
-fn cancel_search_activity(state: &mut UiState, generation: u64) {
-    state.search_loading = false;
-    state.search_generation = generation;
-    state.pending_search_query = None;
-    state.search_error = None;
-}
-
-fn complete_search_activity(widgets: &Widgets, state: &SharedState, generation: u64) -> bool {
-    if widgets.search_generation.get() != generation {
-        return false;
-    }
-    finish_search_activity(&mut state.borrow_mut(), generation)
-}
-
-fn execute_search_page(
-    options: &LaunchOptions,
-    query: &str,
-    offset: usize,
-) -> anyhow::Result<SearchData> {
-    let runtime = runtime_settings(options);
-    let limit = runtime.page_size.max(1);
-    let excluded_tags = runtime.excluded_tags;
-    let db = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
-    let revision = db.revision();
-    let db_path = db.path();
-    let key = search_cache_key(
-        query,
-        &db_path,
-        &revision,
-        offset,
-        limit,
-        excluded_tags.clone(),
-    );
-    let cached = {
-        let mut cache = search_cache().lock().expect("search cache lock");
-        cache.get(&key).cloned()
-    };
-    if let Some(mut cached) = cached {
-        cached.cached = true;
-        return Ok(cached);
-    }
-    let tags = db.all_tags();
-    let opts = QueryOptions {
-        limit,
-        offset,
-        sort: SortOrder::NewestFirst,
-        excluded_tags,
-    };
-    let threads = db.search_threads(query, &opts)?;
-    let count = db
-        .count_threads(query, &opts)
-        .unwrap_or(threads.len() as u32);
-    let details = thread_details_for_threads(&db, &db_path, &revision, &threads);
-    let data = SearchData {
-        query: query.to_string(),
-        threads,
-        details,
-        count,
-        offset,
-        limit,
-        tags,
-        database_path: db_path,
-        revision,
-        cached: false,
-    };
-    search_cache()
-        .lock()
-        .expect("search cache lock")
-        .insert(key, data.clone());
-    Ok(data)
-}
-
 fn load_more_threads(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
     select_last_loaded: bool,
 ) -> bool {
-    if state.borrow().search_loading {
-        return false;
-    }
-    let (query, offset, can_load_more) = {
-        let state = state.borrow();
-        (
-            state.current_query.clone(),
-            state.thread_window_offset + state.thread_list_items.len(),
-            state.can_load_more_threads,
-        )
+    let (query, offset) = match thread_list::plan_load_more(&thread_paging_snapshot(state)) {
+        LoadMoreDecision::Busy => return false,
+        LoadMoreDecision::Exhausted => {
+            widgets
+                .status_label
+                .set_text("All currently counted threads are already loaded");
+            return false;
+        }
+        LoadMoreDecision::Ready { query, offset } => (query, offset),
     };
-    if !can_load_more {
-        widgets
-            .status_label
-            .set_text("All currently counted threads are already loaded");
-        return false;
-    }
     set_thread_loading_indicator(
         widgets,
         &format!("Loading more messages from {}…", format_count(offset + 1)),
     );
-    let (tx, rx) = mpsc::channel::<SearchResponse>();
-    let opts = options.clone();
-    let generation = widgets.search_generation.get().saturating_add(1);
-    widgets.search_generation.set(generation);
+    let generation = reserve_search_generation(widgets);
     begin_search_activity(&mut state.borrow_mut(), generation, &query);
-    widgets.thread_result_label.set_text("Loading more…");
-    thread::spawn(move || {
-        let result = execute_search_page(&opts, &query, offset);
-        let _ = tx.send(SearchResponse { generation, result });
-    });
-
+    widgets.thread_list.set_result_label("Loading more…");
+    let request = SearchPageRequest {
+        query,
+        generation,
+        offset,
+        select_first: false,
+        delay: Duration::ZERO,
+    };
+    let coordinator = search_page_coordinator(options);
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
-    gtk::glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
-        Ok(response) => {
-            if complete_search_activity(&w, &st, response.generation) {
-                match response.result {
-                    Ok(data) => append_search_data(&opts, &w, &st, data, select_last_loaded),
-                    Err(err) => apply_search_error(&w, &st, err),
+    coordinator.launch(request, "thread page load cancelled", move |response| {
+        if accept_search_page_response(&w, &st, &response) {
+            match response.result {
+                Ok(data) => {
+                    let snapshot = thread_search_state_snapshot(&w, &st);
+                    finish_appended_search(
+                        &opts,
+                        &w,
+                        &st,
+                        thread_list::reduce_append_search(snapshot, data, select_last_loaded),
+                    );
+                }
+                Err(err) => {
+                    let has_threads = !st.borrow().thread_list_items.is_empty();
+                    finish_search_error(
+                        &w,
+                        &st,
+                        thread_list::reduce_search_error(err, has_threads),
+                    );
                 }
             }
-            gtk::glib::ControlFlow::Break
-        }
-        Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
-        Err(mpsc::TryRecvError::Disconnected) => {
-            if complete_search_activity(&w, &st, generation) {
-                apply_search_error(&w, &st, anyhow::anyhow!("thread page load cancelled"));
-            }
-            gtk::glib::ControlFlow::Break
         }
     });
     true
 }
 
-fn apply_search_data(
+fn finish_replaced_search(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
-    data: SearchData,
+    outcome: ReplaceSearchOutcome,
     select_first: bool,
 ) {
-    let query = data.query.clone();
-    let count = data.count;
-    let offset = data.offset;
-    let cached = data.cached;
-    let preserve_search_focus = widget_contains_focus(widgets.search_entry.upcast_ref());
+    let query = outcome.update.current_query.clone();
+    let cached = outcome.cached;
+    let preserve_search_focus = widgets.search_bar.has_focus();
+    apply_thread_search_state_update(state, outcome.update);
     {
-        let mut s = state.borrow_mut();
-        s.current_query = query.clone();
-        s.thread_window_offset = offset;
-        s.thread_list_items = data.threads;
-        s.thread_total_count = count;
-        s.thread_loaded_count = s.thread_list_items.len();
-        s.thread_page_size = data.limit;
-        s.can_load_more_threads =
-            s.thread_window_offset + s.thread_list_items.len() < count as usize;
-        s.thread_details = data.details;
-        s.selected_thread = None;
-        s.selected_message = None;
-        s.messages.clear();
-        s.visual_select_mode = false;
-        s.visual_select_anchor = None;
-        s.visual_select_cursor = None;
-        s.visual_selected_threads.clear();
-        s.visual_selection_pending_range = None;
-        s.multi_selected_threads.clear();
-        s.visible_tags = data.tags;
-        s.database_path = Some(data.database_path);
-        s.database_revision = Some(data.revision);
-        s.last_error = None;
-        s.search_error = None;
-        s.last_operation = Some(format!(
-            "search `{}` loaded {} of {} thread(s) from offset {}{}",
-            query,
-            s.thread_list_items.len(),
-            count,
-            offset,
-            if cached { " from cache" } else { "" }
-        ));
+        let mut state = state.borrow_mut();
+        state.selected_thread = None;
+        state.selected_message = None;
+        state.messages.clear();
+        state.visual_select_mode = false;
+        state.visual_select_anchor = None;
+        state.visual_select_cursor = None;
+        state.visual_selected_threads.clear();
+        state.visual_selection_pending_range = None;
+        state.multi_selected_threads.clear();
     }
-    populate_thread_list(options, widgets, state);
+    widgets
+        .thread_list
+        .apply_model_update(&thread_model_snapshot(state), ThreadModelUpdate::Replace);
     update_tag_searches(options, widgets, state);
+
     let pending_open_message_id = { state.borrow().pending_open_message_id.clone() };
     if let Some(message_id) = pending_open_message_id {
-        let has_loaded_threads = { !state.borrow().thread_list_items.is_empty() };
+        let has_loaded_threads = !state.borrow().thread_list_items.is_empty();
         if has_loaded_threads && open_loaded_thread_at_message(options, widgets, state, &message_id)
         {
             state.borrow_mut().pending_open_message_id = None;
@@ -11361,7 +10400,7 @@ fn apply_search_data(
             widgets.status_label.set_text(&format!(
                 "Message id not in loaded startup results: {message_id}; opening direct match"
             ));
-            widgets.search_entry.set_text(&fallback_query);
+            widgets.search_bar.set_query(&fallback_query);
             run_search(options, widgets, state, &fallback_query);
             return;
         }
@@ -11377,8 +10416,7 @@ fn apply_search_data(
         return;
     }
 
-    let selected_first = select_first && !state.borrow().thread_list_items.is_empty();
-    if selected_first {
+    if select_first && !state.borrow().thread_list_items.is_empty() {
         select_thread_index_clamped(options, widgets, state, 0);
     } else {
         refresh_thread_attachment_list(widgets, state);
@@ -11397,74 +10435,18 @@ fn apply_search_data(
     update_debug(widgets, state);
 }
 
-fn append_search_data(
+fn finish_appended_search(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
-    data: SearchData,
-    select_last_loaded: bool,
+    outcome: AppendSearchOutcome,
 ) {
-    let query = data.query.clone();
-    let count = data.count;
-    let offset = data.offset;
-    let cached = data.cached;
-    let selected_thread_id = state
-        .borrow()
-        .selected_thread
-        .as_ref()
-        .map(|thread| thread.thread_id.clone());
-    let selected_index = selected_thread_index(widgets);
-    let (reset_model, append_start, append_count) = {
-        let mut s = state.borrow_mut();
-        let expected_offset = s.thread_window_offset + s.thread_list_items.len();
-        let reset_model = data.offset != expected_offset;
-        let append_start = if reset_model {
-            s.thread_window_offset = data.offset;
-            s.thread_list_items.clear();
-            s.thread_details.clear();
-            0
-        } else {
-            s.thread_list_items.len()
-        };
-        let append_count = data.threads.len();
-        s.current_query = query.clone();
-        s.thread_list_items.extend(data.threads);
-        s.thread_details.extend(data.details);
-        s.thread_total_count = count;
-        s.thread_loaded_count = s.thread_list_items.len();
-        s.thread_page_size = data.limit;
-        s.can_load_more_threads =
-            s.thread_window_offset + s.thread_list_items.len() < count as usize;
-        s.visible_tags = data.tags;
-        s.database_path = Some(data.database_path);
-        s.database_revision = Some(data.revision);
-        s.last_error = None;
-        s.search_error = None;
-        s.last_operation = Some(format!(
-            "loaded page at offset {}: {}{}",
-            offset,
-            thread_window_status_from_parts(
-                s.thread_window_offset,
-                s.thread_list_items.len(),
-                count as usize,
-            ),
-            if cached { " from cache" } else { "" }
-        ));
-        (reset_model, append_start, append_count)
-    };
-    let restored_index = if reset_model {
-        populate_thread_list(options, widgets, state);
-        restore_thread_selection(widgets, state, selected_thread_id, selected_index)
-    } else {
-        append_thread_model_rows(widgets, state, append_start, append_count);
-        update_visual_selection_rows(widgets, state);
-        selected_thread_index(widgets).or(selected_index)
-    };
-    let selected_index = if select_last_loaded && append_count > 0 {
-        Some(append_start + append_count - 1)
-    } else {
-        restored_index
-    };
+    let model_update = outcome.model_update;
+    let selected_index = outcome.selected_index;
+    apply_thread_search_state_update(state, outcome.update);
+    widgets
+        .thread_list
+        .apply_model_update(&thread_model_snapshot(state), model_update);
     update_tag_searches(options, widgets, state);
     if let Some(index) = selected_index {
         select_thread_index_clamped(options, widgets, state, index);
@@ -11480,35 +10462,32 @@ fn append_search_data(
     update_debug(widgets, state);
 }
 
-fn restore_thread_selection(
-    widgets: &Widgets,
-    state: &SharedState,
-    selected_thread_id: Option<String>,
-    selected_index: Option<usize>,
-) -> Option<usize> {
-    let threads = state.borrow().thread_list_items.clone();
-    let index = selected_thread_id
-        .and_then(|thread_id| {
-            threads
-                .iter()
-                .position(|thread| thread.thread_id == thread_id)
-        })
-        .or(selected_index)
-        .filter(|index| *index < threads.len());
-    if let Some(index) = index {
-        select_thread_index_in_list(widgets, index);
-        return Some(index);
+fn finish_search_error(widgets: &Widgets, state: &SharedState, outcome: SearchErrorOutcome) {
+    {
+        let mut state = state.borrow_mut();
+        state.last_error = Some(outcome.error.clone());
+        state.search_error = Some(outcome.error);
+        if outcome.clear_empty_counts {
+            state.thread_loaded_count = 0;
+            state.thread_total_count = 0;
+            state.can_load_more_threads = false;
+        }
     }
-    None
+    widgets.status_label.set_text(&outcome.message);
+    if outcome.clear_empty_counts {
+        show_thread_list_message(widgets, &outcome.message);
+    }
+    update_thread_result_label(widgets, state);
+    update_debug(widgets, state);
 }
 
 fn update_thread_result_label(widgets: &Widgets, state: &SharedState) {
     let state_ref = state.borrow();
     if state_ref.search_loading {
         drop(state_ref);
-        widgets.thread_result_label.set_text("Loading search…");
-        widgets.load_more_button.set_label("Loading…");
-        widgets.load_more_button.set_sensitive(false);
+        widgets
+            .thread_list
+            .set_result("Loading search…", "Loading…", false);
         return;
     }
     let status = thread_window_status_from_parts(
@@ -11516,14 +10495,13 @@ fn update_thread_result_label(widgets: &Widgets, state: &SharedState) {
         state_ref.thread_list_items.len(),
         state_ref.thread_total_count as usize,
     );
-    widgets.thread_result_label.set_text(&format!(
-        "{status} · page size {}",
-        state_ref.thread_page_size
-    ));
+    let result = format!("{status} · page size {}", state_ref.thread_page_size);
     let can_load_more = state_ref.can_load_more_threads;
     drop(state_ref);
-    set_button_label(&widgets.load_more_button, "Load more", "Ctrl+f", state);
-    widgets.load_more_button.set_sensitive(can_load_more);
+    let label = button_label("Load more", "Ctrl+f", state);
+    widgets
+        .thread_list
+        .set_result(&result, &label, can_load_more);
 }
 
 fn thread_window_status(state: &SharedState) -> String {
@@ -11535,131 +10513,10 @@ fn thread_window_status(state: &SharedState) -> String {
     )
 }
 
-fn thread_window_status_from_parts(offset: usize, loaded: usize, total: usize) -> String {
-    if loaded == 0 {
-        return format!("Loaded 0 of {} thread(s)", format_count(total));
-    }
-    let start = offset + 1;
-    let end = offset + loaded;
-    if offset == 0 {
-        format!(
-            "Loaded {} of {} thread(s)",
-            format_count(loaded),
-            format_count(total.max(loaded))
-        )
-    } else {
-        format!(
-            "Showing {}-{} of {} thread(s) ({} loaded)",
-            format_count(start),
-            format_count(end),
-            format_count(total.max(end)),
-            format_count(loaded)
-        )
-    }
-}
-
-fn search_cache_key(
-    query: &str,
-    db_path: &str,
-    revision: &notm_notmuch::Revision,
-    offset: usize,
-    limit: usize,
-    excluded_tags: Vec<String>,
-) -> SearchCacheKey {
-    SearchCacheKey {
-        database_path: db_path.to_string(),
-        database_uuid: revision.uuid.clone(),
-        database_revision: revision.revision,
-        query: query.to_string(),
-        offset,
-        limit,
-        excluded_tags,
-    }
-}
-
-fn apply_search_error(widgets: &Widgets, state: &SharedState, err: anyhow::Error) {
-    let message = format!("Search failed: {err}");
-    {
-        let mut state = state.borrow_mut();
-        state.last_error = Some(err.to_string());
-        state.search_error = Some(err.to_string());
-        if state.thread_list_items.is_empty() {
-            state.thread_loaded_count = 0;
-            state.thread_total_count = 0;
-            state.can_load_more_threads = false;
-        }
-    }
-    widgets.status_label.set_text(&message);
-    if state.borrow().thread_list_items.is_empty() {
-        show_thread_list_message(widgets, &message);
-    }
-    update_thread_result_label(widgets, state);
-    update_debug(widgets, state);
-}
-
-fn populate_thread_list(_options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
-    clear_thread_model(widgets);
-    let len = state.borrow().thread_list_items.len();
-    append_thread_model_rows(widgets, state, 0, len);
-    update_visual_selection_rows(widgets, state);
-}
-
-fn append_thread_model_rows(widgets: &Widgets, state: &SharedState, start: usize, count: usize) {
-    let tokens = {
-        let state = state.borrow();
-        let range = visual_selection_range_from_state(&state);
-        let display = ThreadListDisplay::from_state(&state);
-        (start..start.saturating_add(count))
-            .filter_map(|index| {
-                state.thread_list_items.get(index)?;
-                Some(thread_row_token(
-                    index,
-                    thread_row_is_marked_selected(&state, index, range),
-                    display,
-                ))
-            })
-            .collect::<Vec<_>>()
-    };
-    let additions = tokens.iter().map(String::as_str).collect::<Vec<_>>();
-    widgets
-        .thread_model
-        .splice(widgets.thread_model.n_items(), 0, &additions);
-}
-
 fn refresh_thread_model_rows(widgets: &Widgets, state: &SharedState, indices: &[usize]) {
-    let selected_position = selected_thread_position(widgets);
-    let tokens = {
-        let state = state.borrow();
-        let range = visual_selection_range_from_state(&state);
-        let display = ThreadListDisplay::from_state(&state);
-        indices
-            .iter()
-            .filter_map(|index| {
-                state.thread_list_items.get(*index)?;
-                Some((
-                    *index as u32,
-                    thread_row_token(
-                        *index,
-                        thread_row_is_marked_selected(&state, *index, range),
-                        display,
-                    ),
-                ))
-            })
-            .collect::<Vec<_>>()
-    };
-    widgets.thread_selection_refreshing.set(true);
-    for (position, token) in tokens {
-        if position < widgets.thread_model.n_items() {
-            widgets.thread_model.splice(position, 1, &[token.as_str()]);
-        }
-    }
-    if let Some(position) = selected_position
-        && position < widgets.thread_model.n_items()
-        && widgets.thread_selection.selected() != position
-    {
-        widgets.thread_selection.set_selected(position);
-    }
-    widgets.thread_selection_refreshing.set(false);
+    widgets
+        .thread_list
+        .refresh_rows(&thread_model_snapshot(state), indices);
 }
 
 fn toggle_visual_select_mode(widgets: &Widgets, state: &SharedState) {
@@ -11805,67 +10662,14 @@ fn update_visual_selection_rows(widgets: &Widgets, state: &SharedState) {
     update_visual_selection_rows_with_force(widgets, state, false);
 }
 
-fn update_visual_selection_rows_with_force(widgets: &Widgets, state: &SharedState, force: bool) {
-    let selected_position = selected_thread_position(widgets);
-    let tokens = {
-        let state = state.borrow();
-        let range = visual_selection_range_from_state(&state);
-        let display = ThreadListDisplay::from_state(&state);
-        state
-            .thread_list_items
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                thread_row_token(
-                    index,
-                    thread_row_is_marked_selected(&state, index, range),
-                    display,
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-    widgets.thread_selection_refreshing.set(true);
-    for (index, token) in tokens.iter().enumerate() {
-        let position = index as u32;
-        if force
-            || widgets
-                .thread_model
-                .string(position)
-                .is_none_or(|current| current.as_str() != token)
-        {
-            widgets.thread_model.splice(position, 1, &[token.as_str()]);
-        }
-    }
-    if let Some(position) = selected_position
-        && position < widgets.thread_model.n_items()
-        && widgets.thread_selection.selected() != position
-    {
-        widgets.thread_selection.set_selected(position);
-    }
-    widgets.thread_selection_refreshing.set(false);
+fn update_visual_selection_rows_with_force(widgets: &Widgets, state: &SharedState, _force: bool) {
+    let snapshot = thread_model_snapshot(state);
+    let indices = (0..snapshot.len).collect::<Vec<_>>();
+    widgets.thread_list.refresh_rows(&snapshot, &indices);
 }
 
 fn set_thread_numbers_visible(widgets: &Widgets, state: &SharedState, visible: bool) {
     set_thread_display_visible(widgets, state, ThreadDisplayToggle::Numbers, visible);
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ThreadDisplayToggle {
-    Numbers,
-    Dates,
-    Tags,
-    Preview,
-}
-
-impl ThreadDisplayToggle {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Numbers => "Thread numbers",
-            Self::Dates => "Thread dates",
-            Self::Tags => "Thread tags",
-            Self::Preview => "Thread preview",
-        }
-    }
 }
 
 fn set_thread_display_visible(
@@ -11889,271 +10693,6 @@ fn set_thread_display_visible(
         toggle.label(),
         if visible { "on" } else { "off" }
     ));
-}
-
-fn thread_row_widget(
-    idx: usize,
-    absolute_index: usize,
-    display: ThreadListDisplay,
-    thread: &notm_notmuch::ThreadSummary,
-    detail: &ThreadUiDetails,
-    visual_selected: bool,
-) -> gtk::Box {
-    let box_ = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    box_.set_widget_name(&format!("notm-thread-row-{idx}"));
-    box_.add_css_class("notm-thread-row");
-    box_.set_hexpand(true);
-    box_.set_halign(gtk::Align::Fill);
-    if thread.has_unread {
-        box_.add_css_class("unread");
-    } else {
-        box_.remove_css_class("unread");
-    }
-    if visual_selected {
-        box_.add_css_class("notm-visual-selected");
-        box_.add_css_class("notm-multi-selected");
-    }
-    let row_content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    row_content.set_hexpand(true);
-    row_content.set_halign(gtk::Align::Fill);
-    row_content.set_margin_start(6);
-    row_content.set_margin_end(6);
-    row_content.set_margin_top(6);
-    row_content.set_margin_bottom(6);
-    if display.numbers {
-        let number = gtk::Label::new(Some(&format!("{}.", format_count(absolute_index + 1))));
-        number.set_widget_name(&format!("notm-thread-number-{idx}"));
-        number.set_xalign(0.0);
-        number.set_yalign(0.0);
-        number.set_valign(gtk::Align::Start);
-        number.add_css_class("dim-label");
-        number.add_css_class("monospace");
-        number.add_css_class("notm-thread-number");
-        row_content.append(&number);
-    }
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 3);
-    content.set_hexpand(true);
-    content.set_halign(gtk::Align::Fill);
-    let title = gtk::Label::new(Some(&format!(
-        "{}{}{}{}{}{}",
-        if thread.has_unread { "● " } else { "" },
-        if thread.is_flagged { "★ " } else { "" },
-        if detail.has_attachment { "📎 " } else { "" },
-        if detail.has_encrypted { "🔒 " } else { "" },
-        if detail.has_signed { "✍ " } else { "" },
-        thread.subject
-    )));
-    title.set_widget_name(&format!("notm-thread-title-{idx}"));
-    title.set_xalign(0.0);
-    title.set_hexpand(true);
-    title.set_halign(gtk::Align::Fill);
-    title.set_wrap(true);
-    let meta_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    meta_row.set_hexpand(true);
-    meta_row.set_halign(gtk::Align::Fill);
-    if display.dates {
-        let date = gtk::Label::new(Some(&format_thread_list_date(thread.newest_date)));
-        date.set_widget_name(&format!("notm-thread-date-{idx}"));
-        date.set_width_chars(16);
-        date.set_xalign(1.0);
-        date.set_yalign(0.0);
-        date.set_valign(gtk::Align::Start);
-        date.add_css_class("dim-label");
-        date.add_css_class("monospace");
-        date.add_css_class("notm-thread-date");
-        meta_row.append(&date);
-    }
-    let meta_text = if display.tags {
-        format!(
-            "{}  ·  {}/{}  ·  {}",
-            thread.authors,
-            thread.matched_messages,
-            thread.total_messages,
-            thread.tags.join(" ")
-        )
-    } else {
-        format!(
-            "{}  ·  {}/{}",
-            thread.authors, thread.matched_messages, thread.total_messages
-        )
-    };
-    let meta = gtk::Label::new(Some(&meta_text));
-    meta.set_widget_name(&format!("notm-thread-meta-{idx}"));
-    meta.set_xalign(0.0);
-    meta.set_hexpand(true);
-    meta.set_halign(gtk::Align::Fill);
-    meta.add_css_class("dim-label");
-    meta.set_wrap(true);
-    content.append(&title);
-    meta_row.append(&meta);
-    content.append(&meta_row);
-    if display.preview && !detail.preview.is_empty() {
-        let preview = gtk::Label::new(Some(&detail.preview));
-        preview.set_widget_name(&format!("notm-thread-preview-{idx}"));
-        preview.set_xalign(0.0);
-        preview.set_hexpand(true);
-        preview.set_halign(gtk::Align::Fill);
-        preview.add_css_class("dim-label");
-        preview.set_wrap(true);
-        preview.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-        preview.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        preview.set_lines(
-            i32::try_from(display.preview_lines)
-                .expect("validated thread preview line count fits in i32"),
-        );
-        content.append(&preview);
-    }
-    row_content.append(&content);
-    box_.append(&row_content);
-    box_
-}
-
-fn connect_thread_row_multi_select(row: &gtk::Box, state: &SharedState, thread_id: &str) {
-    let click = gtk::GestureClick::new();
-    click.set_button(0);
-    let row_for_click = row.clone();
-    let st = state.clone();
-    let id = thread_id.to_string();
-    click.connect_pressed(move |gesture, _, _, _| {
-        if !gesture
-            .current_event_state()
-            .contains(gtk::gdk::ModifierType::CONTROL_MASK)
-        {
-            return;
-        }
-        let selected = {
-            let mut state = st.borrow_mut();
-            state.visual_select_mode = false;
-            state.visual_select_anchor = None;
-            state.visual_select_cursor = None;
-            state.visual_selected_threads.clear();
-            state.visual_selection_pending_range = None;
-            if state.multi_selected_threads.contains(&id) {
-                state.multi_selected_threads.remove(&id);
-                false
-            } else {
-                state.multi_selected_threads.insert(id.clone());
-                true
-            }
-        };
-        if selected {
-            row_for_click.add_css_class("notm-multi-selected");
-            row_for_click.add_css_class("notm-visual-selected");
-        } else {
-            row_for_click.remove_css_class("notm-multi-selected");
-            row_for_click.remove_css_class("notm-visual-selected");
-        }
-        gesture.set_state(gtk::EventSequenceState::Claimed);
-    });
-    row.add_controller(click);
-}
-
-fn format_thread_list_date(timestamp: i64) -> String {
-    chrono::DateTime::<Utc>::from_timestamp(timestamp, 0)
-        .map(|date| {
-            date.with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M")
-                .to_string()
-        })
-        .unwrap_or_else(|| timestamp.to_string())
-}
-
-fn thread_details_for_threads(
-    db: &Database,
-    database_path: &str,
-    revision: &notm_notmuch::Revision,
-    threads: &[notm_notmuch::ThreadSummary],
-) -> BTreeMap<String, ThreadUiDetails> {
-    let mut out = BTreeMap::new();
-    for thread in threads {
-        let cache_key = thread_detail_cache_key(database_path, revision, &thread.thread_id);
-        let cached = {
-            let mut cache = thread_detail_cache()
-                .lock()
-                .expect("thread detail cache lock");
-            cache.get(&cache_key).cloned()
-        };
-        if let Some(detail) = cached {
-            out.insert(thread.thread_id.clone(), detail);
-            continue;
-        }
-        let detail = db
-            .thread_messages(&thread.thread_id)
-            .map(|messages| compute_thread_detail(&messages))
-            .unwrap_or_default();
-        thread_detail_cache()
-            .lock()
-            .expect("thread detail cache lock")
-            .insert(cache_key, detail.clone());
-        out.insert(thread.thread_id.clone(), detail);
-    }
-    out
-}
-
-fn thread_detail_cache_key(
-    db_path: &str,
-    revision: &notm_notmuch::Revision,
-    thread_id: &str,
-) -> ThreadDetailCacheKey {
-    ThreadDetailCacheKey {
-        database_path: db_path.to_string(),
-        database_uuid: revision.uuid.clone(),
-        database_revision: revision.revision,
-        thread_id: thread_id.to_string(),
-    }
-}
-
-fn compute_thread_detail(messages: &[notm_notmuch::MessageSummary]) -> ThreadUiDetails {
-    let mut detail = ThreadUiDetails::default();
-    for message in messages {
-        for filename in &message.filenames {
-            let Ok(bytes) = std::fs::read(filename) else {
-                continue;
-            };
-            let raw_lower = String::from_utf8_lossy(&bytes).to_lowercase();
-            detail.has_encrypted |= raw_lower.contains("multipart/encrypted")
-                || raw_lower.contains("application/pgp-encrypted");
-            detail.has_signed |= raw_lower.contains("multipart/signed")
-                || raw_lower.contains("application/pgp-signature")
-                || raw_lower.contains("application/pkcs7-signature");
-            if let Ok(parsed) = notm_mail::mime::parse_rfc5322(&bytes) {
-                detail.has_attachment |= !parsed.attachments.is_empty();
-                if detail.preview.is_empty() {
-                    detail.preview = body_preview(&parsed.safe_body);
-                }
-            }
-        }
-    }
-    detail
-}
-
-fn body_preview(body: &str) -> String {
-    let mut preview = body
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('>'))
-        .collect::<Vec<_>>()
-        .join(" ");
-    if preview.chars().count() > THREAD_PREVIEW_CACHE_MAX_CHARS {
-        preview = preview
-            .chars()
-            .take(THREAD_PREVIEW_CACHE_MAX_CHARS.saturating_sub(1))
-            .collect::<String>();
-        preview.push('…');
-    }
-    preview
-}
-
-fn format_count(value: usize) -> String {
-    let digits = value.to_string();
-    let mut out = String::new();
-    for (index, ch) in digits.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out.chars().rev().collect()
 }
 
 fn truncate_status_text(value: &str, max_chars: usize) -> String {
@@ -12215,7 +10754,7 @@ fn select_thread_by_index(
         return;
     }
     let rejection_restore = capture_message_selection_snapshot(state);
-    let preserve_search_focus = widget_contains_focus(widgets.search_entry.upcast_ref());
+    let preserve_search_focus = widget_contains_focus(widgets.search_bar.entry().upcast_ref());
 
     let result = (|| -> anyhow::Result<()> {
         let db = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
@@ -12297,7 +10836,7 @@ fn focus_after_thread_preview(widgets: &Widgets, state: &SharedState, preserve_s
 }
 
 fn message_id_query(message_id: &str) -> String {
-    format!("id:{}", quote_notmuch_value(message_id))
+    format!("id:{}", search_bar::quote_notmuch_value(message_id))
 }
 
 fn open_message_id_request(
@@ -12314,7 +10853,7 @@ fn open_message_id_request(
         return;
     }
 
-    widgets.search_entry.set_text(&options.default_query);
+    widgets.search_bar.set_query(&options.default_query);
     run_search(options, widgets, state, &options.default_query);
 }
 
@@ -15021,7 +13560,7 @@ fn run_sync_commands(
 }
 
 fn sync_refresh_query(widgets: &Widgets, state: &SharedState) -> String {
-    let requested_query = widgets.requested_search_query.borrow().clone();
+    let requested_query = widgets.search_bar.requested_query();
     if requested_query.trim().is_empty() {
         state.borrow().current_query.clone()
     } else {
@@ -15204,9 +13743,9 @@ fn sync_refresh_worker_delay(
     })?;
     let delay = Duration::from_millis(milliseconds);
     anyhow::ensure!(
-        delay <= MAX_FIXTURE_SEARCH_DELAY,
+        delay <= MAX_SYNC_REFRESH_DELAY,
         "test_refresh_delay_ms must not exceed {}",
-        MAX_FIXTURE_SEARCH_DELAY.as_millis()
+        MAX_SYNC_REFRESH_DELAY.as_millis()
     );
     Ok(delay)
 }
@@ -16145,23 +14684,13 @@ fn fixture_search_worker_delay(
     options: &LaunchOptions,
     args: &serde_json::Value,
 ) -> anyhow::Result<Duration> {
-    let Some(value) = args.get("test_delay_ms") else {
-        return Ok(Duration::ZERO);
-    };
-    anyhow::ensure!(
-        options.fixture_mode && options.automation_enabled,
-        "test_delay_ms is available only in fixture test-harness mode"
-    );
-    let milliseconds = value
-        .as_u64()
-        .ok_or_else(|| anyhow::anyhow!("test_delay_ms must be a non-negative whole number"))?;
-    let delay = Duration::from_millis(milliseconds);
-    anyhow::ensure!(
-        delay <= MAX_FIXTURE_SEARCH_DELAY,
-        "test_delay_ms must not exceed {}",
-        MAX_FIXTURE_SEARCH_DELAY.as_millis()
-    );
-    Ok(delay)
+    search_bar::fixture_search_worker_delay(
+        SearchHarnessPolicy {
+            fixture_mode: options.fixture_mode,
+            automation_enabled: options.automation_enabled,
+        },
+        args,
+    )
 }
 
 fn handle_automation_request(
@@ -16245,7 +14774,7 @@ fn handle_automation_request(
             }
         }
         "focus_search" => {
-            widgets.search_entry.grab_focus();
+            widgets.search_bar.focus();
             json!({"ok": true})
         }
         "focus_compose_field" => {
@@ -16273,13 +14802,14 @@ fn handle_automation_request(
         }
         "entry_state" => {
             let search_selection_bounds = widgets
-                .search_entry
+                .search_bar
+                .entry()
                 .selection_bounds()
                 .map(|(start, end)| json!({"start": start, "end": end}));
             json!({
                 "ok": true,
-                "search": widgets.search_entry.text().to_string(),
-                "search_has_focus": widget_contains_focus(widgets.search_entry.upcast_ref()),
+                "search": widgets.search_bar.entry().text().to_string(),
+                "search_has_focus": widget_contains_focus(widgets.search_bar.entry().upcast_ref()),
                 "search_selection_bounds": search_selection_bounds,
                 "custom_tag": widgets.custom_tag_entry.text().to_string(),
                 "custom_tag_has_focus": widget_contains_focus(widgets.custom_tag_entry.upcast_ref()),
@@ -16301,7 +14831,7 @@ fn handle_automation_request(
                 "compose_fields": compose_fields(widgets, state),
                 "input_mode": format!("{:?}", state.borrow().input_mode),
                 "active_pane": format!("{:?}", state.borrow().active_pane),
-                "search_suggestions_visible": widgets.search_suggestions_list.is_visible(),
+                "search_suggestions_visible": widgets.search_bar.suggestions_visible(),
                 "address_suggestions_visible": widgets.address_suggestions_list.is_visible(),
             })
         }
@@ -16311,15 +14841,15 @@ fn handle_automation_request(
                 .get("query")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            widgets.search_entry.set_text(query);
-            widgets.search_entry.set_position(-1);
+            widgets.search_bar.set_query(query);
+            widgets.search_bar.entry().set_position(-1);
             json!({"ok": true, "current_query": query, "state": &*state.borrow()})
         }
         "run_search" => {
             let query = if let Some(q) = req.args.get("query").and_then(|v| v.as_str()) {
                 q.to_string()
             } else {
-                widgets.search_entry.text().to_string()
+                widgets.search_bar.entry().text().to_string()
             };
             match fixture_search_worker_delay(options, &req.args) {
                 Ok(worker_delay) => {
@@ -16378,7 +14908,7 @@ fn handle_automation_request(
             thread_row_layout_state(widgets, index)
         }
         "scroll_thread_list_to_bottom" => {
-            let adjustment = widgets.thread_scrolled.vadjustment();
+            let adjustment = widgets.thread_list.scrolled().vadjustment();
             let before_loaded = state.borrow().thread_loaded_count;
             let target = (adjustment.upper() - adjustment.page_size()).max(0.0);
             adjustment.set_value(target);
@@ -16434,7 +14964,7 @@ fn handle_automation_request(
             {
                 widgets.saved_name_entry.set_text(&saved.name);
                 widgets.saved_query_entry.set_text(&saved.query);
-                widgets.search_entry.set_text(&saved.query);
+                widgets.search_bar.set_query(&saved.query);
                 state.borrow_mut().visible_saved_search = Some(saved.name.clone());
                 run_search(options, widgets, state, &saved.query);
             } else {
@@ -17584,7 +16114,7 @@ fn respond_pending_confirmation(
 }
 
 fn rendered_thread_preview_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
-    let root = widgets.thread_list.clone().upcast::<gtk::Widget>();
+    let root = widgets.thread_list.list().upcast::<gtk::Widget>();
     let rendered = (0..state.borrow().thread_list_items.len()).find_map(|index| {
         let name = format!("notm-thread-preview-{index}");
         let label = find_widget_by_name(&root, &name)?
@@ -17929,7 +16459,7 @@ fn run_named_command(
     let command = normalize_command_input(command);
     match command.as_str() {
         "search" => {
-            let query = widgets.search_entry.text().to_string();
+            let query = widgets.search_bar.entry().text().to_string();
             run_search(options, widgets, state, &query);
             json!({"ok": true, "state": &*state.borrow()})
         }
@@ -20188,7 +18718,9 @@ fn apply_runtime_settings_values(
     );
     apply_layout_preference_for_current_size(widgets, state, next_layout_preference, false);
     widgets.debug_view.set_visible(values.show_debug_panel);
-    populate_thread_list(options, widgets, state);
+    widgets
+        .thread_list
+        .apply_model_update(&thread_model_snapshot(state), ThreadModelUpdate::Replace);
     update_tag_searches(options, widgets, state);
     update_thread_result_label(widgets, state);
     update_button_binding_labels(widgets, state);
@@ -20205,7 +18737,7 @@ fn apply_runtime_settings_values(
         || previous_runtime.excluded_tags != next_excluded_tags;
     if search_settings_changed {
         let query = state.borrow().current_query.clone();
-        widgets.search_entry.set_text(&query);
+        widgets.search_bar.set_query(&query);
         run_search(options, widgets, state, &query);
     }
     sync_pane_button_classes(widgets, state);
@@ -21396,28 +19928,12 @@ mod tests {
     }
 
     #[test]
-    fn stale_search_completion_cannot_finish_the_current_generation() {
-        let mut state = UiState::default();
-        begin_search_activity(&mut state, 4, "tag:inbox");
-        begin_search_activity(&mut state, 5, "tag:unread");
-
-        assert!(!finish_search_activity(&mut state, 4));
-        assert!(state.search_loading);
-        assert_eq!(state.search_generation, 5);
-        assert_eq!(state.pending_search_query.as_deref(), Some("tag:unread"));
-
-        assert!(finish_search_activity(&mut state, 5));
-        assert!(!state.search_loading);
-        assert_eq!(state.pending_search_query, None);
-        state.full_search_outcome_generation = 5;
-        state.full_search_outcome_error = Some("full search failed".to_string());
-
-        begin_search_activity(&mut state, 6, "tag:flagged");
-        cancel_search_activity(&mut state, 7);
-        assert!(!finish_search_activity(&mut state, 6));
-        assert!(!state.search_loading);
-        assert_eq!(state.search_generation, 7);
-        assert_eq!(state.full_search_outcome_generation, 5);
+    fn full_search_outcome_is_not_replaced_by_an_unrelated_page_error() {
+        let mut state = UiState {
+            full_search_outcome_generation: 5,
+            full_search_outcome_error: Some("full search failed".to_string()),
+            ..UiState::default()
+        };
         assert_eq!(
             full_search_outcome_at_or_after(&state, 4),
             Some(Err("full search failed".to_string()))
@@ -21431,37 +19947,6 @@ mod tests {
             full_search_outcome_at_or_after(&state, 5),
             Some(Ok(())),
             "an unrelated mutable search error replaced the recorded full-search outcome"
-        );
-    }
-
-    #[test]
-    fn delayed_search_work_is_scoped_to_fixture_harnesses() {
-        let fixture = LaunchOptions {
-            fixture_mode: true,
-            automation_enabled: true,
-            ..LaunchOptions::default()
-        };
-        assert_eq!(
-            fixture_search_worker_delay(&fixture, &json!({"test_delay_ms": 250}))
-                .expect("fixture delay"),
-            Duration::from_millis(250)
-        );
-        assert_eq!(
-            fixture_search_worker_delay(&LaunchOptions::default(), &json!({}))
-                .expect("no requested delay"),
-            Duration::ZERO
-        );
-        assert!(
-            fixture_search_worker_delay(&LaunchOptions::default(), &json!({"test_delay_ms": 1}))
-                .unwrap_err()
-                .to_string()
-                .contains("fixture test-harness mode")
-        );
-        assert!(
-            fixture_search_worker_delay(&fixture, &json!({"test_delay_ms": 5001}))
-                .unwrap_err()
-                .to_string()
-                .contains("must not exceed")
         );
     }
 
@@ -21962,268 +20447,6 @@ mod tests {
                 "unexpected error: {error:#}"
             );
         }
-    }
-
-    #[test]
-    fn cached_body_preview_is_bounded_but_not_capped_at_two_source_lines() {
-        let preview = body_preview("first line\nsecond line\nthird line\n> ignored quote");
-        assert_eq!(preview, "first line second line third line");
-
-        let long = body_preview(&"x".repeat(THREAD_PREVIEW_CACHE_MAX_CHARS + 50));
-        assert_eq!(long.chars().count(), THREAD_PREVIEW_CACHE_MAX_CHARS);
-        assert!(long.ends_with('…'));
-    }
-
-    fn test_revision(uuid: &str, revision: u64) -> notm_notmuch::Revision {
-        notm_notmuch::Revision {
-            uuid: uuid.to_string(),
-            revision,
-        }
-    }
-
-    #[test]
-    fn search_cache_key_preserves_every_dimension_and_tag_boundaries() {
-        let base_revision = test_revision("database-a", 7);
-        let base = search_cache_key(
-            "tag:inbox",
-            "/mail/a",
-            &base_revision,
-            25,
-            25,
-            vec!["a,b".to_string(), "c".to_string()],
-        );
-        let variants = [
-            (
-                "path",
-                search_cache_key(
-                    "tag:inbox",
-                    "/mail/b",
-                    &base_revision,
-                    25,
-                    25,
-                    vec!["a,b".to_string(), "c".to_string()],
-                ),
-            ),
-            (
-                "UUID",
-                search_cache_key(
-                    "tag:inbox",
-                    "/mail/a",
-                    &test_revision("database-b", 7),
-                    25,
-                    25,
-                    vec!["a,b".to_string(), "c".to_string()],
-                ),
-            ),
-            (
-                "revision",
-                search_cache_key(
-                    "tag:inbox",
-                    "/mail/a",
-                    &test_revision("database-a", 8),
-                    25,
-                    25,
-                    vec!["a,b".to_string(), "c".to_string()],
-                ),
-            ),
-            (
-                "query",
-                search_cache_key(
-                    "tag:sent",
-                    "/mail/a",
-                    &base_revision,
-                    25,
-                    25,
-                    vec!["a,b".to_string(), "c".to_string()],
-                ),
-            ),
-            (
-                "offset",
-                search_cache_key(
-                    "tag:inbox",
-                    "/mail/a",
-                    &base_revision,
-                    50,
-                    25,
-                    vec!["a,b".to_string(), "c".to_string()],
-                ),
-            ),
-            (
-                "limit",
-                search_cache_key(
-                    "tag:inbox",
-                    "/mail/a",
-                    &base_revision,
-                    25,
-                    50,
-                    vec!["a,b".to_string(), "c".to_string()],
-                ),
-            ),
-            (
-                "excluded tag boundaries",
-                search_cache_key(
-                    "tag:inbox",
-                    "/mail/a",
-                    &base_revision,
-                    25,
-                    25,
-                    vec!["a".to_string(), "b,c".to_string()],
-                ),
-            ),
-            (
-                "excluded tag order",
-                search_cache_key(
-                    "tag:inbox",
-                    "/mail/a",
-                    &base_revision,
-                    25,
-                    25,
-                    vec!["c".to_string(), "a,b".to_string()],
-                ),
-            ),
-        ];
-        let mut cache = BoundedLruCache::new(variants.len() + 1);
-        cache.insert(base.clone(), "base");
-        for (dimension, key) in &variants {
-            assert_ne!(&base, key, "{dimension} did not distinguish the key");
-            cache.insert(key.clone(), *dimension);
-        }
-
-        assert_eq!(cache.len(), variants.len() + 1);
-        assert_eq!(cache.get(&base), Some(&"base"));
-        for (dimension, key) in &variants {
-            assert_eq!(cache.get(key), Some(dimension));
-        }
-    }
-
-    #[test]
-    fn thread_detail_cache_key_isolates_path_uuid_revision_and_thread() {
-        let base_revision = test_revision("database-a", 7);
-        let base = thread_detail_cache_key("/mail/a", &base_revision, "thread-a");
-        let variants = [
-            (
-                "path",
-                thread_detail_cache_key("/mail/b", &base_revision, "thread-a"),
-            ),
-            (
-                "UUID",
-                thread_detail_cache_key("/mail/a", &test_revision("database-b", 7), "thread-a"),
-            ),
-            (
-                "revision",
-                thread_detail_cache_key("/mail/a", &test_revision("database-a", 8), "thread-a"),
-            ),
-            (
-                "thread ID",
-                thread_detail_cache_key("/mail/a", &base_revision, "thread-b"),
-            ),
-        ];
-        let mut cache = BoundedLruCache::new(variants.len() + 1);
-        cache.insert(base.clone(), "base");
-        for (dimension, key) in &variants {
-            assert_ne!(&base, key, "{dimension} did not distinguish the key");
-            cache.insert(key.clone(), *dimension);
-        }
-
-        assert_eq!(cache.len(), variants.len() + 1);
-        assert_eq!(cache.get(&base), Some(&"base"));
-        for (dimension, key) in &variants {
-            assert_eq!(cache.get(key), Some(dimension));
-        }
-    }
-
-    #[test]
-    fn newer_database_generations_evict_stale_search_entries_by_lru() {
-        let make_key = |revision| {
-            search_cache_key(
-                "tag:inbox",
-                "/mail/a",
-                &test_revision("database-a", revision),
-                0,
-                25,
-                vec!["deleted".to_string()],
-            )
-        };
-        let old = make_key(1);
-        let current = make_key(2);
-        let newest = make_key(3);
-        let mut cache = BoundedLruCache::new(2);
-        cache.insert(old.clone(), "old");
-        cache.insert(current.clone(), "current");
-        assert_eq!(cache.get(&current), Some(&"current"));
-
-        cache.insert(newest.clone(), "newest");
-
-        assert_eq!(cache.len(), 2);
-        assert_eq!(cache.get(&old), None);
-        assert_eq!(cache.get(&current), Some(&"current"));
-        assert_eq!(cache.get(&newest), Some(&"newest"));
-    }
-
-    #[test]
-    fn typed_search_cache_enforces_named_capacity_and_lru() {
-        let revision = test_revision("database-a", 7);
-        let keys = (0..SEARCH_PAGE_CACHE_CAPACITY)
-            .map(|offset| {
-                search_cache_key(
-                    "tag:inbox",
-                    "/mail/a",
-                    &revision,
-                    offset,
-                    1,
-                    vec!["deleted".to_string()],
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut cache = BoundedLruCache::new(SEARCH_PAGE_CACHE_CAPACITY);
-        for (value, key) in keys.iter().cloned().enumerate() {
-            cache.insert(key, value);
-            assert!(cache.len() <= SEARCH_PAGE_CACHE_CAPACITY);
-        }
-        assert_eq!(cache.len(), SEARCH_PAGE_CACHE_CAPACITY);
-
-        assert_eq!(cache.get(&keys[0]), Some(&0));
-        assert_eq!(cache.insert(keys[1].clone(), 101), Some(1));
-        assert_eq!(cache.len(), SEARCH_PAGE_CACHE_CAPACITY);
-        let new_generation = search_cache_key(
-            "tag:inbox",
-            "/mail/a",
-            &test_revision("database-a", 8),
-            0,
-            1,
-            vec!["deleted".to_string()],
-        );
-        cache.insert(new_generation.clone(), 1_000);
-
-        assert_eq!(cache.len(), SEARCH_PAGE_CACHE_CAPACITY);
-        assert_eq!(cache.get(&keys[2]), None);
-        assert_eq!(cache.get(&keys[0]), Some(&0));
-        assert_eq!(cache.get(&keys[1]), Some(&101));
-        assert_eq!(cache.get(&new_generation), Some(&1_000));
-    }
-
-    #[test]
-    fn typed_thread_detail_cache_enforces_named_capacity_and_lru() {
-        let revision = test_revision("database-a", 7);
-        let keys = (0..THREAD_DETAIL_CACHE_CAPACITY)
-            .map(|index| thread_detail_cache_key("/mail/a", &revision, &format!("thread-{index}")))
-            .collect::<Vec<_>>();
-        let mut cache = BoundedLruCache::new(THREAD_DETAIL_CACHE_CAPACITY);
-        for (value, key) in keys.iter().cloned().enumerate() {
-            cache.insert(key, value);
-            assert!(cache.len() <= THREAD_DETAIL_CACHE_CAPACITY);
-        }
-        assert_eq!(cache.len(), THREAD_DETAIL_CACHE_CAPACITY);
-
-        assert_eq!(cache.get(&keys[0]), Some(&0));
-        let new_generation =
-            thread_detail_cache_key("/mail/a", &test_revision("database-b", 8), "thread-0");
-        cache.insert(new_generation.clone(), 10_000);
-
-        assert_eq!(cache.len(), THREAD_DETAIL_CACHE_CAPACITY);
-        assert_eq!(cache.get(&keys[1]), None);
-        assert_eq!(cache.get(&keys[0]), Some(&0));
-        assert_eq!(cache.get(&new_generation), Some(&10_000));
     }
 
     #[test]
