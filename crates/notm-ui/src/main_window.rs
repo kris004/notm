@@ -9246,7 +9246,7 @@ fn thread_window_status(state: &SharedState) -> String {
 fn refresh_thread_model_rows(widgets: &Widgets, state: &SharedState, indices: &[usize]) {
     widgets
         .thread_list
-        .refresh_rows(&thread_model_snapshot(state), indices);
+        .refresh_rows(&thread_model_snapshot(state), indices, true);
 }
 
 fn toggle_visual_select_mode(widgets: &Widgets, state: &SharedState) {
@@ -9392,10 +9392,10 @@ fn update_visual_selection_rows(widgets: &Widgets, state: &SharedState) {
     update_visual_selection_rows_with_force(widgets, state, false);
 }
 
-fn update_visual_selection_rows_with_force(widgets: &Widgets, state: &SharedState, _force: bool) {
+fn update_visual_selection_rows_with_force(widgets: &Widgets, state: &SharedState, force: bool) {
     let snapshot = thread_model_snapshot(state);
     let indices = (0..snapshot.len).collect::<Vec<_>>();
-    widgets.thread_list.refresh_rows(&snapshot, &indices);
+    widgets.thread_list.refresh_rows(&snapshot, &indices, force);
 }
 
 fn set_thread_numbers_visible(widgets: &Widgets, state: &SharedState, visible: bool) {

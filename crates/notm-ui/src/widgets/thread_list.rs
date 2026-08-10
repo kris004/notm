@@ -656,7 +656,12 @@ impl ThreadListController {
         self.model.splice(self.model.n_items(), 0, &additions);
     }
 
-    pub(crate) fn refresh_rows(&self, snapshot: &ThreadModelSnapshot, indices: &[usize]) {
+    pub(crate) fn refresh_rows(
+        &self,
+        snapshot: &ThreadModelSnapshot,
+        indices: &[usize],
+        force: bool,
+    ) {
         let selected = self.selected_position();
         self.selection_refreshing.set(true);
         for index in indices
@@ -671,7 +676,18 @@ impl ThreadListController {
                     snapshot.marked_indices.contains(&index),
                     snapshot.display,
                 );
-                self.model.splice(position, 1, &[token.as_str()]);
+                // Visual-selection refresh can run from `notify::selected`. Preserve
+                // unchanged item identities there: splicing every row makes
+                // GtkListView and GtkSingleSelection rebuild the model while they
+                // are handling the selection change.
+                if force
+                    || self
+                        .model
+                        .string(position)
+                        .is_none_or(|current| current.as_str() != token)
+                {
+                    self.model.splice(position, 1, &[token.as_str()]);
+                }
             }
         }
         if let Some(position) = selected
@@ -693,7 +709,7 @@ impl ThreadListController {
             ThreadModelUpdate::Append { start, count } => {
                 self.append_rows(snapshot, start, count);
                 let indices = (0..snapshot.len).collect::<Vec<_>>();
-                self.refresh_rows(snapshot, &indices);
+                self.refresh_rows(snapshot, &indices, false);
             }
         }
     }

@@ -539,6 +539,70 @@ fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
 }
 
 #[test]
+fn fixture_visual_selection_navigation_keeps_thread_list_responsive() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_visual_selection_navigation_keeps_thread_list_responsive: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running visual-selection desktop UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-visual-select-ui-{run_id}"));
+    let token = format!("notm-visual-select-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+
+    let initial = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let rows = json_array_at(&initial, &["state", "thread_list_items"])?;
+    ensure!(
+        rows.len() >= 2,
+        "visual-selection smoke needs at least two fixture threads: {initial}"
+    );
+    let selected = driver.command("select_thread_by_index", json!({"index": 0}))?;
+    assert_eq!(selected["ok"], true, "initial selection failed: {selected}");
+
+    let entered = driver
+        .command("run_command", json!({"command": "visual_select"}))
+        .context("entering visual select wedged the GTK main loop")?;
+    assert_eq!(entered["ok"], true, "visual select failed: {entered}");
+    assert_eq!(
+        entered["state"]["visual_select_mode"], true,
+        "visual select did not become active: {entered}"
+    );
+
+    let moved = driver
+        .command("select_relative_thread", json!({"delta": 1}))
+        .context("moving the visual-selection cursor wedged the GTK main loop")?;
+    assert_eq!(moved["ok"], true, "visual selection move failed: {moved}");
+    assert_eq!(
+        moved["selected_thread_index"], 1,
+        "visual selection did not move to the next thread: {moved}"
+    );
+    assert_eq!(
+        moved["state"]["visual_select_cursor"], 1,
+        "visual selection cursor did not follow the selected row: {moved}"
+    );
+
+    let health = driver
+        .command("health", json!({}))
+        .context("GTK main loop stopped responding after visual-selection refresh")?;
+    assert_eq!(
+        health["ok"], true,
+        "thread-row refresh wedged the GTK main loop: {health}"
+    );
+    let cleared = driver.command("run_command", json!({"command": "clear_visual_selection"}))?;
+    assert_eq!(
+        cleared["state"]["visual_select_mode"], false,
+        "visual selection did not clear: {cleared}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn fixture_compose_attachment_headers_are_safe_and_round_trip() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
