@@ -59,12 +59,11 @@ the active table; it is not a second status table.
 
 Update this block at every handoff; historical evidence remains append-only.
 
-- Captured: 2026-08-09.
-- Branch: `main`. Last implementation and tested-tree HEAD: `fb90953`; current
+- Captured: 2026-08-10.
+- Branch: `main`. Last implementation and tested-tree HEAD: `d7b42ea`; current
   HEAD is the tracker-only evidence commit containing this snapshot.
-- Active item/child checkpoint: `S01-MODULES.4`; extract runtime settings,
-  Settings dialog validation/application, and raw TOML persistence into
-  `widgets/settings.rs` without changing behavior.
+- Active item/child checkpoint: `S01-MODULES.5`; extract the standalone-window
+  controller without changing behavior.
 - Owner: Codex. Blockers: none recorded.
 - Unrelated dirty paths that must not be staged, overwritten, stashed, or reset:
   `Cargo.toml`, `Cargo.lock`, and
@@ -122,7 +121,7 @@ scope of this work:
 | `R07-ATTACHMENTS` | Use a save chooser for Save; use private temporary storage for Open. | `DONE` | `.1` storage/private-directory semantics were validated at `0bf9afd`; `.2` chooser/opener wiring, fixture seams, docs, and non-skipping GTK proof were exact-tree validated at `eb9113f`. |
 | `R10-SETTINGS` | Make `ui.theme` and `ui.thread_preview_lines` functional rather than silently storing inert values. | `DONE` | Both `.1` preview/validation/runtime behavior and `.2` three-mode theme behavior were exact-tree validated at `0bbddc4`, including real Settings-dialog seams and non-skipping GTK proof. |
 | `R12-DRAFTS` | Make named drafts visible and confirm destructive draft actions. | `DONE` | `.1` visible saved-draft list, activation, safe deletion, fixture seams, and non-skipping GTK proof were exact-tree validated at `a534c58`; `.2` routes destructive/replacement paths through one typed confirmation controller and was exact-tree validated at `9b679b1`. |
-| `S01-MODULES` | Incrementally extract composer, search, attachment, settings, and standalone-window controllers from `main_window.rs`. | `IN PROGRESS` | `.1` attachment extraction was exact-tree validated at `f62cc54`; `.2` search-bar/thread-list at `e36cff4`; `.3` composer at `fb90953`; `.4` settings extraction is active. `main_window.rs` is 19,419 lines. |
+| `S01-MODULES` | Incrementally extract composer, search, attachment, settings, and standalone-window controllers from `main_window.rs`. | `IN PROGRESS` | `.1` attachment extraction was exact-tree validated at `f62cc54`; `.2` search-bar/thread-list at `e36cff4`; `.3` composer at `fb90953`; `.4` settings extraction is exact-tree validated at `d7b42ea`; `.5` standalone-window extraction remains. `main_window.rs` is 17,689 lines. |
 | `S02-CACHES` | Bound the search and thread-detail caches, including accumulation across database revisions. | `DONE` | Exact-tree validated at `92c01b6`: typed full-identity keys and true-LRU caches bound search pages to 64 and thread details to 4,096 entries, with local-instance capacity/recency/collision/isolation proofs. |
 | `S03-CI` | Add CI for formatting, Clippy, tests, and the real fixture-driven GTK smoke. | `IN PROGRESS` | `.1` is implemented and exact-tree validated at `dda9d45`; `.2` still requires the final integrated pushed SHA and green run URL. |
 | `S04-SYNC-DOCS` | Reconcile startup-sync documentation with the implemented opt-in startup settings. | `DONE` | Implemented and exact-tree validated at `4eb32d6`; current docs, Settings copy, sync selection tests, fixture gate, and non-skipping Wayland GTK smoke agree. |
@@ -551,6 +550,7 @@ Append entries; do not rewrite history.
 | 2026-08-09 | `S01-MODULES.2` | Child checkpoint completed; parent remains `IN PROGRESS`. | implementation `e36cff4`; tested tree `e36cff4` | In the stable exact checkout, formatting, workspace Clippy with `-D warnings`, workspace all-target/all-feature tests, `fixture-smoke`, `probe-send`, 91 UI unit tests, four search-bar tests, 13 thread-list/cache/reducer tests, and `git diff --check` passed. Six required-display search/paging/sync/message-ID/tag smokes passed on `WAYLAND_DISPLAY=wayland-1`, exit 0, with no `SKIP`; the complete required-display desktop binary then passed serially 29/29 in 69.79 seconds. `SearchBarController` owns input, completion, debounce, generations, activity, and generic worker dispatch; `ThreadListController` plus typed `SearchPageCoordinator`, page plans, reducers, and bounded typed caches own execution, paging, results, selection restoration, model population, and row rendering without importing `Widgets`, `SharedState`, or `LaunchOptions`. An initial audit rejected wholesale result/paging logic left in main; the final revision moved it behind typed inputs/outcomes, added reducer tests, fixed a message-ID completion `RefCell` borrow found by the GTK smoke, and passed the independent re-audit. The committed files were byte-compared with the validated exact checkout. |
 
 | 2026-08-09 | `S01-MODULES.3` | Child checkpoint completed; parent remains `IN PROGRESS`. | implementation `fb90953`; tested tree `fb90953` | In the stable exact checkout, formatting, workspace Clippy with `-D warnings`, workspace all-target/all-feature tests, `fixture-smoke`, `probe-send`, 95 UI unit tests, 15 composer-domain tests, and `git diff --check` passed. Nine required-display recovery/draft/confirmation/reply/sync/send/close/standalone smokes passed on `WAYLAND_DISPLAY=wayland-1`, exit 0, with no `SKIP`; the complete required-display desktop binary then passed serially 29/29 in 69.33 seconds. `ComposerController` owns the GTK subtree, fields/focus/Vim/address completion, recovery/named-draft paths and persistence/list, typed confirmation policy/controller with one-shot hooks, send snapshots/message construction, and accepted-cleanup reducer without importing `Widgets`, `SharedState`, `UiState`, or `LaunchOptions`; main retains message-selection rollback, pane/search/status, Notmuch/transport, and application-lifetime adapters. Audits found no core R12 regression; one collateral rename of the stable custom-tag harness commands was restored and locked by a targeted command-name/tag-gate unit test. The committed files were byte-compared with the validated exact checkout. |
+| 2026-08-10 | `S01-MODULES.4` | Child checkpoint completed; parent remains `IN PROGRESS`. | implementation `d7b42ea`; tested tree `d7b42ea` | In the stable exact checkout, `cargo check -p notm-ui --all-targets --all-features`, `cargo test -p notm-ui --lib`, workspace Clippy with `-D warnings`, and the required-display GTK smokes `fixture_settings_preview_limits_apply_without_partial_persistence`, `fixture_theme_modes_follow_both_simulated_system_preferences`, and `validated_config_launches_and_invalid_layout_requests_are_rejected` all passed on `WAYLAND_DISPLAY=wayland-1` with exit 0 and no `SKIP`. `SettingsController` now owns the dialog, validation, Apply/Save response handling, fixture test state, and raw TOML read/modify/write helpers; `main_window.rs` keeps one typed effect adapter for pane/search/theme/preview/debug updates. The committed files were byte-compared with the validated exact checkout. |
 
 ## Decision log
 
@@ -563,9 +563,6 @@ here. Absence of an entry means the scope above still applies.
 
 ## Exact next action
 
-Complete `S01-MODULES.4`: replace the settings placeholder with the existing
-runtime settings model, dialog, parsing/validation, Apply/Save lifecycle, and
-raw TOML read/modify/write helpers. Keep pane/search/message rendering effects
-in one small typed main adapter, preserve R10 theme/preview behavior and config
-round-tripping, move domain tests, and run all required-display Settings and
-validated-config proofs before the baseline and implementation commit.
+Continue `S01-MODULES` with `.5` standalone-window extraction. Keep the typed
+settings controller in place and preserve the same validation/smoke pattern for
+the next slice.
