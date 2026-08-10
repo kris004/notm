@@ -3,9 +3,6 @@
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
-    ffi::OsStr,
-    fs::OpenOptions,
-    io::Write,
     path::{Path, PathBuf},
     process::Command,
     rc::Rc,
@@ -22,9 +19,7 @@ use notm_mail::{
     ComposedMessage, ExternalCommandTransport, FakeSendTransport, ReplyKind, SendTransport,
     TransportMode,
     address::{dedupe_addresses, format_address, parse_address_list},
-    build_reply,
     compose::{AttachmentInput, Identity},
-    forward::{build_attachment_forward, build_inline_forward},
     html_sanitize::sanitize_html,
     mime::parse_file,
 };
@@ -33,7 +28,6 @@ use notm_notmuch::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sourceview5::{Buffer as SourceBuffer, View as SourceView, VimIMContext};
 use uuid::Uuid;
 use webkit6::{
     NavigationPolicyDecision, PolicyDecisionType,
@@ -50,6 +44,11 @@ use crate::{
     widgets::attachments::{
         self, AttachmentActionResult, AttachmentController, AttachmentEvent,
         AttachmentEventHandler, AttachmentOpenStore,
+    },
+    widgets::composer::{
+        self, ComposerController, ComposerPaths, ComposerReplacementKind, DRAFT_LIST_MAX_HEIGHT,
+        DRAFT_LIST_MIN_HEIGHT, DraftSaveReport, PendingAction, PendingOperation, TransitionHooks,
+        composer_requires_confirmation, fields_has_content,
     },
     widgets::search_bar::{
         self, SearchActivityState, SearchBarController, SearchHarnessPolicy, SearchInputEvent,
@@ -463,7 +462,6 @@ struct Widgets {
     theme_background_probe: gtk::Label,
     pending_settings_dialog: Rc<RefCell<Option<PendingSettingsDialog>>>,
     next_settings_dialog_id: Rc<Cell<u64>>,
-    confirmation_controller: Rc<RefCell<ConfirmationController>>,
     overlay: gtk::Overlay,
     outer_paned: gtk::Paned,
     content_paned: gtk::Paned,
@@ -545,37 +543,10 @@ struct Widgets {
     quote_collapse: Rc<Cell<bool>>,
     attachments: AttachmentController,
     tag_search_box: gtk::Box,
-    draft_path: PathBuf,
-    legacy_draft_path: Option<PathBuf>,
     debug_view: gtk::TextView,
     status_label: gtk::Label,
-    compose_from: gtk::Entry,
-    compose_to: gtk::Entry,
-    compose_cc: gtk::Entry,
-    compose_bcc: gtk::Entry,
-    compose_subject: gtk::Entry,
-    compose_body: SourceView,
-    compose_autosave_suppressed: Rc<Cell<bool>>,
+    composer: ComposerController,
     close_when_idle: Rc<Cell<bool>>,
-    compose_vim_context: VimIMContext,
-    compose_scrolled: gtk::ScrolledWindow,
-    compose_attachments: gtk::Label,
-    add_attachment_button: gtk::Button,
-    save_draft_button: gtk::Button,
-    clear_draft_button: gtk::Button,
-    delete_local_draft_button: gtk::Button,
-    send_button: gtk::Button,
-    address_suggestions_list: gtk::ListBox,
-    active_address_entry: Rc<RefCell<Option<gtk::Entry>>>,
-    active_address_field: Rc<Cell<Option<RecipientField>>>,
-    address_completion: Rc<RefCell<Option<AddressCompletionSession>>>,
-    draft_section: gtk::Box,
-    draft_empty_label: gtk::Label,
-    draft_scrolled: gtk::ScrolledWindow,
-    draft_list: gtk::ListBox,
-    delete_selected_draft_button: gtk::Button,
-    drafts_dir: PathBuf,
-    legacy_drafts_dir: Option<PathBuf>,
     standalone_windows: Rc<RefCell<Vec<Rc<StandaloneMessageWindow>>>>,
     standalone_next_id: Rc<Cell<u64>>,
 }
@@ -612,23 +583,6 @@ struct MainWindowHandle {
     window: gtk::ApplicationWindow,
     widgets: Widgets,
     state: SharedState,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecipientField {
-    To,
-    Cc,
-    Bcc,
-}
-
-#[derive(Debug, Clone)]
-struct AddressCompletionSession {
-    field: RecipientField,
-    base: String,
-    suggestions: Vec<String>,
-    next_index: usize,
-    generated_text: Option<String>,
-    suppress_next_change: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -754,26 +708,11 @@ struct PendingSettingsDialog {
     show_thread_preview: gtk::CheckButton,
 }
 
-struct ConfirmationController {
-    next_id: u64,
-    pending: Option<PendingConfirmation>,
-    last_completion: Option<ConfirmationCompletion>,
-    allow_close_once: bool,
+struct AddressSuggestionsResponse {
+    result: anyhow::Result<Vec<String>>,
 }
 
-struct ConfirmationCompletion {
-    id: u64,
-    accepted: bool,
-    succeeded: bool,
-}
-
-struct PendingConfirmation {
-    id: u64,
-    action: PendingAction,
-    dialog: gtk::glib::WeakRef<gtk::Dialog>,
-}
-
-enum PendingAction {
+enum PendingTransition {
     ClearComposer,
     ReplaceComposer(PreparedComposerReplacement),
     DeleteActiveDraft(ActiveDraft),
@@ -793,6 +732,18 @@ enum PendingAction {
         status: String,
         active_pane: ActivePane,
     },
+    CloseMainWindow,
+}
+
+#[derive(Clone, Copy)]
+enum PendingTransitionKind {
+    ClearComposer,
+    ReplaceComposer(ComposerReplacementKind),
+    DeleteActiveDraft,
+    DeleteNamedDraft,
+    SaveDraftReplacement,
+    SendComposer,
+    ShowSelectedMessage,
     CloseMainWindow,
 }
 
@@ -837,44 +788,8 @@ struct PreparedActiveDraft {
     indexed: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ComposerReplacementKind {
-    New,
-    Reply,
-    ReplyAll,
-    Forward,
-    ForwardAttachment,
-    StandaloneReply,
-    StandaloneReplyAll,
-    StandaloneForward,
-    StandaloneForwardAttachment,
-    NamedDraft,
-    RecoveryDraft,
-    IndexedDraft,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PersistedDraftDeletion {
-    ExplicitActive,
-    ExplicitNamed,
-    SaveReplacement,
-    AcceptedSendCleanup,
-}
-
-fn persisted_draft_deletion_requires_confirmation(_deletion: PersistedDraftDeletion) -> bool {
-    true
-}
-
-struct AddressSuggestionsResponse {
-    result: anyhow::Result<Vec<String>>,
-}
-
 const SIDEBAR_MIN_WIDTH: i32 = 136;
 const THREAD_LIST_MIN_WIDTH: i32 = 320;
-const COMPOSE_BODY_MIN_HEIGHT: i32 = 96;
-const COMPOSE_BODY_NATURAL_HEIGHT: i32 = 260;
-const DRAFT_LIST_MIN_HEIGHT: i32 = 72;
-const DRAFT_LIST_MAX_HEIGHT: i32 = 160;
 const MAX_SYNC_REFRESH_DELAY: Duration = Duration::from_secs(5);
 // GTK measures the message header at unbounded width during compact pane allocation.
 // Reserving multiple lines per metadata row can force the whole message pane taller
@@ -1448,136 +1363,31 @@ fn build_ui(
     message_stack.set_visible_child_name("text");
     right.append(&message_stack);
 
-    let composer_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    composer_box.set_widget_name("notm-composer");
-    composer_box.set_hexpand(true);
-    composer_box.set_vexpand(true);
-    let compose_from = entry_with_placeholder("From");
-    let compose_to = entry_with_placeholder("To");
-    let compose_cc = entry_with_placeholder("Cc");
-    let compose_bcc = entry_with_placeholder("Bcc");
-    let compose_subject = entry_with_placeholder("Subject");
-    let compose_body_buffer = SourceBuffer::builder()
-        .highlight_matching_brackets(true)
-        .highlight_syntax(false)
-        .build();
-    let compose_body = SourceView::builder()
-        .buffer(&compose_body_buffer)
-        .highlight_current_line(false)
-        .hexpand(true)
-        .monospace(true)
-        .vexpand(true)
-        .wrap_mode(gtk::WrapMode::WordChar)
-        .build();
-    compose_body.set_widget_name("notm-compose-body");
-    let compose_vim_context = attach_compose_vim_context(&compose_body);
-    let scrolled_compose_body = gtk::ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vscrollbar_policy(gtk::PolicyType::Automatic)
-        .propagate_natural_width(false)
-        .propagate_natural_height(false)
-        .min_content_width(240)
-        .min_content_height(COMPOSE_BODY_MIN_HEIGHT)
-        .max_content_height(COMPOSE_BODY_NATURAL_HEIGHT)
-        .child(&compose_body)
-        .build();
-    let address_suggestions_list = gtk::ListBox::new();
-    address_suggestions_list.set_widget_name("notm-address-suggestions-list");
-    address_suggestions_list.set_selection_mode(gtk::SelectionMode::Single);
-    address_suggestions_list.add_css_class("boxed-list");
-    address_suggestions_list.set_hexpand(true);
-    address_suggestions_list.set_focusable(false);
-    address_suggestions_list.set_visible(false);
-    let active_address_entry = Rc::new(RefCell::new(None::<gtk::Entry>));
-    let active_address_field = Rc::new(Cell::new(None::<RecipientField>));
-    let address_completion = Rc::new(RefCell::new(None::<AddressCompletionSession>));
-    let compose_attachments = gtk::Label::new(Some("No attachments"));
-    compose_attachments.set_widget_name("notm-compose-attachments");
-    compose_attachments.set_xalign(0.0);
-    compose_attachments.set_wrap(true);
-    compose_attachments.add_css_class("dim-label");
-    let composer_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    composer_actions.set_hexpand(true);
-    let composer_left_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let add_attachment_button = gtk::Button::with_label("Add attachment…");
-    let save_draft_button = gtk::Button::with_label("Save draft");
-    save_draft_button.set_widget_name("notm-save-draft-button");
-    let clear_draft_button = gtk::Button::with_label("Discard draft");
-    let delete_local_draft_button = gtk::Button::with_label("Delete local draft");
-    delete_local_draft_button.set_widget_name("notm-delete-local-draft-button");
-    delete_local_draft_button.add_css_class("destructive-action");
-    delete_local_draft_button.set_visible(false);
-    let send_button = gtk::Button::with_label("Send");
-    send_button.set_widget_name("notm-send-button");
-    for b in [
-        &add_attachment_button,
-        &save_draft_button,
-        &clear_draft_button,
-        &send_button,
-    ] {
-        composer_left_actions.append(b);
-    }
-    let composer_action_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    composer_action_spacer.set_hexpand(true);
-    composer_actions.append(&composer_left_actions);
-    composer_actions.append(&composer_action_spacer);
-    composer_actions.append(&delete_local_draft_button);
-    composer_box.append(&compose_from);
-    composer_box.append(&compose_to);
-    composer_box.append(&address_suggestions_list);
-    composer_box.append(&compose_cc);
-    composer_box.append(&compose_bcc);
-    composer_box.append(&compose_subject);
-    composer_box.append(&scrolled_compose_body);
-    composer_box.append(&compose_attachments);
-    let draft_section = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    draft_section.set_widget_name("notm-saved-drafts-section");
-    draft_section.set_hexpand(true);
-    let draft_header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    draft_header.set_hexpand(true);
-    let draft_title = gtk::Label::new(Some("Saved drafts"));
-    draft_title.set_widget_name("notm-saved-drafts-title");
-    draft_title.set_xalign(0.0);
-    draft_title.set_hexpand(true);
-    draft_title.add_css_class("heading");
-    let delete_selected_draft_button = gtk::Button::with_label("Delete selected draft");
-    delete_selected_draft_button.set_widget_name("notm-delete-selected-draft-button");
-    delete_selected_draft_button.add_css_class("destructive-action");
-    delete_selected_draft_button.set_sensitive(false);
-    draft_header.append(&draft_title);
-    draft_header.append(&delete_selected_draft_button);
-    draft_section.append(&draft_header);
-    let draft_empty_label = gtk::Label::new(Some("No saved drafts"));
-    draft_empty_label.set_widget_name("notm-saved-drafts-empty");
-    draft_empty_label.set_xalign(0.0);
-    draft_empty_label.add_css_class("dim-label");
-    draft_empty_label.set_margin_start(6);
-    draft_empty_label.set_margin_end(6);
-    draft_empty_label.set_margin_top(6);
-    draft_empty_label.set_margin_bottom(6);
-    draft_section.append(&draft_empty_label);
-    let draft_list = gtk::ListBox::new();
-    draft_list.set_widget_name("notm-draft-list");
-    draft_list.set_selection_mode(gtk::SelectionMode::Single);
-    draft_list.set_activate_on_single_click(false);
-    draft_list.add_css_class("boxed-list");
-    let draft_scrolled = gtk::ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(false)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vscrollbar_policy(gtk::PolicyType::Automatic)
-        .propagate_natural_height(false)
-        .min_content_height(DRAFT_LIST_MIN_HEIGHT)
-        .max_content_height(DRAFT_LIST_MAX_HEIGHT)
-        .child(&draft_list)
-        .build();
-    draft_scrolled.set_widget_name("notm-saved-drafts-scrolled");
-    draft_section.append(&draft_scrolled);
-    composer_box.append(&draft_section);
-    composer_box.append(&composer_actions);
-    message_stack.add_named(&composer_box, Some("compose"));
+    let draft_path = options
+        .draft_path
+        .clone()
+        .unwrap_or_else(composer::default_recovery_path);
+    let legacy_draft_path = options
+        .draft_path
+        .is_none()
+        .then(composer::legacy_default_recovery_path)
+        .filter(|legacy_path| legacy_path != &draft_path);
+    let drafts_dir = options
+        .drafts_dir
+        .clone()
+        .unwrap_or_else(composer::default_drafts_dir);
+    let legacy_drafts_dir = options
+        .drafts_dir
+        .is_none()
+        .then(composer::legacy_default_drafts_dir)
+        .filter(|legacy_dir| legacy_dir != &drafts_dir);
+    let composer = ComposerController::new(ComposerPaths {
+        recovery: draft_path,
+        legacy_recovery: legacy_draft_path,
+        drafts: drafts_dir,
+        legacy_drafts: legacy_drafts_dir,
+    });
+    message_stack.add_named(&composer.root(), Some("compose"));
 
     let debug_view = gtk::TextView::new();
     debug_view.set_widget_name("notm-debug-panel");
@@ -1619,24 +1429,6 @@ fn build_ui(
     connect_html_navigation_policy(&html_view, &status_label);
     connect_html_hover_status(&html_view, &status_label);
 
-    let draft_path = options
-        .draft_path
-        .clone()
-        .unwrap_or_else(default_draft_path);
-    let legacy_draft_path = options
-        .draft_path
-        .is_none()
-        .then(legacy_default_draft_path)
-        .filter(|legacy_path| legacy_path != &draft_path);
-    let drafts_dir = options
-        .drafts_dir
-        .clone()
-        .unwrap_or_else(default_drafts_dir);
-    let legacy_drafts_dir = options
-        .drafts_dir
-        .is_none()
-        .then(legacy_default_drafts_dir)
-        .filter(|legacy_dir| legacy_dir != &drafts_dir);
     let widgets = Widgets {
         window: window.clone(),
         gtk_settings,
@@ -1644,12 +1436,6 @@ fn build_ui(
         theme_background_probe,
         pending_settings_dialog: Rc::new(RefCell::new(None)),
         next_settings_dialog_id: Rc::new(Cell::new(1)),
-        confirmation_controller: Rc::new(RefCell::new(ConfirmationController {
-            next_id: 1,
-            pending: None,
-            last_completion: None,
-            allow_close_once: false,
-        })),
         overlay: overlay.clone(),
         outer_paned: outer_paned.clone(),
         content_paned: content_paned.clone(),
@@ -1731,37 +1517,10 @@ fn build_ui(
         quote_collapse,
         attachments,
         tag_search_box,
-        draft_path,
-        legacy_draft_path,
         debug_view,
         status_label,
-        compose_from,
-        compose_to,
-        compose_cc,
-        compose_bcc,
-        compose_subject,
-        compose_body,
-        compose_autosave_suppressed: Rc::new(Cell::new(false)),
+        composer,
         close_when_idle: Rc::new(Cell::new(false)),
-        compose_vim_context: compose_vim_context.clone(),
-        compose_scrolled: scrolled_compose_body.clone(),
-        compose_attachments,
-        add_attachment_button: add_attachment_button.clone(),
-        save_draft_button: save_draft_button.clone(),
-        clear_draft_button: clear_draft_button.clone(),
-        delete_local_draft_button: delete_local_draft_button.clone(),
-        send_button: send_button.clone(),
-        address_suggestions_list,
-        active_address_entry,
-        active_address_field,
-        address_completion,
-        draft_section,
-        draft_empty_label,
-        draft_scrolled,
-        draft_list,
-        delete_selected_draft_button,
-        drafts_dir,
-        legacy_drafts_dir,
         standalone_windows: Rc::new(RefCell::new(Vec::new())),
         standalone_next_id: Rc::new(Cell::new(1)),
     };
@@ -1775,7 +1534,7 @@ fn build_ui(
     update_message_action_buttons(&options, &widgets, &state);
     set_undo_tag_available(&widgets, !undo_state.borrow().is_empty());
     if let Some(id) = identity(&options) {
-        widgets.compose_from.set_text(&id.formatted());
+        widgets.composer.sender_entry().set_text(&id.formatted());
     }
 
     let saved_search_store = Rc::new(RefCell::new(options.custom_saved_searches.clone()));
@@ -1820,7 +1579,7 @@ fn build_ui(
         &palette_button,
         &settings_button,
         &help_button,
-        &send_button,
+        &widgets.composer.send_button(),
     );
     connect_pane_visibility_toggles(&options, &widgets, &state);
     connect_auto_layout(&widgets, &state);
@@ -1828,17 +1587,17 @@ fn build_ui(
         &options,
         &widgets,
         &state,
-        &add_attachment_button,
-        &save_draft_button,
-        &clear_draft_button,
-        &delete_local_draft_button,
+        &widgets.composer.add_attachment_button(),
+        &widgets.composer.save_draft_button(),
+        &widgets.composer.clear_draft_button(),
+        &widgets.composer.delete_local_draft_button(),
     );
     connect_draft_list(&options, &widgets, &state);
-    connect_compose_vim_context(&options, &widgets, &state, &compose_vim_context);
+    connect_compose_vim_context(&options, &widgets, &state);
     connect_message_actions(&options, &widgets, &state);
-    connect_recipient_autocomplete(&widgets.compose_to, &widgets, &state);
-    connect_recipient_autocomplete(&widgets.compose_cc, &widgets, &state);
-    connect_recipient_autocomplete(&widgets.compose_bcc, &widgets, &state);
+    connect_recipient_autocomplete(&widgets.composer.to_entry(), &widgets, &state);
+    connect_recipient_autocomplete(&widgets.composer.cc_entry(), &widgets, &state);
+    connect_recipient_autocomplete(&widgets.composer.bcc_entry(), &widgets, &state);
     connect_address_suggestion_list(&widgets, &state);
     connect_search_bar(&options, &widgets, &state);
     connect_input_mode_focus(&widgets, &state);
@@ -1849,16 +1608,10 @@ fn build_ui(
         let w = widgets.clone();
         let st = state.clone();
         window.connect_close_request(move |window| {
-            let allow_close_once = {
-                let mut controller = w.confirmation_controller.borrow_mut();
-                let allowed = controller.allow_close_once;
-                controller.allow_close_once = false;
-                allowed
-            };
-            if allow_close_once {
+            if w.composer.take_allow_close_once() {
                 return gtk::glib::Propagation::Proceed;
             }
-            if w.confirmation_controller.borrow().pending.is_some() {
+            if w.composer.has_pending_confirmation() {
                 return gtk::glib::Propagation::Stop;
             }
             let background_activity = {
@@ -1875,7 +1628,7 @@ fn build_ui(
                 if !composer_requires_confirmation(&fields, active_draft.as_ref()) {
                     return gtk::glib::Propagation::Proceed;
                 }
-                let _ = request_pending_action(&opts, &w, &st, PendingAction::CloseMainWindow);
+                let _ = request_pending_action(&opts, &w, &st, PendingTransition::CloseMainWindow);
                 gtk::glib::Propagation::Stop
             }
         });
@@ -1887,7 +1640,7 @@ fn build_ui(
 
     restore_draft_if_present(&options, &widgets, &state);
     migrate_legacy_named_drafts_from_ui(&widgets, &state);
-    refresh_draft_list(&widgets);
+    widgets.composer.refresh_draft_list();
     window.present();
     {
         let w = widgets.clone();
@@ -3480,81 +3233,34 @@ fn widget_token(value: &str) -> String {
         .to_string()
 }
 
-fn attach_compose_vim_context(compose_body: &SourceView) -> VimIMContext {
-    let vim_context = VimIMContext::new();
-    let key_controller = gtk::EventControllerKey::new();
-    key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
-    key_controller.set_im_context(Some(&vim_context));
-    compose_body.add_controller(key_controller);
-    vim_context.set_client_widget(Some(compose_body));
-    vim_context
-}
-
-fn connect_compose_vim_context(
-    options: &LaunchOptions,
-    widgets: &Widgets,
-    state: &SharedState,
-    vim_context: &VimIMContext,
-) {
+fn connect_compose_vim_context(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     let status = widgets.status_label.clone();
-    let compose_body = widgets.compose_body.clone();
-    vim_context.connect_command_bar_text_notify(move |context| {
-        update_compose_vim_status(&compose_body, &status, context);
-    });
-
-    let status = widgets.status_label.clone();
-    let compose_body = widgets.compose_body.clone();
-    vim_context.connect_command_text_notify(move |context| {
-        update_compose_vim_status(&compose_body, &status, context);
-    });
-
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
-    vim_context.connect_write(
-        move |_, _, path| match request_save_current_draft(&opts, &w, &st) {
-            Ok(Some(report)) => {
-                refresh_draft_list(&w);
-                let destination = report
-                    .maildir_path
-                    .as_ref()
-                    .or(report.local_path.as_ref())
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "draft store".to_string());
-                let suffix = path
-                    .map(|requested| format!("; ignored Vim file path {requested}"))
-                    .unwrap_or_default();
-                w.status_label
-                    .set_text(&format!("Vim :w saved draft to {destination}{suffix}"));
-            }
-            Ok(None) => {}
-            Err(err) => w.status_label.set_text(&format!("Vim :w failed: {err}")),
-        },
+    widgets.composer.connect_vim(
+        Rc::new(move |text| status.set_text(&text)),
+        Rc::new(
+            move |path| match request_save_current_draft(&opts, &w, &st) {
+                Ok(Some(report)) => {
+                    w.composer.refresh_draft_list();
+                    let destination = report
+                        .maildir_path
+                        .as_ref()
+                        .or(report.local_path.as_ref())
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "draft store".to_string());
+                    let suffix = path
+                        .map(|requested| format!("; ignored Vim file path {requested}"))
+                        .unwrap_or_default();
+                    w.status_label
+                        .set_text(&format!("Vim :w saved draft to {destination}{suffix}"));
+                }
+                Ok(None) => {}
+                Err(err) => w.status_label.set_text(&format!("Vim :w failed: {err}")),
+            },
+        ),
     );
-}
-
-fn compose_vim_ready_for_app_escape(vim_context: &VimIMContext) -> bool {
-    vim_context.command_bar_text().is_empty() && vim_context.command_text().is_empty()
-}
-
-fn update_compose_vim_status(
-    compose_body: &SourceView,
-    status_label: &gtk::Label,
-    vim_context: &VimIMContext,
-) {
-    if !compose_body.has_focus() {
-        return;
-    }
-    let command_bar = vim_context.command_bar_text();
-    let command_text = vim_context.command_text();
-    let text = if !command_bar.is_empty() {
-        command_bar.to_string()
-    } else if !command_text.is_empty() {
-        format!("Vim {command_text}")
-    } else {
-        "Vim composer".to_string()
-    };
-    status_label.set_text(&text);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3568,11 +3274,11 @@ fn connect_compose_helpers(
     delete_local_draft_button: &gtk::Button,
 ) {
     for entry in [
-        widgets.compose_from.clone(),
-        widgets.compose_to.clone(),
-        widgets.compose_cc.clone(),
-        widgets.compose_bcc.clone(),
-        widgets.compose_subject.clone(),
+        widgets.composer.sender_entry().clone(),
+        widgets.composer.to_entry().clone(),
+        widgets.composer.cc_entry().clone(),
+        widgets.composer.bcc_entry().clone(),
+        widgets.composer.subject_entry().clone(),
     ] {
         let w = widgets.clone();
         let st = state.clone();
@@ -3581,7 +3287,8 @@ fn connect_compose_helpers(
     let w = widgets.clone();
     let st = state.clone();
     widgets
-        .compose_body
+        .composer
+        .body()
         .buffer()
         .connect_changed(move |_| autosave_draft_from_widgets(&w, &st));
 
@@ -3605,7 +3312,7 @@ fn connect_compose_helpers(
                 .status_label
                 .set_text(&format!("Draft save failed: {err}")),
         }
-        refresh_draft_list(&w);
+        w.composer.refresh_draft_list();
     });
 
     let opts = options.clone();
@@ -3650,27 +3357,36 @@ fn connect_compose_helpers(
 fn connect_draft_list(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     let w = widgets.clone();
     let st = state.clone();
-    widgets.draft_list.connect_row_selected(move |_, _| {
-        update_draft_action_buttons(&w, &st);
-    });
-
-    let w = widgets.clone();
-    let st = state.clone();
-    let opts = options.clone();
-    widgets.draft_list.connect_row_activated(move |list, row| {
-        list.select_row(Some(row));
-        match load_selected_named_draft(&opts, &w, &st) {
-            Ok((true, _)) => {}
-            Ok((false, _)) => {}
-            Err(err) => report_draft_persistence_error(&w, &st, "Saved draft load failed", &err),
-        }
-    });
+    widgets
+        .composer
+        .draft_list()
+        .connect_row_selected(move |_, _| {
+            update_draft_action_buttons(&w, &st);
+        });
 
     let w = widgets.clone();
     let st = state.clone();
     let opts = options.clone();
     widgets
-        .delete_selected_draft_button
+        .composer
+        .draft_list()
+        .connect_row_activated(move |list, row| {
+            list.select_row(Some(row));
+            match load_selected_named_draft(&opts, &w, &st) {
+                Ok((true, _)) => {}
+                Ok((false, _)) => {}
+                Err(err) => {
+                    report_draft_persistence_error(&w, &st, "Saved draft load failed", &err)
+                }
+            }
+        });
+
+    let w = widgets.clone();
+    let st = state.clone();
+    let opts = options.clone();
+    widgets
+        .composer
+        .delete_selected_draft_button()
         .connect_clicked(move |_| {
             delete_selected_named_draft_from_ui(&opts, &w, &st);
         });
@@ -3776,105 +3492,22 @@ fn connect_message_actions(options: &LaunchOptions, widgets: &Widgets, state: &S
 }
 
 fn connect_recipient_autocomplete(entry: &gtk::Entry, widgets: &Widgets, state: &SharedState) {
+    let suggestions_state = state.clone();
+    let suggestions = Rc::new(move || suggestions_state.borrow().address_suggestions.clone());
     let w = widgets.clone();
     let st = state.clone();
-    let entry_for_change = entry.clone();
-    entry.connect_changed(move |entry| {
-        let text = entry.text().to_string();
-        let field = recipient_field_for_entry(&w, &entry_for_change);
-        {
-            let mut completion = w.address_completion.borrow_mut();
-            if let Some(session) = completion.as_mut()
-                && Some(session.field) == field
-                && session.suppress_next_change
-            {
-                if session.generated_text.as_deref() == Some(text.as_str()) {
-                    session.suppress_next_change = false;
-                    autosave_draft_from_widgets(&w, &st);
-                    return;
-                }
-                if text.is_empty() && session.generated_text.is_some() {
-                    return;
-                }
-            }
-        }
-        if address_completion_current_matches(&w, field, &text) {
-            autosave_draft_from_widgets(&w, &st);
-            return;
-        }
-        reset_address_completion(&w);
-        set_active_address_entry(&w, &entry_for_change);
-        if field.is_some() && field == w.active_address_field.get() {
-            update_address_suggestions_for_entry(&w, &st, &entry_for_change, &text);
-        } else {
-            hide_address_suggestions(&w);
-        }
-        autosave_draft_from_widgets(&w, &st);
-    });
-    let controller = gtk::EventControllerKey::new();
-    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let entry_clone = entry.clone();
-    let w = widgets.clone();
-    let st = state.clone();
-    controller.connect_key_pressed(move |_, key, _, _| {
-        set_active_address_entry(&w, &entry_clone);
-        w.active_address_field
-            .set(recipient_field_for_entry(&w, &entry_clone));
-        if key == gtk::gdk::Key::Tab && complete_recipient_entry(&w, &st, &entry_clone) {
-            autosave_draft_from_widgets(&w, &st);
-            return gtk::glib::Propagation::Stop;
-        }
-        if key == gtk::gdk::Key::Escape {
-            reset_address_completion(&w);
-            hide_address_suggestions(&w);
-            return gtk::glib::Propagation::Stop;
-        }
-        gtk::glib::Propagation::Proceed
-    });
-    entry.add_controller(controller);
-
-    let w = widgets.clone();
-    let focus = gtk::EventControllerFocus::new();
-    let entry_for_enter = entry.clone();
-    focus.connect_enter(move |_| {
-        set_active_address_entry(&w, &entry_for_enter);
-        w.active_address_field
-            .set(recipient_field_for_entry(&w, &entry_for_enter));
-        place_address_suggestions_after_entry(&w, &entry_for_enter);
-        hide_address_suggestions(&w);
-    });
-    let w = widgets.clone();
-    let entry_for_leave = entry.clone();
-    focus.connect_leave(move |_| {
-        let w = w.clone();
-        let field = recipient_field_for_entry(&w, &entry_for_leave);
-        gtk::glib::timeout_add_local_once(Duration::from_millis(150), move || {
-            if w.active_address_field.get() == field {
-                w.active_address_field.set(None);
-                hide_address_suggestions(&w);
-            }
-        });
-    });
-    entry.add_controller(focus);
+    let edited = Rc::new(move || autosave_draft_from_widgets(&w, &st));
+    widgets
+        .composer
+        .connect_recipient_autocomplete(entry, suggestions, edited);
 }
 
 fn connect_address_suggestion_list(widgets: &Widgets, state: &SharedState) {
     let w = widgets.clone();
     let st = state.clone();
     widgets
-        .address_suggestions_list
-        .connect_row_activated(move |_, row| {
-            let Some(child) = row.child() else {
-                return;
-            };
-            let Ok(label) = child.downcast::<gtk::Label>() else {
-                return;
-            };
-            let entry = active_address_entry(&w);
-            apply_recipient_suggestion(&entry, &label.text());
-            hide_address_suggestions(&w);
-            autosave_draft_from_widgets(&w, &st);
-        });
+        .composer
+        .connect_address_suggestion_list(Rc::new(move || autosave_draft_from_widgets(&w, &st)));
 }
 
 fn connect_search_bar(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -4643,21 +4276,15 @@ where
 }
 
 fn composer_has_focus(widgets: &Widgets) -> bool {
-    composer_focus_targets(widgets)
-        .iter()
-        .any(widget_contains_focus)
+    widgets.composer.has_focus()
 }
 
 fn focus_first_composer_field(widgets: &Widgets) {
-    let targets = composer_focus_targets(widgets);
-    focus_widget_at(&targets, 0);
+    widgets.composer.focus_first_field();
 }
 
 fn focus_composer_insert_target(widgets: &Widgets) {
-    if composer_has_focus(widgets) {
-        return;
-    }
-    focus_first_composer_field(widgets);
+    widgets.composer.focus_insert_target();
 }
 
 fn focus_sidebar_insert_target(widgets: &Widgets) {
@@ -4725,22 +4352,7 @@ fn collect_sidebar_focus_targets(widget: &gtk::Widget, targets: &mut Vec<gtk::Wi
 }
 
 fn move_composer_focus(widgets: &Widgets, delta: isize) {
-    let targets = composer_focus_targets(widgets);
-    focus_relative_widget(&targets, delta);
-}
-
-fn composer_focus_targets(widgets: &Widgets) -> Vec<gtk::Widget> {
-    [
-        widgets.compose_from.clone().upcast::<gtk::Widget>(),
-        widgets.compose_to.clone().upcast::<gtk::Widget>(),
-        widgets.compose_cc.clone().upcast::<gtk::Widget>(),
-        widgets.compose_bcc.clone().upcast::<gtk::Widget>(),
-        widgets.compose_subject.clone().upcast::<gtk::Widget>(),
-        widgets.compose_body.clone().upcast::<gtk::Widget>(),
-    ]
-    .into_iter()
-    .filter(|widget| widget.is_visible() && widget.is_sensitive())
-    .collect()
+    widgets.composer.move_focus(delta);
 }
 
 fn focus_relative_widget(targets: &[gtk::Widget], delta: isize) {
@@ -4841,7 +4453,7 @@ fn scroll_window_to_edge(scrolled: &gtk::ScrolledWindow, bottom: bool) {
 
 fn active_message_scrolled(widgets: &Widgets) -> gtk::ScrolledWindow {
     if compose_view_is_visible(widgets) {
-        widgets.compose_scrolled.clone()
+        widgets.composer.scrolled().clone()
     } else if html_view_is_visible(widgets) {
         widgets.html_scrolled.clone()
     } else {
@@ -5542,21 +5154,37 @@ fn update_button_binding_labels(widgets: &Widgets, state: &SharedState) {
         state,
     );
     set_button_label(
-        &widgets.add_attachment_button,
+        &widgets.composer.add_attachment_button(),
         "Add attachment…",
         "A",
         state,
     );
-    set_button_label(&widgets.save_draft_button, "Save draft", "S", state);
-    let clear_base = strip_binding_suffix(&widgets.clear_draft_button.label().unwrap_or_default());
-    set_button_label(&widgets.clear_draft_button, &clear_base, "x", state);
     set_button_label(
-        &widgets.delete_local_draft_button,
+        &widgets.composer.save_draft_button(),
+        "Save draft",
+        "S",
+        state,
+    );
+    let clear_base = strip_binding_suffix(
+        &widgets
+            .composer
+            .clear_draft_button()
+            .label()
+            .unwrap_or_default(),
+    );
+    set_button_label(
+        &widgets.composer.clear_draft_button(),
+        &clear_base,
+        "x",
+        state,
+    );
+    set_button_label(
+        &widgets.composer.delete_local_draft_button(),
         "Delete local draft",
         "D",
         state,
     );
-    set_button_label(&widgets.send_button, "Send", "Ctrl+Enter", state);
+    set_button_label(&widgets.composer.send_button(), "Send", "Ctrl+Enter", state);
     update_saved_search_button_labels(widgets, state);
     update_tag_search_button_labels(widgets, state);
 }
@@ -5592,17 +5220,37 @@ fn connect_input_mode_focus(widgets: &Widgets, state: &SharedState) {
         state,
         ActivePane::Threads,
     );
-    connect_text_focus(&widgets.compose_from, widgets, state, ActivePane::Message);
-    connect_text_focus(&widgets.compose_to, widgets, state, ActivePane::Message);
-    connect_text_focus(&widgets.compose_cc, widgets, state, ActivePane::Message);
-    connect_text_focus(&widgets.compose_bcc, widgets, state, ActivePane::Message);
     connect_text_focus(
-        &widgets.compose_subject,
+        &widgets.composer.sender_entry(),
         widgets,
         state,
         ActivePane::Message,
     );
-    connect_compose_body_focus(&widgets.compose_body, widgets, state);
+    connect_text_focus(
+        &widgets.composer.to_entry(),
+        widgets,
+        state,
+        ActivePane::Message,
+    );
+    connect_text_focus(
+        &widgets.composer.cc_entry(),
+        widgets,
+        state,
+        ActivePane::Message,
+    );
+    connect_text_focus(
+        &widgets.composer.bcc_entry(),
+        widgets,
+        state,
+        ActivePane::Message,
+    );
+    connect_text_focus(
+        &widgets.composer.subject_entry(),
+        widgets,
+        state,
+        ActivePane::Message,
+    );
+    connect_compose_body_focus(&widgets.composer.body(), widgets, state);
 }
 
 fn connect_text_focus<W>(widget: &W, widgets: &Widgets, state: &SharedState, pane: ActivePane)
@@ -5636,11 +5284,11 @@ fn main_text_entry_has_focus(widgets: &Widgets) -> bool {
         &widgets.custom_tag_entry,
         &widgets.tag_command_entry,
         &widgets.search_bar.entry(),
-        &widgets.compose_from,
-        &widgets.compose_to,
-        &widgets.compose_cc,
-        &widgets.compose_bcc,
-        &widgets.compose_subject,
+        &widgets.composer.sender_entry(),
+        &widgets.composer.to_entry(),
+        &widgets.composer.cc_entry(),
+        &widgets.composer.bcc_entry(),
+        &widgets.composer.subject_entry(),
     ]
     .into_iter()
     .any(|entry| widget_contains_focus(entry.upcast_ref()))
@@ -5801,8 +5449,8 @@ fn install_shortcuts(
                     close_custom_tag_editor(&w, &st);
                     return gtk::glib::Propagation::Stop;
                 }
-                if w.compose_body.has_focus() {
-                    if ctrl || compose_vim_ready_for_app_escape(&w.compose_vim_context) {
+                if w.composer.body().has_focus() {
+                    if ctrl || w.composer.vim_ready_for_app_escape() {
                         enter_normal_mode(&w, &st);
                         return gtk::glib::Propagation::Stop;
                     }
@@ -6366,7 +6014,7 @@ fn install_shortcuts(
                     .status_label
                     .set_text(&format!("Draft save failed: {err}")),
             }
-            refresh_draft_list(&w);
+            w.composer.refresh_draft_list();
             true
         } else if key == gtk::gdk::Key::x && compose_view_is_visible(&w) {
             clear_numeric_prefix(&numeric_prefix);
@@ -6848,293 +6496,20 @@ fn apply_address_suggestions_result(
 }
 
 fn update_address_suggestions_label(widgets: &Widgets, state: &SharedState, input: &str) {
-    let entry = active_address_entry(widgets);
-    update_address_suggestions_for_entry(widgets, state, &entry, input);
-}
-
-fn update_address_suggestions_for_entry(
-    widgets: &Widgets,
-    state: &SharedState,
-    entry: &gtk::Entry,
-    input: &str,
-) {
-    let suggestions = matching_address_suggestions(input, &state.borrow().address_suggestions, 6);
-    if suggestions.is_empty() {
-        hide_address_suggestions(widgets);
-    } else {
-        set_active_address_entry(widgets, entry);
-        if let Some(field) = recipient_field_for_entry(widgets, entry) {
-            *widgets.address_completion.borrow_mut() = Some(AddressCompletionSession {
-                field,
-                base: input.to_string(),
-                suggestions: suggestions.clone(),
-                next_index: 0,
-                generated_text: None,
-                suppress_next_change: false,
-            });
-        }
-        place_address_suggestions_after_entry(widgets, entry);
-        populate_address_suggestions_list(widgets, &suggestions);
-        widgets.address_suggestions_list.set_visible(true);
-    }
-}
-
-fn hide_address_suggestions(widgets: &Widgets) {
-    populate_address_suggestions_list(widgets, &[]);
-    widgets.address_suggestions_list.set_visible(false);
-}
-
-fn reset_address_completion(widgets: &Widgets) {
-    *widgets.address_completion.borrow_mut() = None;
-}
-
-fn set_active_address_entry(widgets: &Widgets, entry: &gtk::Entry) {
-    *widgets.active_address_entry.borrow_mut() = Some(entry.clone());
-}
-
-fn active_address_entry(widgets: &Widgets) -> gtk::Entry {
+    let suggestions = state.borrow().address_suggestions.clone();
     widgets
-        .active_address_entry
-        .borrow()
-        .clone()
-        .unwrap_or_else(|| widgets.compose_to.clone())
-}
-
-fn recipient_field_for_entry(widgets: &Widgets, entry: &gtk::Entry) -> Option<RecipientField> {
-    if entry == &widgets.compose_to {
-        Some(RecipientField::To)
-    } else if entry == &widgets.compose_cc {
-        Some(RecipientField::Cc)
-    } else if entry == &widgets.compose_bcc {
-        Some(RecipientField::Bcc)
-    } else {
-        None
-    }
-}
-
-fn focused_recipient_entry(widgets: &Widgets) -> Option<(RecipientField, gtk::Entry)> {
-    match widgets.active_address_field.get()? {
-        RecipientField::To => Some((RecipientField::To, widgets.compose_to.clone())),
-        RecipientField::Cc => Some((RecipientField::Cc, widgets.compose_cc.clone())),
-        RecipientField::Bcc => Some((RecipientField::Bcc, widgets.compose_bcc.clone())),
-    }
-}
-
-fn address_completion_current_matches(
-    widgets: &Widgets,
-    field: Option<RecipientField>,
-    text: &str,
-) -> bool {
-    let Some(field) = field else {
-        return false;
-    };
-    widgets
-        .address_completion
-        .borrow()
-        .as_ref()
-        .is_some_and(|session| {
-            session.field == field && address_session_matches_current(session, text)
-        })
-}
-
-fn place_address_suggestions_after_entry(widgets: &Widgets, entry: &gtk::Entry) {
-    let Some(parent) = entry.parent() else {
-        return;
-    };
-    let Ok(parent_box) = parent.downcast::<gtk::Box>() else {
-        return;
-    };
-    if let Some(current_parent) = widgets.address_suggestions_list.parent()
-        && let Ok(current_box) = current_parent.downcast::<gtk::Box>()
-    {
-        current_box.remove(&widgets.address_suggestions_list);
-    }
-    parent_box.insert_child_after(&widgets.address_suggestions_list, Some(entry));
-}
-
-fn matching_address_suggestions(input: &str, suggestions: &[String], limit: usize) -> Vec<String> {
-    let prefix = current_recipient_prefix(input).to_lowercase();
-    if prefix.is_empty() {
-        return Vec::new();
-    }
-    suggestions
-        .iter()
-        .filter(|suggestion| suggestion.to_lowercase().contains(&prefix))
-        .take(limit)
-        .cloned()
-        .collect()
-}
-
-fn current_recipient_prefix(input: &str) -> String {
-    input
-        .rsplit_once(',')
-        .map(|(_, tail)| tail)
-        .unwrap_or(input)
-        .trim()
-        .to_string()
-}
-
-fn apply_recipient_completion(entry: &gtk::Entry, state: &SharedState) -> bool {
-    let current = entry.text().to_string();
-    let Some(suggestion) =
-        matching_address_suggestions(&current, &state.borrow().address_suggestions, 1)
-            .into_iter()
-            .next()
-    else {
-        return false;
-    };
-    let next = if let Some((head, _)) = current.rsplit_once(',') {
-        format!("{}, {}", head.trim_end(), suggestion)
-    } else {
-        suggestion
-    };
-    entry.set_text(&next);
-    entry.set_position(-1);
-    true
+        .composer
+        .update_address_suggestions_for_active(input, &suggestions);
 }
 
 fn complete_focused_recipient(widgets: &Widgets, state: &SharedState) -> bool {
-    let Some((field, entry)) = focused_recipient_entry(widgets) else {
-        return false;
-    };
-    complete_recipient_entry_for_field(widgets, state, &entry, field)
-}
-
-fn complete_recipient_entry(widgets: &Widgets, state: &SharedState, entry: &gtk::Entry) -> bool {
-    let Some(field) = recipient_field_for_entry(widgets, entry) else {
-        return false;
-    };
-    complete_recipient_entry_for_field(widgets, state, entry, field)
-}
-
-fn complete_recipient_entry_for_field(
-    widgets: &Widgets,
-    state: &SharedState,
-    entry: &gtk::Entry,
-    field: RecipientField,
-) -> bool {
-    set_active_address_entry(widgets, entry);
-    place_address_suggestions_after_entry(widgets, entry);
-
-    let current = entry.text().to_string();
-    let reuse_session = widgets
-        .address_completion
-        .borrow()
-        .as_ref()
-        .is_some_and(|session| {
-            session.field == field && address_session_matches_current(session, &current)
-        });
-
-    if !reuse_session {
-        let suggestions =
-            matching_address_suggestions(&current, &state.borrow().address_suggestions, 20);
-        if suggestions.is_empty() {
-            hide_address_suggestions(widgets);
-            return false;
-        }
-        *widgets.address_completion.borrow_mut() = Some(AddressCompletionSession {
-            field,
-            base: current.clone(),
-            suggestions,
-            next_index: 0,
-            generated_text: None,
-            suppress_next_change: false,
-        });
-    }
-
-    let (next, index, suggestions) = {
-        let mut completion = widgets.address_completion.borrow_mut();
-        let Some(session) = completion.as_mut() else {
-            return false;
-        };
-        if session.suggestions.is_empty() {
-            *completion = None;
-            return false;
-        }
-        if let Some(current_index) = address_generated_index(session, &current) {
-            session.next_index = current_index.saturating_add(1);
-        }
-        let index = session.next_index % session.suggestions.len();
-        let next = recipient_suggestion_text(&session.base, &session.suggestions[index]);
-        session.generated_text = Some(next.clone());
-        session.suppress_next_change = true;
-        session.next_index = index + 1;
-        (next, index, session.suggestions.clone())
-    };
-
-    entry.set_text(&next);
-    entry.set_position(-1);
-    populate_address_suggestions_list(widgets, &suggestions);
-    if let Some(row) = widgets.address_suggestions_list.row_at_index(index as i32) {
-        widgets.address_suggestions_list.select_row(Some(&row));
-    }
-    widgets.address_suggestions_list.set_visible(true);
-    true
-}
-
-fn apply_recipient_suggestion(entry: &gtk::Entry, suggestion: &str) {
-    let current = entry.text().to_string();
-    apply_recipient_suggestion_to_text(entry, &current, suggestion);
-}
-
-fn apply_recipient_suggestion_to_text(entry: &gtk::Entry, current: &str, suggestion: &str) {
-    let next = recipient_suggestion_text(current, suggestion);
-    entry.set_text(&next);
-    entry.set_position(-1);
-}
-
-fn recipient_suggestion_text(current: &str, suggestion: &str) -> String {
-    if let Some((head, _)) = current.rsplit_once(',') {
-        format!("{}, {}", head.trim_end(), suggestion)
-    } else {
-        suggestion.to_string()
-    }
-}
-
-fn address_session_matches_current(session: &AddressCompletionSession, current: &str) -> bool {
-    session.base == current
-        || session.generated_text.as_deref() == Some(current)
-        || address_generated_index(session, current).is_some()
-}
-
-fn address_generated_index(session: &AddressCompletionSession, current: &str) -> Option<usize> {
-    session
-        .suggestions
-        .iter()
-        .position(|suggestion| recipient_suggestion_text(&session.base, suggestion) == current)
-}
-
-fn populate_address_suggestions_list(widgets: &Widgets, suggestions: &[String]) {
-    while let Some(child) = widgets.address_suggestions_list.first_child() {
-        widgets.address_suggestions_list.remove(&child);
-    }
-    for suggestion in suggestions {
-        let row = gtk::ListBoxRow::new();
-        row.set_widget_name(&format!(
-            "notm-address-suggestion-{}",
-            widget_token(suggestion)
-        ));
-        row.set_focusable(false);
-        let label = gtk::Label::new(Some(suggestion));
-        label.set_xalign(0.0);
-        label.set_margin_start(6);
-        label.set_margin_end(6);
-        label.set_margin_top(3);
-        label.set_margin_bottom(3);
-        row.set_child(Some(&label));
-        widgets.address_suggestions_list.append(&row);
-    }
+    let suggestions = state.borrow().address_suggestions.clone();
+    widgets.composer.complete_focused_recipient(&suggestions)
 }
 
 fn compose_fields(widgets: &Widgets, state: &SharedState) -> ComposeFields {
-    let mut fields = read_compose_fields(widgets);
     let stored = state.borrow().compose_fields.clone();
-    fields.attachments = stored.attachments;
-    fields.in_reply_to = stored.in_reply_to;
-    fields.references = stored.references;
-    fields.text_reply_quote = stored.text_reply_quote;
-    fields.html_reply_quote = stored.html_reply_quote;
-    fields
+    widgets.composer.read_fields(&stored)
 }
 
 fn record_compose_edit(state: &SharedState, fields: ComposeFields) {
@@ -7144,7 +6519,7 @@ fn record_compose_edit(state: &SharedState, fields: ComposeFields) {
 }
 
 fn autosave_draft_from_widgets(widgets: &Widgets, state: &SharedState) {
-    if widgets.compose_autosave_suppressed.get() {
+    if widgets.composer.autosave_suppressed() {
         return;
     }
     let fields = compose_fields(widgets, state);
@@ -7159,14 +6534,14 @@ fn persist_recovery_draft_from_ui(
     state: &SharedState,
     fields: &ComposeFields,
 ) -> bool {
-    match persist_recovery_draft(
-        &widgets.draft_path,
-        widgets.legacy_draft_path.as_deref(),
+    match composer::persist_recovery_draft(
+        widgets.composer.recovery_path(),
+        widgets.composer.legacy_recovery_path(),
         fields,
     ) {
         Ok(()) => {
             let mut state = state.borrow_mut();
-            if clear_transient_autosave_error(&mut state.last_error) {
+            if composer::clear_transient_autosave_error(&mut state.last_error) {
                 widgets.status_label.set_text("Draft autosave recovered");
             }
             true
@@ -7190,18 +6565,6 @@ fn report_draft_persistence_error(
     update_debug(widgets, state);
 }
 
-fn clear_transient_autosave_error(last_error: &mut Option<String>) -> bool {
-    if last_error
-        .as_deref()
-        .is_some_and(|error| error.starts_with("Draft autosave failed:"))
-    {
-        *last_error = None;
-        true
-    } else {
-        false
-    }
-}
-
 fn update_draft_action_buttons(widgets: &Widgets, state: &SharedState) {
     let (active_draft, background_activity, send_in_progress) = {
         let state = state.borrow();
@@ -7214,78 +6577,56 @@ fn update_draft_action_buttons(widgets: &Widgets, state: &SharedState) {
     if let Some(active_draft) = active_draft {
         let current_fields = compose_fields(widgets, state);
         if current_fields == active_draft.saved_fields {
-            widgets.clear_draft_button.set_label("Close draft");
+            widgets
+                .composer
+                .clear_draft_button()
+                .set_label("Close draft");
         } else {
-            widgets.clear_draft_button.set_label("Discard changes");
+            widgets
+                .composer
+                .clear_draft_button()
+                .set_label("Discard changes");
         }
-        widgets.delete_local_draft_button.set_visible(true);
+        widgets
+            .composer
+            .delete_local_draft_button()
+            .set_visible(true);
     } else {
-        widgets.clear_draft_button.set_label("Discard draft");
-        widgets.delete_local_draft_button.set_visible(false);
+        widgets
+            .composer
+            .clear_draft_button()
+            .set_label("Discard draft");
+        widgets
+            .composer
+            .delete_local_draft_button()
+            .set_visible(false);
     }
     widgets
-        .save_draft_button
-        .set_sensitive(!background_activity);
-    widgets.clear_draft_button.set_sensitive(!send_in_progress);
-    widgets
-        .delete_local_draft_button
+        .composer
+        .save_draft_button()
         .set_sensitive(!background_activity);
     widgets
-        .delete_selected_draft_button
-        .set_sensitive(!background_activity && widgets.draft_list.selected_row().is_some());
-    widgets.draft_list.set_sensitive(!send_in_progress);
+        .composer
+        .clear_draft_button()
+        .set_sensitive(!send_in_progress);
+    widgets
+        .composer
+        .delete_local_draft_button()
+        .set_sensitive(!background_activity);
+    widgets
+        .composer
+        .delete_selected_draft_button()
+        .set_sensitive(
+            !background_activity && widgets.composer.draft_list().selected_row().is_some(),
+        );
+    widgets
+        .composer
+        .draft_list()
+        .set_sensitive(!send_in_progress);
     update_button_binding_labels(widgets, state);
 }
 
-fn fields_has_content(fields: &ComposeFields) -> bool {
-    !fields.to.trim().is_empty()
-        || !fields.cc.trim().is_empty()
-        || !fields.bcc.trim().is_empty()
-        || !fields.subject.trim().is_empty()
-        || !fields.body.trim().is_empty()
-        || !fields.attachments.is_empty()
-}
-
-fn composer_requires_confirmation(fields: &ComposeFields, active: Option<&ActiveDraft>) -> bool {
-    match active {
-        Some(active) => fields != &active.saved_fields,
-        None => fields_has_content(fields),
-    }
-}
-
-impl ComposerReplacementKind {
-    fn name(self) -> &'static str {
-        match self {
-            Self::New => "new",
-            Self::Reply => "reply",
-            Self::ReplyAll => "reply_all",
-            Self::Forward => "forward",
-            Self::ForwardAttachment => "forward_attachment",
-            Self::StandaloneReply => "standalone_reply",
-            Self::StandaloneReplyAll => "standalone_reply_all",
-            Self::StandaloneForward => "standalone_forward",
-            Self::StandaloneForwardAttachment => "standalone_forward_attachment",
-            Self::NamedDraft => "named_draft",
-            Self::RecoveryDraft => "recovery_draft",
-            Self::IndexedDraft => "indexed_draft",
-        }
-    }
-}
-
-impl PendingAction {
-    fn kind_name(&self) -> &'static str {
-        match self {
-            Self::ClearComposer => "clear_composer",
-            Self::ReplaceComposer(replacement) => replacement.kind.name(),
-            Self::DeleteActiveDraft(_) => "delete_active_draft",
-            Self::DeleteNamedDraft(_) => "delete_named_draft",
-            Self::SaveDraftReplacement { .. } => "save_draft_replacement",
-            Self::SendComposer { .. } => "send_composer",
-            Self::ShowSelectedMessage { .. } => "show_selected_message",
-            Self::CloseMainWindow => "close_main_window",
-        }
-    }
-
+impl PendingTransition {
     fn operation(&self) -> UserOperation {
         match self {
             Self::ClearComposer => UserOperation::DraftClear,
@@ -7301,62 +6642,6 @@ impl PendingAction {
             Self::ShowSelectedMessage { .. } | Self::CloseMainWindow => {
                 UserOperation::ComposeReplace
             }
-        }
-    }
-
-    fn always_requires_confirmation(&self) -> bool {
-        let deletion = match self {
-            Self::DeleteActiveDraft(_) => Some(PersistedDraftDeletion::ExplicitActive),
-            Self::DeleteNamedDraft(_) => Some(PersistedDraftDeletion::ExplicitNamed),
-            Self::SaveDraftReplacement { .. } => Some(PersistedDraftDeletion::SaveReplacement),
-            Self::SendComposer { .. } => Some(PersistedDraftDeletion::AcceptedSendCleanup),
-            _ => None,
-        };
-        deletion.is_some_and(persisted_draft_deletion_requires_confirmation)
-    }
-
-    fn prompt(&self) -> (&'static str, &'static str, &'static str) {
-        match self {
-            Self::DeleteActiveDraft(_) => (
-                "Delete saved draft?",
-                "This permanently deletes the active saved draft.",
-                "Delete",
-            ),
-            Self::DeleteNamedDraft(_) => (
-                "Delete selected draft?",
-                "This permanently deletes the selected saved draft.",
-                "Delete",
-            ),
-            Self::SaveDraftReplacement { .. } => (
-                "Replace saved draft?",
-                "Saving these changes creates a replacement and permanently deletes the previous saved draft.",
-                "Replace",
-            ),
-            Self::SendComposer { .. } => (
-                "Send and delete saved draft?",
-                "If sending succeeds, this permanently deletes the active saved draft.",
-                "Send",
-            ),
-            Self::ClearComposer => (
-                "Discard composer changes?",
-                "The current composer has unsaved changes that will be discarded.",
-                "Discard",
-            ),
-            Self::ReplaceComposer(_) => (
-                "Replace composer contents?",
-                "The current composer has unsaved changes that will be replaced.",
-                "Replace",
-            ),
-            Self::ShowSelectedMessage { .. } => (
-                "Close composer and show message?",
-                "The current composer has unsaved changes. Showing the message detaches its active draft context; recovery data remains available.",
-                "Show message",
-            ),
-            Self::CloseMainWindow => (
-                "Close notm with composer changes?",
-                "The current composer has unsaved changes. Recovery data remains available on the next launch.",
-                "Close",
-            ),
         }
     }
 
@@ -7377,125 +6662,176 @@ impl PendingAction {
             apply_message_selection_snapshot(options, widgets, state, restore);
         }
     }
+
+    fn into_confirmation_action(
+        self,
+        options: &LaunchOptions,
+        widgets: &Widgets,
+        state: &SharedState,
+    ) -> PendingAction {
+        let kind = match &self {
+            Self::ClearComposer => PendingTransitionKind::ClearComposer,
+            Self::ReplaceComposer(replacement) => {
+                PendingTransitionKind::ReplaceComposer(replacement.kind)
+            }
+            Self::DeleteActiveDraft(_) => PendingTransitionKind::DeleteActiveDraft,
+            Self::DeleteNamedDraft(_) => PendingTransitionKind::DeleteNamedDraft,
+            Self::SaveDraftReplacement { .. } => PendingTransitionKind::SaveDraftReplacement,
+            Self::SendComposer { .. } => PendingTransitionKind::SendComposer,
+            Self::ShowSelectedMessage { .. } => PendingTransitionKind::ShowSelectedMessage,
+            Self::CloseMainWindow => PendingTransitionKind::CloseMainWindow,
+        };
+        let transition = Rc::new(RefCell::new(Some(self)));
+        let accept_transition = transition.clone();
+        let opts = options.clone();
+        let w = widgets.clone();
+        let st = state.clone();
+        let accept = move || {
+            let Some(transition) = accept_transition.borrow_mut().take() else {
+                return false;
+            };
+            execute_pending_action(&opts, &w, &st, transition)
+        };
+        let reject_transition = transition;
+        let opts = options.clone();
+        let w = widgets.clone();
+        let st = state.clone();
+        let reject = move || {
+            if let Some(transition) = reject_transition.borrow_mut().take() {
+                transition.rollback_preparation(&opts, &w, &st);
+            }
+        };
+        let hooks = TransitionHooks::new(accept, reject);
+        match kind {
+            PendingTransitionKind::ClearComposer => PendingAction::ClearComposer(hooks),
+            PendingTransitionKind::ReplaceComposer(kind) => {
+                PendingAction::ReplaceComposer { kind, hooks }
+            }
+            PendingTransitionKind::DeleteActiveDraft => PendingAction::DeleteActiveDraft(hooks),
+            PendingTransitionKind::DeleteNamedDraft => PendingAction::DeleteNamedDraft(hooks),
+            PendingTransitionKind::SaveDraftReplacement => {
+                PendingAction::SaveDraftReplacement(hooks)
+            }
+            PendingTransitionKind::SendComposer => PendingAction::SendComposer(hooks),
+            PendingTransitionKind::ShowSelectedMessage => PendingAction::ShowSelectedMessage(hooks),
+            PendingTransitionKind::CloseMainWindow => PendingAction::CloseMainWindow(hooks),
+        }
+    }
 }
 
-fn pending_action_requires_confirmation(
-    action: &PendingAction,
-    fields: &ComposeFields,
-    active: Option<&ActiveDraft>,
-) -> bool {
-    action.always_requires_confirmation() || composer_requires_confirmation(fields, active)
+fn pending_operation(operation: PendingOperation) -> UserOperation {
+    match operation {
+        PendingOperation::DraftClear => UserOperation::DraftClear,
+        PendingOperation::DraftLoad => UserOperation::DraftLoad,
+        PendingOperation::ComposeReplace => UserOperation::ComposeReplace,
+        PendingOperation::DraftDelete => UserOperation::DraftDelete,
+        PendingOperation::DraftSave => UserOperation::DraftSave,
+        PendingOperation::Send => UserOperation::Send,
+    }
 }
 
 fn request_pending_action(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
-    action: PendingAction,
+    action: PendingTransition,
 ) -> bool {
     if let Err(err) = ensure_user_operation_allowed(widgets, state, action.operation()) {
         action.rollback_preparation(options, widgets, state);
         widgets.status_label.set_text(&err.to_string());
         return false;
     }
-    if widgets.confirmation_controller.borrow().pending.is_some() {
-        action.rollback_preparation(options, widgets, state);
-        let message = "Another confirmation is already pending";
-        widgets.status_label.set_text(message);
-        state.borrow_mut().last_error = Some(message.to_string());
-        update_debug(widgets, state);
-        return false;
-    }
     let fields = compose_fields(widgets, state);
     let active = state.borrow().active_draft.clone();
-    if !pending_action_requires_confirmation(&action, &fields, active.as_ref()) {
-        return execute_pending_action(options, widgets, state, action);
-    }
-
-    let (title, detail, confirm_label) = action.prompt();
-    let dialog = gtk::Dialog::builder()
-        .title(title)
-        .transient_for(&widgets.window)
-        .modal(true)
-        .default_width(480)
-        .build();
-    dialog.set_widget_name("notm-confirmation-dialog");
-    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
-    let confirm = dialog.add_button(confirm_label, gtk::ResponseType::Accept);
-    confirm.add_css_class("destructive-action");
-    dialog.set_default_response(gtk::ResponseType::Cancel);
-    let area = dialog.content_area();
-    area.set_spacing(8);
-    area.set_margin_start(16);
-    area.set_margin_end(16);
-    area.set_margin_top(12);
-    area.set_margin_bottom(12);
-    let label = gtk::Label::new(Some(detail));
-    label.set_xalign(0.0);
-    label.set_wrap(true);
-    area.append(&label);
-
-    let id = {
-        let mut controller = widgets.confirmation_controller.borrow_mut();
-        let id = controller.next_id;
-        controller.next_id = controller.next_id.checked_add(1).unwrap_or(1);
-        controller.last_completion = None;
-        controller.pending = Some(PendingConfirmation {
-            id,
-            action,
-            dialog: dialog.downgrade(),
-        });
-        id
-    };
-    let opts = options.clone();
+    let action = action.into_confirmation_action(options, widgets, state);
     let w = widgets.clone();
     let st = state.clone();
-    dialog.connect_response(move |dialog, response| {
-        complete_pending_confirmation(&opts, &w, &st, id, response == gtk::ResponseType::Accept);
-        dialog.destroy();
+    let response_handler = Rc::new(move |id, accepted| {
+        complete_pending_confirmation(&w, &st, id, accepted);
     });
-    widgets
-        .status_label
-        .set_text(&format!("Confirmation required: {title}"));
-    dialog.present();
-    true
+    match widgets.composer.request_confirmation(
+        &fields,
+        active.as_ref(),
+        action,
+        confirmation_presenter(&widgets.window),
+        response_handler,
+    ) {
+        Ok(composer::ConfirmationDisposition::Immediate(action)) => action.accept(),
+        Ok(composer::ConfirmationDisposition::Pending { title, .. }) => {
+            widgets
+                .status_label
+                .set_text(&format!("Confirmation required: {title}"));
+            true
+        }
+        Err(action) => {
+            action.reject();
+            let message = "Another confirmation is already pending";
+            widgets.status_label.set_text(message);
+            state.borrow_mut().last_error = Some(message.to_string());
+            update_debug(widgets, state);
+            false
+        }
+    }
+}
+
+fn confirmation_presenter(window: &gtk::ApplicationWindow) -> composer::ConfirmationPresenter {
+    let parent = window.downgrade();
+    Rc::new(move |prompt, response_handler| {
+        let Some(parent) = parent.upgrade() else {
+            return gtk::glib::WeakRef::new();
+        };
+        let dialog = gtk::Dialog::builder()
+            .title(prompt.title)
+            .transient_for(&parent)
+            .modal(true)
+            .default_width(480)
+            .build();
+        dialog.set_widget_name("notm-confirmation-dialog");
+        dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+        let confirm = dialog.add_button(prompt.confirm_label, gtk::ResponseType::Accept);
+        confirm.add_css_class("destructive-action");
+        dialog.set_default_response(gtk::ResponseType::Cancel);
+        let area = dialog.content_area();
+        area.set_spacing(8);
+        area.set_margin_start(16);
+        area.set_margin_end(16);
+        area.set_margin_top(12);
+        area.set_margin_bottom(12);
+        let label = gtk::Label::new(Some(prompt.detail));
+        label.set_xalign(0.0);
+        label.set_wrap(true);
+        area.append(&label);
+        dialog.connect_response(move |dialog, response| {
+            response_handler(prompt.id, response == gtk::ResponseType::Accept);
+            dialog.destroy();
+        });
+        dialog.present();
+        dialog.upcast::<gtk::Widget>().downgrade()
+    })
 }
 
 fn complete_pending_confirmation(
-    options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
     id: u64,
     accepted: bool,
 ) -> bool {
-    let action = {
-        let mut controller = widgets.confirmation_controller.borrow_mut();
-        let Some(pending) = controller.pending.as_ref() else {
-            return false;
-        };
-        if pending.id != id {
-            return false;
-        }
-        controller
-            .pending
-            .take()
-            .expect("checked pending confirmation")
-            .action
+    let Some(action) = widgets.composer.take_confirmation_action(id) else {
+        return false;
     };
     if !accepted {
-        action.rollback_preparation(options, widgets, state);
+        action.reject();
         widgets.status_label.set_text("Action cancelled");
         update_debug(widgets, state);
-        widgets.confirmation_controller.borrow_mut().last_completion =
-            Some(ConfirmationCompletion {
-                id,
-                accepted: false,
-                succeeded: true,
-            });
+        widgets
+            .composer
+            .record_confirmation_completion(id, false, true);
         return true;
     }
-    if let Err(err) = ensure_user_operation_allowed(widgets, state, action.operation()) {
-        action.rollback_preparation(options, widgets, state);
+    if let Err(err) =
+        ensure_user_operation_allowed(widgets, state, pending_operation(action.operation()))
+    {
+        action.reject();
         let message = err.to_string();
         widgets.status_label.set_text(&message);
         {
@@ -7504,20 +6840,15 @@ fn complete_pending_confirmation(
             state.last_operation = Some(message);
         }
         update_debug(widgets, state);
-        widgets.confirmation_controller.borrow_mut().last_completion =
-            Some(ConfirmationCompletion {
-                id,
-                accepted: true,
-                succeeded: false,
-            });
+        widgets
+            .composer
+            .record_confirmation_completion(id, true, false);
         return false;
     }
-    let succeeded = execute_pending_action(options, widgets, state, action);
-    widgets.confirmation_controller.borrow_mut().last_completion = Some(ConfirmationCompletion {
-        id,
-        accepted: true,
-        succeeded,
-    });
+    let succeeded = action.accept();
+    widgets
+        .composer
+        .record_confirmation_completion(id, true, succeeded);
     succeeded
 }
 
@@ -7525,18 +6856,22 @@ fn execute_pending_action(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
-    action: PendingAction,
+    action: PendingTransition,
 ) -> bool {
     match action {
-        PendingAction::ClearComposer => clear_current_draft_immediately(options, widgets, state),
-        PendingAction::ReplaceComposer(replacement) => {
+        PendingTransition::ClearComposer => {
+            clear_current_draft_immediately(options, widgets, state)
+        }
+        PendingTransition::ReplaceComposer(replacement) => {
             apply_prepared_composer_replacement(options, widgets, state, replacement)
         }
-        PendingAction::DeleteActiveDraft(draft) => {
+        PendingTransition::DeleteActiveDraft(draft) => {
             delete_captured_active_draft(options, widgets, state, draft)
         }
-        PendingAction::DeleteNamedDraft(path) => delete_captured_named_draft(widgets, state, path),
-        PendingAction::SaveDraftReplacement { fields, previous } => {
+        PendingTransition::DeleteNamedDraft(path) => {
+            delete_captured_named_draft(widgets, state, path)
+        }
+        PendingTransition::SaveDraftReplacement { fields, previous } => {
             match finish_captured_draft_save(options, widgets, state, fields, Some(previous)) {
                 Ok(_) => true,
                 Err(err) => {
@@ -7545,7 +6880,7 @@ fn execute_pending_action(
                 }
             }
         }
-        PendingAction::SendComposer {
+        PendingTransition::SendComposer {
             fields,
             active,
             generation,
@@ -7560,7 +6895,7 @@ fn execute_pending_action(
                 false
             }
         },
-        PendingAction::ShowSelectedMessage {
+        PendingTransition::ShowSelectedMessage {
             selection,
             status,
             active_pane,
@@ -7574,11 +6909,8 @@ fn execute_pending_action(
             widgets.status_label.set_text(&status);
             true
         }
-        PendingAction::CloseMainWindow => {
-            widgets
-                .confirmation_controller
-                .borrow_mut()
-                .allow_close_once = true;
+        PendingTransition::CloseMainWindow => {
+            widgets.composer.allow_close_once();
             widgets.window.close();
             true
         }
@@ -7606,7 +6938,7 @@ fn request_show_selected_message(
         options,
         widgets,
         state,
-        PendingAction::ShowSelectedMessage {
+        PendingTransition::ShowSelectedMessage {
             selection,
             rejection_restore,
             status,
@@ -7676,7 +7008,7 @@ fn apply_prepared_composer_replacement(
     match replacement.payload {
         ComposerReplacementPayload::Empty => {
             let fields = ComposeFields {
-                from: widgets.compose_from.text().to_string(),
+                from: widgets.composer.sender_entry().text().to_string(),
                 ..ComposeFields::default()
             };
             apply_compose_fields(widgets, state, fields);
@@ -7725,7 +7057,7 @@ fn apply_prepared_composer_replacement(
     }
     state.borrow_mut().active_pane = replacement.active_pane;
     if state.borrow().input_mode == InputMode::Insert {
-        widgets.compose_to.grab_focus();
+        widgets.composer.to_entry().grab_focus();
     } else {
         focus_active_pane(widgets, state);
     }
@@ -7738,146 +7070,6 @@ fn apply_prepared_composer_replacement(
     }
     update_debug(widgets, state);
     true
-}
-
-fn xdg_home_path(
-    configured_home: Option<&OsStr>,
-    home: Option<&OsStr>,
-    home_suffix: &str,
-    fallback: &str,
-) -> PathBuf {
-    configured_home
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            home.filter(|path| !path.is_empty())
-                .map(|path| PathBuf::from(path).join(home_suffix))
-        })
-        .unwrap_or_else(|| PathBuf::from(fallback))
-}
-
-fn default_state_home() -> PathBuf {
-    let configured_home = std::env::var_os("XDG_STATE_HOME");
-    let home = std::env::var_os("HOME");
-    xdg_home_path(
-        configured_home.as_deref(),
-        home.as_deref(),
-        ".local/state",
-        "target/notm-state",
-    )
-}
-
-fn legacy_default_cache_home() -> PathBuf {
-    let configured_home = std::env::var_os("XDG_CACHE_HOME");
-    let home = std::env::var_os("HOME");
-    xdg_home_path(
-        configured_home.as_deref(),
-        home.as_deref(),
-        ".cache",
-        "target/notm-cache",
-    )
-}
-
-fn compose_state_path(state_home: &Path, relative_path: &str) -> PathBuf {
-    state_home.join("notm").join(relative_path)
-}
-
-fn default_draft_path() -> PathBuf {
-    compose_state_path(&default_state_home(), "draft.json")
-}
-
-fn legacy_default_draft_path() -> PathBuf {
-    legacy_default_cache_home().join("notm/draft.json")
-}
-
-fn legacy_default_drafts_dir() -> PathBuf {
-    legacy_default_cache_home().join("notm/drafts")
-}
-
-fn default_drafts_dir() -> PathBuf {
-    compose_state_path(&default_state_home(), "drafts")
-}
-
-fn save_draft_fields(path: &Path, fields: &ComposeFields) -> anyhow::Result<PathBuf> {
-    atomic_write(path, &serde_json::to_vec_pretty(fields)?)?;
-    Ok(path.to_path_buf())
-}
-
-fn persist_recovery_draft(
-    path: &Path,
-    legacy_path: Option<&Path>,
-    fields: &ComposeFields,
-) -> anyhow::Result<()> {
-    if fields_has_content(fields) {
-        save_draft_fields(path, fields)?;
-        if let Some(legacy_path) = legacy_path {
-            remove_file_if_present(legacy_path)?;
-        }
-    } else {
-        clear_recovery_draft_files(path, legacy_path)?;
-    }
-    Ok(())
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    atomic_write_with_sync(path, bytes, false)
-}
-
-fn atomic_write_durable(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    atomic_write_with_sync(path, bytes, true)
-}
-
-fn atomic_write_with_sync(path: &Path, bytes: &[u8], sync_to_disk: bool) -> anyhow::Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let filename = path
-        .file_name()
-        .and_then(OsStr::to_str)
-        .unwrap_or("notm-state");
-    let temporary_path = parent.join(format!(".{filename}.{}.tmp", Uuid::new_v4()));
-    let write_result = (|| -> anyhow::Result<()> {
-        let mut temporary = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary_path)?;
-        temporary.write_all(bytes)?;
-        if sync_to_disk {
-            temporary.sync_all()?;
-        }
-        drop(temporary);
-        std::fs::rename(&temporary_path, path)?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = std::fs::remove_file(&temporary_path);
-    }
-    write_result.map_err(|err| anyhow::anyhow!("writing {} atomically: {err}", path.display()))
-}
-
-fn save_named_draft_fields(dir: &Path, fields: &ComposeFields) -> anyhow::Result<PathBuf> {
-    anyhow::ensure!(fields_has_content(fields), "draft has no content");
-    std::fs::create_dir_all(dir)?;
-    let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
-    let slug = widget_token(&fields.subject);
-    let slug = if slug.is_empty() {
-        "untitled".to_string()
-    } else {
-        slug.chars().take(32).collect()
-    };
-    let path = dir.join(format!("{stamp}-{slug}-{}.json", Uuid::new_v4()));
-    atomic_write_durable(&path, &serde_json::to_vec_pretty(fields)?)?;
-    Ok(path)
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DraftSaveReport {
-    local_path: Option<PathBuf>,
-    maildir_path: Option<PathBuf>,
-    indexed_message_id: Option<String>,
-    replaced_path: Option<PathBuf>,
 }
 
 fn request_save_current_draft(
@@ -7904,7 +7096,7 @@ fn request_save_current_draft(
             options,
             widgets,
             state,
-            PendingAction::SaveDraftReplacement { fields, previous },
+            PendingTransition::SaveDraftReplacement { fields, previous },
         );
         anyhow::ensure!(
             requested,
@@ -7924,13 +7116,16 @@ fn finish_captured_draft_save(
 ) -> anyhow::Result<DraftSaveReport> {
     anyhow::ensure!(fields_has_content(&fields), "draft has no content");
     let persisted = if options.save_drafts_to_maildir {
-        let message = composed_message_from_fields(&fields)?;
+        let message = composer::composed_message_from_fields(&fields)?;
         persist_draft_message(options, &message)?
     } else {
         None
     };
     let local_path = if persisted.is_none() {
-        Some(save_named_draft_fields(&widgets.drafts_dir, &fields)?)
+        Some(composer::save_named_draft_fields(
+            widgets.composer.drafts_dir(),
+            &fields,
+        )?)
     } else {
         None
     };
@@ -7975,7 +7170,7 @@ fn finish_captured_draft_save(
         indexed_message_id: persisted.and_then(|persisted| persisted.indexed_message_id),
         replaced_path,
     };
-    refresh_draft_list(widgets);
+    widgets.composer.refresh_draft_list();
     announce_draft_save(widgets, state, &report);
     if report.indexed_message_id.is_some() {
         let current = state.borrow().current_query.clone();
@@ -8032,7 +7227,7 @@ fn delete_active_draft_from_ui(
         options,
         widgets,
         state,
-        PendingAction::DeleteActiveDraft(draft),
+        PendingTransition::DeleteActiveDraft(draft),
     )
 }
 
@@ -8046,9 +7241,9 @@ fn delete_captured_active_draft(
         Ok(()) => {
             if state.borrow().active_draft.as_ref() == Some(&draft) {
                 clear_draft_widgets(options, widgets, state);
-                if let Err(err) = clear_recovery_draft_files(
-                    &widgets.draft_path,
-                    widgets.legacy_draft_path.as_deref(),
+                if let Err(err) = composer::clear_recovery_draft_files(
+                    widgets.composer.recovery_path(),
+                    widgets.composer.legacy_recovery_path(),
                 ) {
                     report_draft_persistence_error(
                         widgets,
@@ -8084,46 +7279,11 @@ fn delete_captured_active_draft(
     }
 }
 
-fn migrate_legacy_named_drafts(dir: &Path, legacy_dir: &Path) -> anyhow::Result<usize> {
-    let entries = match std::fs::read_dir(legacy_dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(err) => return Err(err.into()),
-    };
-    let mut migrated = 0;
-    for entry in entries {
-        let entry = entry?;
-        let legacy_path = entry.path();
-        if legacy_path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
-        let bytes = std::fs::read(&legacy_path)?;
-        std::fs::create_dir_all(dir)?;
-        let filename = entry.file_name();
-        let mut destination = dir.join(&filename);
-        if destination.exists() {
-            if std::fs::read(&destination)? == bytes {
-                remove_file_if_present(&legacy_path)?;
-                continue;
-            }
-            destination = dir.join(format!(
-                "legacy-{}-{}",
-                Uuid::new_v4(),
-                filename.to_string_lossy()
-            ));
-        }
-        atomic_write_durable(&destination, &bytes)?;
-        remove_file_if_present(&legacy_path)?;
-        migrated += 1;
-    }
-    Ok(migrated)
-}
-
 fn migrate_legacy_named_drafts_from_ui(widgets: &Widgets, state: &SharedState) {
-    let Some(legacy_dir) = widgets.legacy_drafts_dir.as_deref() else {
+    let Some(legacy_dir) = widgets.composer.legacy_drafts_dir() else {
         return;
     };
-    match migrate_legacy_named_drafts(&widgets.drafts_dir, legacy_dir) {
+    match composer::migrate_legacy_named_drafts(widgets.composer.drafts_dir(), legacy_dir) {
         Ok(0) => {}
         Ok(count) => {
             let message = format!("Migrated {count} legacy named draft(s) to persistent state");
@@ -8136,99 +7296,12 @@ fn migrate_legacy_named_drafts_from_ui(widgets: &Widgets, state: &SharedState) {
     }
 }
 
-fn list_named_drafts(dir: &Path, legacy_dir: Option<&Path>) -> Vec<(PathBuf, ComposeFields)> {
-    let mut drafts: Vec<(Option<std::time::SystemTime>, PathBuf, ComposeFields)> = Vec::new();
-    for dir in std::iter::once(dir).chain(legacy_dir) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                continue;
-            }
-            let Some(fields) = std::fs::read(&path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<ComposeFields>(&bytes).ok())
-            else {
-                continue;
-            };
-            let duplicate = drafts.iter().any(|(_, existing_path, existing_fields)| {
-                existing_path.file_name() == path.file_name() && existing_fields == &fields
-            });
-            if duplicate {
-                continue;
-            }
-            let modified = entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .ok();
-            drafts.push((modified, path, fields));
-        }
-    }
-    drafts.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    drafts
-        .into_iter()
-        .map(|(_, path, fields)| (path, fields))
-        .collect()
-}
-
-fn refresh_draft_list(widgets: &Widgets) {
-    while let Some(child) = widgets.draft_list.first_child() {
-        widgets.draft_list.remove(&child);
-    }
-    let drafts = list_named_drafts(&widgets.drafts_dir, widgets.legacy_drafts_dir.as_deref());
-    let is_empty = drafts.is_empty();
-    for (index, (path, fields)) in drafts.into_iter().enumerate() {
-        let row = gtk::ListBoxRow::new();
-        row.set_widget_name(&format!("notm-draft-row-{index}"));
-        let subject = if fields.subject.trim().is_empty() {
-            "(no subject)"
-        } else {
-            fields.subject.trim()
-        };
-        let to = if fields.to.trim().is_empty() {
-            "(no recipients)"
-        } else {
-            fields.to.trim()
-        };
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("draft.json");
-        let label = gtk::Label::new(Some(&format!("{subject} → {to}\n{filename}")));
-        label.set_xalign(0.0);
-        label.set_wrap(true);
-        label.set_margin_start(6);
-        label.set_margin_end(6);
-        label.set_margin_top(3);
-        label.set_margin_bottom(3);
-        row.set_child(Some(&label));
-        widgets.draft_list.append(&row);
-    }
-    widgets.draft_empty_label.set_visible(is_empty);
-    widgets.draft_scrolled.set_visible(!is_empty);
-    widgets.delete_selected_draft_button.set_sensitive(false);
-}
-
-fn selected_named_draft(widgets: &Widgets) -> anyhow::Result<(PathBuf, ComposeFields)> {
-    let index = widgets
-        .draft_list
-        .selected_row()
-        .map(|row| row.index() as usize)
-        .unwrap_or(0);
-    list_named_drafts(&widgets.drafts_dir, widgets.legacy_drafts_dir.as_deref())
-        .into_iter()
-        .nth(index)
-        .ok_or_else(|| anyhow::anyhow!("no selected draft"))
-}
-
 fn load_selected_named_draft(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
 ) -> anyhow::Result<(bool, PathBuf)> {
-    let (path, fields) = selected_named_draft(widgets)?;
+    let (path, fields) = widgets.composer.selected_named_draft()?;
     let active_source = PreparedActiveDraft {
         path: path.clone(),
         message_id: None,
@@ -8238,7 +7311,7 @@ fn load_selected_named_draft(
         options,
         widgets,
         state,
-        PendingAction::ReplaceComposer(PreparedComposerReplacement {
+        PendingTransition::ReplaceComposer(PreparedComposerReplacement {
             kind: ComposerReplacementKind::NamedDraft,
             payload: ComposerReplacementPayload::Draft(Box::new(PreparedDraftReplacement {
                 fields,
@@ -8257,16 +7330,12 @@ fn load_selected_named_draft(
     Ok((requested, path))
 }
 
-fn active_draft_matches_path(active_draft: Option<&ActiveDraft>, path: &Path) -> bool {
-    active_draft.is_some_and(|draft| draft.path == path)
-}
-
 fn delete_selected_named_draft_from_ui(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
 ) -> bool {
-    let path = match selected_named_draft(widgets) {
+    let path = match widgets.composer.selected_named_draft() {
         Ok((path, _)) => path,
         Err(err) => {
             report_draft_persistence_error(widgets, state, "Saved draft delete failed", &err);
@@ -8277,7 +7346,7 @@ fn delete_selected_named_draft_from_ui(
         options,
         widgets,
         state,
-        PendingAction::DeleteNamedDraft(path),
+        PendingTransition::DeleteNamedDraft(path),
     )
 }
 
@@ -8286,10 +7355,10 @@ fn delete_captured_named_draft(widgets: &Widgets, state: &SharedState, path: Pat
         .map_err(|err| anyhow::anyhow!("removing saved draft {}: {err}", path.display()))
     {
         Ok(()) => {
-            if active_draft_matches_path(state.borrow().active_draft.as_ref(), &path) {
+            if composer::active_draft_matches_path(state.borrow().active_draft.as_ref(), &path) {
                 set_active_draft(widgets, state, None);
             }
-            refresh_draft_list(widgets);
+            widgets.composer.refresh_draft_list();
             let message = format!("Deleted saved draft {}", path.display());
             {
                 let mut state = state.borrow_mut();
@@ -8307,28 +7376,17 @@ fn delete_captured_named_draft(widgets: &Widgets, state: &SharedState, path: Pat
     }
 }
 
-#[cfg(test)]
-fn migrate_legacy_recovery_draft(path: &Path, legacy_path: &Path) -> anyhow::Result<bool> {
-    if path.exists() || !legacy_path.exists() {
-        return Ok(false);
-    }
-    let bytes = std::fs::read(legacy_path)?;
-    atomic_write_durable(path, &bytes)?;
-    remove_file_if_present(legacy_path)?;
-    Ok(true)
-}
-
 fn restore_draft_if_present(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
 ) -> bool {
-    let source_path = if widgets.draft_path.exists() {
-        Some(widgets.draft_path.as_path())
+    let source_path = if widgets.composer.recovery_path().exists() {
+        Some(widgets.composer.recovery_path())
     } else {
         widgets
-            .legacy_draft_path
-            .as_deref()
+            .composer
+            .legacy_recovery_path()
             .filter(|legacy_path| legacy_path.exists())
     };
     let Some(source_path) = source_path else {
@@ -8347,19 +7405,19 @@ fn restore_draft_if_present(
     if !fields_has_content(&fields) {
         return true;
     }
-    let status = if source_path == widgets.draft_path {
+    let status = if source_path == widgets.composer.recovery_path() {
         format!("Recovered draft from {}", source_path.display())
     } else {
         format!(
             "Recovered draft from {} (migrated from legacy cache)",
-            widgets.draft_path.display()
+            widgets.composer.recovery_path().display()
         )
     };
     request_pending_action(
         options,
         widgets,
         state,
-        PendingAction::ReplaceComposer(PreparedComposerReplacement {
+        PendingTransition::ReplaceComposer(PreparedComposerReplacement {
             kind: ComposerReplacementKind::RecoveryDraft,
             payload: ComposerReplacementPayload::Draft(Box::new(PreparedDraftReplacement {
                 fields,
@@ -8377,33 +7435,12 @@ fn restore_draft_if_present(
     )
 }
 
-fn remove_file_if_present(path: &Path) -> anyhow::Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(anyhow::anyhow!("removing {}: {err}", path.display())),
-    }
-}
-
-fn clear_recovery_draft_files(path: &Path, legacy_path: Option<&Path>) -> anyhow::Result<()> {
-    let mut errors = Vec::new();
-    for path in std::iter::once(path).chain(legacy_path) {
-        if let Err(err) = remove_file_if_present(path) {
-            errors.push(format!("{}: {err}", path.display()));
-        }
-    }
-    if !errors.is_empty() {
-        anyhow::bail!("could not remove recovery draft: {}", errors.join("; "));
-    }
-    Ok(())
-}
-
 fn clear_current_draft_from_ui(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
 ) -> bool {
-    request_pending_action(options, widgets, state, PendingAction::ClearComposer)
+    request_pending_action(options, widgets, state, PendingTransition::ClearComposer)
 }
 
 fn clear_current_draft_immediately(
@@ -8411,9 +7448,10 @@ fn clear_current_draft_immediately(
     widgets: &Widgets,
     state: &SharedState,
 ) -> bool {
-    if let Err(err) =
-        clear_recovery_draft_files(&widgets.draft_path, widgets.legacy_draft_path.as_deref())
-    {
+    if let Err(err) = composer::clear_recovery_draft_files(
+        widgets.composer.recovery_path(),
+        widgets.composer.legacy_recovery_path(),
+    ) {
         report_draft_persistence_error(widgets, state, "Draft recovery clear failed", &err);
         return false;
     }
@@ -8425,12 +7463,12 @@ fn clear_current_draft_immediately(
 
 fn clear_draft_widgets(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     let fields = ComposeFields {
-        from: widgets.compose_from.text().to_string(),
+        from: widgets.composer.sender_entry().text().to_string(),
         ..ComposeFields::default()
     };
     apply_compose_fields(widgets, state, fields);
     set_active_draft(widgets, state, None);
-    widgets.address_suggestions_list.set_visible(false);
+    widgets.composer.hide_address_suggestions();
     restore_message_view_after_compose(options, widgets, state);
 }
 
@@ -8451,13 +7489,7 @@ fn restore_message_view_after_compose(
 }
 
 fn apply_compose_fields(widgets: &Widgets, state: &SharedState, fields: ComposeFields) {
-    widgets.compose_from.set_text(&fields.from);
-    widgets.compose_to.set_text(&fields.to);
-    widgets.compose_cc.set_text(&fields.cc);
-    widgets.compose_bcc.set_text(&fields.bcc);
-    widgets.compose_subject.set_text(&fields.subject);
-    widgets.compose_body.buffer().set_text(&fields.body);
-    move_compose_cursor_to_start(widgets);
+    widgets.composer.apply_fields(&fields);
     update_attachment_label(widgets, &fields.attachments);
     record_compose_edit(state, fields.clone());
     persist_recovery_draft_from_ui(widgets, state, &fields);
@@ -8465,14 +7497,7 @@ fn apply_compose_fields(widgets: &Widgets, state: &SharedState, fields: ComposeF
 }
 
 fn move_compose_cursor_to_start(widgets: &Widgets) {
-    let buffer = widgets.compose_body.buffer();
-    let start = buffer.start_iter();
-    buffer.place_cursor(&start);
-    let compose_body = widgets.compose_body.clone();
-    gtk::glib::timeout_add_local_once(Duration::from_millis(0), move || {
-        let mut start = compose_body.buffer().start_iter();
-        compose_body.scroll_to_iter(&mut start, 0.0, true, 0.0, 0.0);
-    });
+    widgets.composer.move_cursor_to_start();
 }
 
 fn add_attachment_path(widgets: &Widgets, state: &SharedState, path: PathBuf) {
@@ -8495,33 +7520,7 @@ fn add_attachment_path(widgets: &Widgets, state: &SharedState, path: PathBuf) {
 }
 
 fn update_attachment_label(widgets: &Widgets, attachments: &[String]) {
-    attachments::set_compose_attachment_label(&widgets.compose_attachments, attachments);
-}
-
-fn composed_message_from_fields(fields: &ComposeFields) -> anyhow::Result<ComposedMessage> {
-    let mut message = ComposedMessage::new(
-        fields.from.clone(),
-        split_recipients(&fields.to),
-        fields.subject.clone(),
-        fields.body.clone(),
-    );
-    message.cc = split_recipients(&fields.cc);
-    message.bcc = split_recipients(&fields.bcc);
-    message.in_reply_to = fields
-        .in_reply_to
-        .as_ref()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    message.references = fields
-        .references
-        .iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect();
-    message.text_reply_quote = fields.text_reply_quote.clone();
-    message.html_reply_quote = fields.html_reply_quote.clone();
-    message.attachments = attachments::load_compose_attachments(fields)?;
-    Ok(message)
+    attachments::set_compose_attachment_label(&widgets.composer.attachments_label(), attachments);
 }
 
 fn attachment_event_handler(widgets: &Widgets, state: &SharedState) -> AttachmentEventHandler {
@@ -9195,7 +8194,7 @@ fn open_selected_draft_message(
         .filenames
         .first()
         .ok_or_else(|| anyhow::anyhow!("selected draft has no file"))?;
-    let (fields, attachment_inputs) = prepare_draft_fields_from_message_file(filename)?;
+    let (fields, attachment_inputs) = composer::prepare_draft_fields_from_message_file(filename)?;
     let active_source = PreparedActiveDraft {
         path: PathBuf::from(filename),
         message_id: Some(message.message_id.clone()),
@@ -9205,7 +8204,7 @@ fn open_selected_draft_message(
         options,
         widgets,
         state,
-        PendingAction::ReplaceComposer(PreparedComposerReplacement {
+        PendingTransition::ReplaceComposer(PreparedComposerReplacement {
             kind: ComposerReplacementKind::IndexedDraft,
             payload: ComposerReplacementPayload::Draft(Box::new(PreparedDraftReplacement {
                 fields,
@@ -9223,64 +8222,6 @@ fn open_selected_draft_message(
     ))
 }
 
-#[cfg(test)]
-fn draft_fields_from_message_file(path: impl AsRef<Path>) -> anyhow::Result<ComposeFields> {
-    let (mut fields, attachment_inputs) = prepare_draft_fields_from_message_file(path)?;
-    fields.attachments = cache_composer_attachments(&attachment_inputs)?;
-    Ok(fields)
-}
-
-fn prepare_draft_fields_from_message_file(
-    path: impl AsRef<Path>,
-) -> anyhow::Result<(ComposeFields, Vec<AttachmentInput>)> {
-    let path = path.as_ref();
-    let parsed = parse_file(path)?;
-    let attachment_inputs = attachments::attachment_inputs_from_file(path)?;
-    let body = if parsed.text_body.trim().is_empty() {
-        parsed.safe_body
-    } else {
-        parsed.text_body
-    };
-    Ok((
-        ComposeFields {
-            from: parsed.from,
-            to: parsed.to,
-            cc: parsed.cc,
-            bcc: header_value(&parsed.headers, "Bcc"),
-            subject: parsed.subject,
-            body,
-            attachments: Vec::new(),
-            in_reply_to: nonempty_string(parsed.in_reply_to),
-            references: references_from_header(&parsed.references),
-            text_reply_quote: None,
-            html_reply_quote: None,
-        },
-        attachment_inputs,
-    ))
-}
-
-fn header_value(headers: &BTreeMap<String, String>, name: &str) -> String {
-    headers
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.clone())
-        .unwrap_or_default()
-}
-
-fn nonempty_string(value: String) -> Option<String> {
-    let value = value.trim().to_string();
-    (!value.is_empty()).then_some(value)
-}
-
-fn references_from_header(value: &str) -> Vec<String> {
-    value
-        .split_whitespace()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .collect()
-}
-
 fn show_text_message_view(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     widgets.message_stack.set_visible_child_name("text");
     update_message_header(widgets, state);
@@ -9289,7 +8230,7 @@ fn show_text_message_view(options: &LaunchOptions, widgets: &Widgets, state: &Sh
 }
 
 fn show_compose_view(widgets: &Widgets) {
-    widgets.address_suggestions_list.set_visible(false);
+    widgets.composer.hide_address_suggestions();
     widgets.html_policy_row.set_visible(false);
     widgets.message_header_box.set_visible(false);
     widgets.attachments.hide();
@@ -10803,7 +9744,7 @@ fn select_thread_by_index(
                     status,
                     Some(rejection_restore.clone()),
                 );
-                if widgets.confirmation_controller.borrow().pending.is_none() {
+                if !widgets.composer.has_pending_confirmation() {
                     focus_after_thread_preview(widgets, state, preserve_search_focus);
                 }
             }
@@ -12214,7 +11155,7 @@ fn run_standalone_response_action(
                 options,
                 widgets,
                 state,
-                PendingAction::ReplaceComposer(PreparedComposerReplacement {
+                PendingTransition::ReplaceComposer(PreparedComposerReplacement {
                     kind,
                     payload: ComposerReplacementPayload::Message(Box::new(message)),
                     selection: None,
@@ -12245,12 +11186,11 @@ fn composed_reply_for_message(
     let path = message_filename(message)?;
     let identity =
         identity(options).ok_or_else(|| anyhow::anyhow!("No identity configured for reply"))?;
-    let parsed = parse_file(path)?;
     let mut own = options.other_email.clone();
     if let Some(email) = &options.primary_email {
         own.push(email.clone());
     }
-    Ok(build_reply(&parsed, &identity, &own, kind))
+    composer::composed_reply_from_file(path, &identity, &own, kind)
 }
 
 fn composed_inline_forward_for_message(
@@ -12260,7 +11200,7 @@ fn composed_inline_forward_for_message(
     let path = message_filename(message)?;
     let identity =
         identity(options).ok_or_else(|| anyhow::anyhow!("No identity configured for forward"))?;
-    Ok(build_inline_forward(&parse_file(path)?, &identity))
+    composer::composed_inline_forward_from_file(path, &identity)
 }
 
 fn composed_attachment_forward_for_message(
@@ -12270,9 +11210,7 @@ fn composed_attachment_forward_for_message(
     let path = message_filename(message)?;
     let identity =
         identity(options).ok_or_else(|| anyhow::anyhow!("No identity configured for forward"))?;
-    let raw = std::fs::read(path)?;
-    let parsed = notm_mail::mime::parse_rfc5322(&raw)?;
-    Ok(build_attachment_forward(&parsed, &identity, raw))
+    composer::composed_attachment_forward_from_file(path, &identity)
 }
 
 fn standalone_html_view_is_visible(standalone: &StandaloneMessageWindow) -> bool {
@@ -12517,9 +11455,7 @@ fn ensure_user_operation_allowed(
     state: &SharedState,
     operation: UserOperation,
 ) -> anyhow::Result<()> {
-    if operation == UserOperation::Send
-        && widgets.confirmation_controller.borrow().pending.is_some()
-    {
+    if operation == UserOperation::Send && widgets.composer.has_pending_confirmation() {
         let message = "sending is unavailable while a confirmation is pending";
         widgets.status_label.set_text(message);
         state.borrow_mut().last_operation = Some(message.to_string());
@@ -12798,7 +11734,10 @@ fn update_background_activity_controls(
     if let Some(button) = &widgets.manual_sync_button {
         button.set_sensitive(!background_activity);
     }
-    widgets.send_button.set_sensitive(!background_activity);
+    widgets
+        .composer
+        .send_button()
+        .set_sensitive(!background_activity);
     widgets.compose_button.set_sensitive(!send_in_progress);
     if send_in_progress {
         widgets.response_menu_button.popdown();
@@ -13781,7 +12720,7 @@ fn open_compose(options: &LaunchOptions, widgets: &Widgets, state: &SharedState)
         options,
         widgets,
         state,
-        PendingAction::ReplaceComposer(PreparedComposerReplacement {
+        PendingTransition::ReplaceComposer(PreparedComposerReplacement {
             kind: ComposerReplacementKind::New,
             payload: ComposerReplacementPayload::Empty,
             selection: None,
@@ -13812,7 +12751,7 @@ fn reply_selected(
             options,
             widgets,
             state,
-            PendingAction::ReplaceComposer(PreparedComposerReplacement {
+            PendingTransition::ReplaceComposer(PreparedComposerReplacement {
                 kind: if kind == ReplyKind::All {
                     ComposerReplacementKind::ReplyAll
                 } else {
@@ -13851,7 +12790,7 @@ fn forward_selected(options: &LaunchOptions, widgets: &Widgets, state: &SharedSt
             options,
             widgets,
             state,
-            PendingAction::ReplaceComposer(PreparedComposerReplacement {
+            PendingTransition::ReplaceComposer(PreparedComposerReplacement {
                 kind: ComposerReplacementKind::Forward,
                 payload: ComposerReplacementPayload::Message(Box::new(message)),
                 selection: None,
@@ -13890,7 +12829,7 @@ fn forward_as_attachment_selected(
             options,
             widgets,
             state,
-            PendingAction::ReplaceComposer(PreparedComposerReplacement {
+            PendingTransition::ReplaceComposer(PreparedComposerReplacement {
                 kind: ComposerReplacementKind::ForwardAttachment,
                 payload: ComposerReplacementPayload::Message(Box::new(message)),
                 selection: None,
@@ -13917,13 +12856,7 @@ fn forward_as_attachment_selected(
 fn fill_composer(widgets: &Widgets, state: &SharedState, message: ComposedMessage) {
     show_compose_view(widgets);
     set_active_draft(widgets, state, None);
-    widgets.compose_from.set_text(&message.from);
-    widgets.compose_to.set_text(&message.to.join(", "));
-    widgets.compose_cc.set_text(&message.cc.join(", "));
-    widgets.compose_bcc.set_text(&message.bcc.join(", "));
-    widgets.compose_subject.set_text(&message.subject);
-    widgets.compose_body.buffer().set_text(&message.body);
-    move_compose_cursor_to_start(widgets);
+    widgets.composer.apply_message_fields(&message);
     let mut fields = compose_fields(widgets, state);
     fields.in_reply_to = message.in_reply_to;
     fields.references = message.references;
@@ -13945,7 +12878,7 @@ fn fill_composer(widgets: &Widgets, state: &SharedState, message: ComposedMessag
     state.borrow_mut().active_pane = ActivePane::Message;
     persist_recovery_draft_from_ui(widgets, state, &fields);
     if state.borrow().input_mode == InputMode::Insert {
-        widgets.compose_to.grab_focus();
+        widgets.composer.to_entry().grab_focus();
     } else {
         focus_active_pane(widgets, state);
     }
@@ -13954,16 +12887,12 @@ fn fill_composer(widgets: &Widgets, state: &SharedState, message: ComposedMessag
 fn cache_composer_attachments(attachments: &[AttachmentInput]) -> anyhow::Result<Vec<String>> {
     attachments::cache_composer_attachments(
         attachments,
-        &default_compose_attachment_dir(),
-        atomic_write_durable,
+        &composer::default_attachment_cache_dir(),
+        composer::atomic_write_durable,
     )
 }
 
-fn default_compose_attachment_dir() -> PathBuf {
-    compose_state_path(&default_state_home(), "compose-attachments")
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum SendFailureStage {
     Compose,
     Transport,
@@ -13975,44 +12904,10 @@ struct SendFailure {
     error: anyhow::Error,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SendCleanupStage {
-    SentPersistence,
-    DraftDelete,
-    RecoveryClear,
-    NewerDraftAutosave,
-    DraftIdentity,
-}
-
-#[derive(Debug)]
-struct SendCleanupIssue {
-    stage: SendCleanupStage,
-    error: String,
-}
-
-impl SendCleanupIssue {
-    fn new(stage: SendCleanupStage, error: impl ToString) -> Self {
-        Self {
-            stage,
-            error: error.to_string(),
-        }
-    }
-
-    fn description(&self) -> &'static str {
-        match self.stage {
-            SendCleanupStage::SentPersistence => "sent save/index failed",
-            SendCleanupStage::DraftDelete => "draft delete failed",
-            SendCleanupStage::RecoveryClear => "draft recovery clear failed",
-            SendCleanupStage::NewerDraftAutosave => "newer draft autosave failed",
-            SendCleanupStage::DraftIdentity => "active draft changed unexpectedly",
-        }
-    }
-}
-
 struct SendSuccess {
     report: notm_mail::SendReport,
     persisted: Option<PersistedMessage>,
-    issues: Vec<SendCleanupIssue>,
+    issues: Vec<composer::SendCleanupIssue>,
 }
 
 struct SendResponse {
@@ -14039,17 +12934,25 @@ fn send_compose(
     state: &SharedState,
 ) -> anyhow::Result<SendStart> {
     ensure_user_operation_allowed(widgets, state, UserOperation::Send)?;
-    let sent_fields = compose_fields(widgets, state);
-    let (sent_generation, sent_draft) = {
+    let snapshot = {
         let state = state.borrow();
-        (state.compose_generation, state.active_draft.clone())
+        widgets.composer.capture_send(
+            &state.compose_fields,
+            state.compose_generation,
+            state.active_draft.clone(),
+        )
     };
+    let composer::SendSnapshot {
+        fields: sent_fields,
+        generation: sent_generation,
+        active_draft: sent_draft,
+    } = snapshot;
     if let Some(active) = sent_draft {
         let requested = request_pending_action(
             options,
             widgets,
             state,
-            PendingAction::SendComposer {
+            PendingTransition::SendComposer {
                 fields: sent_fields,
                 active,
                 generation: sent_generation,
@@ -14146,7 +13049,7 @@ fn send_start_response(
         Err(err) => json!({
             "ok": false,
             "pending": false,
-            "pending_confirmation": widgets.confirmation_controller.borrow().pending.is_some(),
+            "pending_confirmation": widgets.composer.has_pending_confirmation(),
             "error": err.to_string(),
             "state": &*state.borrow(),
         }),
@@ -14171,7 +13074,7 @@ fn execute_send(
     options: &LaunchOptions,
     fields: &ComposeFields,
 ) -> Result<SendSuccess, SendFailure> {
-    let message = composed_message_from_fields(fields).map_err(|error| SendFailure {
+    let message = composer::composed_message_from_fields(fields).map_err(|error| SendFailure {
         stage: SendFailureStage::Compose,
         error,
     })?;
@@ -14192,8 +13095,8 @@ fn execute_send(
                 }
                 persisted = saved;
             }
-            Err(err) => issues.push(SendCleanupIssue::new(
-                SendCleanupStage::SentPersistence,
+            Err(err) => issues.push(composer::SendCleanupIssue::new(
+                composer::SendCleanupStage::SentPersistence,
                 err,
             )),
         }
@@ -14227,8 +13130,8 @@ fn begin_accepted_send_cleanup(pending: PendingSend, mut success: SendSuccess) {
         return;
     };
     if pending.state.borrow().active_draft.as_ref() != Some(&draft) {
-        success.issues.push(SendCleanupIssue::new(
-            SendCleanupStage::DraftIdentity,
+        success.issues.push(composer::SendCleanupIssue::new(
+            composer::SendCleanupStage::DraftIdentity,
             "captured draft is no longer active",
         ));
         finish_send_success(pending, success, false);
@@ -14237,9 +13140,10 @@ fn begin_accepted_send_cleanup(pending: PendingSend, mut success: SendSuccess) {
     let rx = match spawn_sent_draft_delete(pending.options.clone(), draft) {
         Ok(rx) => rx,
         Err(err) => {
-            success
-                .issues
-                .push(SendCleanupIssue::new(SendCleanupStage::DraftDelete, err));
+            success.issues.push(composer::SendCleanupIssue::new(
+                composer::SendCleanupStage::DraftDelete,
+                err,
+            ));
             finish_send_success(pending, success, false);
             return;
         }
@@ -14254,9 +13158,10 @@ fn begin_accepted_send_cleanup(pending: PendingSend, mut success: SendSuccess) {
                 let draft_deleted = match result {
                     Ok(()) => true,
                     Err(err) => {
-                        success
-                            .issues
-                            .push(SendCleanupIssue::new(SendCleanupStage::DraftDelete, err));
+                        success.issues.push(composer::SendCleanupIssue::new(
+                            composer::SendCleanupStage::DraftDelete,
+                            err,
+                        ));
                         false
                     }
                 };
@@ -14270,8 +13175,8 @@ fn begin_accepted_send_cleanup(pending: PendingSend, mut success: SendSuccess) {
             Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
             Err(mpsc::TryRecvError::Disconnected) => {
                 let mut success = success.take().expect("send success should still be owned");
-                success.issues.push(SendCleanupIssue::new(
-                    SendCleanupStage::DraftDelete,
+                success.issues.push(composer::SendCleanupIssue::new(
+                    composer::SendCleanupStage::DraftDelete,
                     "draft delete worker disconnected",
                 ));
                 finish_send_success(
@@ -14321,12 +13226,12 @@ fn finish_send_success(pending: PendingSend, mut success: SendSuccess, draft_del
     let newer_composer_changes =
         accepted && finish_accepted_send_cleanup(&pending, &mut success, draft_deleted);
     if newer_composer_changes && let Some(error) = pending_autosave_error {
-        success.issues.push(SendCleanupIssue::new(
-            SendCleanupStage::NewerDraftAutosave,
+        success.issues.push(composer::SendCleanupIssue::new(
+            composer::SendCleanupStage::NewerDraftAutosave,
             error,
         ));
     }
-    let issue_summary = format_send_cleanup_issues(&success.issues);
+    let issue_summary = composer::format_send_cleanup_issues(&success.issues);
     let operation = send_operation_summary(&success, issue_summary.as_deref());
     let status = if accepted {
         if let Some(summary) = &issue_summary {
@@ -14352,7 +13257,7 @@ fn finish_send_success(pending: PendingSend, mut success: SendSuccess, draft_del
         state.last_operation = Some(operation);
     }
     pending.widgets.status_label.set_text(&status);
-    refresh_draft_list(&pending.widgets);
+    pending.widgets.composer.refresh_draft_list();
     finish_send_activity(&pending);
 }
 
@@ -14361,56 +13266,50 @@ fn finish_accepted_send_cleanup(
     success: &mut SendSuccess,
     draft_deleted: bool,
 ) -> bool {
-    let same_active_draft =
-        pending.state.borrow().active_draft.as_ref() == pending.sent_draft.as_ref();
-    if pending.sent_draft.is_some() && draft_deleted {
-        if same_active_draft {
-            set_active_draft(&pending.widgets, &pending.state, None);
-        } else {
-            success.issues.push(SendCleanupIssue::new(
-                SendCleanupStage::DraftIdentity,
-                "captured draft changed before cleanup completed",
-            ));
-        }
+    let plan = {
+        let state = pending.state.borrow();
+        composer::plan_accepted_send_cleanup(
+            pending.sent_generation,
+            state.compose_generation,
+            pending.sent_draft.as_ref(),
+            state.active_draft.as_ref(),
+            draft_deleted,
+        )
+    };
+    if plan.clear_active_draft {
+        set_active_draft(&pending.widgets, &pending.state, None);
+    } else if plan.draft_identity_changed {
+        success.issues.push(composer::SendCleanupIssue::new(
+            composer::SendCleanupStage::DraftIdentity,
+            "captured draft changed before cleanup completed",
+        ));
     }
 
-    let composer_unchanged = pending.state.borrow().compose_generation == pending.sent_generation;
-    let source_cleanup_allows_reset = pending.sent_draft.is_none() || draft_deleted;
-    let recovery_cleared = if composer_unchanged && source_cleanup_allows_reset {
-        match clear_recovery_draft_files(
-            &pending.widgets.draft_path,
-            pending.widgets.legacy_draft_path.as_deref(),
+    let recovery_cleared = if plan.clear_recovery {
+        match composer::clear_recovery_draft_files(
+            pending.widgets.composer.recovery_path(),
+            pending.widgets.composer.legacy_recovery_path(),
         ) {
             Ok(()) => true,
             Err(err) => {
-                success
-                    .issues
-                    .push(SendCleanupIssue::new(SendCleanupStage::RecoveryClear, err));
+                success.issues.push(composer::SendCleanupIssue::new(
+                    composer::SendCleanupStage::RecoveryClear,
+                    err,
+                ));
                 false
             }
         }
     } else {
         false
     };
-    if composer_unchanged && source_cleanup_allows_reset && recovery_cleared {
+    if plan.reset_composer(recovery_cleared) {
         reset_composer_after_send(&pending.options, &pending.widgets, &pending.state);
     }
-    !composer_unchanged
+    plan.newer_composer_changes
 }
 
 fn reset_composer_after_send(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
-    let fields = ComposeFields {
-        from: widgets.compose_from.text().to_string(),
-        ..ComposeFields::default()
-    };
-    widgets.compose_autosave_suppressed.set(true);
-    widgets.compose_from.set_text(&fields.from);
-    widgets.compose_to.set_text("");
-    widgets.compose_cc.set_text("");
-    widgets.compose_bcc.set_text("");
-    widgets.compose_subject.set_text("");
-    widgets.compose_body.buffer().set_text("");
-    widgets.compose_autosave_suppressed.set(false);
+    let fields = widgets.composer.reset_after_send();
     update_attachment_label(widgets, &[]);
     {
         let mut state = state.borrow_mut();
@@ -14418,19 +13317,8 @@ fn reset_composer_after_send(options: &LaunchOptions, widgets: &Widgets, state: 
         state.compose_generation = state.compose_generation.saturating_add(1);
         state.active_draft = None;
     }
-    widgets.address_suggestions_list.set_visible(false);
     update_draft_action_buttons(widgets, state);
     restore_message_view_after_compose(options, widgets, state);
-}
-
-fn format_send_cleanup_issues(issues: &[SendCleanupIssue]) -> Option<String> {
-    (!issues.is_empty()).then(|| {
-        issues
-            .iter()
-            .map(|issue| format!("{}: {}", issue.description(), issue.error))
-            .collect::<Vec<_>>()
-            .join("; ")
-    })
 }
 
 fn send_operation_summary(success: &SendSuccess, issue_summary: Option<&str>) -> String {
@@ -14701,9 +13589,10 @@ fn handle_automation_request(
     saved_store: &SavedSearchStore,
     req: AutomationRequest,
 ) {
-    let pending_block = {
-        let controller = widgets.confirmation_controller.borrow();
-        controller.pending.as_ref().and_then(|pending| {
+    let pending_block = widgets
+        .composer
+        .pending_confirmation_snapshot()
+        .and_then(|pending| {
             (!automation_command_allowed_while_confirmation_pending(&req.command)).then(|| {
                 json!({
                     "ok": false,
@@ -14711,12 +13600,11 @@ fn handle_automation_request(
                     "pending_confirmation": true,
                     "pending": {
                         "id": pending.id,
-                        "kind": pending.action.kind_name(),
+                        "kind": pending.kind,
                     },
                 })
             })
-        })
-    };
+        });
     if let Some(response) = pending_block {
         let _ = req.response.send(response);
         return;
@@ -14727,14 +13615,11 @@ fn handle_automation_request(
             .send(json!({"ok": false, "error": err.to_string()}));
         return;
     }
-    let confirmation_control = {
-        let controller = widgets.confirmation_controller.borrow();
-        ensure_confirmation_control_allowed(
-            options,
-            controller.pending.as_ref().map(|pending| &pending.action),
-            req.command.as_str(),
-        )
-    };
+    let confirmation_control = ensure_confirmation_control_allowed(
+        options,
+        widgets.composer.pending_confirmation_is_saved_send(),
+        req.command.as_str(),
+    );
     if let Err(err) = confirmation_control {
         let _ = req
             .response
@@ -14784,19 +13669,15 @@ fn handle_automation_request(
                 .and_then(|v| v.as_str())
                 .unwrap_or("to");
             let entry = match field {
-                "from" => &widgets.compose_from,
-                "cc" => &widgets.compose_cc,
-                "bcc" => &widgets.compose_bcc,
-                "subject" => &widgets.compose_subject,
-                _ => &widgets.compose_to,
+                "from" => &widgets.composer.sender_entry(),
+                "cc" => &widgets.composer.cc_entry(),
+                "bcc" => &widgets.composer.bcc_entry(),
+                "subject" => &widgets.composer.subject_entry(),
+                _ => &widgets.composer.to_entry(),
             };
             entry.grab_focus();
             if matches!(field, "to" | "cc" | "bcc") {
-                set_active_address_entry(widgets, entry);
-                widgets
-                    .active_address_field
-                    .set(recipient_field_for_entry(widgets, entry));
-                place_address_suggestions_after_entry(widgets, entry);
+                widgets.composer.activate_address_entry(entry);
             }
             json!({"ok": true, "field": field})
         }
@@ -14832,7 +13713,7 @@ fn handle_automation_request(
                 "input_mode": format!("{:?}", state.borrow().input_mode),
                 "active_pane": format!("{:?}", state.borrow().active_pane),
                 "search_suggestions_visible": widgets.search_bar.suggestions_visible(),
-                "address_suggestions_visible": widgets.address_suggestions_list.is_visible(),
+                "address_suggestions_visible": widgets.composer.address_suggestions().is_visible(),
             })
         }
         "set_search_query" => {
@@ -15327,11 +14208,11 @@ fn handle_automation_request(
             widgets.custom_tag_entry.set_text(tag);
             json!({"ok": true, "tag": tag})
         }
-        "add_custom_tag_from_entry" => {
+        ADD_CUSTOM_TAG_FROM_ENTRY_COMMAND => {
             let ok = apply_custom_tag_from_entry(options, widgets, state, undo_state, true);
             automation_mutation_response(ok, widgets, state)
         }
-        "remove_custom_tag_from_entry" => {
+        REMOVE_CUSTOM_TAG_FROM_ENTRY_COMMAND => {
             let ok = apply_custom_tag_from_entry(options, widgets, state, undo_state, false);
             automation_mutation_response(ok, widgets, state)
         }
@@ -15393,13 +14274,13 @@ fn handle_automation_request(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
             match req.command.as_str() {
-                "compose_set_from" => widgets.compose_from.set_text(value),
-                "compose_set_to" => widgets.compose_to.set_text(value),
-                "compose_set_cc" => widgets.compose_cc.set_text(value),
-                "compose_set_bcc" => widgets.compose_bcc.set_text(value),
-                "compose_set_subject" => widgets.compose_subject.set_text(value),
+                "compose_set_from" => widgets.composer.sender_entry().set_text(value),
+                "compose_set_to" => widgets.composer.to_entry().set_text(value),
+                "compose_set_cc" => widgets.composer.cc_entry().set_text(value),
+                "compose_set_bcc" => widgets.composer.bcc_entry().set_text(value),
+                "compose_set_subject" => widgets.composer.subject_entry().set_text(value),
                 "compose_set_body" => {
-                    widgets.compose_body.buffer().set_text(value);
+                    widgets.composer.body().buffer().set_text(value);
                     move_compose_cursor_to_start(widgets);
                 }
                 _ => {}
@@ -15423,16 +14304,21 @@ fn handle_automation_request(
                 .unwrap_or_default();
             json!({
                 "ok": true,
-                "suggestions": matching_address_suggestions(prefix, &state.borrow().address_suggestions, 20)
+                "suggestions": composer::matching_address_suggestions(prefix, &state.borrow().address_suggestions, 20)
             })
         }
         "select_address_suggestion_by_index" => {
-            let input = widgets.compose_to.text().to_string();
+            let input = widgets.composer.to_entry().text().to_string();
             let index = req.args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let suggestions =
-                matching_address_suggestions(&input, &state.borrow().address_suggestions, 20);
+            let suggestions = composer::matching_address_suggestions(
+                &input,
+                &state.borrow().address_suggestions,
+                20,
+            );
             if let Some(suggestion) = suggestions.get(index) {
-                apply_recipient_suggestion(&widgets.compose_to, suggestion);
+                widgets
+                    .composer
+                    .apply_recipient_suggestion(&widgets.composer.to_entry(), suggestion);
                 record_compose_edit(state, compose_fields(widgets, state));
                 json!({"ok": true, "suggestion": suggestion, "compose_fields": state.borrow().compose_fields})
             } else {
@@ -15446,19 +14332,27 @@ fn handle_automation_request(
                 .and_then(|v| v.as_str())
                 .unwrap_or("to");
             let entry = match field {
-                "cc" => &widgets.compose_cc,
-                "bcc" => &widgets.compose_bcc,
-                "from" => &widgets.compose_from,
-                _ => &widgets.compose_to,
+                "cc" => &widgets.composer.cc_entry(),
+                "bcc" => &widgets.composer.bcc_entry(),
+                "from" => &widgets.composer.sender_entry(),
+                _ => &widgets.composer.to_entry(),
             };
-            let completed = apply_recipient_completion(entry, state);
-            update_address_suggestions_label(widgets, state, &entry.text());
+            let suggestions = state.borrow().address_suggestions.clone();
+            let completed = widgets
+                .composer
+                .apply_first_recipient_completion(entry, &suggestions);
+            widgets.composer.update_address_suggestions_for_entry(
+                entry,
+                &entry.text(),
+                &suggestions,
+                6,
+            );
             record_compose_edit(state, compose_fields(widgets, state));
             json!({"ok": completed, "compose_fields": state.borrow().compose_fields})
         }
         "save_draft" => match request_save_current_draft(options, widgets, state) {
             Ok(Some(report)) => {
-                refresh_draft_list(widgets);
+                widgets.composer.refresh_draft_list();
                 let destination = report
                     .maildir_path
                     .as_ref()
@@ -15478,17 +14372,19 @@ fn handle_automation_request(
             Err(err) => json!({"ok": false, "error": err.to_string()}),
         },
         "list_drafts" => {
-            let drafts =
-                list_named_drafts(&widgets.drafts_dir, widgets.legacy_drafts_dir.as_deref())
-                    .into_iter()
-                    .map(|(path, fields)| json!({"path": path, "fields": fields}))
-                    .collect::<Vec<_>>();
+            let drafts = composer::list_named_drafts(
+                widgets.composer.drafts_dir(),
+                widgets.composer.legacy_drafts_dir(),
+            )
+            .into_iter()
+            .map(|(path, fields)| json!({"path": path, "fields": fields}))
+            .collect::<Vec<_>>();
             json!({"ok": true, "drafts": drafts})
         }
         "select_draft_by_index" => {
             let index = req.args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
-            if let Some(row) = widgets.draft_list.row_at_index(index) {
-                widgets.draft_list.select_row(Some(&row));
+            if let Some(row) = widgets.composer.draft_list().row_at_index(index) {
+                widgets.composer.draft_list().select_row(Some(&row));
                 json!({"ok": true})
             } else {
                 json!({"ok": false, "error": "draft index not found"})
@@ -15508,10 +14404,11 @@ fn handle_automation_request(
         },
         "activate_draft_by_index" => {
             let index = req.args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
-            if let Some(row) = widgets.draft_list.row_at_index(index) {
-                widgets.draft_list.select_row(Some(&row));
+            if let Some(row) = widgets.composer.draft_list().row_at_index(index) {
+                widgets.composer.draft_list().select_row(Some(&row));
                 widgets
-                    .draft_list
+                    .composer
+                    .draft_list()
                     .emit_by_name::<()>("row-activated", &[&row]);
                 spin_main_context_for(Duration::from_millis(25));
                 draft_list_state_json(widgets, state)
@@ -15520,18 +14417,24 @@ fn handle_automation_request(
             }
         }
         "click_delete_selected_draft" => {
-            let selected = selected_named_draft(widgets).map(|(path, _)| path);
+            let selected = widgets
+                .composer
+                .selected_named_draft()
+                .map(|(path, _)| path);
             match selected {
                 Ok(path) => {
                     let existed_before = path.exists();
-                    widgets.delete_selected_draft_button.emit_clicked();
+                    widgets
+                        .composer
+                        .delete_selected_draft_button()
+                        .emit_clicked();
                     spin_main_context_for(Duration::from_millis(25));
                     let deleted = existed_before && !path.exists();
                     let mut response = draft_list_state_json(widgets, state);
                     response["ok"] = json!(true);
                     response["deleted"] = json!(deleted);
                     response["pending_confirmation"] =
-                        json!(widgets.confirmation_controller.borrow().pending.is_some());
+                        json!(widgets.composer.has_pending_confirmation());
                     response["path"] = json!(path);
                     response
                 }
@@ -15541,19 +14444,19 @@ fn handle_automation_request(
         "load_selected_draft" => match load_selected_named_draft(options, widgets, state) {
             Ok((requested, path)) => {
                 let error = (!requested).then(|| widgets.status_label.text().to_string());
-                json!({"ok": requested, "path": path, "pending_confirmation": widgets.confirmation_controller.borrow().pending.is_some(), "error": error, "compose_fields": state.borrow().compose_fields})
+                json!({"ok": requested, "path": path, "pending_confirmation": widgets.composer.has_pending_confirmation(), "error": error, "compose_fields": state.borrow().compose_fields})
             }
             Err(err) => json!({"ok": false, "error": err.to_string()}),
         },
         "delete_selected_draft" => {
             let ok = delete_selected_named_draft_from_ui(options, widgets, state);
             let error = (!ok).then(|| widgets.status_label.text().to_string());
-            json!({"ok": ok, "pending_confirmation": widgets.confirmation_controller.borrow().pending.is_some(), "error": error, "compose_fields": state.borrow().compose_fields, "active_draft": state.borrow().active_draft, "last_error": state.borrow().last_error})
+            json!({"ok": ok, "pending_confirmation": widgets.composer.has_pending_confirmation(), "error": error, "compose_fields": state.borrow().compose_fields, "active_draft": state.borrow().active_draft, "last_error": state.borrow().last_error})
         }
         "delete_active_draft" | "delete_local_draft" => {
             let ok = delete_active_draft_from_ui(options, widgets, state);
             let error = (!ok).then(|| widgets.status_label.text().to_string());
-            json!({"ok": ok, "pending_confirmation": widgets.confirmation_controller.borrow().pending.is_some(), "error": error, "compose_fields": state.borrow().compose_fields, "active_draft": state.borrow().active_draft, "last_error": state.borrow().last_error})
+            json!({"ok": ok, "pending_confirmation": widgets.composer.has_pending_confirmation(), "error": error, "compose_fields": state.borrow().compose_fields, "active_draft": state.borrow().active_draft, "last_error": state.borrow().last_error})
         }
         "load_draft" => {
             let loaded = restore_draft_if_present(options, widgets, state);
@@ -15562,7 +14465,7 @@ fn handle_automation_request(
         "clear_draft" => {
             let ok = clear_current_draft_from_ui(options, widgets, state);
             let error = (!ok).then(|| widgets.status_label.text().to_string());
-            json!({"ok": ok, "pending_confirmation": widgets.confirmation_controller.borrow().pending.is_some(), "error": error, "compose_fields": state.borrow().compose_fields, "active_draft": state.borrow().active_draft})
+            json!({"ok": ok, "pending_confirmation": widgets.composer.has_pending_confirmation(), "error": error, "compose_fields": state.borrow().compose_fields, "active_draft": state.borrow().active_draft})
         }
         "compose_send" => send_start_response(options, widgets, state),
         "reply_selected" => automation_reply_response(
@@ -15966,10 +14869,14 @@ fn automation_mutation_response(
 }
 
 fn draft_list_state_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
-    let selected_index = widgets.draft_list.selected_row().map(|row| row.index());
+    let selected_index = widgets
+        .composer
+        .draft_list()
+        .selected_row()
+        .map(|row| row.index());
     let mut rows = Vec::new();
     let mut index = 0;
-    while let Some(row) = widgets.draft_list.row_at_index(index) {
+    while let Some(row) = widgets.composer.draft_list().row_at_index(index) {
         let text = row
             .child()
             .and_then(|child| child.downcast::<gtk::Label>().ok())
@@ -15984,46 +14891,45 @@ fn draft_list_state_json(widgets: &Widgets, state: &SharedState) -> serde_json::
         }));
         index += 1;
     }
-    let adjustment = widgets.draft_scrolled.vadjustment();
+    let adjustment = widgets.composer.draft_scrolled().vadjustment();
     let state = state.borrow();
     json!({
         "ok": true,
         "section": {
-            "visible": widgets.draft_section.is_visible(),
-            "mapped": widgets.draft_section.is_mapped(),
+            "visible": widgets.composer.draft_section().is_visible(),
+            "mapped": widgets.composer.draft_section().is_mapped(),
         },
         "empty_state": {
-            "text": widgets.draft_empty_label.text().to_string(),
-            "visible": widgets.draft_empty_label.is_visible(),
-            "mapped": widgets.draft_empty_label.is_mapped(),
+            "text": widgets.composer.draft_empty_label().text().to_string(),
+            "visible": widgets.composer.draft_empty_label().is_visible(),
+            "mapped": widgets.composer.draft_empty_label().is_mapped(),
         },
         "scroller": {
-            "visible": widgets.draft_scrolled.is_visible(),
-            "mapped": widgets.draft_scrolled.is_mapped(),
+            "visible": widgets.composer.draft_scrolled().is_visible(),
+            "mapped": widgets.composer.draft_scrolled().is_mapped(),
             "min_content_height": DRAFT_LIST_MIN_HEIGHT,
             "max_content_height": DRAFT_LIST_MAX_HEIGHT,
             "scroll_upper": adjustment.upper(),
             "scroll_page_size": adjustment.page_size(),
         },
         "list": {
-            "visible": widgets.draft_list.is_visible(),
-            "mapped": widgets.draft_list.is_mapped(),
+            "visible": widgets.composer.draft_list().is_visible(),
+            "mapped": widgets.composer.draft_list().is_mapped(),
             "selected_index": selected_index,
             "rows": rows,
         },
         "delete_button": {
-            "label": widgets
-                .delete_selected_draft_button
+            "label": widgets.composer.delete_selected_draft_button()
                 .label()
                 .map(|label| label.to_string()),
-            "visible": widgets.delete_selected_draft_button.is_visible(),
-            "mapped": widgets.delete_selected_draft_button.is_mapped(),
-            "sensitive": widgets.delete_selected_draft_button.is_sensitive(),
+            "visible": widgets.composer.delete_selected_draft_button().is_visible(),
+            "mapped": widgets.composer.delete_selected_draft_button().is_mapped(),
+            "sensitive": widgets.composer.delete_selected_draft_button().is_sensitive(),
         },
         "compose_fields": &state.compose_fields,
         "active_draft": &state.active_draft,
-        "recovery_path": &widgets.draft_path,
-        "drafts_dir": &widgets.drafts_dir,
+        "recovery_path": widgets.composer.recovery_path(),
+        "drafts_dir": widgets.composer.drafts_dir(),
         "last_error": &state.last_error,
         "last_operation": &state.last_operation,
         "status_text": widgets.status_label.text().to_string(),
@@ -16031,28 +14937,28 @@ fn draft_list_state_json(widgets: &Widgets, state: &SharedState) -> serde_json::
 }
 
 fn pending_confirmation_state_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
-    let controller = widgets.confirmation_controller.borrow();
-    let pending = controller.pending.as_ref().map(|pending| {
-        let (title, _, confirm_label) = pending.action.prompt();
-        json!({
-            "id": pending.id,
-            "kind": pending.action.kind_name(),
-            "title": title,
-            "confirm_label": confirm_label,
-            "visible": pending
-                .dialog
-                .upgrade()
-                .is_some_and(|dialog| dialog.is_visible()),
-        })
-    });
-    let completion = controller.last_completion.as_ref().map(|completion| {
-        json!({
-            "id": completion.id,
-            "accepted": completion.accepted,
-            "succeeded": completion.succeeded,
-        })
-    });
-    drop(controller);
+    let pending = widgets
+        .composer
+        .pending_confirmation_snapshot()
+        .map(|pending| {
+            json!({
+                "id": pending.id,
+                "kind": pending.kind,
+                "title": pending.title,
+                "confirm_label": pending.confirm_label,
+                "visible": pending.visible,
+            })
+        });
+    let completion = widgets
+        .composer
+        .last_confirmation_completion()
+        .map(|completion| {
+            json!({
+                "id": completion.id,
+                "accepted": completion.accepted,
+                "succeeded": completion.succeeded,
+            })
+        });
     let state = state.borrow();
     json!({
         "ok": true,
@@ -16060,8 +14966,8 @@ fn pending_confirmation_state_json(widgets: &Widgets, state: &SharedState) -> se
         "last_completion": completion,
         "compose_fields": &state.compose_fields,
         "active_draft": &state.active_draft,
-        "recovery_path": &widgets.draft_path,
-        "drafts_dir": &widgets.drafts_dir,
+        "recovery_path": widgets.composer.recovery_path(),
+        "drafts_dir": widgets.composer.drafts_dir(),
         "last_error": &state.last_error,
         "last_operation": &state.last_operation,
         "status_text": widgets.status_label.text().to_string(),
@@ -16082,31 +14988,14 @@ fn respond_pending_confirmation(
         "reject" | "cancel" => gtk::ResponseType::Cancel,
         _ => anyhow::bail!("response must be accept or reject"),
     };
-    let (pending_id, dialog) = {
-        let controller = widgets.confirmation_controller.borrow();
-        let pending = controller
-            .pending
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no confirmation is pending"))?;
-        let requested_id = args
-            .get("id")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(pending.id);
-        anyhow::ensure!(requested_id == pending.id, "confirmation id does not match");
-        let dialog = pending
-            .dialog
-            .upgrade()
-            .ok_or_else(|| anyhow::anyhow!("pending confirmation dialog is unavailable"))?;
-        (pending.id, dialog)
-    };
-    dialog.response(response);
+    let pending_id = widgets
+        .composer
+        .respond_confirmation(args.get("id").and_then(serde_json::Value::as_u64), response)?;
     spin_main_context_for(Duration::from_millis(75));
     let mut result = pending_confirmation_state_json(widgets, state);
     let succeeded = widgets
-        .confirmation_controller
-        .borrow()
-        .last_completion
-        .as_ref()
+        .composer
+        .last_confirmation_completion()
         .is_some_and(|completion| completion.id == pending_id && completion.succeeded);
     result["ok"] = json!(succeeded);
     result["response"] = json!(response_name);
@@ -16320,6 +15209,9 @@ enum AutomationOperation {
     ConfirmationControl,
 }
 
+const ADD_CUSTOM_TAG_FROM_ENTRY_COMMAND: &str = "add_custom_tag_from_entry";
+const REMOVE_CUSTOM_TAG_FROM_ENTRY_COMMAND: &str = "remove_custom_tag_from_entry";
+
 fn ensure_automation_request_allowed(
     options: &LaunchOptions,
     command: &str,
@@ -16334,8 +15226,8 @@ fn ensure_automation_request_allowed(
         | "unflag_selected"
         | "trash_selected"
         | "spam_selected"
-        | "add_custom_tag_from_entry"
-        | "remove_custom_tag_from_entry"
+        | ADD_CUSTOM_TAG_FROM_ENTRY_COMMAND
+        | REMOVE_CUSTOM_TAG_FROM_ENTRY_COMMAND
         | "tag_selected"
         | "add_tag_selected"
         | "remove_tag_selected"
@@ -16401,7 +15293,7 @@ fn ensure_automation_request_allowed(
 
 fn ensure_confirmation_control_allowed(
     options: &LaunchOptions,
-    pending_action: Option<&PendingAction>,
+    pending_saved_send: bool,
     command: &str,
 ) -> anyhow::Result<()> {
     if !matches!(command, "pending_confirmation" | "respond_confirmation") || options.fixture_mode {
@@ -16411,10 +15303,8 @@ fn ensure_confirmation_control_allowed(
         options.allow_live_send_test,
         "confirmation controls require automation.allow_live_send_test=true"
     );
-    let send_pending =
-        pending_action.is_some_and(|action| matches!(action, PendingAction::SendComposer { .. }));
     anyhow::ensure!(
-        send_pending,
+        pending_saved_send,
         "live confirmation controls are available only for a pending saved-draft Send"
     );
     Ok(())
@@ -16437,7 +15327,7 @@ fn automation_reply_response(
     if replied {
         json!({
             "ok": true,
-            "pending_confirmation": widgets.confirmation_controller.borrow().pending.is_some(),
+            "pending_confirmation": widgets.composer.has_pending_confirmation(),
             "compose_fields": state.borrow().compose_fields,
         })
     } else {
@@ -16917,35 +15807,6 @@ fn entry_with_placeholder(placeholder: &str) -> gtk::Entry {
     entry
 }
 
-fn read_compose_fields(widgets: &Widgets) -> ComposeFields {
-    let buffer = widgets.compose_body.buffer();
-    let body = buffer
-        .text(&buffer.start_iter(), &buffer.end_iter(), true)
-        .to_string();
-    ComposeFields {
-        from: widgets.compose_from.text().to_string(),
-        to: widgets.compose_to.text().to_string(),
-        cc: widgets.compose_cc.text().to_string(),
-        bcc: widgets.compose_bcc.text().to_string(),
-        subject: widgets.compose_subject.text().to_string(),
-        body,
-        attachments: Vec::new(),
-        in_reply_to: None,
-        references: Vec::new(),
-        text_reply_quote: None,
-        html_reply_quote: None,
-    }
-}
-
-fn split_recipients(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
 fn command_name_candidates() -> &'static [&'static str] {
     &[
         "inbox",
@@ -17141,7 +16002,7 @@ fn show_command_palette(
         let command = normalize_command_input(&entry.text());
         close_command_palette(&w, &st);
         let result = run_named_command(&command, &opts, &w, &st, &undo);
-        if w.confirmation_controller.borrow().pending.is_some() {
+        if w.composer.has_pending_confirmation() {
             return;
         }
         if result
@@ -19519,6 +18380,27 @@ mod tests {
     }
 
     #[test]
+    fn custom_tag_entry_harness_commands_keep_their_stable_names_and_tag_gate() {
+        assert_eq!(
+            [
+                ADD_CUSTOM_TAG_FROM_ENTRY_COMMAND,
+                REMOVE_CUSTOM_TAG_FROM_ENTRY_COMMAND,
+            ],
+            ["add_custom_tag_from_entry", "remove_custom_tag_from_entry"]
+        );
+
+        let live_options = LaunchOptions::default();
+        for command in [
+            ADD_CUSTOM_TAG_FROM_ENTRY_COMMAND,
+            REMOVE_CUSTOM_TAG_FROM_ENTRY_COMMAND,
+        ] {
+            let error = ensure_automation_request_allowed(&live_options, command, &json!({}))
+                .expect_err("stable custom-tag command must remain a gated tag mutation");
+            assert!(error.to_string().contains("allow_live_tag_test=true"));
+        }
+    }
+
+    #[test]
     fn attachment_dialog_test_controls_are_fixture_only() {
         let live_options = LaunchOptions::default();
         let error =
@@ -19616,29 +18498,16 @@ mod tests {
             ensure_automation_request_allowed(&live_send_options, command, &json!({}))
                 .expect("the dispatch layer performs the exact pending-Send check");
         }
-        let fields = ComposeFields::default();
-        let send = PendingAction::SendComposer {
-            fields: fields.clone(),
-            active: ActiveDraft {
-                path: PathBuf::from("/tmp/gated-send-draft.json"),
-                message_id: None,
-                indexed: false,
-                saved_fields: fields,
-            },
-            generation: 1,
-        };
         for command in ["pending_confirmation", "respond_confirmation"] {
-            ensure_confirmation_control_allowed(&live_send_options, Some(&send), command)
+            ensure_confirmation_control_allowed(&live_send_options, true, command)
                 .expect("gated live controls should drive the exact pending Send");
-            let no_pending = ensure_confirmation_control_allowed(&live_send_options, None, command)
-                .expect_err("gated controls must not inspect an absent live confirmation");
+            let no_pending =
+                ensure_confirmation_control_allowed(&live_send_options, false, command)
+                    .expect_err("gated controls must not inspect an absent live confirmation");
             assert!(no_pending.to_string().contains("pending saved-draft Send"));
-            let wrong_action = ensure_confirmation_control_allowed(
-                &live_send_options,
-                Some(&PendingAction::ClearComposer),
-                command,
-            )
-            .expect_err("gated controls must not drive a non-Send confirmation");
+            let wrong_action =
+                ensure_confirmation_control_allowed(&live_send_options, false, command)
+                    .expect_err("gated controls must not drive a non-Send confirmation");
             assert!(
                 wrong_action
                     .to_string()
@@ -19660,6 +18529,25 @@ mod tests {
             ensure_automation_request_allowed(&fixture_options, command, &json!({}))
                 .expect("fixture draft-list UI control");
         }
+    }
+
+    #[test]
+    fn pending_saved_send_revalidates_new_background_activity() {
+        let action = PendingTransition::SendComposer {
+            fields: ComposeFields::default(),
+            active: ActiveDraft {
+                path: PathBuf::from("/tmp/gated-send-draft.json"),
+                message_id: None,
+                indexed: false,
+                saved_fields: ComposeFields::default(),
+            },
+            generation: 7,
+        };
+        assert_eq!(action.operation(), UserOperation::Send);
+        assert!(
+            background_activity_block_reason(true, false, action.operation()).is_some(),
+            "accepting a pending saved-draft Send must revalidate a newly started sync"
+        );
     }
 
     #[test]
@@ -19698,233 +18586,6 @@ mod tests {
                 "{command} must not bypass GTK modality through the harness"
             );
         }
-    }
-
-    #[test]
-    fn confirmation_policy_matches_transient_and_saved_composer_state() {
-        let replacement = |kind| {
-            PendingAction::ReplaceComposer(PreparedComposerReplacement {
-                kind,
-                payload: ComposerReplacementPayload::Empty,
-                selection: None,
-                rejection_restore: None,
-                status: String::new(),
-                source_status: None,
-                present_main_window: false,
-                show_message_pane: false,
-                active_pane: ActivePane::Message,
-            })
-        };
-        let blank = ComposeFields {
-            from: "Me <me@example.test>".to_string(),
-            ..ComposeFields::default()
-        };
-        assert!(!fields_has_content(&blank));
-        assert!(!pending_action_requires_confirmation(
-            &replacement(ComposerReplacementKind::New),
-            &blank,
-            None
-        ));
-
-        for fields in [
-            ComposeFields {
-                to: "you@example.test".to_string(),
-                ..blank.clone()
-            },
-            ComposeFields {
-                cc: "you@example.test".to_string(),
-                ..blank.clone()
-            },
-            ComposeFields {
-                bcc: "you@example.test".to_string(),
-                ..blank.clone()
-            },
-            ComposeFields {
-                subject: "subject".to_string(),
-                ..blank.clone()
-            },
-            ComposeFields {
-                body: "body".to_string(),
-                ..blank.clone()
-            },
-            ComposeFields {
-                attachments: vec!["/tmp/attachment".to_string()],
-                ..blank.clone()
-            },
-        ] {
-            assert!(fields_has_content(&fields));
-            assert!(pending_action_requires_confirmation(
-                &replacement(ComposerReplacementKind::Reply),
-                &fields,
-                None
-            ));
-        }
-
-        let active = ActiveDraft {
-            path: PathBuf::from("/tmp/saved-draft.json"),
-            message_id: None,
-            indexed: false,
-            saved_fields: blank.clone(),
-        };
-        assert!(!pending_action_requires_confirmation(
-            &PendingAction::ClearComposer,
-            &blank,
-            Some(&active)
-        ));
-        assert!(!pending_action_requires_confirmation(
-            &replacement(ComposerReplacementKind::NamedDraft),
-            &blank,
-            Some(&active)
-        ));
-        assert!(!pending_action_requires_confirmation(
-            &PendingAction::CloseMainWindow,
-            &blank,
-            Some(&active)
-        ));
-        let changed = ComposeFields {
-            body: "changed".to_string(),
-            ..blank.clone()
-        };
-        assert!(pending_action_requires_confirmation(
-            &PendingAction::ClearComposer,
-            &changed,
-            Some(&active)
-        ));
-        let show_message = PendingAction::ShowSelectedMessage {
-            selection: MessageSelectionSnapshot {
-                selected_thread: None,
-                selected_thread_index: None,
-                selected_message: None,
-                messages: Vec::new(),
-                active_pane: ActivePane::Message,
-                last_operation: None,
-                last_error: None,
-            },
-            rejection_restore: None,
-            status: String::new(),
-            active_pane: ActivePane::Message,
-        };
-        assert!(pending_action_requires_confirmation(
-            &show_message,
-            &changed,
-            Some(&active)
-        ));
-        assert!(pending_action_requires_confirmation(
-            &PendingAction::CloseMainWindow,
-            &changed,
-            Some(&active)
-        ));
-    }
-
-    #[test]
-    fn permanent_draft_actions_always_confirm_and_keep_distinct_types() {
-        let fields = ComposeFields::default();
-        let active = ActiveDraft {
-            path: PathBuf::from("/tmp/saved-draft.json"),
-            message_id: None,
-            indexed: false,
-            saved_fields: fields.clone(),
-        };
-        let actions = [
-            PendingAction::DeleteActiveDraft(active.clone()),
-            PendingAction::DeleteNamedDraft(PathBuf::from("/tmp/named-draft.json")),
-            PendingAction::SaveDraftReplacement {
-                fields: fields.clone(),
-                previous: active.clone(),
-            },
-            PendingAction::SendComposer {
-                fields: fields.clone(),
-                active: active.clone(),
-                generation: 7,
-            },
-        ];
-        let kinds = actions
-            .iter()
-            .map(PendingAction::kind_name)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            kinds,
-            [
-                "delete_active_draft",
-                "delete_named_draft",
-                "save_draft_replacement",
-                "send_composer",
-            ]
-        );
-        for action in &actions {
-            assert!(action.always_requires_confirmation());
-            assert!(pending_action_requires_confirmation(
-                action,
-                &fields,
-                Some(&active)
-            ));
-        }
-        assert_eq!(actions[3].operation(), UserOperation::Send);
-        assert!(
-            background_activity_block_reason(true, false, actions[3].operation()).is_some(),
-            "accepting a pending saved-draft Send must revalidate a newly started sync"
-        );
-        assert!(persisted_draft_deletion_requires_confirmation(
-            PersistedDraftDeletion::ExplicitActive
-        ));
-        assert!(persisted_draft_deletion_requires_confirmation(
-            PersistedDraftDeletion::ExplicitNamed
-        ));
-        assert!(persisted_draft_deletion_requires_confirmation(
-            PersistedDraftDeletion::SaveReplacement
-        ));
-        assert!(persisted_draft_deletion_requires_confirmation(
-            PersistedDraftDeletion::AcceptedSendCleanup
-        ));
-    }
-
-    #[test]
-    fn every_compose_replacement_kind_has_a_stable_distinct_harness_name() {
-        let kinds = [
-            ComposerReplacementKind::New,
-            ComposerReplacementKind::Reply,
-            ComposerReplacementKind::ReplyAll,
-            ComposerReplacementKind::Forward,
-            ComposerReplacementKind::ForwardAttachment,
-            ComposerReplacementKind::StandaloneReply,
-            ComposerReplacementKind::StandaloneReplyAll,
-            ComposerReplacementKind::StandaloneForward,
-            ComposerReplacementKind::StandaloneForwardAttachment,
-            ComposerReplacementKind::NamedDraft,
-            ComposerReplacementKind::RecoveryDraft,
-            ComposerReplacementKind::IndexedDraft,
-        ];
-        let names = kinds.map(ComposerReplacementKind::name);
-        assert_eq!(
-            names
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            kinds.len()
-        );
-    }
-
-    #[test]
-    fn named_draft_delete_only_matches_the_same_active_path() {
-        let active = ActiveDraft {
-            path: PathBuf::from("/tmp/notm-active-draft.json"),
-            message_id: None,
-            indexed: false,
-            saved_fields: ComposeFields::default(),
-        };
-
-        assert!(active_draft_matches_path(
-            Some(&active),
-            Path::new("/tmp/notm-active-draft.json")
-        ));
-        assert!(!active_draft_matches_path(
-            Some(&active),
-            Path::new("/tmp/notm-other-draft.json")
-        ));
-        assert!(!active_draft_matches_path(
-            None,
-            Path::new("/tmp/notm-active-draft.json")
-        ));
     }
 
     #[test]
@@ -20031,215 +18692,6 @@ mod tests {
 
         assert!(sync_command_specs(&options, SyncRunKind::Manual).is_empty());
         assert!(sync_command_specs(&options, SyncRunKind::Startup).is_empty());
-    }
-
-    #[test]
-    fn composed_message_from_fields_preserves_reply_thread_headers() {
-        let fields = ComposeFields {
-            from: "Me <me@example.test>".to_string(),
-            to: "Alice <alice@example.test>".to_string(),
-            subject: "Re: Hello".to_string(),
-            body: "Reply body".to_string(),
-            in_reply_to: Some("<original@example.test>".to_string()),
-            references: vec![
-                "<older@example.test>".to_string(),
-                "<original@example.test>".to_string(),
-            ],
-            ..ComposeFields::default()
-        };
-
-        let message = composed_message_from_fields(&fields).expect("message");
-        let rendered = message.to_rfc5322();
-
-        assert_eq!(
-            message.in_reply_to.as_deref(),
-            Some("<original@example.test>")
-        );
-        assert_eq!(
-            message.references,
-            vec![
-                "<older@example.test>".to_string(),
-                "<original@example.test>".to_string(),
-            ]
-        );
-        assert!(rendered.contains("In-Reply-To: <original@example.test>\r\n"));
-        assert!(rendered.contains("References: <older@example.test> <original@example.test>\r\n"));
-    }
-
-    #[test]
-    fn draft_fields_load_from_saved_rfc5322_message() {
-        let path = std::env::temp_dir().join(format!("notm-draft-{}.eml", Uuid::new_v4()));
-        let raw = "From: Me <me@example.test>\r\nTo: You <you@example.test>\r\nCc: Other <other@example.test>\r\nBcc: Hidden <hidden@example.test>\r\nSubject: Draft subject\r\nMessage-ID: <draft@example.test>\r\nIn-Reply-To: <parent@example.test>\r\nReferences: <root@example.test> <parent@example.test>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nDraft body.";
-        std::fs::write(&path, raw).expect("write draft");
-
-        let fields = draft_fields_from_message_file(&path).expect("draft fields");
-
-        assert_eq!(fields.from, "Me <me@example.test>");
-        assert_eq!(fields.to, "You <you@example.test>");
-        assert_eq!(fields.cc, "Other <other@example.test>");
-        assert_eq!(fields.bcc, "Hidden <hidden@example.test>");
-        assert_eq!(fields.subject, "Draft subject");
-        assert_eq!(fields.body, "Draft body.");
-        assert_eq!(fields.in_reply_to.as_deref(), Some("<parent@example.test>"));
-        assert_eq!(
-            fields.references,
-            vec![
-                "<root@example.test>".to_string(),
-                "<parent@example.test>".to_string()
-            ]
-        );
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn compose_persistence_paths_use_the_xdg_state_layout() {
-        let state_home = xdg_home_path(
-            Some(OsStr::new("/tmp/notm-xdg-state")),
-            Some(OsStr::new("/tmp/notm-home")),
-            ".local/state",
-            "target/notm-state",
-        );
-        assert_eq!(state_home, PathBuf::from("/tmp/notm-xdg-state"));
-        assert_eq!(
-            compose_state_path(&state_home, "draft.json"),
-            PathBuf::from("/tmp/notm-xdg-state/notm/draft.json")
-        );
-        assert_eq!(
-            compose_state_path(&state_home, "drafts"),
-            PathBuf::from("/tmp/notm-xdg-state/notm/drafts")
-        );
-        assert_eq!(
-            compose_state_path(&state_home, "compose-attachments"),
-            PathBuf::from("/tmp/notm-xdg-state/notm/compose-attachments")
-        );
-        assert_eq!(
-            xdg_home_path(
-                Some(OsStr::new("")),
-                Some(OsStr::new("/tmp/notm-home")),
-                ".local/state",
-                "target/notm-state",
-            ),
-            PathBuf::from("/tmp/notm-home/.local/state")
-        );
-    }
-
-    #[test]
-    fn atomic_state_write_replaces_complete_file_without_temporary_artifacts() {
-        let directory = tempfile::tempdir().expect("temporary state directory");
-        let path = directory.path().join("draft.json");
-        atomic_write(&path, b"old draft").expect("write initial draft");
-        atomic_write_durable(&path, b"complete replacement").expect("replace durable draft");
-
-        assert_eq!(
-            std::fs::read(&path).expect("read replaced draft"),
-            b"complete replacement"
-        );
-        let entries = std::fs::read_dir(directory.path())
-            .expect("list state directory")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("read state entries");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].path(), path);
-    }
-
-    #[test]
-    fn legacy_cache_recovery_is_migrated_without_changing_its_contents() {
-        let directory = tempfile::tempdir().expect("temporary draft directory");
-        let current = directory.path().join("state/notm/draft.json");
-        let legacy = directory.path().join("cache/notm/draft.json");
-        std::fs::create_dir_all(legacy.parent().expect("legacy parent"))
-            .expect("create legacy directory");
-        let bytes = br#"{"from":"Me","to":"you@example.test","cc":"","bcc":"","subject":"Legacy","body":"Body"}"#;
-        std::fs::write(&legacy, bytes).expect("write legacy draft");
-
-        assert!(migrate_legacy_recovery_draft(&current, &legacy).expect("migrate legacy draft"));
-        assert_eq!(std::fs::read(&current).expect("read migrated draft"), bytes);
-        assert!(!legacy.exists());
-        assert!(
-            !migrate_legacy_recovery_draft(&current, &legacy).expect("repeat migration is a no-op")
-        );
-    }
-
-    #[test]
-    fn empty_composer_removes_current_and_legacy_recovery_files() {
-        let directory = tempfile::tempdir().expect("temporary draft directory");
-        let current = directory.path().join("state/notm/draft.json");
-        let legacy = directory.path().join("cache/notm/draft.json");
-        let fields = ComposeFields {
-            subject: "Still editing".to_string(),
-            ..ComposeFields::default()
-        };
-        persist_recovery_draft(&current, Some(&legacy), &fields)
-            .expect("write current recovery draft");
-        std::fs::create_dir_all(legacy.parent().expect("legacy parent"))
-            .expect("create legacy directory");
-        std::fs::write(&legacy, b"legacy").expect("write stale legacy draft");
-
-        persist_recovery_draft(&current, Some(&legacy), &ComposeFields::default())
-            .expect("clear recovery drafts");
-
-        assert!(!current.exists());
-        assert!(!legacy.exists());
-    }
-
-    #[test]
-    fn named_drafts_migrate_from_cache_and_duplicate_fallback_rows_are_hidden() {
-        let directory = tempfile::tempdir().expect("temporary named draft directory");
-        let current = directory.path().join("state/notm/drafts");
-        let legacy = directory.path().join("cache/notm/drafts");
-        let existing = ComposeFields {
-            subject: "Existing".to_string(),
-            ..ComposeFields::default()
-        };
-        let legacy_only = ComposeFields {
-            subject: "Legacy only".to_string(),
-            ..ComposeFields::default()
-        };
-        std::fs::create_dir_all(&current).expect("create current drafts directory");
-        std::fs::create_dir_all(&legacy).expect("create legacy drafts directory");
-        let existing_bytes = serde_json::to_vec_pretty(&existing).expect("serialize draft");
-        std::fs::write(current.join("existing.json"), &existing_bytes)
-            .expect("write current draft");
-        std::fs::write(legacy.join("existing.json"), &existing_bytes)
-            .expect("write duplicate legacy draft");
-        std::fs::write(
-            legacy.join("legacy.json"),
-            serde_json::to_vec_pretty(&legacy_only).expect("serialize legacy draft"),
-        )
-        .expect("write legacy draft");
-
-        assert_eq!(
-            migrate_legacy_named_drafts(&current, &legacy).expect("migrate named drafts"),
-            1
-        );
-        assert!(!legacy.join("existing.json").exists());
-        assert!(!legacy.join("legacy.json").exists());
-        let migrated = list_named_drafts(&current, Some(&legacy));
-        assert_eq!(migrated.len(), 2);
-        assert!(
-            migrated
-                .iter()
-                .any(|(_, fields)| fields.subject == "Legacy only")
-        );
-
-        std::fs::write(
-            legacy.join("legacy.json"),
-            serde_json::to_vec_pretty(&legacy_only).expect("serialize fallback draft"),
-        )
-        .expect("write duplicate fallback draft");
-        assert_eq!(list_named_drafts(&current, Some(&legacy)).len(), 2);
-    }
-
-    #[test]
-    fn successful_autosave_clears_only_transient_autosave_errors() {
-        let mut last_error = Some("Draft autosave failed: temporary error".to_string());
-        assert!(clear_transient_autosave_error(&mut last_error));
-        assert_eq!(last_error, None);
-
-        let mut last_error = Some("Send failed: permanent error".to_string());
-        assert!(!clear_transient_autosave_error(&mut last_error));
-        assert_eq!(last_error.as_deref(), Some("Send failed: permanent error"));
     }
 
     #[test]
@@ -20754,22 +19206,6 @@ mod tests {
         assert_eq!(
             background_activity_block_reason(false, true, UserOperation::ComposeEdit),
             None
-        );
-    }
-
-    #[test]
-    fn send_cleanup_issues_preserve_every_stage_in_order() {
-        let issues = vec![
-            SendCleanupIssue::new(SendCleanupStage::SentPersistence, "sent store"),
-            SendCleanupIssue::new(SendCleanupStage::DraftDelete, "draft source"),
-            SendCleanupIssue::new(SendCleanupStage::RecoveryClear, "recovery file"),
-        ];
-
-        assert_eq!(
-            format_send_cleanup_issues(&issues).as_deref(),
-            Some(
-                "sent save/index failed: sent store; draft delete failed: draft source; draft recovery clear failed: recovery file"
-            )
         );
     }
 
