@@ -3750,13 +3750,31 @@ fn fixture_current_message_navigation_and_tagging_are_explicit() -> anyhow::Resu
         "message tag menu is disabled: {controls}"
     );
     assert_eq!(
-        controls["read_label"], "Mark message read",
+        controls["archive_label"], "Archive message (M a)",
+        "wrong current-message archive binding: {controls}"
+    );
+    assert_eq!(
+        controls["read_label"], "Mark message read (M u)",
         "wrong current-message read action: {controls}"
     );
-    ensure!(
-        controls["menu_label"]
-            .as_str()
-            .is_some_and(|label| label.starts_with("Tag message")),
+    assert_eq!(
+        controls["flag_label"], "Flag message (M f)",
+        "wrong current-message flag binding: {controls}"
+    );
+    assert_eq!(
+        controls["trash_label"], "Move message to trash (M t)",
+        "wrong current-message trash binding: {controls}"
+    );
+    assert_eq!(
+        controls["spam_label"], "Mark message as spam (M s)",
+        "wrong current-message spam binding: {controls}"
+    );
+    assert_eq!(
+        controls["custom_apply_label"], "Add tag (M T)",
+        "wrong current-message custom-tag binding: {controls}"
+    );
+    assert_eq!(
+        controls["menu_label"], "Tag message (M)",
         "message-only scope is not visible in the action label: {controls}"
     );
 
@@ -3798,7 +3816,7 @@ fn fixture_current_message_navigation_and_tagging_are_explicit() -> anyhow::Resu
 
     let controls = driver.command("message_tag_state", json!({}))?;
     assert_eq!(
-        controls["custom_apply_label"], "Remove tag",
+        controls["custom_apply_label"], "Remove tag (M T)",
         "custom tag toggle did not follow the current message: {controls}"
     );
     let actions = driver.command("undo_tag_actions", json!({}))?;

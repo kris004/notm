@@ -134,8 +134,10 @@ Press `?` in the application for searchable shortcut help. A few useful keys:
   continue to scroll the message view.
 - `h`/`l` move between panes; `Ctrl+1`, `Ctrl+2`, and `Ctrl+3` toggle them.
 - `a`, `t`, `s`, `u`, and `f` archive, trash, spam, mark read/unread, and flag.
-- `M` opens actions that tag only the currently displayed message; the actions
-  above the thread list remain thread-scoped.
+- `M` opens actions that tag only the currently displayed message. Follow it
+  with `a`, `t`, `s`, `u`, or `f` to mirror the corresponding thread action;
+  `M T` focuses the custom-tag field. The controls above the thread list remain
+  thread-scoped.
 - `r r`, `r a`, `r f`, and `r A` reply, reply all, forward inline, and forward
   as an attachment.
 - `c` composes, `Ctrl+Enter` sends, and `S` saves a draft.

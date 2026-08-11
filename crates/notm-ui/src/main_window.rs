@@ -463,6 +463,7 @@ struct Widgets {
     message_menu_button: gtk::MenuButton,
     message_menu_box: gtk::Box,
     message_tag_menu_button: gtk::MenuButton,
+    message_tag_menu_box: gtk::Box,
     message_archive_button: gtk::Button,
     message_read_toggle_button: gtk::Button,
     message_flag_toggle_button: gtk::Button,
@@ -1371,6 +1372,7 @@ fn build_ui(
         message_menu_button,
         message_menu_box,
         message_tag_menu_button,
+        message_tag_menu_box,
         message_archive_button,
         message_read_toggle_button,
         message_flag_toggle_button,
@@ -5029,6 +5031,60 @@ fn update_button_binding_labels(widgets: &Widgets, state: &SharedState) {
         visible_binding(message_bindings, "M"),
         state,
     );
+    set_button_label(
+        &widgets.message_archive_button,
+        "Archive message",
+        visible_binding(message_bindings, "M a"),
+        state,
+    );
+    let message_read_base = strip_binding_suffix(
+        &widgets
+            .message_read_toggle_button
+            .label()
+            .unwrap_or_default(),
+    );
+    set_button_label(
+        &widgets.message_read_toggle_button,
+        &message_read_base,
+        visible_binding(message_bindings, "M u"),
+        state,
+    );
+    let message_flag_base = strip_binding_suffix(
+        &widgets
+            .message_flag_toggle_button
+            .label()
+            .unwrap_or_default(),
+    );
+    set_button_label(
+        &widgets.message_flag_toggle_button,
+        &message_flag_base,
+        visible_binding(message_bindings, "M f"),
+        state,
+    );
+    set_button_label(
+        &widgets.message_trash_button,
+        "Move message to trash",
+        visible_binding(message_bindings, "M t"),
+        state,
+    );
+    set_button_label(
+        &widgets.message_spam_button,
+        "Mark message as spam",
+        visible_binding(message_bindings, "M s"),
+        state,
+    );
+    let message_custom_tag_base = strip_binding_suffix(
+        &widgets
+            .message_custom_tag_apply_button
+            .label()
+            .unwrap_or_default(),
+    );
+    set_button_label(
+        &widgets.message_custom_tag_apply_button,
+        &message_custom_tag_base,
+        visible_binding(message_bindings, "M T"),
+        state,
+    );
     set_menu_button_label(
         &widgets.view_menu_button,
         "View",
@@ -5513,6 +5569,7 @@ fn install_shortcuts(
     let pending_response = Rc::new(RefCell::new(false));
     let pending_view = Rc::new(RefCell::new(false));
     let pending_copy = Rc::new(RefCell::new(false));
+    let pending_message_tag = Rc::new(RefCell::new(false));
     let pending_tag = Rc::new(RefCell::new(false));
     let pending_undo = Rc::new(RefCell::new(false));
     let numeric_prefix = Rc::new(RefCell::new(String::new()));
@@ -5523,6 +5580,7 @@ fn install_shortcuts(
         pending_response.clone(),
         pending_view.clone(),
         pending_copy.clone(),
+        pending_message_tag.clone(),
         pending_tag.clone(),
         pending_undo.clone(),
         undo.clone(),
@@ -5535,6 +5593,7 @@ fn install_shortcuts(
             *pending_response.borrow_mut() = false;
             *pending_view.borrow_mut() = false;
             *pending_copy.borrow_mut() = false;
+            *pending_message_tag.borrow_mut() = false;
             *pending_tag.borrow_mut() = false;
             *pending_undo.borrow_mut() = false;
             clear_numeric_prefix(&numeric_prefix);
@@ -5707,6 +5766,26 @@ fn install_shortcuts(
                 gtk::glib::Propagation::Stop
             } else {
                 gtk::glib::Propagation::Proceed
+            };
+        }
+        if *pending_message_tag.borrow() {
+            if !message_pane_shortcuts_available(&w) || compose_view_is_visible(&w) {
+                *pending_message_tag.borrow_mut() = false;
+                w.message_tag_menu_button.popdown();
+                return gtk::glib::Propagation::Proceed;
+            }
+            *pending_message_tag.borrow_mut() = false;
+            clear_numeric_prefix(&numeric_prefix);
+            return match activate_message_tag_sequence_key(&w, &st, key, mods) {
+                MessageTagSequenceOutcome::CloseMenu => {
+                    w.message_tag_menu_button.popdown();
+                    gtk::glib::Propagation::Stop
+                }
+                MessageTagSequenceOutcome::KeepMenuOpen => gtk::glib::Propagation::Stop,
+                MessageTagSequenceOutcome::Unhandled => {
+                    w.message_tag_menu_button.popdown();
+                    gtk::glib::Propagation::Proceed
+                }
             };
         }
         if *pending_tag.borrow() {
@@ -5900,9 +5979,11 @@ fn install_shortcuts(
             && !compose_view_is_visible(&w)
         {
             clear_numeric_prefix(&numeric_prefix);
+            *pending_message_tag.borrow_mut() = true;
             w.message_tag_menu_button.popup();
-            w.status_label
-                .set_text("Current message actions: use j/k and Enter");
+            w.status_label.set_text(
+                "Current message: a archive, u read/unread, f flag, t trash, s spam, T custom tag; j/k choose",
+            );
             true
         } else if is_tag_sequence_prefix(key, mods) {
             clear_numeric_prefix(&numeric_prefix);
@@ -6039,6 +6120,7 @@ fn connect_dropdown_sequence_keys(
     pending_response: Rc<RefCell<bool>>,
     pending_view: Rc<RefCell<bool>>,
     pending_copy: Rc<RefCell<bool>>,
+    pending_message_tag: Rc<RefCell<bool>>,
     pending_tag: Rc<RefCell<bool>>,
     pending_undo: Rc<RefCell<bool>>,
     undo_state: UndoState,
@@ -6164,6 +6246,38 @@ fn connect_dropdown_sequence_keys(
         }
     });
     widgets.copy_menu_box.add_controller(controller);
+
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let w = widgets.clone();
+    let st = state.clone();
+    let pending = pending_message_tag;
+    controller.connect_key_pressed(move |_, key, _, mods| {
+        if st.borrow().input_mode == InputMode::Insert {
+            return gtk::glib::Propagation::Proceed;
+        }
+        if !message_pane_shortcuts_available(&w) || compose_view_is_visible(&w) {
+            *pending.borrow_mut() = false;
+            w.message_tag_menu_button.popdown();
+            return gtk::glib::Propagation::Proceed;
+        }
+        if is_tag_menu_navigation_key(key) {
+            return gtk::glib::Propagation::Proceed;
+        }
+        match activate_message_tag_sequence_key(&w, &st, key, mods) {
+            MessageTagSequenceOutcome::CloseMenu => {
+                *pending.borrow_mut() = false;
+                w.message_tag_menu_button.popdown();
+                gtk::glib::Propagation::Stop
+            }
+            MessageTagSequenceOutcome::KeepMenuOpen => {
+                *pending.borrow_mut() = false;
+                gtk::glib::Propagation::Stop
+            }
+            MessageTagSequenceOutcome::Unhandled => gtk::glib::Propagation::Proceed,
+        }
+    });
+    widgets.message_tag_menu_box.add_controller(controller);
 
     let controller = gtk::EventControllerKey::new();
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -7895,19 +8009,26 @@ fn update_message_tag_controls(widgets: &Widgets, state: &SharedState) {
         .as_ref()
         .map(|message| message.tags.as_slice())
         .unwrap_or_default();
-    widgets.message_read_toggle_button.set_label(
+    let message_bindings = message_pane_shortcuts_available(widgets);
+    set_button_label(
+        &widgets.message_read_toggle_button,
         if selected_tags.iter().any(|tag| tag == "unread") {
             "Mark message read"
         } else {
             "Mark message unread"
         },
+        visible_binding(message_bindings, "M u"),
+        state,
     );
-    widgets.message_flag_toggle_button.set_label(
+    set_button_label(
+        &widgets.message_flag_toggle_button,
         if selected_tags.iter().any(|tag| tag == "flagged") {
             "Unflag message"
         } else {
             "Flag message"
         },
+        visible_binding(message_bindings, "M f"),
+        state,
     );
 
     let custom_tag = widgets.message_custom_tag_entry.text().trim().to_string();
@@ -7922,13 +8043,16 @@ fn update_message_tag_controls(widgets: &Widgets, state: &SharedState) {
         } else {
             "Current message does not have this tag"
         });
-    widgets
-        .message_custom_tag_apply_button
-        .set_label(if has_custom_tag {
+    set_button_label(
+        &widgets.message_custom_tag_apply_button,
+        if has_custom_tag {
             "Remove tag"
         } else {
             "Add tag"
-        });
+        },
+        visible_binding(message_bindings, "M T"),
+        state,
+    );
     widgets.message_custom_tag_entry.set_sensitive(can_mutate);
     widgets
         .message_custom_tag_apply_button
@@ -11101,6 +11225,84 @@ fn is_message_tag_menu_key(key: gtk::gdk::Key, mods: gtk::gdk::ModifierType) -> 
     shifted_shortcut_key(key, mods, gtk::gdk::Key::m, gtk::gdk::Key::M)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageTagSequenceKeyAction {
+    Archive,
+    ToggleRead,
+    ToggleFlag,
+    Trash,
+    Spam,
+    CustomTag,
+}
+
+fn message_tag_sequence_key_action(
+    key: gtk::gdk::Key,
+    mods: gtk::gdk::ModifierType,
+) -> Option<MessageTagSequenceKeyAction> {
+    if shifted_shortcut_key(key, mods, gtk::gdk::Key::t, gtk::gdk::Key::T) {
+        return Some(MessageTagSequenceKeyAction::CustomTag);
+    }
+    match key {
+        gtk::gdk::Key::a => Some(MessageTagSequenceKeyAction::Archive),
+        gtk::gdk::Key::u => Some(MessageTagSequenceKeyAction::ToggleRead),
+        gtk::gdk::Key::f => Some(MessageTagSequenceKeyAction::ToggleFlag),
+        gtk::gdk::Key::t => Some(MessageTagSequenceKeyAction::Trash),
+        gtk::gdk::Key::s => Some(MessageTagSequenceKeyAction::Spam),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageTagSequenceOutcome {
+    Unhandled,
+    CloseMenu,
+    KeepMenuOpen,
+}
+
+fn activate_message_tag_sequence_key(
+    widgets: &Widgets,
+    state: &SharedState,
+    key: gtk::gdk::Key,
+    mods: gtk::gdk::ModifierType,
+) -> MessageTagSequenceOutcome {
+    let Some(action) = message_tag_sequence_key_action(key, mods) else {
+        return MessageTagSequenceOutcome::Unhandled;
+    };
+    if action == MessageTagSequenceKeyAction::CustomTag {
+        if widgets.message_custom_tag_entry.is_sensitive() {
+            set_input_mode(
+                widgets,
+                state,
+                InputMode::Insert,
+                "Insert mode: current-message tag (Esc for normal)",
+            );
+            widgets.message_custom_tag_entry.grab_focus();
+            widgets.message_custom_tag_entry.select_region(0, -1);
+            return MessageTagSequenceOutcome::KeepMenuOpen;
+        }
+        widgets
+            .status_label
+            .set_text("Current message action is unavailable");
+        return MessageTagSequenceOutcome::CloseMenu;
+    }
+    let button = match action {
+        MessageTagSequenceKeyAction::Archive => &widgets.message_archive_button,
+        MessageTagSequenceKeyAction::ToggleRead => &widgets.message_read_toggle_button,
+        MessageTagSequenceKeyAction::ToggleFlag => &widgets.message_flag_toggle_button,
+        MessageTagSequenceKeyAction::Trash => &widgets.message_trash_button,
+        MessageTagSequenceKeyAction::Spam => &widgets.message_spam_button,
+        MessageTagSequenceKeyAction::CustomTag => unreachable!("handled above"),
+    };
+    if button.is_sensitive() {
+        button.emit_clicked();
+    } else {
+        widgets
+            .status_label
+            .set_text("Current message action is unavailable");
+    }
+    MessageTagSequenceOutcome::CloseMenu
+}
+
 fn relative_message_index(current: usize, total: usize, delta: isize) -> Option<usize> {
     if total == 0 {
         return None;
@@ -12988,6 +13190,10 @@ fn handle_automation_request(
                 "search_selection_bounds": search_selection_bounds,
                 "custom_tag": widgets.custom_tag_entry.text().to_string(),
                 "custom_tag_has_focus": widget_contains_focus(widgets.custom_tag_entry.upcast_ref()),
+                "message_custom_tag": widgets.message_custom_tag_entry.text().to_string(),
+                "message_custom_tag_has_focus": widget_contains_focus(
+                    widgets.message_custom_tag_entry.upcast_ref()
+                ),
                 "tag_command": widgets.tag_command_entry.text().to_string(),
                 "tag_command_has_focus": widget_contains_focus(widgets.tag_command_entry.upcast_ref()),
                 "status": widgets.status_label.text().to_string(),
@@ -15694,6 +15900,16 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
         },
         HelpEntry {
             section: "Message actions",
+            key: "M a/u/f/t/s",
+            description: "Archive, toggle read or flagged, trash, or spam the current message.",
+        },
+        HelpEntry {
+            section: "Message actions",
+            key: "M T",
+            description: "Focus the custom-tag field for the current message.",
+        },
+        HelpEntry {
+            section: "Message actions",
             key: "r r",
             description: "Reply to the selected message.",
         },
@@ -16213,6 +16429,37 @@ mod tests {
         assert!(is_message_tag_menu_key(gtk::gdk::Key::M, none));
         assert!(is_message_tag_menu_key(gtk::gdk::Key::m, shift));
         assert!(!is_message_tag_menu_key(gtk::gdk::Key::m, none));
+        assert_eq!(
+            message_tag_sequence_key_action(gtk::gdk::Key::a, none),
+            Some(MessageTagSequenceKeyAction::Archive)
+        );
+        assert_eq!(
+            message_tag_sequence_key_action(gtk::gdk::Key::u, none),
+            Some(MessageTagSequenceKeyAction::ToggleRead)
+        );
+        assert_eq!(
+            message_tag_sequence_key_action(gtk::gdk::Key::f, none),
+            Some(MessageTagSequenceKeyAction::ToggleFlag)
+        );
+        assert_eq!(
+            message_tag_sequence_key_action(gtk::gdk::Key::t, none),
+            Some(MessageTagSequenceKeyAction::Trash)
+        );
+        assert_eq!(
+            message_tag_sequence_key_action(gtk::gdk::Key::s, none),
+            Some(MessageTagSequenceKeyAction::Spam)
+        );
+        assert_eq!(
+            message_tag_sequence_key_action(gtk::gdk::Key::T, none),
+            Some(MessageTagSequenceKeyAction::CustomTag)
+        );
+        assert_eq!(
+            message_tag_sequence_key_action(gtk::gdk::Key::t, shift),
+            Some(MessageTagSequenceKeyAction::CustomTag)
+        );
+        for key in [gtk::gdk::Key::m, gtk::gdk::Key::x, gtk::gdk::Key::A] {
+            assert_eq!(message_tag_sequence_key_action(key, none), None);
+        }
         assert_eq!(relative_message_index(1, 3, 1), Some(2));
         assert_eq!(relative_message_index(1, 3, -1), Some(0));
         assert_eq!(relative_message_index(2, 3, 8), Some(2));

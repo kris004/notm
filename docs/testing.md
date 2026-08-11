@@ -127,8 +127,9 @@ NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
 
 The focused-text and physical-key shortcut regressions have a self-contained
 headless Sway check. It covers J/K message navigation, lowercase j/k scrolling,
-the M current-message menu, and normal/insert-mode tag-editor safety. It
-requires `dbus-run-session`, `sway`, `swaymsg`, and `wtype`:
+the M current-message menu and its two-key actions, and normal/insert-mode
+tag-editor safety. It requires `dbus-run-session`, `sway`, `swaymsg`, and
+`wtype`:
 
 ```sh
 CARGO_HOME=$PWD/.cargo-home cargo build -p notm-app

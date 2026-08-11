@@ -457,7 +457,7 @@ def exercise_message_navigation(
     wait_for_selected_message(harness, THREAD_ROOT_ID)
 
     driver.send("-M", "shift", "-k", "m", "-m", "shift")
-    wait_until(
+    menu_state = wait_until(
         "M current-message action menu",
         lambda: (
             state
@@ -467,19 +467,56 @@ def exercise_message_navigation(
         ),
         timeout=5,
     )
-    driver.send("-k", "Escape")
+    expected_labels = {
+        "archive_label": "Archive message (M a)",
+        "read_label": "Mark message read (M u)",
+        "flag_label": "Flag message (M f)",
+        "trash_label": "Move message to trash (M t)",
+        "spam_label": "Mark message as spam (M s)",
+        "custom_apply_label": "Add tag (M T)",
+    }
+    for field, expected in expected_labels.items():
+        if menu_state.get(field) != expected:
+            raise SmokeFailure(
+                f"M menu did not expose {expected!r}: {menu_state!r}"
+            )
+
+    def current_message_unread(expected: bool) -> dict[str, Any] | None:
+        state = harness.request("message_tag_state")
+        selected = state.get("selected_message")
+        if not isinstance(selected, dict) or selected.get("message_id") != THREAD_ROOT_ID:
+            return None
+        tags = selected.get("tags")
+        if not isinstance(tags, list) or (("unread" in tags) != expected):
+            return None
+        return state if state.get("menu_popup_visible") is False else None
+
+    driver.send("-k", "u")
+    wait_until("M u to mark only the current message read", lambda: current_message_unread(False))
+
+    driver.send("-M", "shift", "-k", "m", "-m", "shift", "-k", "u")
     wait_until(
-        "current-message action menu to close",
-        lambda: (
-            state
-            if (state := harness.request("message_tag_state")).get("menu_popup_visible")
-            is False
-            else None
-        ),
-        timeout=5,
+        "a second M u to restore the current message unread tag",
+        lambda: current_message_unread(True),
     )
+
+    driver.send("-M", "shift", "-k", "m", "-m", "shift", "-M", "shift", "-k", "t", "-m", "shift")
+
+    def message_custom_tag_editor_ready() -> dict[str, Any] | None:
+        entry = harness.entry_state()
+        menu = harness.request("message_tag_state")
+        return (
+            entry
+            if entry.get("input_mode") == "Insert"
+            and entry.get("message_custom_tag_has_focus") is True
+            and menu.get("menu_popup_visible") is True
+            else None
+        )
+
+    wait_until("M T to focus the current-message custom-tag field", message_custom_tag_editor_ready)
+    driver.send("-k", "Escape", "-k", "Escape")
     print(
-        "[ui-message-navigation] J/K navigation, lowercase scrolling, and M menu passed",
+        "[ui-message-navigation] J/K navigation and M a/u/f/t/s/T actions passed",
         flush=True,
     )
 
@@ -857,6 +894,11 @@ def run_inside_dbus(args: argparse.Namespace) -> int:
         wait_until("fixture test harness health", harness_ready, timeout=30)
         focus_app_window(environment, app_process.pid)
         driver = WtypeDriver(environment)
+        # Establish the virtual keyboard before the first asserted shortcut.
+        # A newly added headless seat can otherwise consume its first key while
+        # Sway is assigning keyboard focus.
+        driver.send("-k", "Escape")
+        focus_app_window(environment, app_process.pid)
         exercise_message_navigation(environment, driver, harness, app_process.pid)
         exercise_ui(environment, driver, harness, app_process.pid)
         exercise_tag_editor(environment, driver, harness, app_process.pid)
