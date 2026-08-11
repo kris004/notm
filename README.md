@@ -20,7 +20,8 @@ real mail or account data.
 - Fast Notmuch queries, saved searches, tag searches, and paged thread results.
 - Column and stacked layouts with keyboard navigation throughout the interface.
 - Plain-text, sanitized HTML, header, raw-source, and MIME-tree message views.
-- Archive, trash, spam, read, flag, and custom-tag actions, with undo support.
+- Thread- and message-scoped archive, trash, spam, read, flag, and custom-tag
+  actions, with undo support.
 - Reply, reply-all, forwarding, attachments, address completion, and recoverable
   local drafts.
 - External send and sync commands, so existing tools such as `sendmail`,
@@ -129,8 +130,12 @@ behavior.
 Press `?` in the application for searchable shortcut help. A few useful keys:
 
 - `/` searches, `:` opens the command palette, and `j`/`k` move through rows.
+- `J`/`K` select the next or previous message in a thread; lowercase `j`/`k`
+  continue to scroll the message view.
 - `h`/`l` move between panes; `Ctrl+1`, `Ctrl+2`, and `Ctrl+3` toggle them.
 - `a`, `t`, `s`, `u`, and `f` archive, trash, spam, mark read/unread, and flag.
+- `M` opens actions that tag only the currently displayed message; the actions
+  above the thread list remain thread-scoped.
 - `r r`, `r a`, `r f`, and `r A` reply, reply all, forward inline, and forward
   as an attachment.
 - `c` composes, `Ctrl+Enter` sends, and `S` saves a draft.

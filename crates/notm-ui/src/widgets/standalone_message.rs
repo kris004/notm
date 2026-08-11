@@ -173,6 +173,9 @@ impl StandaloneMessageController {
             "notm-message-window-message-menu-button",
             &options.policy,
         );
+        message_menu_button.set_tooltip_text(Some(
+            "Choose a message in this thread. Use J/K for next/previous message.",
+        ));
         let (view_menu_button, view_menu_box) = menu_button_with_box(
             "View",
             "notm-message-window-view-menu-button",
@@ -625,6 +628,14 @@ fn update_button_binding_labels(standalone: &StandaloneMessageWindow) {
         "r A",
         standalone,
     );
+    let message_base =
+        strip_binding_suffix(&standalone.message_menu_button.label().unwrap_or_default());
+    set_menu_button_label(
+        &standalone.message_menu_button,
+        &message_base,
+        "J/K",
+        standalone,
+    );
     set_menu_button_label(&standalone.view_menu_button, "View", "V", standalone);
     set_button_label(&standalone.view_text_button, "Text", "V t", standalone);
     set_button_label(
@@ -763,7 +774,9 @@ fn standalone_key_controller(
                 false
             });
         }
-        let handled = if key == gtk::gdk::Key::j || key == gtk::gdk::Key::Down {
+        let handled = if let Some(delta) = message_navigation_delta(key, mods) {
+            select_relative_message(&standalone, delta)
+        } else if key == gtk::gdk::Key::j || key == gtk::gdk::Key::Down {
             scroll_message_lines(&standalone, 1.0);
             true
         } else if key == gtk::gdk::Key::k || key == gtk::gdk::Key::Up {
@@ -977,6 +990,52 @@ fn select_message(standalone: &Rc<StandaloneMessageWindow>, index: usize) -> boo
     populate_message_menu(standalone);
     standalone.message_menu_button.popdown();
     true
+}
+
+fn message_navigation_delta(key: gtk::gdk::Key, mods: gtk::gdk::ModifierType) -> Option<isize> {
+    let shifted = |lowercase, uppercase| {
+        key == uppercase || (key == lowercase && mods.contains(gtk::gdk::ModifierType::SHIFT_MASK))
+    };
+    if shifted(gtk::gdk::Key::j, gtk::gdk::Key::J) {
+        Some(1)
+    } else if shifted(gtk::gdk::Key::k, gtk::gdk::Key::K) {
+        Some(-1)
+    } else {
+        None
+    }
+}
+
+fn relative_message_index(current: usize, total: usize, delta: isize) -> Option<usize> {
+    if total == 0 {
+        return None;
+    }
+    Some(if delta >= 0 {
+        current
+            .saturating_add(delta as usize)
+            .min(total.saturating_sub(1))
+    } else {
+        current.saturating_sub(delta.unsigned_abs())
+    })
+}
+
+fn select_relative_message(standalone: &Rc<StandaloneMessageWindow>, delta: isize) -> bool {
+    let (current, total) = {
+        let state = standalone.state.borrow();
+        (state.selected_index, state.messages.len())
+    };
+    let Some(target) = relative_message_index(current, total, delta) else {
+        standalone.status_label.set_text("Thread has no messages");
+        return false;
+    };
+    if target == current {
+        standalone.status_label.set_text(if delta < 0 {
+            "Already at the first message in this thread"
+        } else {
+            "Already at the last message in this thread"
+        });
+        return true;
+    }
+    select_message(standalone, target)
 }
 
 fn populate_message_menu(standalone: &Rc<StandaloneMessageWindow>) {
@@ -1628,6 +1687,19 @@ mod tests {
 
     #[test]
     fn standalone_message_shortcut_sequences_match_their_menu_bindings() {
+        let none = gtk::gdk::ModifierType::empty();
+        let shift = gtk::gdk::ModifierType::SHIFT_MASK;
+        assert_eq!(message_navigation_delta(gtk::gdk::Key::J, none), Some(1));
+        assert_eq!(message_navigation_delta(gtk::gdk::Key::K, none), Some(-1));
+        assert_eq!(message_navigation_delta(gtk::gdk::Key::j, shift), Some(1));
+        assert_eq!(message_navigation_delta(gtk::gdk::Key::k, shift), Some(-1));
+        assert_eq!(message_navigation_delta(gtk::gdk::Key::j, none), None);
+        assert_eq!(message_navigation_delta(gtk::gdk::Key::k, none), None);
+        assert_eq!(relative_message_index(1, 3, 1), Some(2));
+        assert_eq!(relative_message_index(1, 3, -1), Some(0));
+        assert_eq!(relative_message_index(2, 3, 8), Some(2));
+        assert_eq!(relative_message_index(0, 3, -8), Some(0));
+        assert_eq!(relative_message_index(0, 0, 1), None);
         assert_eq!(
             response_sequence_action(gtk::gdk::Key::r),
             Some(StandaloneResponseAction::Reply(ReplyKind::Sender))

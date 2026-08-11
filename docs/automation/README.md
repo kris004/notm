@@ -81,12 +81,13 @@ Implemented test-harness commands include:
   `thread_selection_view_state`, `thread_row_layout`, `thread_list_rows`,
   `select_saved_search`, `save_current_search`, `select_thread_by_index`,
   `select_relative_thread`, `select_thread_edge`, `open_selected_thread`,
-  `select_message_by_index`, `thread_ui_details`, `toggle_multi_select_thread`,
-  `clear_multi_selection`
+  `select_message_by_index`, `select_relative_message`, `thread_ui_details`,
+  `toggle_multi_select_thread`, `clear_multi_selection`
 - tags: `archive_selected`, `mark_read_selected`, `mark_unread_selected`,
   `flag_selected`, `unflag_selected`, `trash_selected`, `spam_selected`,
   `tag_selected`, `add_tag_selected`, `remove_tag_selected`, `undo_last_tag`,
-  `undo_tag_actions`
+  `undo_tag_actions`, `message_tag_state`, `set_message_tag_entry`,
+  `click_message_tag_action`
 - compose/send: `open_compose`, `compose_set_from`, `compose_set_to`,
   `compose_set_cc`, `compose_set_bcc`, `compose_set_subject`,
   `compose_set_body`, `compose_add_attachment`, `compose_send`
@@ -120,6 +121,13 @@ Implemented test-harness commands include:
 mode. Tests that exercise keyboard editing should send the same `/`, `i`, or
 Enter transition that a user would use instead of relying on the harness to
 change modes implicitly.
+
+`click_message_tag_action` drives the real current-message menu buttons and
+accepts `action` set to `archive`, `read`, `flag`, `trash`, `spam`, or `custom`.
+The custom action also accepts `tag`. These operations target the selected
+message ID only; thread selection and multi-selection are ignored. Like the
+thread tag commands, they require fixture mode or
+`automation.allow_live_tag_test=true`.
 
 In fixture mode, `draft_list_state` reports whether the rendered Saved drafts
 section, explicit empty state, bounded scroller, rows, and per-selection Delete

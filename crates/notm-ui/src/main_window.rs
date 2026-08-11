@@ -462,6 +462,15 @@ struct Widgets {
     response_menu_box: gtk::Box,
     message_menu_button: gtk::MenuButton,
     message_menu_box: gtk::Box,
+    message_tag_menu_button: gtk::MenuButton,
+    message_archive_button: gtk::Button,
+    message_read_toggle_button: gtk::Button,
+    message_flag_toggle_button: gtk::Button,
+    message_trash_button: gtk::Button,
+    message_spam_button: gtk::Button,
+    message_custom_tag_entry: gtk::Entry,
+    message_custom_tag_action_label: gtk::Label,
+    message_custom_tag_apply_button: gtk::Button,
     view_menu_button: gtk::MenuButton,
     view_menu_box: gtk::Box,
     view_text_button: gtk::Button,
@@ -1069,6 +1078,55 @@ fn build_ui(
     }
     let (message_menu_button, message_menu_box) =
         menu_button_with_box("Message", "notm-message-menu-button", &state);
+    message_menu_button.set_tooltip_text(Some(
+        "Choose a message in this thread. Use J/K for next/previous message.",
+    ));
+    let (message_tag_menu_button, message_tag_menu_box) =
+        menu_button_with_box("Tag message", "notm-message-tag-menu-button", &state);
+    message_tag_menu_button
+        .set_tooltip_text(Some("Apply tags to the currently displayed message only."));
+    message_tag_menu_box.set_spacing(4);
+    message_tag_menu_box.set_margin_start(6);
+    message_tag_menu_box.set_margin_end(6);
+    message_tag_menu_box.set_margin_top(6);
+    message_tag_menu_box.set_margin_bottom(6);
+    let message_tag_scope_label = gtk::Label::new(Some("Current message only"));
+    message_tag_scope_label.set_xalign(0.0);
+    message_tag_scope_label.add_css_class("dim-label");
+    message_tag_menu_box.append(&message_tag_scope_label);
+    let message_archive_button = gtk::Button::with_label("Archive message");
+    message_archive_button.set_widget_name("notm-message-archive-button");
+    let message_read_toggle_button = gtk::Button::with_label("Mark message read");
+    message_read_toggle_button.set_widget_name("notm-message-read-toggle-button");
+    let message_flag_toggle_button = gtk::Button::with_label("Flag message");
+    message_flag_toggle_button.set_widget_name("notm-message-flag-toggle-button");
+    let message_trash_button = gtk::Button::with_label("Move message to trash");
+    message_trash_button.set_widget_name("notm-message-trash-button");
+    let message_spam_button = gtk::Button::with_label("Mark message as spam");
+    message_spam_button.set_widget_name("notm-message-spam-button");
+    for button in [
+        &message_archive_button,
+        &message_read_toggle_button,
+        &message_flag_toggle_button,
+        &message_trash_button,
+        &message_spam_button,
+    ] {
+        message_tag_menu_box.append(button);
+    }
+    let message_custom_tag_action_label = gtk::Label::new(Some("Custom tag"));
+    message_custom_tag_action_label.set_xalign(0.0);
+    message_custom_tag_action_label.add_css_class("dim-label");
+    message_tag_menu_box.append(&message_custom_tag_action_label);
+    let message_custom_tag_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    let message_custom_tag_entry = entry_with_placeholder("message tag");
+    message_custom_tag_entry.set_widget_name("notm-message-custom-tag-entry");
+    message_custom_tag_entry.set_hexpand(true);
+    let message_custom_tag_apply_button = gtk::Button::with_label("Add tag");
+    message_custom_tag_apply_button.set_widget_name("notm-message-custom-tag-apply-button");
+    message_custom_tag_apply_button.add_css_class("suggested-action");
+    message_custom_tag_row.append(&message_custom_tag_entry);
+    message_custom_tag_row.append(&message_custom_tag_apply_button);
+    message_tag_menu_box.append(&message_custom_tag_row);
     let (view_menu_button, view_menu_box) =
         menu_button_with_box("View", "notm-view-menu-button", &state);
     let view_text_button = gtk::Button::with_label("Text");
@@ -1117,6 +1175,7 @@ fn build_ui(
     }
     message_actions.append(&response_menu_button);
     message_actions.append(&message_menu_button);
+    message_actions.append(&message_tag_menu_button);
     message_actions.append(&view_menu_button);
     message_actions.append(&collapse_quotes_button);
     message_actions.append(&copy_menu_button);
@@ -1311,6 +1370,15 @@ fn build_ui(
         response_menu_box: response_menu_box.clone(),
         message_menu_button,
         message_menu_box,
+        message_tag_menu_button,
+        message_archive_button,
+        message_read_toggle_button,
+        message_flag_toggle_button,
+        message_trash_button,
+        message_spam_button,
+        message_custom_tag_entry,
+        message_custom_tag_action_label,
+        message_custom_tag_apply_button,
         view_menu_button,
         view_menu_box: view_menu_box.clone(),
         view_text_button,
@@ -1409,7 +1477,7 @@ fn build_ui(
     );
     connect_draft_list(&options, &widgets, &state);
     connect_compose_vim_context(&options, &widgets, &state);
-    connect_message_actions(&options, &widgets, &state);
+    connect_message_actions(&options, &widgets, &state, &undo_state);
     connect_recipient_autocomplete(&widgets.composer.to_entry(), &widgets, &state);
     connect_recipient_autocomplete(&widgets.composer.cc_entry(), &widgets, &state);
     connect_recipient_autocomplete(&widgets.composer.bcc_entry(), &widgets, &state);
@@ -3155,7 +3223,12 @@ fn connect_draft_list(options: &LaunchOptions, widgets: &Widgets, state: &Shared
         });
 }
 
-fn connect_message_actions(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+fn connect_message_actions(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    undo_state: &UndoState,
+) {
     // These view-mode actions are presentation-only: they retain composer fields, active-draft
     // identity, and recovery bytes. Transitions that actually detach the composer from a selected
     // message are routed through `request_show_selected_message` instead.
@@ -3251,6 +3324,117 @@ fn connect_message_actions(options: &LaunchOptions, widgets: &Widgets, state: &S
     widgets.copy_subject_button.connect_clicked(move |_| {
         copy_selected_message_subject(&w, &st);
         w.copy_menu_button.popdown();
+    });
+
+    connect_message_tag_button(
+        &widgets.message_archive_button,
+        options,
+        widgets,
+        state,
+        undo_state,
+        &[],
+        &["inbox"],
+    );
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let undo = undo_state.clone();
+    widgets
+        .message_read_toggle_button
+        .connect_clicked(move |_| {
+            toggle_selected_message_tag(&opts, &w, &st, &undo, "unread");
+            w.message_tag_menu_button.popdown();
+        });
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let undo = undo_state.clone();
+    widgets
+        .message_flag_toggle_button
+        .connect_clicked(move |_| {
+            toggle_selected_message_tag(&opts, &w, &st, &undo, "flagged");
+            w.message_tag_menu_button.popdown();
+        });
+
+    connect_message_tag_button(
+        &widgets.message_trash_button,
+        options,
+        widgets,
+        state,
+        undo_state,
+        &["trash"],
+        &["inbox", "spam"],
+    );
+    connect_message_tag_button(
+        &widgets.message_spam_button,
+        options,
+        widgets,
+        state,
+        undo_state,
+        &["spam"],
+        &["inbox", "trash"],
+    );
+
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets
+        .message_custom_tag_entry
+        .connect_changed(move |_| update_message_tag_controls(&w, &st));
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let undo = undo_state.clone();
+    widgets
+        .message_custom_tag_apply_button
+        .connect_clicked(move |_| {
+            apply_custom_tag_to_selected_message(&opts, &w, &st, &undo);
+        });
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let undo = undo_state.clone();
+    widgets.message_custom_tag_entry.connect_activate(move |_| {
+        apply_custom_tag_to_selected_message(&opts, &w, &st, &undo);
+    });
+}
+
+fn connect_message_tag_button(
+    button: &gtk::Button,
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    undo_state: &UndoState,
+    add: &[&str],
+    remove: &[&str],
+) {
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let undo = undo_state.clone();
+    let add = add.iter().map(|tag| (*tag).to_string()).collect::<Vec<_>>();
+    let remove = remove
+        .iter()
+        .map(|tag| (*tag).to_string())
+        .collect::<Vec<_>>();
+    button.connect_clicked(move |_| {
+        tag_selected_message(
+            &opts,
+            &w,
+            &st,
+            &undo,
+            TagMutation {
+                add: add.clone(),
+                remove: remove.clone(),
+                sync_maildir_flags: settings::sync_maildir_flags_after_tag_change(
+                    &opts.runtime_settings,
+                ),
+            },
+        );
+        w.message_tag_menu_button.popdown();
     });
 }
 
@@ -4831,6 +5015,20 @@ fn update_button_binding_labels(widgets: &Widgets, state: &SharedState) {
         visible_binding(message_bindings, "r A"),
         state,
     );
+    let message_base =
+        strip_binding_suffix(&widgets.message_menu_button.label().unwrap_or_default());
+    set_menu_button_label(
+        &widgets.message_menu_button,
+        &message_base,
+        visible_binding(message_bindings, "J/K"),
+        state,
+    );
+    set_menu_button_label(
+        &widgets.message_tag_menu_button,
+        "Tag message",
+        visible_binding(message_bindings, "M"),
+        state,
+    );
     set_menu_button_label(
         &widgets.view_menu_button,
         "View",
@@ -4978,6 +5176,12 @@ fn connect_input_mode_focus(widgets: &Widgets, state: &SharedState) {
         ActivePane::Threads,
     );
     connect_text_focus(
+        &widgets.message_custom_tag_entry,
+        widgets,
+        state,
+        ActivePane::Message,
+    );
+    connect_text_focus(
         &widgets.search_bar.entry(),
         widgets,
         state,
@@ -5046,6 +5250,7 @@ fn main_text_entry_has_focus(widgets: &Widgets) -> bool {
         &widgets.saved_query_entry,
         &widgets.custom_tag_entry,
         &widgets.tag_command_entry,
+        &widgets.message_custom_tag_entry,
         &widgets.search_bar.entry(),
         &widgets.composer.sender_entry(),
         &widgets.composer.to_entry(),
@@ -5337,6 +5542,7 @@ fn install_shortcuts(
             w.view_menu_button.popdown();
             w.copy_menu_button.popdown();
             w.tag_menu_button.popdown();
+            w.message_tag_menu_button.popdown();
             w.undo_tag_button.popdown();
         };
         let input_mode_generation = w.input_mode_generation.get();
@@ -5622,6 +5828,10 @@ fn install_shortcuts(
                 "Go: g top/count, 1-9 tags, i inbox, u unread, f flagged, s sent, d drafts, t trash, a all, c custom",
             );
             true
+        } else if let Some(delta) = message_navigation_delta(key, mods) {
+            let available = message_pane_shortcuts_available(&w) && !compose_view_is_visible(&w);
+            clear_numeric_prefix(&numeric_prefix);
+            available && select_relative_message(&opts, &w, &st, delta * count as isize)
         } else if key == gtk::gdk::Key::j || key == gtk::gdk::Key::Down {
             if st.borrow().active_pane == ActivePane::Threads {
                 select_relative_thread(&opts, &w, &st, count as isize);
@@ -5684,6 +5894,15 @@ fn install_shortcuts(
         } else if key == gtk::gdk::Key::f {
             clear_numeric_prefix(&numeric_prefix);
             toggle_flagged_selected(&opts, &w, &st, &undo);
+            true
+        } else if is_message_tag_menu_key(key, mods)
+            && message_pane_shortcuts_available(&w)
+            && !compose_view_is_visible(&w)
+        {
+            clear_numeric_prefix(&numeric_prefix);
+            w.message_tag_menu_button.popup();
+            w.status_label
+                .set_text("Current message actions: use j/k and Enter");
             true
         } else if is_tag_sequence_prefix(key, mods) {
             clear_numeric_prefix(&numeric_prefix);
@@ -7650,6 +7869,72 @@ fn activate_image_policy_button(options: &LaunchOptions, widgets: &Widgets, stat
     }
 }
 
+fn update_message_tag_controls(widgets: &Widgets, state: &SharedState) {
+    let (selected, background_activity) = {
+        let state = state.borrow();
+        (
+            state.selected_message.clone(),
+            state.sync_in_progress || state.send_in_progress,
+        )
+    };
+    let has_message = selected.is_some() && !compose_view_is_visible(widgets);
+    let can_mutate = has_message && !background_activity;
+    widgets.message_tag_menu_button.set_visible(has_message);
+    widgets.message_tag_menu_button.set_sensitive(can_mutate);
+    for button in [
+        &widgets.message_archive_button,
+        &widgets.message_read_toggle_button,
+        &widgets.message_flag_toggle_button,
+        &widgets.message_trash_button,
+        &widgets.message_spam_button,
+    ] {
+        button.set_sensitive(can_mutate);
+    }
+
+    let selected_tags = selected
+        .as_ref()
+        .map(|message| message.tags.as_slice())
+        .unwrap_or_default();
+    widgets.message_read_toggle_button.set_label(
+        if selected_tags.iter().any(|tag| tag == "unread") {
+            "Mark message read"
+        } else {
+            "Mark message unread"
+        },
+    );
+    widgets.message_flag_toggle_button.set_label(
+        if selected_tags.iter().any(|tag| tag == "flagged") {
+            "Unflag message"
+        } else {
+            "Flag message"
+        },
+    );
+
+    let custom_tag = widgets.message_custom_tag_entry.text().trim().to_string();
+    let has_custom_tag =
+        !custom_tag.is_empty() && selected_tags.iter().any(|existing| existing == &custom_tag);
+    widgets
+        .message_custom_tag_action_label
+        .set_text(if custom_tag.is_empty() {
+            "Custom tag for current message"
+        } else if has_custom_tag {
+            "Current message has this tag"
+        } else {
+            "Current message does not have this tag"
+        });
+    widgets
+        .message_custom_tag_apply_button
+        .set_label(if has_custom_tag {
+            "Remove tag"
+        } else {
+            "Add tag"
+        });
+    widgets.message_custom_tag_entry.set_sensitive(can_mutate);
+    widgets
+        .message_custom_tag_apply_button
+        .set_sensitive(can_mutate && !custom_tag.is_empty());
+}
+
 fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     let html_visible = html_view_is_visible(widgets);
     let has_html = selected_message_has_html(state);
@@ -7737,6 +8022,7 @@ fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, sta
     widgets.copy_to_email_button.set_sensitive(has_message);
     widgets.copy_cc_email_button.set_sensitive(has_message);
     widgets.copy_subject_button.set_sensitive(has_message);
+    update_message_tag_controls(widgets, state);
     if html_visible && has_html {
         let image_policy = if html_view_images_allowed(widgets) {
             if selected_message_allows_images(options, state) {
@@ -8023,6 +8309,7 @@ fn show_compose_view(widgets: &Widgets) {
     widgets.composer.hide_address_suggestions();
     widgets.html_policy_row.set_visible(false);
     widgets.message_header_box.set_visible(false);
+    widgets.message_tag_menu_button.set_visible(false);
     widgets.attachments.hide();
     widgets.message_stack.set_visible_child_name("compose");
 }
@@ -10051,6 +10338,19 @@ fn tag_undo_label(
     target_threads: usize,
     changed_messages: usize,
 ) -> String {
+    let ops = tag_mutation_label(mutation);
+    format!(
+        "{ops} on {} ({changed_messages} changed)",
+        tag_target_status_label(target_threads)
+    )
+}
+
+fn message_tag_undo_label(mutation: &TagMutation, changed_messages: usize) -> String {
+    let ops = tag_mutation_label(mutation);
+    format!("{ops} on 1 message ({changed_messages} changed)")
+}
+
+fn tag_mutation_label(mutation: &TagMutation) -> String {
     let adds = if mutation.add.is_empty() {
         String::new()
     } else {
@@ -10061,15 +10361,11 @@ fn tag_undo_label(
     } else {
         format!("-{}", mutation.remove.join(" -"))
     };
-    let ops = [adds, removes]
+    [adds, removes]
         .into_iter()
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
-        .join(" ");
-    format!(
-        "{ops} on {} ({changed_messages} changed)",
-        tag_target_status_label(target_threads)
-    )
+        .join(" ")
 }
 
 fn undo_detail_for_visual_range(query: &str, start: usize, end: usize) -> String {
@@ -10209,6 +10505,135 @@ fn ensure_user_operation_allowed(
     state.borrow_mut().last_operation = Some(message.to_string());
     update_debug(widgets, state);
     anyhow::bail!(message)
+}
+
+fn selected_message_has_tag(state: &SharedState, tag: &str) -> bool {
+    state
+        .borrow()
+        .selected_message
+        .as_ref()
+        .is_some_and(|message| message.tags.iter().any(|existing| existing == tag))
+}
+
+fn toggle_selected_message_tag(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    undo_state: &UndoState,
+    tag: &str,
+) -> bool {
+    let remove = selected_message_has_tag(state, tag);
+    tag_selected_message(
+        options,
+        widgets,
+        state,
+        undo_state,
+        TagMutation {
+            add: (!remove).then(|| tag.to_string()).into_iter().collect(),
+            remove: remove.then(|| tag.to_string()).into_iter().collect(),
+            sync_maildir_flags: settings::sync_maildir_flags_after_tag_change(
+                &options.runtime_settings,
+            ),
+        },
+    )
+}
+
+fn apply_custom_tag_to_selected_message(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    undo_state: &UndoState,
+) -> bool {
+    let tag = widgets.message_custom_tag_entry.text().trim().to_string();
+    if tag.is_empty() {
+        widgets.status_label.set_text("Message tag name is empty");
+        return false;
+    }
+    let applied = toggle_selected_message_tag(options, widgets, state, undo_state, &tag);
+    update_message_tag_controls(widgets, state);
+    if applied {
+        widgets.message_custom_tag_entry.grab_focus();
+        widgets.message_custom_tag_entry.select_region(0, -1);
+    }
+    applied
+}
+
+fn tag_selected_message(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    undo_state: &UndoState,
+    mutation: TagMutation,
+) -> bool {
+    if ensure_user_operation_allowed(widgets, state, UserOperation::Tag).is_err() {
+        return false;
+    }
+    let Some(message) = state.borrow().selected_message.clone() else {
+        widgets
+            .status_label
+            .set_text("No selected message for tag operation");
+        return false;
+    };
+    let message_id = message.message_id.clone();
+    let result = (|| -> anyhow::Result<usize> {
+        let db = Database::open(&open_config(options), DatabaseMode::ReadWrite)?;
+        let changes = db.apply_tags_to_messages(
+            &[MessageTagMutation {
+                message_id: message_id.clone(),
+                add: mutation.add.clone(),
+                remove: mutation.remove.clone(),
+            }],
+            mutation.sync_maildir_flags,
+        )?;
+        if !changes.is_empty() {
+            push_undo_tag_action(
+                undo_state,
+                UndoTagAction {
+                    mutations: changes.iter().map(|change| change.inverse()).collect(),
+                    sync_maildir_flags: mutation.sync_maildir_flags,
+                    label: message_tag_undo_label(&mutation, changes.len()),
+                    detail: Some(undo_detail_for_message(&message)),
+                },
+            );
+        }
+        let mut state = state.borrow_mut();
+        state.last_operation = Some(format!(
+            "tagged current message {}: +{:?} -{:?}",
+            message_id, mutation.add, mutation.remove
+        ));
+        state.last_error = None;
+        Ok(changes.len())
+    })();
+    match result {
+        Ok(changed_messages) => {
+            if changed_messages > 0 {
+                apply_local_message_tag_mutation(widgets, state, &message_id, &mutation);
+            }
+            update_message_header(widgets, state);
+            update_message_tag_controls(widgets, state);
+            update_message_action_buttons(options, widgets, state);
+            set_undo_tag_available(widgets, !undo_state.borrow().is_empty());
+            if changed_messages > 0 {
+                widgets.status_label.set_text(
+                    "Tag operation complete for current message; Undo menu shows recent tag actions",
+                );
+            } else {
+                widgets
+                    .status_label
+                    .set_text("Message tag operation made no changes");
+            }
+            update_debug(widgets, state);
+            true
+        }
+        Err(err) => {
+            state.borrow_mut().last_error = Some(err.to_string());
+            widgets
+                .status_label
+                .set_text(&format!("Message tag operation failed: {err}"));
+            update_debug(widgets, state);
+            false
+        }
+    }
 }
 
 fn tag_selected(
@@ -10426,6 +10851,71 @@ fn apply_local_tag_mutation(
     update_visual_selection_rows(widgets, state);
 }
 
+fn apply_local_message_tag_mutation(
+    widgets: &Widgets,
+    state: &SharedState,
+    message_id: &str,
+    mutation: &TagMutation,
+) {
+    let row_updates = {
+        let mut state = state.borrow_mut();
+        let Some(thread_id) = state
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .map(|message| message.thread_id.clone())
+        else {
+            return;
+        };
+        for message in &mut state.messages {
+            if message.message_id == message_id {
+                apply_tag_mutation_to_tags(&mut message.tags, mutation);
+            }
+        }
+        if let Some(message) = &mut state.selected_message
+            && message.message_id == message_id
+        {
+            apply_tag_mutation_to_tags(&mut message.tags, mutation);
+        }
+
+        let aggregate_tags = aggregate_thread_tags(&state.messages, &thread_id);
+        let mut updated_thread_indices = Vec::new();
+        for (index, thread) in state.thread_list_items.iter_mut().enumerate() {
+            if thread.thread_id == thread_id {
+                set_thread_tags(thread, &aggregate_tags);
+                updated_thread_indices.push(index);
+            }
+        }
+        if let Some(thread) = &mut state.selected_thread
+            && thread.thread_id == thread_id
+        {
+            set_thread_tags(thread, &aggregate_tags);
+        }
+        updated_thread_indices
+    };
+    refresh_thread_model_rows(widgets, state, &row_updates);
+    update_visual_selection_rows(widgets, state);
+}
+
+fn aggregate_thread_tags(
+    messages: &[notm_notmuch::MessageSummary],
+    thread_id: &str,
+) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|message| message.thread_id == thread_id)
+        .flat_map(|message| message.tags.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn set_thread_tags(thread: &mut notm_notmuch::ThreadSummary, tags: &[String]) {
+    thread.tags = tags.to_vec();
+    thread.has_unread = thread.tags.iter().any(|tag| tag == "unread");
+    thread.is_flagged = thread.tags.iter().any(|tag| tag == "flagged");
+}
+
 fn apply_tag_mutation_to_thread(thread: &mut notm_notmuch::ThreadSummary, mutation: &TagMutation) {
     apply_tag_mutation_to_tags(&mut thread.tags, mutation);
     thread.has_unread = thread.tags.iter().any(|tag| tag == "unread");
@@ -10586,6 +11076,86 @@ fn select_message_by_index(
             Some(rejection_restore),
         );
     }
+}
+
+fn shifted_shortcut_key(
+    key: gtk::gdk::Key,
+    mods: gtk::gdk::ModifierType,
+    lowercase: gtk::gdk::Key,
+    uppercase: gtk::gdk::Key,
+) -> bool {
+    key == uppercase || (key == lowercase && mods.contains(gtk::gdk::ModifierType::SHIFT_MASK))
+}
+
+fn message_navigation_delta(key: gtk::gdk::Key, mods: gtk::gdk::ModifierType) -> Option<isize> {
+    if shifted_shortcut_key(key, mods, gtk::gdk::Key::j, gtk::gdk::Key::J) {
+        Some(1)
+    } else if shifted_shortcut_key(key, mods, gtk::gdk::Key::k, gtk::gdk::Key::K) {
+        Some(-1)
+    } else {
+        None
+    }
+}
+
+fn is_message_tag_menu_key(key: gtk::gdk::Key, mods: gtk::gdk::ModifierType) -> bool {
+    shifted_shortcut_key(key, mods, gtk::gdk::Key::m, gtk::gdk::Key::M)
+}
+
+fn relative_message_index(current: usize, total: usize, delta: isize) -> Option<usize> {
+    if total == 0 {
+        return None;
+    }
+    Some(if delta >= 0 {
+        current
+            .saturating_add(delta as usize)
+            .min(total.saturating_sub(1))
+    } else {
+        current.saturating_sub(delta.unsigned_abs())
+    })
+}
+
+fn select_relative_message(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    delta: isize,
+) -> bool {
+    let (current, total) = {
+        let state = state.borrow();
+        let Some(selected_id) = state
+            .selected_message
+            .as_ref()
+            .map(|message| message.message_id.as_str())
+        else {
+            widgets.status_label.set_text("No selected message");
+            return false;
+        };
+        let Some(current) = state
+            .messages
+            .iter()
+            .position(|message| message.message_id == selected_id)
+        else {
+            widgets
+                .status_label
+                .set_text("Selected message is not in its thread");
+            return false;
+        };
+        (current, state.messages.len())
+    };
+    let Some(target) = relative_message_index(current, total, delta) else {
+        widgets.status_label.set_text("Thread has no messages");
+        return false;
+    };
+    if target == current {
+        widgets.status_label.set_text(if delta < 0 {
+            "Already at the first message in this thread"
+        } else {
+            "Already at the last message in this thread"
+        });
+        return true;
+    }
+    select_message_by_index(options, widgets, state, target);
+    true
 }
 
 fn undo_last_tag(
@@ -12638,6 +13208,8 @@ fn handle_automation_request(
             "ok": true,
             "respond": widgets.response_menu_button.label().map(|label| label.to_string()),
             "reply": widgets.reply_button.label().map(|label| label.to_string()),
+            "message": widgets.message_menu_button.label().map(|label| label.to_string()),
+            "message_tag": widgets.message_tag_menu_button.label().map(|label| label.to_string()),
             "view": widgets.view_menu_button.label().map(|label| label.to_string()),
             "collapse_quotes": widgets.collapse_quotes_button.label().map(|label| label.to_string()),
             "copy": widgets.copy_menu_button.label().map(|label| label.to_string()),
@@ -12740,6 +13312,19 @@ fn handle_automation_request(
             select_message_by_index(options, widgets, state, index);
             json!({"ok": true, "selected_message": state.borrow().selected_message})
         }
+        "select_relative_message" => {
+            let delta = req
+                .args
+                .get("delta")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(0) as isize;
+            let ok = select_relative_message(options, widgets, state, delta);
+            json!({
+                "ok": ok,
+                "selected_index": selected_message_index(state),
+                "selected_message": state.borrow().selected_message,
+            })
+        }
         "open_selected_thread" => {
             let idx = selected_thread_index(widgets).unwrap_or(0);
             open_thread_by_index(options, widgets, state, idx);
@@ -12818,6 +13403,77 @@ fn handle_automation_request(
                 None => {
                     json!({"ok": false, "error": format!("unknown standalone response action: {action_name}")})
                 }
+            }
+        }
+        "message_tag_state" => {
+            let selected = state.borrow().selected_message.clone();
+            json!({
+                "ok": true,
+                "selected_message": selected,
+                "menu_visible": widgets.message_tag_menu_button.is_visible(),
+                "menu_sensitive": widgets.message_tag_menu_button.is_sensitive(),
+                "menu_popup_visible": widgets
+                    .message_tag_menu_button
+                    .popover()
+                    .is_some_and(|popover| popover.is_visible()),
+                "menu_label": widgets.message_tag_menu_button.label().map(|label| label.to_string()),
+                "archive_label": widgets.message_archive_button.label().map(|label| label.to_string()),
+                "read_label": widgets.message_read_toggle_button.label().map(|label| label.to_string()),
+                "flag_label": widgets.message_flag_toggle_button.label().map(|label| label.to_string()),
+                "trash_label": widgets.message_trash_button.label().map(|label| label.to_string()),
+                "spam_label": widgets.message_spam_button.label().map(|label| label.to_string()),
+                "custom_tag": widgets.message_custom_tag_entry.text().to_string(),
+                "custom_action": widgets.message_custom_tag_action_label.text().to_string(),
+                "custom_apply_label": widgets.message_custom_tag_apply_button.label().map(|label| label.to_string()),
+                "custom_apply_sensitive": widgets.message_custom_tag_apply_button.is_sensitive(),
+                "status": widgets.status_label.text().to_string(),
+            })
+        }
+        "set_message_tag_entry" => {
+            let tag = req
+                .args
+                .get("tag")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            widgets.message_custom_tag_entry.set_text(tag);
+            json!({"ok": true, "tag": tag, "state": &*state.borrow()})
+        }
+        "click_message_tag_action" => {
+            let action = req
+                .args
+                .get("action")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if action == "custom"
+                && let Some(tag) = req.args.get("tag").and_then(|value| value.as_str())
+            {
+                widgets.message_custom_tag_entry.set_text(tag);
+            }
+            let button = match action {
+                "archive" => Some(&widgets.message_archive_button),
+                "read" | "toggle_read" => Some(&widgets.message_read_toggle_button),
+                "flag" | "toggle_flag" => Some(&widgets.message_flag_toggle_button),
+                "trash" => Some(&widgets.message_trash_button),
+                "spam" => Some(&widgets.message_spam_button),
+                "custom" => Some(&widgets.message_custom_tag_apply_button),
+                _ => None,
+            };
+            match button {
+                Some(button) if button.is_sensitive() => {
+                    button.emit_clicked();
+                    let ok = state.borrow().last_error.is_none();
+                    automation_mutation_response(ok, widgets, state)
+                }
+                Some(_) => json!({
+                    "ok": false,
+                    "error": "message tag action is unavailable",
+                    "state": &*state.borrow(),
+                }),
+                None => json!({
+                    "ok": false,
+                    "error": format!("unknown message tag action: {action}"),
+                    "state": &*state.borrow(),
+                }),
             }
         }
         "archive_selected" => {
@@ -13577,6 +14233,7 @@ fn automation_command_allowed_while_confirmation_pending(command: &str) -> bool 
             | "custom_saved_searches"
             | "pane_visibility"
             | "message_action_labels"
+            | "message_tag_state"
             | "layout_state"
             | "standalone_message_windows"
             | "undo_tag_actions"
@@ -13864,6 +14521,7 @@ fn ensure_automation_request_allowed(
         | "unflag_selected"
         | "trash_selected"
         | "spam_selected"
+        | "click_message_tag_action"
         | ADD_CUSTOM_TAG_FROM_ENTRY_COMMAND
         | REMOVE_CUSTOM_TAG_FROM_ENTRY_COMMAND
         | "tag_selected"
@@ -14987,7 +15645,7 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
         HelpEntry {
             section: "Thread actions",
             key: "T t",
-            description: "Open an add/remove tag input that uses the selected message(s) to choose add or remove.",
+            description: "Open an add/remove tag input for the selected thread(s).",
         },
         HelpEntry {
             section: "Thread actions",
@@ -15023,6 +15681,16 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
             section: "Saved searches",
             key: "g 1-9",
             description: "Open a numbered found-tag search or tag-path dropdown.",
+        },
+        HelpEntry {
+            section: "Message actions",
+            key: "J / K",
+            description: "Select the next or previous message in the current thread; lowercase j/k still scroll.",
+        },
+        HelpEntry {
+            section: "Message actions",
+            key: "M",
+            description: "Open tag actions for the currently displayed message only.",
         },
         HelpEntry {
             section: "Message actions",
@@ -15093,6 +15761,11 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
             section: "Menus",
             key: "Message menu",
             description: "Choose which message in a thread is selected.",
+        },
+        HelpEntry {
+            section: "Menus",
+            key: "Tag message menu",
+            description: "Archive, mark, or add/remove a tag on the current message without changing the rest of its thread.",
         },
         HelpEntry {
             section: "Menus",
@@ -15528,6 +16201,55 @@ mod tests {
     }
 
     #[test]
+    fn uppercase_message_navigation_preserves_lowercase_scroll_keys() {
+        let none = gtk::gdk::ModifierType::empty();
+        let shift = gtk::gdk::ModifierType::SHIFT_MASK;
+        assert_eq!(message_navigation_delta(gtk::gdk::Key::J, none), Some(1));
+        assert_eq!(message_navigation_delta(gtk::gdk::Key::K, none), Some(-1));
+        assert_eq!(message_navigation_delta(gtk::gdk::Key::j, shift), Some(1));
+        assert_eq!(message_navigation_delta(gtk::gdk::Key::k, shift), Some(-1));
+        assert_eq!(message_navigation_delta(gtk::gdk::Key::j, none), None);
+        assert_eq!(message_navigation_delta(gtk::gdk::Key::k, none), None);
+        assert!(is_message_tag_menu_key(gtk::gdk::Key::M, none));
+        assert!(is_message_tag_menu_key(gtk::gdk::Key::m, shift));
+        assert!(!is_message_tag_menu_key(gtk::gdk::Key::m, none));
+        assert_eq!(relative_message_index(1, 3, 1), Some(2));
+        assert_eq!(relative_message_index(1, 3, -1), Some(0));
+        assert_eq!(relative_message_index(2, 3, 8), Some(2));
+        assert_eq!(relative_message_index(0, 3, -8), Some(0));
+        assert_eq!(relative_message_index(0, 0, 1), None);
+    }
+
+    #[test]
+    fn current_message_tag_projection_keeps_other_message_tags_in_thread_summary() {
+        let message = |id: &str, thread_id: &str, tags: &[&str]| notm_notmuch::MessageSummary {
+            message_id: id.to_string(),
+            thread_id: thread_id.to_string(),
+            date: 0,
+            from: String::new(),
+            to: String::new(),
+            cc: String::new(),
+            subject: String::new(),
+            tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
+            filenames: Vec::new(),
+        };
+        let messages = vec![
+            message("one", "thread", &["inbox", "unread"]),
+            message("two", "thread", &["flagged"]),
+            message("other", "other-thread", &["spam"]),
+        ];
+
+        assert_eq!(
+            aggregate_thread_tags(&messages, "thread"),
+            vec![
+                "flagged".to_string(),
+                "inbox".to_string(),
+                "unread".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn live_send_without_command_or_fixture_capture_fails() {
         let options = LaunchOptions::default();
         let message = ComposedMessage::new(
@@ -15555,6 +16277,18 @@ mod tests {
         let tag_error = ensure_automation_request_allowed(&options, "archive_selected", &json!({}))
             .expect_err("live harness tag should be gated");
         assert!(tag_error.to_string().contains("allow_live_tag_test=true"));
+
+        let message_tag_error = ensure_automation_request_allowed(
+            &options,
+            "click_message_tag_action",
+            &json!({"action": "archive"}),
+        )
+        .expect_err("live harness current-message tag should be gated");
+        assert!(
+            message_tag_error
+                .to_string()
+                .contains("allow_live_tag_test=true")
+        );
 
         let nested_error = ensure_automation_request_allowed(
             &options,

@@ -86,6 +86,7 @@ outstanding; non-fixture runs reject that test-only argument.
 .BR select_thread_edge ,
 .BR open_selected_thread ,
 .BR select_message_by_index ,
+.BR select_relative_message ,
 .BR thread_ui_details ,
 .BR toggle_multi_select_thread ,
 .BR clear_multi_selection .
@@ -101,7 +102,25 @@ outstanding; non-fixture runs reject that test-only argument.
 .BR add_tag_selected ,
 .BR remove_tag_selected ,
 .BR undo_last_tag ,
-.BR undo_tag_actions .
+.BR undo_tag_actions ,
+.BR message_tag_state ,
+.BR set_message_tag_entry ,
+.BR click_message_tag_action .
+.PP
+.B click_message_tag_action
+drives the rendered current-message buttons.  Its
+.B action
+is one of
+.BR archive ,
+.BR read ,
+.BR flag ,
+.BR trash ,
+.BR spam ,
+or
+.BR custom ;
+the custom action also accepts
+.BR tag .
+It targets the selected message ID only and ignores thread multi-selection.
 .SS Compose and sending
 .BR open_compose ,
 .BR compose_set_from ,

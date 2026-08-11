@@ -113,8 +113,22 @@ NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
   -- --exact --nocapture --test-threads=1
 ```
 
-The focused-text shortcut regression has a self-contained headless Sway check.
-It requires `dbus-run-session`, `sway`, `swaymsg`, and `wtype`:
+Current-message navigation and message-only tag actions have a separate
+fixture-backed smoke. It verifies bounded relative navigation, drives the real
+custom-tag button, proves that only the selected message ID changes, and checks
+exact undo restoration:
+
+```sh
+NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
+  cargo test -p notm-app --test desktop_ui_smoke \
+  fixture_current_message_navigation_and_tagging_are_explicit \
+  -- --exact --nocapture --test-threads=1
+```
+
+The focused-text and physical-key shortcut regressions have a self-contained
+headless Sway check. It covers J/K message navigation, lowercase j/k scrolling,
+the M current-message menu, and normal/insert-mode tag-editor safety. It
+requires `dbus-run-session`, `sway`, `swaymsg`, and `wtype`:
 
 ```sh
 CARGO_HOME=$PWD/.cargo-home cargo build -p notm-app

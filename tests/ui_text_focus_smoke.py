@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise text-field and tag-editor keyboard safety in headless Sway.
+"""Exercise message navigation, text-field, and tag-editor keys in headless Sway.
 
 This is an explicit UI smoke test rather than a Cargo test.  It drives the real
 GTK window with ``wtype`` while the developer test harness is used only to set
@@ -26,6 +26,9 @@ from typing import Any, Callable
 TARGET_MESSAGE_ID = "unicode@fixture.test"
 TARGET_QUERY = 'subject:"Unicode"'
 TARGET_TAGS = ["inbox", "unread"]
+THREAD_QUERY = 'subject:"Three message thread"'
+THREAD_ROOT_ID = "thread-root-three-message@fixture.test"
+THREAD_REPLY1_ID = "thread-reply1-three-message@fixture.test"
 SINGLE_TAG = "ui-single-tag-smoke"
 MULTI_TAG = "ui-multi-tag-smoke"
 TOKEN = "notm-ui-text-focus-smoke"
@@ -411,6 +414,76 @@ def wait_for_tag_menu(harness: Harness) -> None:
         raise SmokeFailure(f"{error}; last entry state: {last_entry!r}") from error
 
 
+def wait_for_selected_message(harness: Harness, message_id: str) -> dict[str, Any]:
+    def selected() -> dict[str, Any] | None:
+        message = harness.state().get("selected_message")
+        return (
+            message
+            if isinstance(message, dict) and message.get("message_id") == message_id
+            else None
+        )
+
+    return wait_until(f"selected message {message_id!r}", selected, timeout=5)
+
+
+def exercise_message_navigation(
+    environment: dict[str, str], driver: WtypeDriver, harness: Harness, app_pid: int
+) -> None:
+    response = harness.request("run_search", {"query": THREAD_QUERY})
+    if response.get("scheduled") is not True:
+        raise SmokeFailure(f"thread navigation search was not scheduled: {response!r}")
+    state_value = harness.wait_for_search()
+    threads = state_value.get("thread_list_items")
+    if not isinstance(threads, list) or len(threads) != 1:
+        raise SmokeFailure(f"thread navigation fixture was not unique: {state_value!r}")
+    harness.request("select_thread_by_index", {"index": 0})
+    harness.request("select_message_by_index", {"index": 0})
+    wait_for_selected_message(harness, THREAD_ROOT_ID)
+    focus_app_window(environment, app_pid)
+
+    driver.send("-M", "shift", "-k", "j", "-m", "shift")
+    wait_for_selected_message(harness, THREAD_REPLY1_ID)
+
+    # Lowercase j remains the message-scroll binding and must not change which
+    # message is selected.
+    driver.send("-k", "j")
+    time.sleep(0.4)
+    wait_for_selected_message(harness, THREAD_REPLY1_ID)
+
+    driver.send("-M", "shift", "-k", "k", "-m", "shift")
+    wait_for_selected_message(harness, THREAD_ROOT_ID)
+    driver.send("-M", "shift", "-k", "k", "-m", "shift")
+    time.sleep(0.4)
+    wait_for_selected_message(harness, THREAD_ROOT_ID)
+
+    driver.send("-M", "shift", "-k", "m", "-m", "shift")
+    wait_until(
+        "M current-message action menu",
+        lambda: (
+            state
+            if (state := harness.request("message_tag_state")).get("menu_popup_visible")
+            is True
+            else None
+        ),
+        timeout=5,
+    )
+    driver.send("-k", "Escape")
+    wait_until(
+        "current-message action menu to close",
+        lambda: (
+            state
+            if (state := harness.request("message_tag_state")).get("menu_popup_visible")
+            is False
+            else None
+        ),
+        timeout=5,
+    )
+    print(
+        "[ui-message-navigation] J/K navigation, lowercase scrolling, and M menu passed",
+        flush=True,
+    )
+
+
 def exercise_ui(
     environment: dict[str, str], driver: WtypeDriver, harness: Harness, app_pid: int
 ) -> None:
@@ -784,6 +857,7 @@ def run_inside_dbus(args: argparse.Namespace) -> int:
         wait_until("fixture test harness health", harness_ready, timeout=30)
         focus_app_window(environment, app_process.pid)
         driver = WtypeDriver(environment)
+        exercise_message_navigation(environment, driver, harness, app_process.pid)
         exercise_ui(environment, driver, harness, app_process.pid)
         exercise_tag_editor(environment, driver, harness, app_process.pid)
         print("[ui-text-focus] PASS", flush=True)

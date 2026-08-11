@@ -3690,6 +3690,152 @@ fn fixture_standalone_message_window_keeps_its_thread_snapshot() -> anyhow::Resu
 }
 
 #[test]
+fn fixture_current_message_navigation_and_tagging_are_explicit() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_current_message_navigation_and_tagging_are_explicit: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running current-message navigation/tagging UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-message-tag-ui-{run_id}"));
+    let token = format!("notm-message-tag-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+
+    let query = "subject:\"Three message thread\"";
+    select_first_thread(&mut driver, query)?;
+    let before_state = driver.command("app_state", json!({}))?;
+    let before = message_tags(&before_state)?;
+    ensure!(before.len() == 3, "expected fixture thread: {before_state}");
+
+    let root_id = "thread-root-three-message@fixture.test";
+    let reply1_id = "thread-reply1-three-message@fixture.test";
+    let reply2_id = "thread-reply2-three-message@fixture.test";
+    let selected = driver.command("select_message_by_index", json!({"index": 0}))?;
+    assert_eq!(selected["selected_message"]["message_id"], root_id);
+    let action_labels = driver.command("message_action_labels", json!({}))?;
+    assert_eq!(
+        action_labels["message"], "Message 1/3 (J/K)",
+        "message navigation hint is missing: {action_labels}"
+    );
+
+    let next = driver.command("select_relative_message", json!({"delta": 1}))?;
+    assert_eq!(next["ok"], true, "next-message navigation failed: {next}");
+    assert_eq!(next["selected_index"], 1);
+    assert_eq!(next["selected_message"]["message_id"], reply1_id);
+    let last = driver.command("select_relative_message", json!({"delta": 20}))?;
+    assert_eq!(last["selected_index"], 2);
+    assert_eq!(last["selected_message"]["message_id"], reply2_id);
+    let still_last = driver.command("select_relative_message", json!({"delta": 1}))?;
+    assert_eq!(
+        still_last["selected_index"], 2,
+        "navigation did not clamp: {still_last}"
+    );
+    let previous = driver.command("select_relative_message", json!({"delta": -1}))?;
+    assert_eq!(previous["selected_index"], 1);
+    assert_eq!(previous["selected_message"]["message_id"], reply1_id);
+
+    driver.command("select_message_by_index", json!({"index": 0}))?;
+    let controls = driver.command("message_tag_state", json!({}))?;
+    assert_eq!(
+        controls["menu_visible"], true,
+        "message tag menu is hidden: {controls}"
+    );
+    assert_eq!(
+        controls["menu_sensitive"], true,
+        "message tag menu is disabled: {controls}"
+    );
+    assert_eq!(
+        controls["read_label"], "Mark message read",
+        "wrong current-message read action: {controls}"
+    );
+    ensure!(
+        controls["menu_label"]
+            .as_str()
+            .is_some_and(|label| label.starts_with("Tag message")),
+        "message-only scope is not visible in the action label: {controls}"
+    );
+
+    let custom_tag = format!("message-only-{run_id}");
+    let tagged = driver.command(
+        "click_message_tag_action",
+        json!({"action": "custom", "tag": custom_tag}),
+    )?;
+    assert_eq!(
+        tagged["ok"], true,
+        "current-message tag action failed: {tagged}"
+    );
+    let after = message_tags(&tagged)?;
+    for (message_id, tags) in &after {
+        assert_eq!(
+            tags.contains(&custom_tag),
+            message_id == root_id,
+            "current-message action changed the wrong message: {after:?}"
+        );
+        let expected_without_custom = before
+            .get(message_id)
+            .with_context(|| format!("missing original message tags for {message_id}"))?;
+        let actual_without_custom = tags
+            .iter()
+            .filter(|tag| *tag != &custom_tag)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            &actual_without_custom, expected_without_custom,
+            "current-message action changed unrelated tags on {message_id}"
+        );
+    }
+    ensure!(
+        tagged["state"]["selected_thread"]["tags"]
+            .as_array()
+            .is_some_and(|tags| tags.iter().any(|tag| tag == &custom_tag)),
+        "thread summary did not retain the tagged message's aggregate tag: {tagged}"
+    );
+
+    let controls = driver.command("message_tag_state", json!({}))?;
+    assert_eq!(
+        controls["custom_apply_label"], "Remove tag",
+        "custom tag toggle did not follow the current message: {controls}"
+    );
+    let actions = driver.command("undo_tag_actions", json!({}))?;
+    let actions = json_array_at(&actions, &["actions"])?;
+    ensure!(
+        actions.len() == 1,
+        "expected one message-only undo action: {actions:?}"
+    );
+    ensure!(
+        actions[0]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("1 message")),
+        "undo label does not identify message scope: {}",
+        actions[0]
+    );
+    let mutations = json_array_at(&actions[0], &["mutations"])?;
+    assert_eq!(
+        mutations.len(),
+        1,
+        "message-only undo is not exact: {actions:?}"
+    );
+    assert_eq!(mutations[0]["message_id"], root_id);
+
+    let undone = driver.command("undo_last_tag", json!({}))?;
+    assert_eq!(undone["ok"], true, "message-only undo failed: {undone}");
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    select_first_thread(&mut driver, query)?;
+    let restored = message_tags(&driver.command("app_state", json!({}))?)?;
+    assert_eq!(
+        restored, before,
+        "message-only undo did not restore exact tags"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn fixture_tag_undo_restores_each_messages_original_tags() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
