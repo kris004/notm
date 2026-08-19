@@ -44,7 +44,9 @@ jobs:
             libnotmuch-dev \
             libwebkitgtk-6.0-dev \
             pkg-config \
-            weston
+            weston \
+            xauth \
+            xvfb
 
           packages=(
             build-essential
@@ -57,9 +59,11 @@ jobs:
             libwebkitgtk-6.0-dev
             pkg-config
             weston
+            xauth
+            xvfb
           )
           dpkg-query --show --showformat='${binary:Package}\t${Version}\n' "${packages[@]}"
-          for executable in cc clang dbus-run-session pkg-config weston; do
+          for executable in Xvfb cc clang dbus-run-session pkg-config weston xauth xvfb-run; do
             command -v "$executable"
           done
           pkg-config --modversion gtk4 gtksourceview-5 webkitgtk-6.0
@@ -112,7 +116,7 @@ jobs:
           EOF
           cargo run -p notm-app -- --config "$probe_config" probe-send
 
-      - name: Run the complete GTK smoke with a required display
+      - name: Run the complete Wayland GTK smoke with a required display
         # GitHub-hosted runners block the user namespace required by WebKitGTK's
         # bubblewrap sandbox. This exception is scoped to disposable fixture UI tests.
         env:
@@ -124,3 +128,20 @@ jobs:
             dbus-run-session -- \
             cargo test -p notm-app --test desktop_ui_smoke -- \
               --nocapture --test-threads=1
+
+      - name: Run a WebKit GTK smoke on X11
+        # Keep a narrow second-backend check without doubling the complete UI suite.
+        env:
+          WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS: "1"
+        shell: bash
+        run: |
+          set -euxo pipefail
+          env -u DISPLAY -u WAYLAND_DISPLAY -u SWAYSOCK \
+            GDK_BACKEND=x11 \
+            NOTM_GUI_TEST_DISPLAY=provided \
+            NOTM_REQUIRE_GTK_DISPLAY=1 \
+            dbus-run-session -- \
+            xvfb-run -a \
+            cargo test -p notm-app --test desktop_ui_smoke \
+              fixture_html_link_hints_label_visible_links_and_cancel -- \
+              --exact --nocapture --test-threads=1

@@ -45,10 +45,11 @@ missing, or fail when `NOTM_REQUIRE_GTK_DISPLAY=1` is set. For intentional
 interactive debugging, set `NOTM_GUI_TEST_DISPLAY=provided` to use the existing
 `WAYLAND_DISPLAY` or `DISPLAY`. CI runs the suite through
 `tests/run_with_headless_weston.sh`, which starts a private software-rendered
-Weston display with a native Wayland GTK backend. This makes neither Sway nor an
-X11 server a CI dependency and prevents a local CI reproduction from reaching
-the interactive compositor. The older `live` value remains an alias for
-`provided`.
+Weston display with a native Wayland GTK backend. This makes Sway unnecessary
+in CI and prevents a local CI reproduction from reaching the interactive
+compositor. CI also runs the link-hint fixture under Xvfb as a narrow GTK and
+WebKitGTK X11-backend check without repeating the complete UI suite. The older
+`live` value remains an alias for `provided`.
 
 Use fixture data first when validating UI behavior. Start the app with the local
 developer test harness:
