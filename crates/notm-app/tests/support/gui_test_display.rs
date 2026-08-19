@@ -25,7 +25,7 @@ pub(crate) struct GuiTestDisplay {
 }
 
 enum DisplayTarget {
-    Live,
+    Provided,
     Offscreen(HeadlessSway),
 }
 
@@ -34,12 +34,13 @@ impl GuiTestDisplay {
         let permit = GuiTestPermit::acquire();
         let mode = requested_display_mode(|name| env::var(name).ok())?;
         let target = match mode {
-            DisplayMode::Live => {
+            DisplayMode::Provided => {
                 ensure!(
-                    live_display_environment(|name| env::var(name).ok()).is_some(),
-                    "{GUI_TEST_DISPLAY_ENV}=live requires a non-empty DISPLAY or WAYLAND_DISPLAY"
+                    provided_display_environment(|name| env::var(name).ok()).is_some(),
+                    "{GUI_TEST_DISPLAY_ENV}=provided requires a non-empty DISPLAY or \
+                     WAYLAND_DISPLAY"
                 );
-                DisplayTarget::Live
+                DisplayTarget::Provided
             }
             DisplayMode::Offscreen => {
                 ensure!(
@@ -63,7 +64,7 @@ impl GuiTestDisplay {
 
     pub(crate) fn diagnostic_log(&self) -> Option<String> {
         match &self.target {
-            DisplayTarget::Live => None,
+            DisplayTarget::Provided => None,
             DisplayTarget::Offscreen(display) => Some(display.logs()),
         }
     }
@@ -89,7 +90,7 @@ fn resolve_display_environment(
             "offscreen {OFFSCREEN_COMPOSITOR} (headless Wayland)"
         )),
         DisplayMode::Offscreen => None,
-        DisplayMode::Live => live_display_environment(get_variable),
+        DisplayMode::Provided => provided_display_environment(get_variable),
     };
     ensure!(
         !required || display.is_some(),
@@ -101,7 +102,7 @@ fn resolve_display_environment(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DisplayMode {
     Offscreen,
-    Live,
+    Provided,
 }
 
 fn requested_display_mode(
@@ -109,14 +110,14 @@ fn requested_display_mode(
 ) -> anyhow::Result<DisplayMode> {
     match get_variable(GUI_TEST_DISPLAY_ENV).as_deref() {
         None | Some("") | Some("offscreen") => Ok(DisplayMode::Offscreen),
-        Some("live") => Ok(DisplayMode::Live),
+        Some("provided" | "live") => Ok(DisplayMode::Provided),
         Some(value) => anyhow::bail!(
-            "unsupported {GUI_TEST_DISPLAY_ENV} value {value:?}; use `offscreen` or `live`"
+            "unsupported {GUI_TEST_DISPLAY_ENV} value {value:?}; use `offscreen` or `provided`"
         ),
     }
 }
 
-fn live_display_environment(
+fn provided_display_environment(
     mut get_variable: impl FnMut(&str) -> Option<String>,
 ) -> Option<String> {
     ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().find_map(|name| {
@@ -318,7 +319,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn offscreen_is_default_even_when_a_live_display_exists() {
+    fn offscreen_is_default_even_when_a_provided_display_exists() {
         let display = resolve_display_environment(
             |name| match name {
                 "WAYLAND_DISPLAY" => Some("wayland-user".to_string()),
@@ -336,10 +337,10 @@ mod tests {
     }
 
     #[test]
-    fn live_display_requires_an_explicit_mode_and_nonempty_name() {
+    fn provided_display_requires_an_explicit_mode_and_nonempty_name() {
         let display = resolve_display_environment(
             |name| match name {
-                GUI_TEST_DISPLAY_ENV => Some("live".to_string()),
+                GUI_TEST_DISPLAY_ENV => Some("provided".to_string()),
                 "WAYLAND_DISPLAY" => Some(String::new()),
                 "DISPLAY" => Some(":42".to_string()),
                 _ => None,
@@ -347,9 +348,25 @@ mod tests {
             true,
             true,
         )
-        .expect("explicit live display selection");
+        .expect("explicit provided display selection");
 
         assert_eq!(display.as_deref(), Some("DISPLAY=:42"));
+    }
+
+    #[test]
+    fn live_remains_an_alias_for_a_provided_display() {
+        let display = resolve_display_environment(
+            |name| match name {
+                GUI_TEST_DISPLAY_ENV => Some("live".to_string()),
+                "WAYLAND_DISPLAY" => Some("wayland-ci".to_string()),
+                _ => None,
+            },
+            false,
+            true,
+        )
+        .expect("legacy live display selection");
+
+        assert_eq!(display.as_deref(), Some("WAYLAND_DISPLAY=wayland-ci"));
     }
 
     #[test]
@@ -376,6 +393,9 @@ mod tests {
         )
         .expect_err("unsupported display mode must fail");
 
-        assert!(error.to_string().contains("offscreen` or `live"), "{error}");
+        assert!(
+            error.to_string().contains("offscreen` or `provided"),
+            "{error}"
+        );
     }
 }

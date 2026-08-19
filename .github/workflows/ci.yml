@@ -122,7 +122,8 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          NOTM_REQUIRE_GTK_DISPLAY=1 \
+          NOTM_GUI_TEST_DISPLAY=provided \
+            NOTM_REQUIRE_GTK_DISPLAY=1 \
             dbus-run-session -- \
             xvfb-run -a \
             cargo test -p notm-app --test desktop_ui_smoke -- \

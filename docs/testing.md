@@ -42,8 +42,10 @@ and at most two GUI fixtures run concurrently. This keeps test windows off the
 interactive desktop and prevents unrelated fixtures from being tiled together.
 `sway` must be available in `PATH`; tests skip with a clear reason when it is
 missing, or fail when `NOTM_REQUIRE_GTK_DISPLAY=1` is set. For intentional
-interactive debugging only, set `NOTM_GUI_TEST_DISPLAY=live` to use the existing
-`WAYLAND_DISPLAY` or `DISPLAY`.
+interactive debugging, set `NOTM_GUI_TEST_DISPLAY=provided` to use the existing
+`WAYLAND_DISPLAY` or `DISPLAY`. CI uses this mode with its private Xvfb server,
+so Sway is not a CI dependency. The older `live` value remains an alias for
+`provided`.
 
 Use fixture data first when validating UI behavior. Start the app with the local
 developer test harness:
