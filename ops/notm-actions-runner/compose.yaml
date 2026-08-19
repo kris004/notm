@@ -16,11 +16,12 @@ services:
       LANG: C.UTF-8
       RUSTUP_HOME: /opt/rustup
       CARGO_HOME: /home/ubuntu/.cargo
+      RUNNER_MANUALLY_TRAP_SIG: "1"
     volumes:
       - /home/user/.local/share/notm-actions-runner/home:/home/ubuntu
     read_only: true
     tmpfs:
-      - /tmp:rw,nosuid,nodev,size=8g
+      - /tmp:rw,nosuid,nodev,exec,size=8g
       - /var/tmp:rw,nosuid,nodev,size=4g
     shm_size: "2gb"
     cap_drop:

@@ -85,6 +85,13 @@ jobs:
           done
           pkg-config --modversion gtk4 gtksourceview-5 webkitgtk-6.0
           test -r /usr/include/notmuch.h
+          temporary_executable="$(mktemp)"
+          trap 'rm -f "$temporary_executable"' EXIT
+          printf '#!/usr/bin/bash\nexit 0\n' >"$temporary_executable"
+          chmod 0700 "$temporary_executable"
+          "$temporary_executable"
+          rm "$temporary_executable"
+          trap - EXIT
 
       - name: Select the stable Rust toolchain
         if: runner.environment == 'github-hosted'

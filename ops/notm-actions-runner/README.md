@@ -9,6 +9,8 @@ host filesystem mounts. It drops every capability and runs as UID 1000 with
 bounded CPU, memory, PIDs, and shared memory. Its only writable persistent
 mount is the dedicated runner home at
 `~/.local/share/notm-actions-runner/home`.
+The executable `/tmp` used by transport tests is a container-only tmpfs; it
+does not expose private-ci-host's host `/tmp`.
 
 Private CI host requires host networking because its firewall blocks Docker bridge DNS
 and egress. The runner publishes no ports, but workflow code can reach private-ci-host's
@@ -43,6 +45,8 @@ docker compose restart runner
 
 The GitHub runner updates itself in the writable home. Rebuild the image when
 updating the pinned Ubuntu base, Rust toolchain, or native CI dependencies.
+The Compose environment enables the runner's manual signal trap so container
+stops disconnect the GitHub session cleanly before exit.
 
 Before making `notm` public, change the workflow back to a GitHub-hosted label,
 stop this container, and remove the repository runner registration. After the
