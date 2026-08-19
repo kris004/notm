@@ -44,7 +44,9 @@ interactive desktop and prevents unrelated fixtures from being tiled together.
 missing, or fail when `NOTM_REQUIRE_GTK_DISPLAY=1` is set. For intentional
 interactive debugging, set `NOTM_GUI_TEST_DISPLAY=provided` to use the existing
 `WAYLAND_DISPLAY` or `DISPLAY`. CI uses this mode with its private Xvfb server,
-so Sway is not a CI dependency. The older `live` value remains an alias for
+explicitly removing inherited Wayland variables and selecting the GTK X11
+backend so Sway is not a CI dependency and a local reproduction cannot reach an
+interactive Wayland compositor. The older `live` value remains an alias for
 `provided`.
 
 Use fixture data first when validating UI behavior. Start the app with the local

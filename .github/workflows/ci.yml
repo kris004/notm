@@ -122,7 +122,9 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          NOTM_GUI_TEST_DISPLAY=provided \
+          env -u WAYLAND_DISPLAY -u SWAYSOCK \
+            GDK_BACKEND=x11 \
+            NOTM_GUI_TEST_DISPLAY=provided \
             NOTM_REQUIRE_GTK_DISPLAY=1 \
             dbus-run-session -- \
             xvfb-run -a \
