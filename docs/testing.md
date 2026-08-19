@@ -145,10 +145,13 @@ NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
   -- --exact --nocapture --test-threads=1
 ```
 
-The focused-text and physical-key shortcut regressions have a self-contained
-headless Sway check. It covers J/K message navigation, lowercase j/k scrolling,
-the M current-message menu and its two-key actions, physical Shift+F routing to
-link hints (with overlay behavior covered by the GTK smoke above), and
+Use the fixture-only test-harness `send_key` command for application shortcut
+checks that do not need compositor input; it calls the same ordered router as
+the main window without focusing or presenting a window. The focused-text and
+physical-key propagation regressions retain a self-contained headless Sway
+check. It covers J/K message navigation, lowercase j/k scrolling, the M
+current-message menu and its two-key actions, physical Shift+F routing to link
+hints (with overlay behavior covered by the GTK smoke above), and
 normal/insert-mode tag-editor safety. It requires
 `dbus-run-session`, `sway`, `swaymsg`, and `wtype`:
 

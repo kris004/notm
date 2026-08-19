@@ -177,6 +177,7 @@ It targets the selected message ID only and ignores thread multi-selection.
 .BR command_completion ,
 .BR open_shortcuts ,
 .BR help_search ,
+.BR send_key ,
 .BR run_command ,
 .BR run_manual_sync ,
 .BR open_settings ,
@@ -191,6 +192,26 @@ It targets the selected message ID only and ignores thread multi-selection.
 .BR toggle_layout ,
 .BR close_main_window ,
 .BR toggle_debug_panel .
+.PP
+.B send_key
+routes a fixture-only application shortcut directly through the same ordered
+key router used by the primary window.  Its
+.B key
+argument is a GDK key name.  The optional
+.B modifiers
+argument is a string or array containing
+.BR shift ,
+.BR control
+(or
+.BR ctrl ),
+.BR alt ,
+or
+.BR super .
+The response reports whether the application handled the key.  This command
+does not synthesize compositor input and does not forward an unhandled key into
+a focused text widget.  Use it for notm shortcuts; use an isolated compositor
+input tool only when testing GTK text-entry propagation.  It is unavailable
+outside fixture mode because arbitrary shortcuts can send mail or mutate tags.
 .PP
 .B run_manual_sync
 returns with

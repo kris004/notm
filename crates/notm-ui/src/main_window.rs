@@ -1491,7 +1491,8 @@ fn build_ui(
     connect_address_suggestion_list(&widgets, &state);
     connect_search_bar(&options, &widgets, &state);
     connect_input_mode_focus(&widgets, &state);
-    install_shortcuts(&options, &widgets, &state, &undo_state, &saved_search_store);
+    let shortcut_router =
+        install_shortcuts(&options, &widgets, &state, &undo_state, &saved_search_store);
     connect_auto_load_more(&options, &widgets, &state);
     {
         let opts = options.clone();
@@ -1525,7 +1526,14 @@ fn build_ui(
     }
 
     if options.automation_enabled {
-        setup_automation(&options, &widgets, &state, &undo_state, &saved_search_store);
+        setup_automation(
+            &options,
+            &widgets,
+            &state,
+            &undo_state,
+            &saved_search_store,
+            &shortcut_router,
+        );
     }
 
     restore_draft_if_present(&options, &widgets, &state);
@@ -5323,6 +5331,20 @@ fn main_text_entry_has_focus(widgets: &Widgets) -> bool {
     .any(|entry| widget_contains_focus(entry.upcast_ref()))
 }
 
+fn main_shortcut_controller_count(widgets: &Widgets) -> u32 {
+    let controllers = widgets.window.observe_controllers();
+    (0..controllers.n_items())
+        .filter(|index| {
+            controllers
+                .item(*index)
+                .and_then(|controller| controller.downcast::<gtk::EventControllerKey>().ok())
+                .is_some_and(|controller| {
+                    controller.name().as_deref() == Some(MAIN_SHORTCUT_CONTROLLER_NAME)
+                })
+        })
+        .count() as u32
+}
+
 fn normal_text_focus_blocks_key(key: gtk::gdk::Key) -> bool {
     key_to_digit(key).is_none()
         && key.to_unicode().is_some()
@@ -5398,24 +5420,37 @@ where
     widget.add_controller(focus);
 }
 
+type MainShortcutHandler = dyn Fn(gtk::gdk::Key, gtk::gdk::ModifierType) -> gtk::glib::Propagation;
+const MAIN_SHORTCUT_CONTROLLER_NAME: &str = "notm-main-shortcut-router";
+
+#[derive(Clone)]
+struct MainShortcutRouter {
+    handler: Rc<MainShortcutHandler>,
+}
+
+impl MainShortcutRouter {
+    fn handle_key(
+        &self,
+        key: gtk::gdk::Key,
+        modifiers: gtk::gdk::ModifierType,
+    ) -> gtk::glib::Propagation {
+        (self.handler)(key, modifiers)
+    }
+}
+
 fn install_shortcuts(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
     undo_state: &UndoState,
     saved_store: &SavedSearchStore,
-) {
-    let capture_controller = gtk::EventControllerKey::new();
-    capture_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+) -> MainShortcutRouter {
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
     let undo = undo_state.clone();
     let saved_for_capture = saved_store.clone();
-    capture_controller.connect_key_pressed(move |_, key, _, mods| {
-        if w.link_hints.handle_key(key, mods) {
-            return gtk::glib::Propagation::Stop;
-        }
+    let fallback_handler: Rc<MainShortcutHandler> = Rc::new(move |key, mods| {
         let ctrl = mods.contains(gtk::gdk::ModifierType::CONTROL_MASK);
         let normal_mode = st.borrow().input_mode == InputMode::Normal;
         if normal_mode
@@ -5563,10 +5598,7 @@ fn install_shortcuts(
         }
         gtk::glib::Propagation::Proceed
     });
-    widgets.window.add_controller(capture_controller);
 
-    let controller = gtk::EventControllerKey::new();
-    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
@@ -5594,13 +5626,7 @@ fn install_shortcuts(
         undo.clone(),
     );
     let observed_input_mode_generation = Cell::new(w.input_mode_generation.get());
-    controller.connect_key_pressed(move |_, key, _, mods| {
-        // GTK runs this later-added capture controller before the controller
-        // above. Keep modal link-hint input ahead of every normal-mode
-        // binding, including uppercase H/J navigation shortcuts.
-        if w.link_hints.handle_key(key, mods) {
-            return gtk::glib::Propagation::Stop;
-        }
+    let normal_handler: Rc<MainShortcutHandler> = Rc::new(move |key, mods| {
         let cancel_pending_sequences = || {
             *pending_go.borrow_mut() = false;
             *pending_custom_search.borrow_mut() = false;
@@ -5976,7 +6002,9 @@ fn install_shortcuts(
                 TagMutation {
                     add: vec![],
                     remove: vec!["inbox".to_string()],
-                    sync_maildir_flags: settings::sync_maildir_flags_after_tag_change(&opts.runtime_settings),
+                    sync_maildir_flags: settings::sync_maildir_flags_after_tag_change(
+                        &opts.runtime_settings,
+                    ),
                 },
             );
             true
@@ -6030,7 +6058,9 @@ fn install_shortcuts(
                 TagMutation {
                     add: vec!["trash".to_string()],
                     remove: vec!["inbox".to_string(), "spam".to_string()],
-                    sync_maildir_flags: settings::sync_maildir_flags_after_tag_change(&opts.runtime_settings),
+                    sync_maildir_flags: settings::sync_maildir_flags_after_tag_change(
+                        &opts.runtime_settings,
+                    ),
                 },
             );
             true
@@ -6044,7 +6074,9 @@ fn install_shortcuts(
                 TagMutation {
                     add: vec!["spam".to_string()],
                     remove: vec!["inbox".to_string(), "trash".to_string()],
-                    sync_maildir_flags: settings::sync_maildir_flags_after_tag_change(&opts.runtime_settings),
+                    sync_maildir_flags: settings::sync_maildir_flags_after_tag_change(
+                        &opts.runtime_settings,
+                    ),
                 },
             );
             true
@@ -6126,7 +6158,26 @@ fn install_shortcuts(
             gtk::glib::Propagation::Proceed
         }
     });
+    let link_widgets = widgets.clone();
+    let handler = Rc::new(move |key, modifiers| {
+        if link_widgets.link_hints.handle_key(key, modifiers) {
+            return gtk::glib::Propagation::Stop;
+        }
+        match normal_handler(key, modifiers) {
+            gtk::glib::Propagation::Stop => gtk::glib::Propagation::Stop,
+            gtk::glib::Propagation::Proceed => fallback_handler(key, modifiers),
+        }
+    });
+    let router = MainShortcutRouter { handler };
+    let controller = gtk::EventControllerKey::new();
+    controller.set_name(Some(MAIN_SHORTCUT_CONTROLLER_NAME));
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let router_for_controller = router.clone();
+    controller.connect_key_pressed(move |_, key, _, modifiers| {
+        router_for_controller.handle_key(key, modifiers)
+    });
     widgets.window.add_controller(controller);
+    router
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13053,6 +13104,7 @@ fn setup_automation(
     state: &SharedState,
     undo_state: &UndoState,
     saved_store: &SavedSearchStore,
+    shortcut_router: &MainShortcutRouter,
 ) {
     let (tx, rx) = mpsc::channel::<AutomationRequest>();
     let socket = options
@@ -13086,9 +13138,10 @@ fn setup_automation(
     let st = state.clone();
     let undo = undo_state.clone();
     let saved = saved_store.clone();
+    let shortcuts = shortcut_router.clone();
     gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
         while let Ok(req) = rx.try_recv() {
-            handle_automation_request(&opts, &w, &st, &undo, &saved, req);
+            handle_automation_request(&opts, &w, &st, &undo, &saved, &shortcuts, req);
         }
         gtk::glib::ControlFlow::Continue
     });
@@ -13125,6 +13178,7 @@ fn handle_automation_request(
     state: &SharedState,
     undo_state: &UndoState,
     saved_store: &SavedSearchStore,
+    shortcut_router: &MainShortcutRouter,
     req: AutomationRequest,
 ) {
     let pending_block = widgets
@@ -13254,10 +13308,31 @@ fn handle_automation_request(
                 "compose_fields": compose_fields(widgets, state),
                 "input_mode": format!("{:?}", state.borrow().input_mode),
                 "active_pane": format!("{:?}", state.borrow().active_pane),
+                "main_shortcut_controller_count": main_shortcut_controller_count(widgets),
                 "search_suggestions_visible": widgets.search_bar.suggestions_visible(),
                 "address_suggestions_visible": widgets.composer.address_suggestions().is_visible(),
             })
         }
+        "send_key" => match injected_shortcut(&req.args) {
+            Ok((key, modifiers)) => {
+                let propagation = shortcut_router.handle_key(key, modifiers);
+                spin_main_context_for(Duration::from_millis(25));
+                json!({
+                    "ok": true,
+                    "handled": propagation == gtk::glib::Propagation::Stop,
+                    "propagation": match propagation {
+                        gtk::glib::Propagation::Stop => "stop",
+                        gtk::glib::Propagation::Proceed => "proceed",
+                    },
+                    "key": key.name().map(|name| name.to_string()),
+                    "modifiers": shortcut_modifier_names(modifiers),
+                    "input_mode": format!("{:?}", state.borrow().input_mode),
+                    "active_pane": format!("{:?}", state.borrow().active_pane),
+                    "status_text": widgets.status_label.text().to_string(),
+                })
+            }
+            Err(err) => json!({"ok": false, "error": err.to_string()}),
+        },
         "set_search_query" => {
             let query = req
                 .args
@@ -14771,6 +14846,60 @@ fn link_hint_state_json(widgets: &Widgets) -> serde_json::Value {
     })
 }
 
+fn injected_shortcut(
+    args: &serde_json::Value,
+) -> anyhow::Result<(gtk::gdk::Key, gtk::gdk::ModifierType)> {
+    let key_name = args
+        .get("key")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("key must be a non-empty GDK key name"))?;
+    let key = match key_name {
+        " " | "Space" => Some(gtk::gdk::Key::space),
+        "Enter" => Some(gtk::gdk::Key::Return),
+        "Esc" => Some(gtk::gdk::Key::Escape),
+        _ => gtk::gdk::Key::from_name(key_name),
+    }
+    .ok_or_else(|| anyhow::anyhow!("unknown GDK key name: {key_name}"))?;
+
+    let modifier_names = match args.get("modifiers") {
+        None => Vec::new(),
+        Some(serde_json::Value::String(name)) => vec![name.as_str()],
+        Some(serde_json::Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("modifiers must contain only strings"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        Some(_) => anyhow::bail!("modifiers must be a string or array of strings"),
+    };
+    let mut modifiers = gtk::gdk::ModifierType::empty();
+    for name in modifier_names {
+        modifiers |= match name.to_ascii_lowercase().as_str() {
+            "shift" => gtk::gdk::ModifierType::SHIFT_MASK,
+            "control" | "ctrl" => gtk::gdk::ModifierType::CONTROL_MASK,
+            "alt" => gtk::gdk::ModifierType::ALT_MASK,
+            "super" => gtk::gdk::ModifierType::SUPER_MASK,
+            _ => anyhow::bail!("unknown key modifier: {name}"),
+        };
+    }
+    Ok((key, modifiers))
+}
+
+fn shortcut_modifier_names(modifiers: gtk::gdk::ModifierType) -> Vec<&'static str> {
+    [
+        (gtk::gdk::ModifierType::SHIFT_MASK, "shift"),
+        (gtk::gdk::ModifierType::CONTROL_MASK, "control"),
+        (gtk::gdk::ModifierType::ALT_MASK, "alt"),
+        (gtk::gdk::ModifierType::SUPER_MASK, "super"),
+    ]
+    .into_iter()
+    .filter_map(|(mask, name)| modifiers.contains(mask).then_some(name))
+    .collect()
+}
+
 fn string_array_arg(args: &serde_json::Value, name: &str) -> Vec<String> {
     match args.get(name) {
         Some(serde_json::Value::Array(values)) => values
@@ -14824,7 +14953,8 @@ fn ensure_automation_request_allowed(
         | "activate_draft_by_index"
         | "click_delete_selected_draft"
         | "settings_test_state"
-        | "respond_settings" => Some(AutomationOperation::FixtureOnly),
+        | "respond_settings"
+        | "send_key" => Some(AutomationOperation::FixtureOnly),
         "pending_confirmation" | "respond_confirmation" => {
             Some(AutomationOperation::ConfirmationControl)
         }
@@ -16570,6 +16700,39 @@ mod tests {
     }
 
     #[test]
+    fn injected_shortcuts_parse_gdk_names_and_reject_ambiguous_input() {
+        let (key, modifiers) = injected_shortcut(&json!({
+            "key": "J",
+            "modifiers": ["shift", "ctrl"],
+        }))
+        .expect("named shortcut");
+        assert_eq!(key, gtk::gdk::Key::J);
+        assert!(modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK));
+        assert!(modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK));
+        assert_eq!(shortcut_modifier_names(modifiers), vec!["shift", "control"]);
+
+        assert_eq!(
+            injected_shortcut(&json!({"key": "Enter"}))
+                .expect("common Enter alias")
+                .0,
+            gtk::gdk::Key::Return
+        );
+        assert!(
+            injected_shortcut(&json!({"key": "j", "modifiers": [42]}))
+                .expect_err("non-string modifier")
+                .to_string()
+                .contains("only strings")
+        );
+        assert!(
+            injected_shortcut(&json!({"key": "j", "modifiers": ["hyper"]}))
+                .expect_err("unknown modifier")
+                .to_string()
+                .contains("unknown key modifier")
+        );
+        assert!(injected_shortcut(&json!({})).is_err());
+    }
+
+    #[test]
     fn current_message_tag_projection_keeps_other_message_tags_in_thread_summary() {
         let message = |id: &str, thread_id: &str, tags: &[&str]| notm_notmuch::MessageSummary {
             message_id: id.to_string(),
@@ -16682,6 +16845,25 @@ mod tests {
         )
         .expect_err("nested fixture sync should be blocked");
         assert!(nested.to_string().contains("disabled in fixture mode"));
+    }
+
+    #[test]
+    fn injected_shortcuts_are_fixture_only() {
+        let live_options = LaunchOptions {
+            allow_live_send_test: true,
+            allow_live_tag_test: true,
+            ..LaunchOptions::default()
+        };
+        let error = ensure_automation_request_allowed(&live_options, "send_key", &json!({}))
+            .expect_err("arbitrary live shortcut routing must stay disabled");
+        assert!(error.to_string().contains("available only in fixture mode"));
+
+        let fixture_options = LaunchOptions {
+            fixture_mode: true,
+            ..LaunchOptions::default()
+        };
+        ensure_automation_request_allowed(&fixture_options, "send_key", &json!({}))
+            .expect("fixture shortcut routing");
     }
 
     #[test]
@@ -16883,6 +17065,7 @@ mod tests {
             "tag_selected",
             "run_manual_sync",
             "respond_settings",
+            "send_key",
             "close_main_window",
             "run_command",
         ] {

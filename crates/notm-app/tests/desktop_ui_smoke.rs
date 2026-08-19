@@ -2786,8 +2786,11 @@ fn fixture_html_link_hints_label_visible_links_and_cancel() -> anyhow::Result<()
     let mut driver = app.connect(&token)?;
     select_first_thread(&mut driver, "id:html-message@fixture.test")?;
 
-    let started = driver.command("start_link_hints", json!({}))?;
-    assert_eq!(started["ok"], true, "link hints did not start: {started}");
+    let started = driver.command("send_key", json!({"key": "F", "modifiers": ["shift"]}))?;
+    assert_eq!(
+        started["handled"], true,
+        "link-hint shortcut was not routed: {started}"
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     let hints = loop {
         let state = driver.command("link_hint_state", json!({}))?;
@@ -2818,7 +2821,28 @@ fn fixture_html_link_hints_label_visible_links_and_cancel() -> anyhow::Result<()
         invalid["link_hints"]["active"], true,
         "invalid input unexpectedly closed link hints: {invalid}"
     );
-    let cancelled = driver.command("cancel_link_hints", json!({}))?;
+    let pane_before = driver.command("app_state", json!({}))?["state"]["active_pane"].clone();
+    let modal_h = driver.command("send_key", json!({"key": "H", "modifiers": ["shift"]}))?;
+    assert_eq!(
+        modal_h["handled"], true,
+        "link hints did not consume H: {modal_h}"
+    );
+    let after_h = driver.command("link_hint_state", json!({}))?;
+    assert_eq!(
+        after_h["link_hints"]["active"], true,
+        "H escaped link-hint mode into its normal binding: {after_h}"
+    );
+    assert_eq!(
+        driver.command("app_state", json!({}))?["state"]["active_pane"],
+        pane_before,
+        "modal H moved the active pane"
+    );
+    let cancelled = driver.command("send_key", json!({"key": "Escape"}))?;
+    assert_eq!(
+        cancelled["handled"], true,
+        "Escape was not routed: {cancelled}"
+    );
+    let cancelled = driver.command("link_hint_state", json!({}))?;
     assert_eq!(cancelled["link_hints"]["phase"], "idle", "{cancelled}");
     assert_eq!(cancelled["link_hints"]["overlay_count"], 0, "{cancelled}");
 
@@ -3775,6 +3799,46 @@ fn fixture_current_message_navigation_and_tagging_are_explicit() -> anyhow::Resu
     assert_eq!(
         action_labels["message"], "Message 1/3 (J/K)",
         "message navigation hint is missing: {action_labels}"
+    );
+    let entry_state = driver.command("entry_state", json!({}))?;
+    assert_eq!(
+        entry_state["main_shortcut_controller_count"], 1,
+        "main-window shortcuts are split across overlapping controllers: {entry_state}"
+    );
+
+    let pane_left = driver.command("send_key", json!({"key": "h", "modifiers": ["control"]}))?;
+    assert_eq!(
+        pane_left["handled"], true,
+        "Ctrl+h was not routed: {pane_left}"
+    );
+    assert_eq!(pane_left["active_pane"], "Threads", "{pane_left}");
+    let pane_right = driver.command("send_key", json!({"key": "l", "modifiers": ["control"]}))?;
+    assert_eq!(
+        pane_right["handled"], true,
+        "Ctrl+l was not routed: {pane_right}"
+    );
+    assert_eq!(pane_right["active_pane"], "Message", "{pane_right}");
+
+    let shortcut_next = driver.command("send_key", json!({"key": "J", "modifiers": ["shift"]}))?;
+    assert_eq!(
+        shortcut_next["handled"], true,
+        "J was not routed: {shortcut_next}"
+    );
+    let shortcut_state = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        shortcut_state["state"]["selected_message"]["message_id"], reply1_id,
+        "J did not select the next message: {shortcut_state}"
+    );
+    let shortcut_previous =
+        driver.command("send_key", json!({"key": "K", "modifiers": ["shift"]}))?;
+    assert_eq!(
+        shortcut_previous["handled"], true,
+        "K was not routed: {shortcut_previous}"
+    );
+    let shortcut_state = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        shortcut_state["state"]["selected_message"]["message_id"], root_id,
+        "K did not select the previous message: {shortcut_state}"
     );
 
     let next = driver.command("select_relative_message", json!({"delta": 1}))?;

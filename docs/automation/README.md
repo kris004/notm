@@ -111,10 +111,11 @@ Implemented test-harness commands include:
   `start_link_hints`, `link_hint_state`, `input_link_hint`,
   `cancel_link_hints`, `toggle_quote_collapse`, `message_view_text`,
   `copy_message_id`, `copy_thread_id`
-- UI/debug: `open_command_palette`, `command_completion`, `open_shortcuts`,
-  `show_shortcuts`, `help_search`, `run_command`, `run_manual_sync`,
-  `open_settings`, `settings_test_state`, `respond_settings`, `save_settings`,
-  `resize_window`, `pane_visibility`, `set_pane_visibility`, `layout_state`,
+- UI/debug: `send_key`, `open_command_palette`, `command_completion`,
+  `open_shortcuts`, `show_shortcuts`, `help_search`, `run_command`,
+  `run_manual_sync`, `open_settings`, `settings_test_state`,
+  `respond_settings`, `save_settings`, `resize_window`, `pane_visibility`,
+  `set_pane_visibility`, `layout_state`,
   `set_layout`, `toggle_layout`, `toggle_debug_panel`, `close_main_window`,
   custom saved-search commands, and custom tag-editor commands
 
@@ -122,6 +123,16 @@ Implemented test-harness commands include:
 mode. Tests that exercise keyboard editing should send the same `/`, `i`, or
 Enter transition that a user would use instead of relying on the harness to
 change modes implicitly.
+
+Fixture harnesses can route an application shortcut directly through the same
+ordered key router used by the main window with `send_key`. Pass a GDK key name
+and optional `shift`, `control` (or `ctrl`), `alt`, and `super` modifiers, for
+example `{"key":"J","modifiers":["shift"]}`. The response reports whether the
+application handled the key. This does not synthesize a compositor event or
+forward an unhandled key into a focused text widget; use it for notm shortcuts,
+and reserve an isolated compositor input tool for GTK text-entry propagation
+checks. Arbitrary shortcut routing is rejected outside fixture mode because a
+shortcut can send mail or mutate tags.
 
 `click_message_tag_action` drives the real current-message menu buttons and
 accepts `action` set to `archive`, `read`, `flag`, `trash`, `spam`, or `custom`.
