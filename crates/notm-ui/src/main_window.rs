@@ -488,6 +488,7 @@ struct Widgets {
     view_raw_button: gtk::Button,
     sender_view_preference_button: gtk::Button,
     active_message_view: Rc<Cell<MessageViewKind>>,
+    pending_html_scroll_fraction: Rc<Cell<Option<f64>>>,
     image_policy_button: gtk::Button,
     html_policy_row: gtk::Box,
     html_policy_label: gtk::Label,
@@ -1190,6 +1191,7 @@ fn build_ui(
     sender_view_preference_button.set_visible(false);
     view_menu_box.append(&sender_view_preference_button);
     let active_message_view = Rc::new(Cell::new(MessageViewKind::Text));
+    let pending_html_scroll_fraction = Rc::new(Cell::new(None));
     let image_policy_button = gtk::Button::with_label("Load images once");
     image_policy_button.set_widget_name("notm-image-policy-button");
     let collapse_quotes_button = gtk::Button::with_label("Collapse quotes");
@@ -1349,6 +1351,7 @@ fn build_ui(
     window.set_child(Some(&overlay));
     connect_html_navigation_policy(&html_view, &status_label);
     connect_html_hover_status(&html_view, &status_label);
+    connect_html_scroll_restore(&html_view, &status_label, &pending_html_scroll_fraction);
     let link_opener: LinkHintOpener = Rc::new(open_html_link_externally);
     let link_hints = LinkHintController::new(&html_view, &status_label, link_opener);
 
@@ -1436,6 +1439,7 @@ fn build_ui(
         view_raw_button,
         sender_view_preference_button,
         active_message_view,
+        pending_html_scroll_fraction,
         image_policy_button,
         html_policy_row,
         html_policy_label,
@@ -4734,19 +4738,34 @@ fn html_scroll_fraction(widgets: &Widgets) -> Option<f64> {
 }
 
 fn restore_html_scroll_fraction(widgets: &Widgets, fraction: f64) {
-    let view = widgets.html_view.clone();
-    gtk::glib::timeout_add_local_once(Duration::from_millis(100), move || {
-        view.evaluate_javascript(
+    widgets
+        .pending_html_scroll_fraction
+        .set(Some(fraction.clamp(0.0, 1.0)));
+}
+
+fn connect_html_scroll_restore(
+    view: &webkit6::WebView,
+    status_label: &gtk::Label,
+    pending_fraction: &Rc<Cell<Option<f64>>>,
+) {
+    let pending_fraction = pending_fraction.clone();
+    let status = status_label.clone();
+    view.connect_load_changed(move |view, event| {
+        if event != webkit6::LoadEvent::Finished {
+            return;
+        }
+        let Some(fraction) = pending_fraction.take() else {
+            return;
+        };
+        evaluate_web_view_scroll_script(
+            view,
+            &status,
             &format!(
                 "const e = document.scrollingElement || document.documentElement || document.body; \
                  const max = Math.max(0, e.scrollHeight - e.clientHeight); \
                  e.scrollTo(0, max * {});",
                 fraction.clamp(0.0, 1.0)
             ),
-            Some("notm-scroll"),
-            Some("notm://scroll-restore"),
-            None::<&gtk::gio::Cancellable>,
-            |_| {},
         );
     });
 }
