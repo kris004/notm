@@ -11,13 +11,18 @@ use anyhow::{Context, ensure};
 use notm_test_support::ui_driver::UiDriver;
 use serde_json::{Value, json};
 
+#[path = "support/gui_test_display.rs"]
+mod gui_test_display;
+
+use gui_test_display::{GuiTestDisplay, gtk_display_environment};
+
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TEST_HARNESS_APPLICATION_ID_ENV: &str = "NOTM_TEST_HARNESS_APPLICATION_ID";
-const REQUIRE_GTK_DISPLAY_ENV: &str = "NOTM_REQUIRE_GTK_DISPLAY";
 
 struct FixtureApp {
     child: Child,
+    display: Option<GuiTestDisplay>,
     socket_path: PathBuf,
     log_path: PathBuf,
     work_dir: PathBuf,
@@ -135,6 +140,7 @@ impl FixtureApp {
             fs::create_dir_all(directory)
                 .with_context(|| format!("creating test directory {}", directory.display()))?;
         }
+        let display = GuiTestDisplay::start(&work_dir)?;
         if let Some(prefers_dark) = system_prefers_dark {
             let gtk_config_home = config_home.join("gtk-4.0");
             fs::create_dir_all(&gtk_config_home)?;
@@ -177,6 +183,7 @@ impl FixtureApp {
         if system_prefers_dark.is_some() {
             command.env("GDK_DEBUG", "default-settings");
         }
+        display.configure_command(&mut command);
         let child = command
             .env("HOME", home)
             .env("XDG_CONFIG_HOME", config_home)
@@ -194,6 +201,7 @@ impl FixtureApp {
 
         Ok(Self {
             child,
+            display: Some(display),
             socket_path,
             log_path,
             work_dir,
@@ -227,8 +235,18 @@ impl FixtureApp {
     }
 
     fn logs(&self) -> String {
-        fs::read_to_string(&self.log_path)
-            .unwrap_or_else(|err| format!("could not read app log: {err}"))
+        let app_log = fs::read_to_string(&self.log_path)
+            .unwrap_or_else(|err| format!("could not read app log: {err}"));
+        match self
+            .display
+            .as_ref()
+            .and_then(GuiTestDisplay::diagnostic_log)
+        {
+            Some(display_log) => {
+                format!("--- notm log ---\n{app_log}\n--- compositor log ---\n{display_log}")
+            }
+            None => app_log,
+        }
     }
 
     fn wait_for_exit(&mut self, timeout: Duration) -> anyhow::Result<std::process::ExitStatus> {
@@ -270,13 +288,14 @@ impl FixtureApp {
             .open(&log_path)
             .with_context(|| format!("creating app log {}", log_path.display()))?;
         let socket_path = secondary.join("h.sock");
-        let child = Command::new(env!("CARGO_BIN_EXE_notm"))
-            .args([
-                "launch",
-                "--fixture",
-                "--test-harness",
-                "--test-harness-socket",
-            ])
+        let mut command = Command::new(env!("CARGO_BIN_EXE_notm"));
+        command.args([
+            "launch",
+            "--fixture",
+            "--test-harness",
+            "--test-harness-socket",
+        ]);
+        command
             .arg(&socket_path)
             .args(["--test-harness-token", token, "--message-id", message_id])
             .env(TEST_HARNESS_APPLICATION_ID_ENV, application_id)
@@ -290,7 +309,11 @@ impl FixtureApp {
             .env("GTK_USE_PORTAL", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone()?))
-            .stderr(Stdio::from(log))
+            .stderr(Stdio::from(log));
+        if let Some(display) = &self.display {
+            display.configure_command(&mut command);
+        }
+        let child = command
             .spawn()
             .context("launching the secondary fixture app")?;
         let mut child = ChildGuard(child);
@@ -320,6 +343,7 @@ impl Drop for FixtureApp {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        drop(self.display.take());
         let _ = fs::remove_dir_all(&self.work_dir);
     }
 }
@@ -328,8 +352,7 @@ impl Drop for FixtureApp {
 fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_app_serves_authenticated_desktop_harness: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP fixture_app_serves_authenticated_desktop_harness: no GUI test display is available"
         );
         return Ok(());
     };
@@ -542,8 +565,7 @@ fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
 fn fixture_visual_selection_navigation_keeps_thread_list_responsive() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_visual_selection_navigation_keeps_thread_list_responsive: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP fixture_visual_selection_navigation_keeps_thread_list_responsive: no GUI test display is available"
         );
         return Ok(());
     };
@@ -611,8 +633,7 @@ fn fixture_visual_selection_navigation_keeps_thread_list_responsive() -> anyhow:
 fn fixture_compose_attachment_headers_are_safe_and_round_trip() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_compose_attachment_headers_are_safe_and_round_trip: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP fixture_compose_attachment_headers_are_safe_and_round_trip: no GUI test display is available"
         );
         return Ok(());
     };
@@ -701,8 +722,7 @@ fn fixture_harness_quarantines_external_commands() -> anyhow::Result<()> {
 
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_harness_quarantines_external_commands: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP fixture_harness_quarantines_external_commands: no GUI test display is available"
         );
         return Ok(());
     };
@@ -827,8 +847,7 @@ fn slow_manual_sync_keeps_desktop_responsive() -> anyhow::Result<()> {
 
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP slow_manual_sync_keeps_desktop_responsive: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP slow_manual_sync_keeps_desktop_responsive: no GUI test display is available"
         );
         return Ok(());
     };
@@ -1125,8 +1144,7 @@ fn closing_main_window_waits_for_manual_sync() -> anyhow::Result<()> {
 
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP closing_main_window_waits_for_manual_sync: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP closing_main_window_waits_for_manual_sync: no GUI test display is available"
         );
         return Ok(());
     };
@@ -1199,8 +1217,7 @@ fn live_harness_denies_ungated_mutations_and_reports_reply_noops() -> anyhow::Re
 
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP live_harness_denies_ungated_mutations_and_reports_reply_noops: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP live_harness_denies_ungated_mutations_and_reports_reply_noops: no GUI test display is available"
         );
         return Ok(());
     };
@@ -1318,8 +1335,7 @@ fn live_harness_denies_ungated_mutations_and_reports_reply_noops() -> anyhow::Re
 fn default_draft_recovery_migrates_clears_and_reports_autosave_failures() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP default_draft_recovery_migrates_clears_and_reports_autosave_failures: no \
-             DISPLAY or WAYLAND_DISPLAY is available"
+            "SKIP default_draft_recovery_migrates_clears_and_reports_autosave_failures: no GUI test display is available"
         );
         return Ok(());
     };
@@ -1453,8 +1469,7 @@ fn fixture_saved_drafts_are_visible_activatable_and_delete_safely() -> anyhow::R
 
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_saved_drafts_are_visible_activatable_and_delete_safely: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP fixture_saved_drafts_are_visible_activatable_and_delete_safely: no GUI test display is available"
         );
         return Ok(());
     };
@@ -1801,8 +1816,7 @@ fn reject_confirmation_unchanged(
 fn fixture_draft_confirmations_preserve_rejected_state() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_draft_confirmations_preserve_rejected_state: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP fixture_draft_confirmations_preserve_rejected_state: no GUI test display is available"
         );
         return Ok(());
     };
@@ -2096,8 +2110,7 @@ fn fixture_draft_confirmations_preserve_rejected_state() -> anyhow::Result<()> {
 fn validated_config_launches_and_invalid_layout_requests_are_rejected() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP validated_config_launches_and_invalid_layout_requests_are_rejected: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP validated_config_launches_and_invalid_layout_requests_are_rejected: no GUI test display is available"
         );
         return Ok(());
     };
@@ -2218,8 +2231,7 @@ fn validated_config_launches_and_invalid_layout_requests_are_rejected() -> anyho
 fn invalid_config_exits_before_exposing_the_desktop_harness() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP invalid_config_exits_before_exposing_the_desktop_harness: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP invalid_config_exits_before_exposing_the_desktop_harness: no GUI test display is available"
         );
         return Ok(());
     };
@@ -2258,8 +2270,7 @@ fn invalid_config_exits_before_exposing_the_desktop_harness() -> anyhow::Result<
 fn fixture_cold_message_id_launch_preserves_target_and_startup_query() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_cold_message_id_launch_preserves_target_and_startup_query: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP fixture_cold_message_id_launch_preserves_target_and_startup_query: no GUI test display is available"
         );
         return Ok(());
     };
@@ -2304,8 +2315,7 @@ fn fixture_cold_message_id_launch_preserves_target_and_startup_query() -> anyhow
 fn fixture_existing_instance_message_id_request_reaches_primary() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_existing_instance_message_id_request_reaches_primary: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP fixture_existing_instance_message_id_request_reaches_primary: no GUI test display is available"
         );
         return Ok(());
     };
@@ -2369,8 +2379,7 @@ fn assert_target_message_rendered(driver: &mut UiDriver) -> anyhow::Result<()> {
 fn fixture_reply_all_preserves_quoted_names_and_flattens_groups() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_reply_all_preserves_quoted_names_and_flattens_groups: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP fixture_reply_all_preserves_quoted_names_and_flattens_groups: no GUI test display is available"
         );
         return Ok(());
     };
@@ -2421,8 +2430,7 @@ fn fixture_reply_all_preserves_quoted_names_and_flattens_groups() -> anyhow::Res
 fn fixture_attachment_save_keeps_existing_files() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_attachment_save_keeps_existing_files: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP fixture_attachment_save_keeps_existing_files: no GUI test display is available"
         );
         return Ok(());
     };
@@ -2498,8 +2506,7 @@ fn fixture_attachment_save_keeps_existing_files() -> anyhow::Result<()> {
 fn fixture_attachment_save_chooser_and_private_open_are_deterministic() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_attachment_save_chooser_and_private_open_are_deterministic: no DISPLAY \
-             or WAYLAND_DISPLAY is available"
+            "SKIP fixture_attachment_save_chooser_and_private_open_are_deterministic: no GUI test display is available"
         );
         return Ok(());
     };
@@ -2673,8 +2680,7 @@ fn fixture_attachment_save_chooser_and_private_open_are_deterministic() -> anyho
 fn fixture_malformed_text_shows_a_decode_warning() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_malformed_text_shows_a_decode_warning: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP fixture_malformed_text_shows_a_decode_warning: no GUI test display is available"
         );
         return Ok(());
     };
@@ -2767,8 +2773,7 @@ fn fixture_malformed_text_shows_a_decode_warning() -> anyhow::Result<()> {
 fn fixture_html_link_hints_label_visible_links_and_cancel() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_html_link_hints_label_visible_links_and_cancel: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP fixture_html_link_hints_label_visible_links_and_cancel: no GUI test display is available"
         );
         return Ok(());
     };
@@ -2827,8 +2832,7 @@ fn external_file_arg_send_reports_existing_sent_copy() -> anyhow::Result<()> {
 
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP external_file_arg_send_reports_existing_sent_copy: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP external_file_arg_send_reports_existing_sent_copy: no GUI test display is available"
         );
         return Ok(());
     };
@@ -2946,8 +2950,7 @@ fn timed_out_send_reports_failure_and_leaves_desktop_responsive() -> anyhow::Res
 
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP timed_out_send_reports_failure_and_leaves_desktop_responsive: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP timed_out_send_reports_failure_and_leaves_desktop_responsive: no GUI test display is available"
         );
         return Ok(());
     };
@@ -3082,8 +3085,7 @@ fn slow_send_preserves_newer_composer_edits_and_serializes_writes() -> anyhow::R
 
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP slow_send_preserves_newer_composer_edits_and_serializes_writes: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP slow_send_preserves_newer_composer_edits_and_serializes_writes: no GUI test display is available"
         );
         return Ok(());
     };
@@ -3280,8 +3282,7 @@ fn closing_main_window_waits_for_send_finalization() -> anyhow::Result<()> {
 
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP closing_main_window_waits_for_send_finalization: no DISPLAY or WAYLAND_DISPLAY \
-             is available"
+            "SKIP closing_main_window_waits_for_send_finalization: no GUI test display is available"
         );
         return Ok(());
     };
@@ -3401,8 +3402,7 @@ fn reactivating_during_send_reuses_the_pending_window_session() -> anyhow::Resul
 
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP reactivating_during_send_reuses_the_pending_window_session: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP reactivating_during_send_reuses_the_pending_window_session: no GUI test display is available"
         );
         return Ok(());
     };
@@ -3513,8 +3513,7 @@ fn accepted_send_aggregates_cleanup_failures_and_preserves_recovery() -> anyhow:
 
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP accepted_send_aggregates_cleanup_failures_and_preserves_recovery: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP accepted_send_aggregates_cleanup_failures_and_preserves_recovery: no GUI test display is available"
         );
         return Ok(());
     };
@@ -3625,8 +3624,7 @@ fn accepted_send_aggregates_cleanup_failures_and_preserves_recovery() -> anyhow:
 fn fixture_standalone_message_window_keeps_its_thread_snapshot() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_standalone_message_window_keeps_its_thread_snapshot: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP fixture_standalone_message_window_keeps_its_thread_snapshot: no GUI test display is available"
         );
         return Ok(());
     };
@@ -3750,8 +3748,7 @@ fn fixture_standalone_message_window_keeps_its_thread_snapshot() -> anyhow::Resu
 fn fixture_current_message_navigation_and_tagging_are_explicit() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_current_message_navigation_and_tagging_are_explicit: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP fixture_current_message_navigation_and_tagging_are_explicit: no GUI test display is available"
         );
         return Ok(());
     };
@@ -3914,8 +3911,7 @@ fn fixture_current_message_navigation_and_tagging_are_explicit() -> anyhow::Resu
 fn fixture_tag_undo_restores_each_messages_original_tags() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_tag_undo_restores_each_messages_original_tags: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP fixture_tag_undo_restores_each_messages_original_tags: no GUI test display is available"
         );
         return Ok(());
     };
@@ -4003,8 +3999,7 @@ fn fixture_tag_undo_restores_each_messages_original_tags() -> anyhow::Result<()>
 fn fixture_settings_preview_limits_apply_without_partial_persistence() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_settings_preview_limits_apply_without_partial_persistence: no DISPLAY \
-             or WAYLAND_DISPLAY is available"
+            "SKIP fixture_settings_preview_limits_apply_without_partial_persistence: no GUI test display is available"
         );
         return Ok(());
     };
@@ -4174,8 +4169,7 @@ fn fixture_settings_preview_limits_apply_without_partial_persistence() -> anyhow
 fn fixture_theme_modes_follow_both_simulated_system_preferences() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_theme_modes_follow_both_simulated_system_preferences: no DISPLAY or \
-             WAYLAND_DISPLAY is available"
+            "SKIP fixture_theme_modes_follow_both_simulated_system_preferences: no GUI test display is available"
         );
         return Ok(());
     };
@@ -4415,33 +4409,6 @@ fn toml_path(path: &std::path::Path) -> String {
     toml::Value::String(path.display().to_string()).to_string()
 }
 
-fn gtk_display_environment() -> anyhow::Result<Option<String>> {
-    let display = display_environment_from(|name| std::env::var(name).ok());
-    let required = std::env::var(REQUIRE_GTK_DISPLAY_ENV).is_ok_and(|value| value == "1");
-    enforce_required_display(display, required)
-}
-
-fn enforce_required_display(
-    display: Option<String>,
-    required: bool,
-) -> anyhow::Result<Option<String>> {
-    ensure!(
-        !required || display.is_some(),
-        "{REQUIRE_GTK_DISPLAY_ENV}=1 requires a non-empty DISPLAY or WAYLAND_DISPLAY"
-    );
-    Ok(display)
-}
-
-fn display_environment_from(
-    mut get_variable: impl FnMut(&str) -> Option<String>,
-) -> Option<String> {
-    ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().find_map(|name| {
-        get_variable(name)
-            .filter(|value| !value.is_empty())
-            .map(|value| format!("{name}={value}"))
-    })
-}
-
 fn unique_run_id() -> anyhow::Result<String> {
     let epoch_nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4463,37 +4430,4 @@ fn json_array_at<'a>(value: &'a Value, path: &[&str]) -> anyhow::Result<&'a Vec<
             path.join(".")
         )
     })
-}
-
-#[test]
-fn display_gate_requires_a_nonempty_display_name() {
-    assert_eq!(display_environment_from(|_| None), None);
-    assert_eq!(
-        display_environment_from(|name| match name {
-            "WAYLAND_DISPLAY" => Some(String::new()),
-            "DISPLAY" => Some(":42".to_string()),
-            _ => None,
-        }),
-        Some("DISPLAY=:42".to_string())
-    );
-}
-
-#[test]
-fn required_display_mode_fails_instead_of_skipping_without_display() {
-    let error = enforce_required_display(None, true)
-        .expect_err("required-display mode must reject an absent display");
-
-    assert!(
-        error.to_string().contains(REQUIRE_GTK_DISPLAY_ENV),
-        "required-display error did not name the opt-in: {error}"
-    );
-    assert_eq!(
-        enforce_required_display(None, false).expect("optional display gate"),
-        None
-    );
-    assert_eq!(
-        enforce_required_display(Some("DISPLAY=:42".to_string()), true)
-            .expect("present required display"),
-        Some("DISPLAY=:42".to_string())
-    );
 }

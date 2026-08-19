@@ -2,9 +2,10 @@
 
 Fixture tests create a disposable Maildir and Notmuch database through
 `libnotmuch`. Normal tests and fixture behavior should not shell out to the
-`notmuch` CLI. Desktop UI smoke tests skip with a clear reason when no GTK
-display is available; interactive GTK flows can be driven through the local
-developer test harness described in [automation/README.md](automation/README.md).
+`notmuch` CLI. Desktop UI smoke tests start an isolated headless display when
+Sway is available and otherwise skip with a clear reason; interactive GTK flows
+can be driven through the local developer test harness described in
+[automation/README.md](automation/README.md).
 
 ## Routine checks
 
@@ -34,6 +35,15 @@ the configured transport and then waits briefly for it to appear in Notmuch; it
 does not force sync.
 
 ## GUI smoke checks
+
+The Cargo desktop UI smokes use a private, software-rendered headless Sway
+compositor by default. Each fixture app gets its own 1920x1080 Wayland display,
+and at most two GUI fixtures run concurrently. This keeps test windows off the
+interactive desktop and prevents unrelated fixtures from being tiled together.
+`sway` must be available in `PATH`; tests skip with a clear reason when it is
+missing, or fail when `NOTM_REQUIRE_GTK_DISPLAY=1` is set. For intentional
+interactive debugging only, set `NOTM_GUI_TEST_DISPLAY=live` to use the existing
+`WAYLAND_DISPLAY` or `DISPLAY`.
 
 Use fixture data first when validating UI behavior. Start the app with the local
 developer test harness:
