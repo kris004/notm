@@ -22,6 +22,26 @@ pub enum ThemePreference {
     Dark,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageViewPreference {
+    Text,
+    VisualHtml,
+    FullHeaders,
+    RawSource,
+}
+
+impl MessageViewPreference {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Text => "Text",
+            Self::VisualHtml => "Visual HTML",
+            Self::FullHeaders => "Full headers",
+            Self::RawSource => "Raw source",
+        }
+    }
+}
+
 impl ThemePreference {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -112,6 +132,10 @@ pub struct UiState {
     pub quote_collapse_enabled: bool,
     pub prefer_html_view: bool,
     #[serde(default)]
+    pub message_view_preferences: BTreeMap<String, MessageViewPreference>,
+    #[serde(default)]
+    pub sender_view_preferences: BTreeMap<String, MessageViewPreference>,
+    #[serde(default)]
     pub theme: ThemePreference,
     #[serde(default = "default_thread_preview_lines")]
     pub thread_preview_lines: usize,
@@ -175,6 +199,8 @@ impl Default for UiState {
             screenshot_path: None,
             quote_collapse_enabled: false,
             prefer_html_view: false,
+            message_view_preferences: BTreeMap::new(),
+            sender_view_preferences: BTreeMap::new(),
             theme: ThemePreference::System,
             thread_preview_lines: 2,
             show_thread_numbers: true,
@@ -264,7 +290,7 @@ pub struct ActiveDraft {
 mod tests {
     use std::str::FromStr;
 
-    use super::{ThemePreference, UiState};
+    use super::{MessageViewPreference, ThemePreference, UiState};
 
     #[test]
     fn theme_preference_accepts_only_the_documented_exact_values() {
@@ -291,9 +317,38 @@ mod tests {
         let object = serialized.as_object_mut().expect("UI state object");
         object.remove("theme");
         object.remove("thread_preview_lines");
+        object.remove("message_view_preferences");
+        object.remove("sender_view_preferences");
 
         let restored: UiState = serde_json::from_value(serialized).expect("deserialize old state");
         assert_eq!(restored.theme, ThemePreference::System);
         assert_eq!(restored.thread_preview_lines, 2);
+        assert!(restored.message_view_preferences.is_empty());
+        assert!(restored.sender_view_preferences.is_empty());
+    }
+
+    #[test]
+    fn message_view_preferences_have_stable_config_values_and_labels() {
+        for (preference, serialized, label) in [
+            (MessageViewPreference::Text, "\"text\"", "Text"),
+            (
+                MessageViewPreference::VisualHtml,
+                "\"visual_html\"",
+                "Visual HTML",
+            ),
+            (
+                MessageViewPreference::FullHeaders,
+                "\"full_headers\"",
+                "Full headers",
+            ),
+            (
+                MessageViewPreference::RawSource,
+                "\"raw_source\"",
+                "Raw source",
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&preference).unwrap(), serialized);
+            assert_eq!(preference.label(), label);
+        }
     }
 }

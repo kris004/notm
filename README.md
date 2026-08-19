@@ -146,6 +146,11 @@ Press `?` in the application for searchable shortcut help. A few useful keys:
   open that link externally. `Esc` cancels the link-hint mode.
 - `c` composes, `Ctrl+Enter` sends, and `S` saves a draft.
 
+Choosing Text, Visual HTML, Full headers, or Raw source remembers that view for
+the current Message-ID. The View menu can also make the currently selected view
+the default for that sender; a per-message choice takes precedence, and the
+same button removes a matching sender default.
+
 ## Security and privacy
 
 `notm` has no telemetry or hosted service. Remote images are blocked by default,

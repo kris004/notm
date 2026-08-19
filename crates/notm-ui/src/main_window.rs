@@ -36,7 +36,7 @@ use crate::{
     automation::{self, AutomationConfig, AutomationRequest},
     model::{
         ActiveDraft, ActivePane, ComposeFields, ContentLayout, InputMode, LayoutPreference,
-        ThemePreference, UiState,
+        MessageViewPreference, ThemePreference, UiState,
     },
     screenshot, theme,
     widgets::attachments::{
@@ -62,8 +62,10 @@ use crate::{
         StandaloneHtmlRender, StandaloneHtmlRenderer, StandaloneHtmlScroll,
         StandaloneHtmlScrollHandler, StandaloneHtmlViewInitializer, StandaloneImagePolicy,
         StandaloneMessageController, StandaloneMessageHasHtml, StandaloneOpenOptions,
-        StandalonePolicyProvider, StandalonePolicySnapshot, StandaloneResponseAction,
-        StandaloneResponseHandler, StandaloneResponseRequest, StandaloneTextRenderer,
+        StandalonePolicyProvider, StandalonePolicySnapshot, StandalonePreferredView,
+        StandaloneRememberView, StandaloneResponseAction, StandaloneResponseHandler,
+        StandaloneResponseRequest, StandaloneSenderView, StandaloneTextRenderer,
+        StandaloneToggleSenderView,
     },
     widgets::thread_list::{
         self, AppendSearchOutcome, LoadMoreDecision, LocatePagePlan, ReplaceSearchOutcome,
@@ -147,6 +149,8 @@ pub struct LaunchOptions {
     pub layout: String,
     pub html_mode: String,
     pub trusted_image_senders: Vec<String>,
+    pub message_view_preferences: BTreeMap<String, MessageViewPreference>,
+    pub sender_view_preferences: BTreeMap<String, MessageViewPreference>,
     pub hidden_tag_searches: Vec<String>,
     pub sync_maildir_flags_after_tag_change: bool,
     pub draft_path: Option<PathBuf>,
@@ -217,6 +221,8 @@ impl Default for LaunchOptions {
             layout: "auto".to_string(),
             html_mode: "sanitize_then_render_text_fallback".to_string(),
             trusted_image_senders: Vec::new(),
+            message_view_preferences: BTreeMap::new(),
+            sender_view_preferences: BTreeMap::new(),
             hidden_tag_searches: Vec::new(),
             sync_maildir_flags_after_tag_change: true,
             draft_path: None,
@@ -480,6 +486,8 @@ struct Widgets {
     view_html_button: gtk::Button,
     view_headers_button: gtk::Button,
     view_raw_button: gtk::Button,
+    sender_view_preference_button: gtk::Button,
+    active_message_view: Rc<Cell<MessageViewKind>>,
     image_policy_button: gtk::Button,
     html_policy_row: gtk::Box,
     html_policy_label: gtk::Label,
@@ -560,6 +568,26 @@ enum MessageViewKind {
     Html,
     Headers,
     Raw,
+}
+
+impl MessageViewKind {
+    const fn preference(self) -> MessageViewPreference {
+        match self {
+            Self::Text => MessageViewPreference::Text,
+            Self::Html => MessageViewPreference::VisualHtml,
+            Self::Headers => MessageViewPreference::FullHeaders,
+            Self::Raw => MessageViewPreference::RawSource,
+        }
+    }
+
+    const fn from_preference(preference: MessageViewPreference) -> Self {
+        match preference {
+            MessageViewPreference::Text => Self::Text,
+            MessageViewPreference::VisualHtml => Self::Html,
+            MessageViewPreference::FullHeaders => Self::Headers,
+            MessageViewPreference::RawSource => Self::Raw,
+        }
+    }
 }
 
 struct AddressSuggestionsResponse {
@@ -719,6 +747,12 @@ fn build_ui(
             .as_ref()
             .map(|p| p.display().to_string()),
         prefer_html_view: options.html_mode == "visual_html_preferred",
+        message_view_preferences: normalize_message_view_preferences(
+            &options.message_view_preferences,
+        ),
+        sender_view_preferences: normalize_sender_view_preferences(
+            &options.sender_view_preferences,
+        ),
         theme: settings::theme(&options.runtime_settings),
         thread_preview_lines: settings::thread_preview_lines(&options.runtime_settings),
         show_thread_numbers: options.show_thread_numbers,
@@ -1148,6 +1182,14 @@ fn build_ui(
     ] {
         view_menu_box.append(b);
     }
+    let view_preference_separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+    view_menu_box.append(&view_preference_separator);
+    let sender_view_preference_button =
+        gtk::Button::with_label("Always show messages from this sender in this view");
+    sender_view_preference_button.set_widget_name("notm-sender-view-preference-button");
+    sender_view_preference_button.set_visible(false);
+    view_menu_box.append(&sender_view_preference_button);
+    let active_message_view = Rc::new(Cell::new(MessageViewKind::Text));
     let image_policy_button = gtk::Button::with_label("Load images once");
     image_policy_button.set_widget_name("notm-image-policy-button");
     let collapse_quotes_button = gtk::Button::with_label("Collapse quotes");
@@ -1392,6 +1434,8 @@ fn build_ui(
         view_html_button,
         view_headers_button,
         view_raw_button,
+        sender_view_preference_button,
+        active_message_view,
         image_policy_button,
         html_policy_row,
         html_policy_label,
@@ -2542,6 +2586,93 @@ fn persist_trusted_image_senders(
     )
 }
 
+fn persist_message_view_preferences(
+    options: &LaunchOptions,
+    preferences: &BTreeMap<String, MessageViewPreference>,
+) -> anyhow::Result<()> {
+    settings::persist_ui_value(
+        options.app_config_path.as_deref(),
+        "message_view_preferences",
+        toml::Value::try_from(preferences)?,
+    )
+}
+
+fn persist_sender_view_preferences(
+    options: &LaunchOptions,
+    preferences: &BTreeMap<String, MessageViewPreference>,
+) -> anyhow::Result<()> {
+    settings::persist_ui_value(
+        options.app_config_path.as_deref(),
+        "sender_view_preferences",
+        toml::Value::try_from(preferences)?,
+    )
+}
+
+fn remember_message_view_preference(
+    options: &LaunchOptions,
+    state: &SharedState,
+    message_id: &str,
+    preference: MessageViewPreference,
+) -> anyhow::Result<()> {
+    let message_id = normalize_message_id(message_id);
+    anyhow::ensure!(!message_id.is_empty(), "message id is empty");
+    let previous = state
+        .borrow_mut()
+        .message_view_preferences
+        .insert(message_id.clone(), preference);
+    let snapshot = state.borrow().message_view_preferences.clone();
+    if let Err(error) = persist_message_view_preferences(options, &snapshot) {
+        let mut state = state.borrow_mut();
+        match previous {
+            Some(previous) => {
+                state.message_view_preferences.insert(message_id, previous);
+            }
+            None => {
+                state.message_view_preferences.remove(&message_id);
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn toggle_sender_view_preference(
+    options: &LaunchOptions,
+    state: &SharedState,
+    sender: &str,
+    preference: MessageViewPreference,
+) -> anyhow::Result<bool> {
+    let sender = normalize_sender(sender);
+    anyhow::ensure!(!sender.is_empty(), "sender is empty");
+    let previous = {
+        let mut state = state.borrow_mut();
+        let previous = state.sender_view_preferences.get(&sender).copied();
+        if previous == Some(preference) {
+            state.sender_view_preferences.remove(&sender);
+        } else {
+            state
+                .sender_view_preferences
+                .insert(sender.clone(), preference);
+        }
+        previous
+    };
+    let enabled = previous != Some(preference);
+    let snapshot = state.borrow().sender_view_preferences.clone();
+    if let Err(error) = persist_sender_view_preferences(options, &snapshot) {
+        let mut state = state.borrow_mut();
+        match previous {
+            Some(previous) => {
+                state.sender_view_preferences.insert(sender, previous);
+            }
+            None => {
+                state.sender_view_preferences.remove(&sender);
+            }
+        }
+        return Err(error);
+    }
+    Ok(enabled)
+}
+
 fn connect_custom_tag_editor(
     options: &LaunchOptions,
     widgets: &Widgets,
@@ -3244,17 +3375,14 @@ fn connect_message_actions(
     state: &SharedState,
     undo_state: &UndoState,
 ) {
-    // These view-mode actions are presentation-only: they retain composer fields, active-draft
-    // identity, and recovery bytes. Transitions that actually detach the composer from a selected
-    // message are routed through `request_show_selected_message` instead.
+    // View-mode actions retain composer fields, active-draft identity, and recovery bytes while
+    // remembering the selected message's view. Transitions that detach the composer from a
+    // selected message are routed through `request_show_selected_message` instead.
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
     widgets.view_text_button.connect_clicked(move |_| {
-        let scroll = current_message_scroll_fraction(&w);
-        st.borrow_mut().prefer_html_view = false;
-        show_rendered_selected_thread(&opts, &w, &st);
-        restore_message_scroll_fraction(&w, scroll);
+        choose_selected_message_view(&opts, &w, &st, MessageViewKind::Text);
         w.view_menu_button.popdown();
     });
 
@@ -3262,10 +3390,7 @@ fn connect_message_actions(
     let w = widgets.clone();
     let st = state.clone();
     widgets.view_html_button.connect_clicked(move |_| {
-        let scroll = current_message_scroll_fraction(&w);
-        st.borrow_mut().prefer_html_view = true;
-        show_visual_html_selected_message(&opts, &w, &st);
-        restore_message_scroll_fraction(&w, scroll);
+        choose_selected_message_view(&opts, &w, &st, MessageViewKind::Html);
         w.view_menu_button.popdown();
     });
 
@@ -3273,7 +3398,7 @@ fn connect_message_actions(
     let w = widgets.clone();
     let st = state.clone();
     widgets.view_headers_button.connect_clicked(move |_| {
-        show_full_headers(&opts, &w, &st);
+        choose_selected_message_view(&opts, &w, &st, MessageViewKind::Headers);
         w.view_menu_button.popdown();
     });
 
@@ -3281,9 +3406,49 @@ fn connect_message_actions(
     let w = widgets.clone();
     let st = state.clone();
     widgets.view_raw_button.connect_clicked(move |_| {
-        show_raw_source(&opts, &w, &st);
+        choose_selected_message_view(&opts, &w, &st, MessageViewKind::Raw);
         w.view_menu_button.popdown();
     });
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets
+        .sender_view_preference_button
+        .connect_clicked(move |_| {
+            let Some(sender) = selected_sender_email(&st) else {
+                w.status_label
+                    .set_text("The selected message sender could not be parsed");
+                w.view_menu_button.popdown();
+                return;
+            };
+            let preference = w.active_message_view.get().preference();
+            match toggle_sender_view_preference(&opts, &st, &sender, preference) {
+                Ok(true) => {
+                    w.status_label.set_text(&format!(
+                        "Messages from {sender} will default to {}",
+                        preference.label()
+                    ));
+                    st.borrow_mut().last_error = None;
+                }
+                Ok(false) => {
+                    w.status_label.set_text(&format!(
+                        "Removed the {} default for messages from {sender}",
+                        preference.label()
+                    ));
+                    st.borrow_mut().last_error = None;
+                }
+                Err(error) => {
+                    w.status_label.set_text(&format!(
+                        "Sender view preference could not be saved: {error}"
+                    ));
+                    st.borrow_mut().last_error = Some(error.to_string());
+                }
+            }
+            update_sender_view_preference_button(&w, &st);
+            update_debug(&w, &st);
+            w.view_menu_button.popdown();
+        });
 
     let opts = options.clone();
     let w = widgets.clone();
@@ -5753,22 +5918,16 @@ fn install_shortcuts(
             w.view_menu_button.popdown();
             clear_numeric_prefix(&numeric_prefix);
             let handled = if key == gtk::gdk::Key::t {
-                let scroll = current_message_scroll_fraction(&w);
-                st.borrow_mut().prefer_html_view = false;
-                show_rendered_selected_thread(&opts, &w, &st);
-                restore_message_scroll_fraction(&w, scroll);
+                choose_selected_message_view(&opts, &w, &st, MessageViewKind::Text);
                 true
             } else if key == gtk::gdk::Key::v {
-                let scroll = current_message_scroll_fraction(&w);
-                st.borrow_mut().prefer_html_view = true;
-                show_visual_html_selected_message(&opts, &w, &st);
-                restore_message_scroll_fraction(&w, scroll);
+                choose_selected_message_view(&opts, &w, &st, MessageViewKind::Html);
                 true
             } else if key == gtk::gdk::Key::h {
-                show_full_headers(&opts, &w, &st);
+                choose_selected_message_view(&opts, &w, &st, MessageViewKind::Headers);
                 true
             } else if key == gtk::gdk::Key::r {
-                show_raw_source(&opts, &w, &st);
+                choose_selected_message_view(&opts, &w, &st, MessageViewKind::Raw);
                 true
             } else {
                 false
@@ -6250,22 +6409,16 @@ fn connect_dropdown_sequence_keys(
             return gtk::glib::Propagation::Proceed;
         }
         let handled = if key == gtk::gdk::Key::t {
-            let scroll = current_message_scroll_fraction(&w);
-            st.borrow_mut().prefer_html_view = false;
-            show_rendered_selected_thread(&opts, &w, &st);
-            restore_message_scroll_fraction(&w, scroll);
+            choose_selected_message_view(&opts, &w, &st, MessageViewKind::Text);
             true
         } else if key == gtk::gdk::Key::v {
-            let scroll = current_message_scroll_fraction(&w);
-            st.borrow_mut().prefer_html_view = true;
-            show_visual_html_selected_message(&opts, &w, &st);
-            restore_message_scroll_fraction(&w, scroll);
+            choose_selected_message_view(&opts, &w, &st, MessageViewKind::Html);
             true
         } else if key == gtk::gdk::Key::h {
-            show_full_headers(&opts, &w, &st);
+            choose_selected_message_view(&opts, &w, &st, MessageViewKind::Headers);
             true
         } else if key == gtk::gdk::Key::r {
-            show_raw_source(&opts, &w, &st);
+            choose_selected_message_view(&opts, &w, &st, MessageViewKind::Raw);
             true
         } else {
             false
@@ -7824,10 +7977,20 @@ fn show_preferred_selected_message_view(
     widgets: &Widgets,
     state: &SharedState,
 ) {
-    if state.borrow().prefer_html_view && selected_message_has_html(state) {
-        show_visual_html_selected_message(options, widgets, state);
-    } else {
-        show_selected_message_text_view(options, widgets, state);
+    let preference = {
+        let state = state.borrow();
+        state
+            .selected_message
+            .as_ref()
+            .map(|message| message_view_preference(&state, message))
+    };
+    match preference.map(MessageViewKind::from_preference) {
+        Some(MessageViewKind::Html) => show_visual_html_selected_message(options, widgets, state),
+        Some(MessageViewKind::Headers) => show_full_headers(options, widgets, state),
+        Some(MessageViewKind::Raw) => show_raw_source(options, widgets, state),
+        Some(MessageViewKind::Text) | None => {
+            show_selected_message_text_view(options, widgets, state)
+        }
     }
 }
 
@@ -7838,8 +8001,8 @@ fn show_selected_message_text_view(
 ) {
     match render_selected_message_text(widgets, state) {
         Ok(rendered) => {
-            show_text_message_view(options, widgets, state);
             set_active_message_view(widgets, MessageViewKind::Text);
+            show_text_message_view(options, widgets, state);
             widgets.message_view.set_monospace(false);
             widgets.message_view.buffer().set_text(&rendered);
             let index = selected_message_index(state)
@@ -7849,6 +8012,7 @@ fn show_selected_message_text_view(
             widgets
                 .status_label
                 .set_text(&format!("Showing message {index} of {total}"));
+            state.borrow_mut().last_error = None;
         }
         Err(err) => {
             state.borrow_mut().last_error = Some(err.to_string());
@@ -8016,6 +8180,7 @@ fn format_message_date(timestamp: i64) -> String {
 }
 
 fn set_active_message_view(widgets: &Widgets, active: MessageViewKind) {
+    widgets.active_message_view.set(active);
     if active != MessageViewKind::Html {
         widgets.link_hints.cancel_silent();
     }
@@ -8037,16 +8202,90 @@ fn set_active_message_view(widgets: &Widgets, active: MessageViewKind) {
     }
 }
 
-fn toggle_text_visual_view(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
-    let scroll = current_message_scroll_fraction(widgets);
-    if html_view_is_visible(widgets) {
-        state.borrow_mut().prefer_html_view = false;
-        show_rendered_selected_thread(options, widgets, state);
+fn update_sender_view_preference_button(widgets: &Widgets, state: &SharedState) {
+    let Some(sender) = selected_sender_email(state) else {
+        widgets.sender_view_preference_button.set_visible(false);
+        widgets.sender_view_preference_button.set_tooltip_text(None);
+        return;
+    };
+    let preference = widgets.active_message_view.get().preference();
+    let enabled = state
+        .borrow()
+        .sender_view_preferences
+        .get(&sender)
+        .is_some_and(|saved| *saved == preference);
+    let label = if enabled {
+        format!("Stop always showing this sender as {}", preference.label())
     } else {
-        state.borrow_mut().prefer_html_view = true;
-        show_visual_html_selected_message(options, widgets, state);
+        format!("Always show this sender as {}", preference.label())
+    };
+    widgets.sender_view_preference_button.set_label(&label);
+    widgets
+        .sender_view_preference_button
+        .set_tooltip_text(Some(&format!(
+            "Sender: {sender}. A per-message view choice still takes precedence."
+        )));
+    widgets.sender_view_preference_button.set_visible(true);
+    widgets.sender_view_preference_button.set_sensitive(true);
+}
+
+fn toggle_text_visual_view(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) -> bool {
+    if html_view_is_visible(widgets) {
+        choose_selected_message_view(options, widgets, state, MessageViewKind::Text)
+    } else {
+        choose_selected_message_view(options, widgets, state, MessageViewKind::Html)
+    }
+}
+
+fn choose_selected_message_view(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    view: MessageViewKind,
+) -> bool {
+    let Some(message) = state.borrow().selected_message.clone() else {
+        widgets.status_label.set_text("No selected message");
+        return false;
+    };
+    if view == MessageViewKind::Html && !message_has_html(&message) {
+        widgets.status_label.set_text("No visual HTML part");
+        return false;
+    }
+    let scroll = current_message_scroll_fraction(widgets);
+    state.borrow_mut().last_error = None;
+    match view {
+        MessageViewKind::Text => show_selected_message_text_view(options, widgets, state),
+        MessageViewKind::Html => show_visual_html_selected_message(options, widgets, state),
+        MessageViewKind::Headers => show_full_headers(options, widgets, state),
+        MessageViewKind::Raw => show_raw_source(options, widgets, state),
     }
     restore_message_scroll_fraction(widgets, scroll);
+    if state.borrow().last_error.is_some() {
+        return false;
+    }
+    if let Err(error) =
+        remember_message_view_preference(options, state, &message.message_id, view.preference())
+    {
+        let status = format!(
+            "{} shown, but its message preference could not be saved: {error}",
+            view.preference().label()
+        );
+        widgets.status_label.set_text(&status);
+        {
+            let mut state_ref = state.borrow_mut();
+            state_ref.last_error = Some(error.to_string());
+            state_ref.last_operation = Some(status);
+        }
+        update_debug(widgets, state);
+        return false;
+    }
+    update_sender_view_preference_button(widgets, state);
+    update_debug(widgets, state);
+    true
 }
 
 fn activate_image_policy_button(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -8215,6 +8454,7 @@ fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, sta
     widgets.view_html_button.set_sensitive(has_html);
     widgets.view_headers_button.set_sensitive(has_message);
     widgets.view_raw_button.set_sensitive(has_message);
+    update_sender_view_preference_button(widgets, state);
     widgets
         .copy_menu_button
         .set_sensitive(has_message || has_thread);
@@ -8297,7 +8537,6 @@ fn start_link_hint_mode(options: &LaunchOptions, widgets: &Widgets, state: &Shar
         return true;
     }
     if !html_view_is_visible(widgets) {
-        state.borrow_mut().prefer_html_view = true;
         show_visual_html_selected_message(options, widgets, state);
         if state.borrow().last_error.is_some() {
             return true;
@@ -8348,13 +8587,15 @@ fn show_raw_source(options: &LaunchOptions, widgets: &Widgets, state: &SharedSta
     })();
     match result {
         Ok(raw) => {
-            show_text_message_view(options, widgets, state);
             set_active_message_view(widgets, MessageViewKind::Raw);
+            show_text_message_view(options, widgets, state);
             widgets.message_view.set_monospace(true);
             widgets.message_view.buffer().set_text(&raw);
             restore_message_scroll_fraction(widgets, scroll);
             widgets.status_label.set_text("Raw message source shown");
-            state.borrow_mut().last_operation = Some("showed raw source".to_string());
+            let mut state = state.borrow_mut();
+            state.last_operation = Some("showed raw source".to_string());
+            state.last_error = None;
         }
         Err(err) => {
             state.borrow_mut().last_error = Some(err.to_string());
@@ -8375,13 +8616,15 @@ fn show_full_headers(options: &LaunchOptions, widgets: &Widgets, state: &SharedS
     })();
     match result {
         Ok(headers) => {
-            show_text_message_view(options, widgets, state);
             set_active_message_view(widgets, MessageViewKind::Headers);
+            show_text_message_view(options, widgets, state);
             widgets.message_view.set_monospace(true);
             widgets.message_view.buffer().set_text(&headers);
             restore_message_scroll_fraction(widgets, scroll);
             widgets.status_label.set_text("Full message headers shown");
-            state.borrow_mut().last_operation = Some("showed full headers".to_string());
+            let mut state = state.borrow_mut();
+            state.last_operation = Some("showed full headers".to_string());
+            state.last_error = None;
         }
         Err(err) => {
             state.borrow_mut().last_error = Some(err.to_string());
@@ -8839,6 +9082,78 @@ fn sender_email_from_header(value: &str) -> Option<String> {
         .into_iter()
         .next()
         .map(|address| normalize_sender(&address.email))
+}
+
+fn normalize_message_id(message_id: &str) -> String {
+    message_id.trim().to_string()
+}
+
+fn normalize_message_view_preferences(
+    preferences: &BTreeMap<String, MessageViewPreference>,
+) -> BTreeMap<String, MessageViewPreference> {
+    preferences
+        .iter()
+        .filter_map(|(message_id, preference)| {
+            let message_id = normalize_message_id(message_id);
+            (!message_id.is_empty()).then_some((message_id, *preference))
+        })
+        .collect()
+}
+
+fn normalize_sender_view_preferences(
+    preferences: &BTreeMap<String, MessageViewPreference>,
+) -> BTreeMap<String, MessageViewPreference> {
+    preferences
+        .iter()
+        .filter_map(|(sender, preference)| {
+            let sender = normalize_sender(sender);
+            (!sender.is_empty()).then_some((sender, *preference))
+        })
+        .collect()
+}
+
+fn resolve_message_view_preference(
+    prefer_html_view: bool,
+    message_preferences: &BTreeMap<String, MessageViewPreference>,
+    sender_preferences: &BTreeMap<String, MessageViewPreference>,
+    message_id: &str,
+    sender: Option<&str>,
+    has_html: bool,
+) -> MessageViewPreference {
+    let message_id = normalize_message_id(message_id);
+    let sender = sender.map(normalize_sender);
+    let preference = message_preferences
+        .get(&message_id)
+        .copied()
+        .or_else(|| {
+            sender
+                .as_deref()
+                .and_then(|sender| sender_preferences.get(sender).copied())
+        })
+        .unwrap_or(if prefer_html_view {
+            MessageViewPreference::VisualHtml
+        } else {
+            MessageViewPreference::Text
+        });
+    if preference == MessageViewPreference::VisualHtml && !has_html {
+        MessageViewPreference::Text
+    } else {
+        preference
+    }
+}
+
+fn message_view_preference(
+    state: &UiState,
+    message: &notm_notmuch::MessageSummary,
+) -> MessageViewPreference {
+    resolve_message_view_preference(
+        state.prefer_html_view,
+        &state.message_view_preferences,
+        &state.sender_view_preferences,
+        &message.message_id,
+        message_sender_email(message).as_deref(),
+        message_has_html(message),
+    )
 }
 
 fn normalize_sender(sender: &str) -> String {
@@ -10313,7 +10628,6 @@ fn open_standalone_message_window(
     let policy: StandalonePolicyProvider = Rc::new(move || {
         let state = policy_state.borrow();
         StandalonePolicySnapshot {
-            prefer_html_view: state.prefer_html_view,
             collapse_quotes: policy_quote_collapse.get(),
             remote_images: settings::remote_images(&policy_options.runtime_settings),
             trusted_image_senders: state.trusted_image_senders.clone(),
@@ -10364,6 +10678,35 @@ fn open_standalone_message_window(
             }
         });
     let open_link: LinkHintOpener = Rc::new(open_html_link_externally);
+    let preferred_state = state.clone();
+    let preferred_view: StandalonePreferredView =
+        Rc::new(move |message| message_view_preference(&preferred_state.borrow(), message));
+    let remember_options = options.clone();
+    let remember_state = state.clone();
+    let remember_view: StandaloneRememberView = Rc::new(move |message, preference| {
+        remember_message_view_preference(
+            &remember_options,
+            &remember_state,
+            &message.message_id,
+            preference,
+        )
+    });
+    let sender_state = state.clone();
+    let sender_view: StandaloneSenderView = Rc::new(move |message| {
+        let sender = message_sender_email(message)?;
+        sender_state
+            .borrow()
+            .sender_view_preferences
+            .get(&sender)
+            .copied()
+    });
+    let toggle_options = options.clone();
+    let toggle_state = state.clone();
+    let toggle_sender_view: StandaloneToggleSenderView = Rc::new(move |message, preference| {
+        let sender = message_sender_email(message)
+            .ok_or_else(|| anyhow::anyhow!("selected message sender could not be parsed"))?;
+        toggle_sender_view_preference(&toggle_options, &toggle_state, &sender, preference)
+    });
     let response_options = options.clone();
     let response_widgets = widgets.clone();
     let response_state = state.clone();
@@ -10388,6 +10731,10 @@ fn open_standalone_message_window(
         scroll_html,
         open_link,
         respond,
+        preferred_view,
+        remember_view,
+        sender_view,
+        toggle_sender_view,
     })
 }
 
@@ -14215,31 +14562,30 @@ fn handle_automation_request(
             json!({"ok": true, "debug_visible": widgets.debug_view.is_visible()})
         }
         "show_raw_source" | "open_raw_source" => {
-            show_raw_source(options, widgets, state);
-            json!({"ok": state.borrow().last_error.is_none(), "last_error": state.borrow().last_error})
+            let ok = choose_selected_message_view(options, widgets, state, MessageViewKind::Raw);
+            json!({"ok": ok, "last_error": state.borrow().last_error})
         }
         "show_full_headers" | "full_headers" => {
-            show_full_headers(options, widgets, state);
-            json!({"ok": state.borrow().last_error.is_none(), "last_error": state.borrow().last_error})
+            let ok =
+                choose_selected_message_view(options, widgets, state, MessageViewKind::Headers);
+            json!({"ok": ok, "last_error": state.borrow().last_error})
         }
         "show_rendered_thread" | "show_text_thread" | "text_view" => {
-            state.borrow_mut().prefer_html_view = false;
-            show_rendered_selected_thread(options, widgets, state);
-            json!({"ok": true, "state": &*state.borrow()})
+            let ok = choose_selected_message_view(options, widgets, state, MessageViewKind::Text);
+            json!({"ok": ok, "state": &*state.borrow()})
         }
         "toggle_text_visual" | "toggle_visual_html" => {
-            toggle_text_visual_view(options, widgets, state);
+            let ok = toggle_text_visual_view(options, widgets, state);
             json!({
-                "ok": state.borrow().last_error.is_none(),
+                "ok": ok,
                 "html_view": html_view_state(options, widgets, state),
                 "last_error": state.borrow().last_error,
             })
         }
         "show_visual_html" | "show_html_visual" | "visual_html" => {
-            state.borrow_mut().prefer_html_view = true;
-            show_visual_html_selected_message(options, widgets, state);
+            let ok = choose_selected_message_view(options, widgets, state, MessageViewKind::Html);
             json!({
-                "ok": state.borrow().last_error.is_none(),
+                "ok": ok,
                 "html_view": html_view_state(options, widgets, state),
                 "last_error": state.borrow().last_error,
             })
@@ -14316,6 +14662,23 @@ fn handle_automation_request(
             json!({"ok": true, "trusted_image_senders": state.borrow().trusted_image_senders})
         }
         "html_view_state" => html_view_state(options, widgets, state),
+        "view_preference_state" => view_preference_state_json(widgets, state),
+        "click_sender_view_preference" => {
+            update_sender_view_preference_button(widgets, state);
+            widgets.view_menu_button.popup();
+            spin_main_context_for(Duration::from_millis(50));
+            let button_was_visible = widgets.sender_view_preference_button.is_visible();
+            if widgets.sender_view_preference_button.is_sensitive()
+                && selected_sender_email(state).is_some()
+            {
+                widgets.sender_view_preference_button.emit_clicked();
+                let mut result = view_preference_state_json(widgets, state);
+                result["sender_button_was_visible"] = json!(button_was_visible);
+                result
+            } else {
+                json!({"ok": false, "error": "sender view preference is unavailable"})
+            }
+        }
         "toggle_quote_collapse" => {
             toggle_quote_collapse(options, widgets, state);
             json!({"ok": true, "quote_collapse_enabled": state.borrow().quote_collapse_enabled})
@@ -14853,6 +15216,30 @@ fn link_hint_state_json(widgets: &Widgets) -> serde_json::Value {
     })
 }
 
+fn view_preference_state_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
+    let state_ref = state.borrow();
+    let selected_message = state_ref.selected_message.clone();
+    let resolved = selected_message
+        .as_ref()
+        .map(|message| message_view_preference(&state_ref, message));
+    let selected_sender = selected_message.as_ref().and_then(message_sender_email);
+    json!({
+        "ok": true,
+        "active_view": widgets.active_message_view.get().preference(),
+        "resolved_view": resolved,
+        "selected_message": selected_message,
+        "selected_sender": selected_sender,
+        "message_view_preferences": state_ref.message_view_preferences,
+        "sender_view_preferences": state_ref.sender_view_preferences,
+        "sender_button": {
+            "visible": widgets.sender_view_preference_button.is_visible(),
+            "sensitive": widgets.sender_view_preference_button.is_sensitive(),
+            "label": widgets.sender_view_preference_button.label().map(|label| label.to_string()),
+            "tooltip": widgets.sender_view_preference_button.tooltip_text().map(|text| text.to_string()),
+        },
+    })
+}
+
 fn injected_shortcut(
     args: &serde_json::Value,
 ) -> anyhow::Result<(gtk::gdk::Key, gtk::gdk::ModifierType)> {
@@ -14961,6 +15348,8 @@ fn ensure_automation_request_allowed(
         | "click_delete_selected_draft"
         | "settings_test_state"
         | "respond_settings"
+        | "view_preference_state"
+        | "click_sender_view_preference"
         | "send_key" => Some(AutomationOperation::FixtureOnly),
         "pending_confirmation" | "respond_confirmation" => {
             Some(AutomationOperation::ConfirmationControl)
@@ -15249,31 +15638,30 @@ fn run_named_command(
             json!({"ok": true, "layout": layout_state_json(widgets, state)})
         }
         "raw_source" | "open_raw_source" => {
-            show_raw_source(options, widgets, state);
-            json!({"ok": state.borrow().last_error.is_none(), "last_error": state.borrow().last_error})
+            let ok = choose_selected_message_view(options, widgets, state, MessageViewKind::Raw);
+            json!({"ok": ok, "last_error": state.borrow().last_error})
         }
         "full_headers" | "show_full_headers" => {
-            show_full_headers(options, widgets, state);
-            json!({"ok": state.borrow().last_error.is_none(), "last_error": state.borrow().last_error})
+            let ok =
+                choose_selected_message_view(options, widgets, state, MessageViewKind::Headers);
+            json!({"ok": ok, "last_error": state.borrow().last_error})
         }
         "text" | "rendered" | "show_rendered_thread" | "show_text_thread" => {
-            state.borrow_mut().prefer_html_view = false;
-            show_rendered_selected_thread(options, widgets, state);
-            json!({"ok": true, "state": &*state.borrow()})
+            let ok = choose_selected_message_view(options, widgets, state, MessageViewKind::Text);
+            json!({"ok": ok, "state": &*state.borrow()})
         }
         "toggle_text_visual" | "toggle_visual_html" => {
-            toggle_text_visual_view(options, widgets, state);
+            let ok = toggle_text_visual_view(options, widgets, state);
             json!({
-                "ok": state.borrow().last_error.is_none(),
+                "ok": ok,
                 "html_view": html_view_state(options, widgets, state),
                 "last_error": state.borrow().last_error,
             })
         }
         "visual_html" | "show_visual_html" | "show_html_visual" => {
-            state.borrow_mut().prefer_html_view = true;
-            show_visual_html_selected_message(options, widgets, state);
+            let ok = choose_selected_message_view(options, widgets, state, MessageViewKind::Html);
             json!({
-                "ok": state.borrow().last_error.is_none(),
+                "ok": ok,
                 "html_view": html_view_state(options, widgets, state),
                 "last_error": state.borrow().last_error,
             })
@@ -16654,6 +17042,75 @@ fn apply_pane_visibility_values(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_view_preferences_use_message_then_sender_then_global_precedence() {
+        let mut by_message = BTreeMap::new();
+        let mut by_sender = BTreeMap::new();
+        by_sender.insert(
+            "sender@example.test".to_string(),
+            MessageViewPreference::FullHeaders,
+        );
+
+        assert_eq!(
+            resolve_message_view_preference(
+                true,
+                &by_message,
+                &by_sender,
+                "message@example.test",
+                Some("Sender@Example.Test"),
+                true,
+            ),
+            MessageViewPreference::FullHeaders
+        );
+
+        by_message.insert(
+            "message@example.test".to_string(),
+            MessageViewPreference::RawSource,
+        );
+        assert_eq!(
+            resolve_message_view_preference(
+                false,
+                &by_message,
+                &by_sender,
+                " message@example.test ",
+                Some("sender@example.test"),
+                true,
+            ),
+            MessageViewPreference::RawSource
+        );
+
+        assert_eq!(
+            resolve_message_view_preference(
+                true,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                "new@example.test",
+                None,
+                true,
+            ),
+            MessageViewPreference::VisualHtml
+        );
+    }
+
+    #[test]
+    fn visual_preference_falls_back_to_text_for_plain_messages() {
+        let by_message = BTreeMap::from([(
+            "plain@example.test".to_string(),
+            MessageViewPreference::VisualHtml,
+        )]);
+        assert_eq!(
+            resolve_message_view_preference(
+                true,
+                &by_message,
+                &BTreeMap::new(),
+                "plain@example.test",
+                None,
+                false,
+            ),
+            MessageViewPreference::Text
+        );
+    }
 
     #[test]
     fn message_header_values_stay_single_line_for_compact_pane_height() {

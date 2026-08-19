@@ -12,6 +12,7 @@ use serde::Serialize;
 use webkit6::prelude::WebViewExt;
 
 use super::link_hints::{LinkHintController, LinkHintOpener, LinkHintSnapshot};
+use crate::model::MessageViewPreference;
 
 const MESSAGE_HEADER_VALUE_LINES: i32 = 1;
 const STATUS_BAR_MAX_WIDTH_CHARS: i32 = 120;
@@ -25,7 +26,6 @@ pub(crate) enum StandaloneImagePolicy {
 
 #[derive(Debug, Clone)]
 pub(crate) struct StandalonePolicySnapshot {
-    pub(crate) prefer_html_view: bool,
     pub(crate) collapse_quotes: bool,
     pub(crate) remote_images: bool,
     pub(crate) trusted_image_senders: Vec<String>,
@@ -71,6 +71,12 @@ pub(crate) type StandaloneHtmlViewInitializer = Rc<dyn Fn(&webkit6::WebView, &gt
 pub(crate) type StandaloneHtmlScrollHandler =
     Rc<dyn Fn(&webkit6::WebView, &gtk::Label, StandaloneHtmlScroll)>;
 pub(crate) type StandaloneResponseHandler = Rc<dyn Fn(StandaloneResponseRequest) -> bool>;
+pub(crate) type StandalonePreferredView = Rc<dyn Fn(&MessageSummary) -> MessageViewPreference>;
+pub(crate) type StandaloneRememberView =
+    Rc<dyn Fn(&MessageSummary, MessageViewPreference) -> anyhow::Result<()>>;
+pub(crate) type StandaloneSenderView = Rc<dyn Fn(&MessageSummary) -> Option<MessageViewPreference>>;
+pub(crate) type StandaloneToggleSenderView =
+    Rc<dyn Fn(&MessageSummary, MessageViewPreference) -> anyhow::Result<bool>>;
 
 pub(crate) struct StandaloneOpenOptions {
     pub(crate) parent: gtk::ApplicationWindow,
@@ -84,6 +90,10 @@ pub(crate) struct StandaloneOpenOptions {
     pub(crate) scroll_html: StandaloneHtmlScrollHandler,
     pub(crate) open_link: LinkHintOpener,
     pub(crate) respond: StandaloneResponseHandler,
+    pub(crate) preferred_view: StandalonePreferredView,
+    pub(crate) remember_view: StandaloneRememberView,
+    pub(crate) sender_view: StandaloneSenderView,
+    pub(crate) toggle_sender_view: StandaloneToggleSenderView,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -201,6 +211,13 @@ impl StandaloneMessageController {
         ] {
             view_menu_box.append(button);
         }
+        view_menu_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        let sender_view_preference_button =
+            gtk::Button::with_label("Always show messages from this sender in this view");
+        sender_view_preference_button
+            .set_widget_name("notm-message-window-sender-view-preference-button");
+        sender_view_preference_button.set_visible(false);
+        view_menu_box.append(&sender_view_preference_button);
         let collapse_quotes_button = gtk::Button::with_label("Collapse quotes");
         collapse_quotes_button.set_widget_name("notm-message-window-collapse-quotes-button");
 
@@ -298,11 +315,7 @@ impl StandaloneMessageController {
         root.append(&status_label);
         window.set_child(Some(&root));
 
-        let initial_view = if policy.prefer_html_view && (options.message_has_html)(&message) {
-            MessageViewKind::Html
-        } else {
-            MessageViewKind::Text
-        };
+        let initial_view = MessageViewKind::from_preference((options.preferred_view)(&message));
         let standalone = Rc::new(StandaloneMessageWindow {
             id,
             window: window.clone(),
@@ -320,6 +333,7 @@ impl StandaloneMessageController {
             view_html_button,
             view_headers_button,
             view_raw_button,
+            sender_view_preference_button,
             html_policy_row,
             html_policy_label,
             image_policy_button,
@@ -345,6 +359,10 @@ impl StandaloneMessageController {
             render_html: options.render_html,
             scroll_html: options.scroll_html,
             respond: options.respond,
+            preferred_view: options.preferred_view,
+            remember_view: options.remember_view,
+            sender_view: options.sender_view,
+            toggle_sender_view: options.toggle_sender_view,
             state: RefCell::new(StandaloneMessageState {
                 messages: options.messages,
                 selected_index,
@@ -421,6 +439,26 @@ enum MessageViewKind {
     Raw,
 }
 
+impl MessageViewKind {
+    const fn preference(self) -> MessageViewPreference {
+        match self {
+            Self::Text => MessageViewPreference::Text,
+            Self::Html => MessageViewPreference::VisualHtml,
+            Self::Headers => MessageViewPreference::FullHeaders,
+            Self::Raw => MessageViewPreference::RawSource,
+        }
+    }
+
+    const fn from_preference(preference: MessageViewPreference) -> Self {
+        match preference {
+            MessageViewPreference::Text => Self::Text,
+            MessageViewPreference::VisualHtml => Self::Html,
+            MessageViewPreference::FullHeaders => Self::Headers,
+            MessageViewPreference::RawSource => Self::Raw,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct StandaloneMessageState {
     messages: Vec<MessageSummary>,
@@ -447,6 +485,7 @@ struct StandaloneMessageWindow {
     view_html_button: gtk::Button,
     view_headers_button: gtk::Button,
     view_raw_button: gtk::Button,
+    sender_view_preference_button: gtk::Button,
     html_policy_row: gtk::Box,
     html_policy_label: gtk::Label,
     image_policy_button: gtk::Button,
@@ -472,6 +511,10 @@ struct StandaloneMessageWindow {
     render_html: StandaloneHtmlRenderer,
     scroll_html: StandaloneHtmlScrollHandler,
     respond: StandaloneResponseHandler,
+    preferred_view: StandalonePreferredView,
+    remember_view: StandaloneRememberView,
+    sender_view: StandaloneSenderView,
+    toggle_sender_view: StandaloneToggleSenderView,
     state: RefCell<StandaloneMessageState>,
 }
 
@@ -576,11 +619,41 @@ fn connect_message_window_actions(standalone: &Rc<StandaloneMessageWindow>) {
         let standalone = Rc::downgrade(standalone);
         button.connect_clicked(move |_| {
             if let Some(standalone) = standalone.upgrade() {
-                show_message_view(&standalone, view);
+                choose_message_view(&standalone, view);
                 standalone.view_menu_button.popdown();
             }
         });
     }
+
+    let standalone_weak = Rc::downgrade(standalone);
+    standalone
+        .sender_view_preference_button
+        .connect_clicked(move |_| {
+            let Some(standalone) = standalone_weak.upgrade() else {
+                return;
+            };
+            let Some(message) = current_message(&standalone) else {
+                standalone.status_label.set_text("No selected message");
+                standalone.view_menu_button.popdown();
+                return;
+            };
+            let preference = standalone.state.borrow().view.preference();
+            match (standalone.toggle_sender_view)(&message, preference) {
+                Ok(true) => standalone.status_label.set_text(&format!(
+                    "Messages from this sender will default to {}",
+                    preference.label()
+                )),
+                Ok(false) => standalone.status_label.set_text(&format!(
+                    "Removed the {} default for this sender",
+                    preference.label()
+                )),
+                Err(error) => standalone.status_label.set_text(&format!(
+                    "Sender view preference could not be saved: {error}"
+                )),
+            }
+            update_sender_view_preference_button(&standalone, &message);
+            standalone.view_menu_button.popdown();
+        });
 
     let standalone_weak = Rc::downgrade(standalone);
     standalone.image_policy_button.connect_clicked(move |_| {
@@ -946,7 +1019,7 @@ fn run_view_key(standalone: &StandaloneMessageWindow, key: gtk::gdk::Key) -> boo
         standalone.status_label.set_text("No visual HTML part");
         return true;
     }
-    show_message_view(standalone, view);
+    choose_message_view(standalone, view);
     true
 }
 
@@ -996,7 +1069,7 @@ fn current_message(standalone: &StandaloneMessageWindow) -> Option<MessageSummar
 }
 
 fn select_message(standalone: &Rc<StandaloneMessageWindow>, index: usize) -> bool {
-    let view = {
+    let message = {
         let mut state = standalone.state.borrow_mut();
         if index >= state.messages.len() {
             standalone.status_label.set_text("Message index not found");
@@ -1004,8 +1077,9 @@ fn select_message(standalone: &Rc<StandaloneMessageWindow>, index: usize) -> boo
         }
         state.selected_index = index;
         state.image_policy = StandaloneImagePolicy::Config;
-        state.view
+        state.messages[index].clone()
     };
+    let view = MessageViewKind::from_preference((standalone.preferred_view)(&message));
     show_message_view(standalone, view);
     populate_message_menu(standalone);
     standalone.message_menu_button.popdown();
@@ -1088,26 +1162,79 @@ fn populate_message_menu(standalone: &Rc<StandaloneMessageWindow>) {
     }
 }
 
-fn show_message_view(standalone: &StandaloneMessageWindow, view: MessageViewKind) {
+fn show_message_view(standalone: &StandaloneMessageWindow, view: MessageViewKind) -> bool {
     let Some(message) = current_message(standalone) else {
         standalone.status_label.set_text("No selected message");
-        return;
+        return false;
     };
     if view == MessageViewKind::Html && !(standalone.message_has_html)(&message) {
         standalone.status_label.set_text("No visual HTML part");
-        return;
+        return false;
     }
     standalone
         .window
         .set_title(Some(&standalone_message_window_title(&message)));
     refresh_message_header(standalone, &message);
-    match view {
+    let shown = match view {
         MessageViewKind::Text => show_text_message(standalone, &message),
         MessageViewKind::Html => show_html_message(standalone, &message),
         MessageViewKind::Headers => show_headers(standalone, &message),
         MessageViewKind::Raw => show_raw(standalone, &message),
-    }
+    };
     update_message_buttons(standalone, &message);
+    update_sender_view_preference_button(standalone, &message);
+    shown
+}
+
+fn choose_message_view(standalone: &StandaloneMessageWindow, view: MessageViewKind) -> bool {
+    let Some(message) = current_message(standalone) else {
+        standalone.status_label.set_text("No selected message");
+        return false;
+    };
+    if view == MessageViewKind::Html && !(standalone.message_has_html)(&message) {
+        standalone.status_label.set_text("No visual HTML part");
+        return false;
+    }
+    if !show_message_view(standalone, view) {
+        return false;
+    }
+    if let Err(error) = (standalone.remember_view)(&message, view.preference()) {
+        standalone.status_label.set_text(&format!(
+            "{} shown, but its message preference could not be saved: {error}",
+            view.preference().label()
+        ));
+        return false;
+    }
+    update_sender_view_preference_button(standalone, &message);
+    true
+}
+
+fn update_sender_view_preference_button(
+    standalone: &StandaloneMessageWindow,
+    message: &MessageSummary,
+) {
+    let Some(sender) = message_sender_email(message) else {
+        standalone.sender_view_preference_button.set_visible(false);
+        standalone
+            .sender_view_preference_button
+            .set_tooltip_text(None);
+        return;
+    };
+    let preference = standalone.state.borrow().view.preference();
+    let enabled = (standalone.sender_view)(message) == Some(preference);
+    let label = if enabled {
+        format!("Stop always showing this sender as {}", preference.label())
+    } else {
+        format!("Always show this sender as {}", preference.label())
+    };
+    standalone.sender_view_preference_button.set_label(&label);
+    standalone
+        .sender_view_preference_button
+        .set_tooltip_text(Some(&format!(
+            "Sender: {sender}. A per-message view choice still takes precedence."
+        )));
+    standalone.sender_view_preference_button.set_visible(true);
+    standalone.sender_view_preference_button.set_sensitive(true);
 }
 
 fn start_link_hint_mode(standalone: &StandaloneMessageWindow) -> bool {
@@ -1128,7 +1255,7 @@ fn start_link_hint_mode(standalone: &StandaloneMessageWindow) -> bool {
     true
 }
 
-fn show_text_message(standalone: &StandaloneMessageWindow, message: &MessageSummary) {
+fn show_text_message(standalone: &StandaloneMessageWindow, message: &MessageSummary) -> bool {
     let collapse_quotes = standalone.state.borrow().collapse_quotes;
     match (standalone.render_text)(message, collapse_quotes) {
         Ok(rendered) => {
@@ -1136,14 +1263,18 @@ fn show_text_message(standalone: &StandaloneMessageWindow, message: &MessageSumm
             standalone.text_view.set_monospace(false);
             standalone.text_view.buffer().set_text(&rendered);
             standalone.status_label.set_text("Text message shown");
+            true
         }
-        Err(err) => standalone
-            .status_label
-            .set_text(&format!("Text view failed: {err}")),
+        Err(err) => {
+            standalone
+                .status_label
+                .set_text(&format!("Text view failed: {err}"));
+            false
+        }
     }
 }
 
-fn show_html_message(standalone: &StandaloneMessageWindow, message: &MessageSummary) {
+fn show_html_message(standalone: &StandaloneMessageWindow, message: &MessageSummary) -> bool {
     let image_policy = standalone.state.borrow().image_policy;
     match (standalone.render_html)(message, image_policy) {
         Ok(rendered) => {
@@ -1153,14 +1284,18 @@ fn show_html_message(standalone: &StandaloneMessageWindow, message: &MessageSumm
                 .load_html(&rendered.document, Some("about:blank"));
             set_active_message_view(standalone, MessageViewKind::Html);
             standalone.status_label.set_text(&rendered.status);
+            true
         }
-        Err(err) => standalone
-            .status_label
-            .set_text(&format!("Visual HTML failed: {err}")),
+        Err(err) => {
+            standalone
+                .status_label
+                .set_text(&format!("Visual HTML failed: {err}"));
+            false
+        }
     }
 }
 
-fn show_headers(standalone: &StandaloneMessageWindow, message: &MessageSummary) {
+fn show_headers(standalone: &StandaloneMessageWindow, message: &MessageSummary) -> bool {
     let result = (|| -> anyhow::Result<String> {
         let filename = message_filename(message)?;
         Ok(header_block(&std::fs::read_to_string(filename)?))
@@ -1173,14 +1308,18 @@ fn show_headers(standalone: &StandaloneMessageWindow, message: &MessageSummary) 
             standalone
                 .status_label
                 .set_text("Full message headers shown");
+            true
         }
-        Err(err) => standalone
-            .status_label
-            .set_text(&format!("Full headers failed: {err}")),
+        Err(err) => {
+            standalone
+                .status_label
+                .set_text(&format!("Full headers failed: {err}"));
+            false
+        }
     }
 }
 
-fn show_raw(standalone: &StandaloneMessageWindow, message: &MessageSummary) {
+fn show_raw(standalone: &StandaloneMessageWindow, message: &MessageSummary) -> bool {
     let result = (|| -> anyhow::Result<String> {
         let filename = message_filename(message)?;
         Ok(std::fs::read_to_string(filename)?)
@@ -1191,10 +1330,14 @@ fn show_raw(standalone: &StandaloneMessageWindow, message: &MessageSummary) {
             standalone.text_view.set_monospace(true);
             standalone.text_view.buffer().set_text(&raw);
             standalone.status_label.set_text("Raw message source shown");
+            true
         }
-        Err(err) => standalone
-            .status_label
-            .set_text(&format!("Raw source failed: {err}")),
+        Err(err) => {
+            standalone
+                .status_label
+                .set_text(&format!("Raw source failed: {err}"));
+            false
+        }
     }
 }
 

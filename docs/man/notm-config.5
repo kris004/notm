@@ -170,6 +170,23 @@ and
 The default is
 .BR sanitize_then_render_text_fallback .
 .TP
+.B message_view_preferences
+Application-managed table mapping Message-IDs to remembered views.  Supported
+values are
+.BR text ,
+.BR visual_html ,
+.BR full_headers ,
+and
+.BR raw_source .
+A message-specific entry takes precedence over a sender entry and
+.BR html_mode .
+.TP
+.B sender_view_preferences
+Application-managed table mapping normalized sender email addresses to their
+default message view.  It uses the same values as
+.BR message_view_preferences .
+Use the sender action in the View menu to add, update, or remove these entries.
+.TP
 .B start_maximized
 Start the window maximized.  Defaults to false.
 .TP

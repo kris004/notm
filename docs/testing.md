@@ -156,6 +156,17 @@ NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
   -- --exact --nocapture --test-threads=1
 ```
 
+Remembered message views have a restart-backed GTK smoke. It verifies all
+preference layers, drives the real sender button, checks Message-ID precedence,
+and confirms that standalone windows resolve their own selected message:
+
+```sh
+NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
+  cargo test -p notm-app --test desktop_ui_smoke \
+  fixture_message_and_sender_views_persist_with_message_precedence \
+  -- --exact --nocapture --test-threads=1
+```
+
 Use the fixture-only test-harness `send_key` command for application shortcut
 checks that do not need compositor input; it calls the same ordered router as
 the main window without focusing or presenting a window. The focused-text and

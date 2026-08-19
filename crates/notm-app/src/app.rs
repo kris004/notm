@@ -134,6 +134,8 @@ fn launch_options(cfg: &config::AppConfig, app_config_path: Option<PathBuf>) -> 
         layout: cfg.ui.layout.clone(),
         html_mode: cfg.ui.html_mode.clone(),
         trusted_image_senders: cfg.ui.trusted_image_senders.clone(),
+        message_view_preferences: cfg.ui.message_view_preferences.clone(),
+        sender_view_preferences: cfg.ui.sender_view_preferences.clone(),
         hidden_tag_searches: cfg.ui.hidden_tag_searches.clone(),
         sync_maildir_flags_after_tag_change: cfg.notmuch.sync_maildir_flags_after_tag_change,
         draft_path: None,

@@ -108,6 +108,7 @@ Implemented test-harness commands include:
   `toggle_text_visual`, `show_visual_html`, `show_html_visual`, `image_policy`,
   `load_images_once`, `trust_sender_images`, `trusted_image_senders`,
   `html_view_state`, `html_scroll_state`, `scroll_html_view_lines`,
+  `view_preference_state`, `click_sender_view_preference`,
   `start_link_hints`, `link_hint_state`, `input_link_hint`,
   `cancel_link_hints`, `toggle_quote_collapse`, `message_view_text`,
   `copy_message_id`, `copy_thread_id`
@@ -133,6 +134,12 @@ forward an unhandled key into a focused text widget; use it for notm shortcuts,
 and reserve an isolated compositor input tool for GTK text-entry propagation
 checks. Arbitrary shortcut routing is rejected outside fixture mode because a
 shortcut can send mail or mutate tags.
+
+`view_preference_state` reports the selected, resolved, and active message
+views plus both persisted preference maps and the rendered sender-button state.
+`click_sender_view_preference` emits the real View-menu button click. Both are
+fixture-only UI-test controls; normal view selection uses the same persistence
+path without requiring the harness.
 
 `click_message_tag_action` drives the real current-message menu buttons and
 accepts `action` set to `archive`, `read`, `flag`, `trash`, `spam`, or `custom`.

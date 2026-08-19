@@ -2936,6 +2936,172 @@ fn fixture_ctrl_e_y_scroll_message_without_changing_selection() -> anyhow::Resul
     Ok(())
 }
 
+#[test]
+fn fixture_message_and_sender_views_persist_with_message_precedence() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_message_and_sender_views_persist_with_message_precedence: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running persistent message-view desktop UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let shared = tempfile::tempdir()?;
+    let config_path = shared.path().join("config.toml");
+    fs::write(&config_path, "")?;
+
+    let token = format!("notm-view-preference-first-{run_id}");
+    let mut app = FixtureApp::spawn_fixture_with_config(
+        std::env::temp_dir().join(format!("notm-view-preference-first-{run_id}")),
+        &token,
+        &config_path,
+    )?;
+    let mut driver = app.connect(&token)?;
+    select_first_thread(&mut driver, "id:html-message@fixture.test")?;
+    let visual = driver.command("show_visual_html", json!({}))?;
+    assert_eq!(
+        visual["ok"], true,
+        "HTML preference was not selected: {visual}"
+    );
+    let first_state = driver.command("view_preference_state", json!({}))?;
+    assert_eq!(first_state["active_view"], "visual_html", "{first_state}");
+    assert_eq!(
+        first_state["message_view_preferences"]["html-message@fixture.test"], "visual_html",
+        "{first_state}"
+    );
+    let fixture_config_path = fixture_app_config_path(&mut driver)?;
+    let persisted_text = fs::read_to_string(&fixture_config_path)?;
+    let persisted: toml::Value = persisted_text.parse()?;
+    assert_eq!(
+        persisted
+            .get("ui")
+            .and_then(|ui| ui.get("message_view_preferences"))
+            .and_then(|preferences| preferences.get("html-message@fixture.test"))
+            .and_then(toml::Value::as_str),
+        Some("visual_html"),
+        "persisted config did not contain the message preference:\n{persisted_text}"
+    );
+    fs::write(&config_path, &persisted_text)?;
+    drop(driver);
+    drop(app);
+
+    let token = format!("notm-view-preference-second-{run_id}");
+    let mut app = FixtureApp::spawn_fixture_with_config(
+        std::env::temp_dir().join(format!("notm-view-preference-second-{run_id}")),
+        &token,
+        &config_path,
+    )?;
+    let mut driver = app.connect(&token)?;
+    select_first_thread(&mut driver, "id:html-message@fixture.test")?;
+    let restored = driver.command("view_preference_state", json!({}))?;
+    assert_eq!(restored["active_view"], "visual_html", "{restored}");
+    assert_eq!(restored["resolved_view"], "visual_html", "{restored}");
+
+    let text = driver.command("show_text_thread", json!({}))?;
+    assert_eq!(text["ok"], true, "text preference was not selected: {text}");
+    select_first_thread(&mut driver, "id:unicode@fixture.test")?;
+    select_first_thread(&mut driver, "id:html-message@fixture.test")?;
+    let changed = driver.command("view_preference_state", json!({}))?;
+    assert_eq!(changed["active_view"], "text", "{changed}");
+    assert_eq!(changed["resolved_view"], "text", "{changed}");
+
+    select_first_thread(&mut driver, "id:sent-like@fixture.test")?;
+    let raw = driver.command("show_raw_source", json!({}))?;
+    assert_eq!(raw["ok"], true, "raw view was not selected: {raw}");
+    let before_sender = driver.command("view_preference_state", json!({}))?;
+    assert_eq!(
+        before_sender["active_view"], "raw_source",
+        "{before_sender}"
+    );
+    ensure!(
+        before_sender["sender_button"]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("Always show this sender as Raw source")),
+        "sender button did not describe the selected view: {before_sender}"
+    );
+    let sender_set = driver.command("click_sender_view_preference", json!({}))?;
+    assert_eq!(sender_set["ok"], true, "{sender_set}");
+    assert_eq!(
+        sender_set["sender_button_was_visible"], true,
+        "sender action was not rendered in the open View menu: {sender_set}"
+    );
+    assert_eq!(
+        sender_set["sender_view_preferences"]["fixture@example.test"], "raw_source",
+        "{sender_set}"
+    );
+    fs::copy(fixture_app_config_path(&mut driver)?, &config_path)?;
+    drop(driver);
+    drop(app);
+
+    let token = format!("notm-view-preference-third-{run_id}");
+    let mut app = FixtureApp::spawn_fixture_with_config(
+        std::env::temp_dir().join(format!("notm-view-preference-third-{run_id}")),
+        &token,
+        &config_path,
+    )?;
+    let mut driver = app.connect(&token)?;
+    select_first_thread(&mut driver, "id:thread-reply1-three-message@fixture.test")?;
+    let selected = driver.command("select_message_by_index", json!({"index": 1}))?;
+    assert_eq!(
+        selected["selected_message"]["message_id"], "thread-reply1-three-message@fixture.test",
+        "{selected}"
+    );
+    let sender_restored = driver.command("view_preference_state", json!({}))?;
+    assert_eq!(
+        sender_restored["active_view"], "raw_source",
+        "{sender_restored}"
+    );
+    assert_eq!(
+        sender_restored["resolved_view"], "raw_source",
+        "{sender_restored}"
+    );
+    ensure!(
+        sender_restored["sender_button"]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("Stop always showing this sender as Raw source")),
+        "restored sender rule was not reflected in the View menu: {sender_restored}"
+    );
+
+    let headers = driver.command("show_full_headers", json!({}))?;
+    assert_eq!(
+        headers["ok"], true,
+        "header view was not selected: {headers}"
+    );
+    select_first_thread(&mut driver, "id:unicode@fixture.test")?;
+    select_first_thread(&mut driver, "id:thread-reply1-three-message@fixture.test")?;
+    driver.command("select_message_by_index", json!({"index": 1}))?;
+    let message_override = driver.command("view_preference_state", json!({}))?;
+    assert_eq!(
+        message_override["active_view"], "full_headers",
+        "{message_override}"
+    );
+    assert_eq!(
+        message_override["resolved_view"], "full_headers",
+        "{message_override}"
+    );
+    assert_eq!(
+        message_override["sender_view_preferences"]["fixture@example.test"], "raw_source",
+        "per-message selection unexpectedly replaced the sender rule: {message_override}"
+    );
+
+    assert_eq!(
+        driver.command("show_raw_source", json!({}))?["ok"],
+        true,
+        "could not return to the matching sender view"
+    );
+    let sender_removed = driver.command("click_sender_view_preference", json!({}))?;
+    assert_eq!(sender_removed["ok"], true, "{sender_removed}");
+    ensure!(
+        sender_removed["sender_view_preferences"]
+            .get("fixture@example.test")
+            .is_none(),
+        "matching sender button did not remove the rule: {sender_removed}"
+    );
+
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn external_file_arg_send_reports_existing_sent_copy() -> anyhow::Result<()> {
@@ -3751,6 +3917,13 @@ fn fixture_standalone_message_window_keeps_its_thread_snapshot() -> anyhow::Resu
     assert_eq!(visible_labels["respond"], "Respond (r)", "{visible_labels}");
     assert_eq!(visible_labels["archive"], "Archive (a)", "{visible_labels}");
 
+    select_first_thread(&mut driver, "subject:\"Three message thread\"")?;
+    let remembered = driver.command("show_raw_source", json!({}))?;
+    assert_eq!(
+        remembered["ok"], true,
+        "could not seed the standalone message preference: {remembered}"
+    );
+
     let hidden = driver.command(
         "set_pane_visibility",
         json!({"pane": "message", "visible": false}),
@@ -3785,6 +3958,10 @@ fn fixture_standalone_message_window_keeps_its_thread_snapshot() -> anyhow::Resu
     );
     assert_eq!(windows[0]["message_count"], 3, "{standalone}");
     assert_eq!(windows[0]["selected_index"], 2, "{standalone}");
+    assert_eq!(
+        windows[0]["view"], "raw",
+        "standalone window ignored the selected message's saved view: {standalone}"
+    );
     assert_eq!(
         windows[0]["selected_message"]["message_id"], "thread-reply2-three-message@fixture.test",
         "standalone did not start on the newest thread message: {standalone}"
@@ -3821,6 +3998,10 @@ fn fixture_standalone_message_window_keeps_its_thread_snapshot() -> anyhow::Resu
         "standalone navigation selected the wrong snapshot message: {selected}"
     );
     assert_eq!(selected["window"]["message_count"], 3, "{selected}");
+    assert_eq!(
+        selected["window"]["view"], "text",
+        "standalone navigation carried the previous message's view instead of resolving the new message: {selected}"
+    );
     assert_eq!(
         selected["main_selected_message"]["message_id"], "unicode@fixture.test",
         "standalone navigation changed the main message selection: {selected}"
@@ -4497,6 +4678,14 @@ fn select_first_thread(driver: &mut UiDriver, query: &str) -> anyhow::Result<()>
         "could not select fixture thread: {selected}"
     );
     Ok(())
+}
+
+fn fixture_app_config_path(driver: &mut UiDriver) -> anyhow::Result<PathBuf> {
+    let state = driver.command("settings_test_state", json!({}))?;
+    state["app_config_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("fixture app did not report its isolated config path: {state}"))
 }
 
 fn directory_tree_snapshot(root: &Path) -> anyhow::Result<BTreeMap<PathBuf, Option<Vec<u8>>>> {

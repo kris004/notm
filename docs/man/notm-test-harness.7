@@ -159,6 +159,8 @@ It targets the selected message ID only and ignores thread multi-selection.
 .BR image_policy ,
 .BR load_images_once ,
 .BR trust_sender_images ,
+.BR view_preference_state ,
+.BR click_sender_view_preference ,
 .BR start_link_hints ,
 .BR link_hint_state ,
 .BR input_link_hint ,
@@ -212,6 +214,12 @@ does not synthesize compositor input and does not forward an unhandled key into
 a focused text widget.  Use it for notm shortcuts; use an isolated compositor
 input tool only when testing GTK text-entry propagation.  It is unavailable
 outside fixture mode because arbitrary shortcuts can send mail or mutate tags.
+.PP
+.B view_preference_state
+reports the current message view, its resolved preference, both preference
+maps, and the rendered sender-button state.
+.B click_sender_view_preference
+emits the real View-menu sender button.  Both controls are fixture-only.
 .PP
 .B run_manual_sync
 returns with

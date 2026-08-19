@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use anyhow::Context;
-use notm_ui::model::{MAX_THREAD_PREVIEW_LINES, ThemePreference};
+use notm_ui::model::{MAX_THREAD_PREVIEW_LINES, MessageViewPreference, ThemePreference};
 use serde::{Deserialize, Serialize};
 
 use crate::paths;
@@ -174,6 +174,10 @@ pub struct UiConfig {
     #[serde(default = "default_html_mode")]
     pub html_mode: String,
     #[serde(default)]
+    pub message_view_preferences: BTreeMap<String, MessageViewPreference>,
+    #[serde(default)]
+    pub sender_view_preferences: BTreeMap<String, MessageViewPreference>,
+    #[serde(default)]
     pub start_maximized: bool,
     #[serde(default = "default_true")]
     pub show_sidebar: bool,
@@ -213,6 +217,8 @@ impl Default for UiConfig {
             remote_images: false,
             trusted_image_senders: Vec::new(),
             html_mode: "sanitize_then_render_text_fallback".to_string(),
+            message_view_preferences: BTreeMap::new(),
+            sender_view_preferences: BTreeMap::new(),
             start_maximized: false,
             show_sidebar: true,
             show_message_list: true,
@@ -514,6 +520,7 @@ fn default_screenshot_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{AppConfig, REDACTED_VALUE};
+    use notm_ui::model::MessageViewPreference;
 
     fn parse_validated(contents: &str) -> anyhow::Result<AppConfig> {
         let config = toml::from_str::<AppConfig>(contents)?;
@@ -598,6 +605,29 @@ mod tests {
         let config: AppConfig = toml::from_str("").expect("empty config should deserialize");
 
         assert_eq!(config.ui.layout, "auto");
+    }
+
+    #[test]
+    fn message_and_sender_view_preferences_deserialize_with_stable_values() {
+        let config = parse_validated(
+            "[ui.message_view_preferences]\n\
+             \"message@example.test\" = \"text\"\n\
+             \n[ui.sender_view_preferences]\n\
+             \"sender@example.test\" = \"visual_html\"\n",
+        )
+        .expect("view preference maps should validate");
+
+        assert_eq!(
+            config
+                .ui
+                .message_view_preferences
+                .get("message@example.test"),
+            Some(&MessageViewPreference::Text)
+        );
+        assert_eq!(
+            config.ui.sender_view_preferences.get("sender@example.test"),
+            Some(&MessageViewPreference::VisualHtml)
+        );
     }
 
     #[test]
