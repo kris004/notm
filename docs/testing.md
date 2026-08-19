@@ -145,6 +145,17 @@ NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
   -- --exact --nocapture --test-threads=1
 ```
 
+Vim-style message viewport scrolling has a long-HTML GTK smoke. It routes
+`Ctrl+e` and `Ctrl+y` through the main shortcut router, verifies movement in
+both directions, and proves the selected message does not change:
+
+```sh
+NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
+  cargo test -p notm-app --test desktop_ui_smoke \
+  fixture_ctrl_e_y_scroll_message_without_changing_selection \
+  -- --exact --nocapture --test-threads=1
+```
+
 Use the fixture-only test-harness `send_key` command for application shortcut
 checks that do not need compositor input; it calls the same ordered router as
 the main window without focusing or presenting a window. The focused-text and

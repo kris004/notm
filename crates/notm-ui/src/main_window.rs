@@ -5543,6 +5543,13 @@ fn install_shortcuts(
             }
             return gtk::glib::Propagation::Proceed;
         }
+        if let Some(lines) = crate::widgets::vim_viewport_scroll_lines(key, mods) {
+            if st.borrow().active_pane == ActivePane::Message && !compose_view_is_visible(&w) {
+                vim_scroll_lines(&w, &st, lines);
+                return gtk::glib::Propagation::Stop;
+            }
+            return gtk::glib::Propagation::Proceed;
+        }
         if ctrl && (key == gtk::gdk::Key::d || key == gtk::gdk::Key::D) {
             if st.borrow().active_pane == ActivePane::Threads {
                 select_thread_page(&opts, &w, &st, 1);
@@ -16114,6 +16121,11 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
             section: "Message actions",
             key: "J / K",
             description: "Select the next or previous message in the current thread; lowercase j/k still scroll.",
+        },
+        HelpEntry {
+            section: "Message actions",
+            key: "Ctrl+e / Ctrl+y",
+            description: "Scroll the message viewport down or up one line without changing the selected message.",
         },
         HelpEntry {
             section: "Message actions",

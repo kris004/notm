@@ -132,6 +132,8 @@ Press `?` in the application for searchable shortcut help. A few useful keys:
 - `/` searches, `:` opens the command palette, and `j`/`k` move through rows.
 - `J`/`K` select the next or previous message in a thread; lowercase `j`/`k`
   continue to scroll the message view.
+- `Ctrl+e`/`Ctrl+y` scroll the message view down or up one line without changing
+  which message is selected.
 - `h`/`l` move between panes; `Ctrl+1`, `Ctrl+2`, and `Ctrl+3` toggle them.
 - `a`, `t`, `s`, `u`, and `f` archive, trash, spam, mark read/unread, and flag.
 - `M` opens actions that tag only the currently displayed message. Follow it

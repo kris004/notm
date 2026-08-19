@@ -753,6 +753,10 @@ fn standalone_key_controller(
             scroll_message_pages(&standalone, -1.0);
             return gtk::glib::Propagation::Stop;
         }
+        if let Some(lines) = super::vim_viewport_scroll_lines(key, mods) {
+            scroll_message_lines(&standalone, lines);
+            return gtk::glib::Propagation::Stop;
+        }
         if ctrl {
             return gtk::glib::Propagation::Proceed;
         }
