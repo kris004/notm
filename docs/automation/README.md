@@ -108,8 +108,9 @@ Implemented test-harness commands include:
   `toggle_text_visual`, `show_visual_html`, `show_html_visual`, `image_policy`,
   `load_images_once`, `trust_sender_images`, `trusted_image_senders`,
   `html_view_state`, `html_scroll_state`, `scroll_html_view_lines`,
-  `toggle_quote_collapse`, `message_view_text`, `copy_message_id`,
-  `copy_thread_id`
+  `start_link_hints`, `link_hint_state`, `input_link_hint`,
+  `cancel_link_hints`, `toggle_quote_collapse`, `message_view_text`,
+  `copy_message_id`, `copy_thread_id`
 - UI/debug: `open_command_palette`, `command_completion`, `open_shortcuts`,
   `show_shortcuts`, `help_search`, `run_command`, `run_manual_sync`,
   `open_settings`, `settings_test_state`, `respond_settings`, `save_settings`,

@@ -140,6 +140,8 @@ Press `?` in the application for searchable shortcut help. A few useful keys:
   thread-scoped.
 - `r r`, `r a`, `r f`, and `r A` reply, reply all, forward inline, and forward
   as an attachment.
+- `F` labels every visible link in an HTML message; type a displayed label to
+  open that link externally. `Esc` cancels the link-hint mode.
 - `c` composes, `Ctrl+Enter` sends, and `S` saves a draft.
 
 ## Security and privacy

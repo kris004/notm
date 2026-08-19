@@ -9,8 +9,8 @@ tagged release yet.
   managing mail in a Notmuch database.
 - Column and stacked layouts, saved searches, paged thread results, keyboard
   navigation, and configurable thread previews.
-- Plain-text and sanitized visual HTML message views, attachment handling, and
-  standalone message windows.
+- Plain-text and sanitized visual HTML message views, keyboard link hints,
+  attachment handling, and standalone message windows.
 - Reply, reply-all, forwarding, local draft recovery, saved drafts, and external
   send transport support.
 - Optional external receive/database-update commands with explicit manual and

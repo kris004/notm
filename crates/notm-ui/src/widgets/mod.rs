@@ -2,6 +2,7 @@ pub mod attachments;
 pub mod command_palette;
 pub mod composer;
 pub mod debug_panel;
+pub mod link_hints;
 pub mod message_view;
 pub mod saved_searches;
 pub mod search_bar;

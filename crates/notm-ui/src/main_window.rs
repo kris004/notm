@@ -48,6 +48,7 @@ use crate::{
         DRAFT_LIST_MIN_HEIGHT, DraftSaveReport, PendingAction, PendingOperation, TransitionHooks,
         composer_requires_confirmation, fields_has_content,
     },
+    widgets::link_hints::{LinkHintController, LinkHintOpener, html_link_scheme_is_external_safe},
     widgets::search_bar::{
         self, SearchActivityState, SearchBarController, SearchHarnessPolicy, SearchInputEvent,
         SearchWorkerRequest, begin_search_activity, cancel_search_activity, finish_search_activity,
@@ -454,6 +455,7 @@ struct Widgets {
     message_scrolled: gtk::ScrolledWindow,
     html_view: webkit6::WebView,
     html_scrolled: gtk::ScrolledWindow,
+    link_hints: LinkHintController,
     response_menu_button: gtk::MenuButton,
     reply_button: gtk::Button,
     reply_all_button: gtk::Button,
@@ -1305,6 +1307,8 @@ fn build_ui(
     window.set_child(Some(&overlay));
     connect_html_navigation_policy(&html_view, &status_label);
     connect_html_hover_status(&html_view, &status_label);
+    let link_opener: LinkHintOpener = Rc::new(open_html_link_externally);
+    let link_hints = LinkHintController::new(&html_view, &status_label, link_opener);
 
     let widgets = Widgets {
         window: window.clone(),
@@ -1363,6 +1367,7 @@ fn build_ui(
         message_scrolled: scrolled_message.clone(),
         html_view,
         html_scrolled: scrolled_html.clone(),
+        link_hints,
         response_menu_button,
         reply_button: reply_button.clone(),
         reply_all_button: reply_all_button.clone(),
@@ -5408,6 +5413,9 @@ fn install_shortcuts(
     let undo = undo_state.clone();
     let saved_for_capture = saved_store.clone();
     capture_controller.connect_key_pressed(move |_, key, _, mods| {
+        if w.link_hints.handle_key(key, mods) {
+            return gtk::glib::Propagation::Stop;
+        }
         let ctrl = mods.contains(gtk::gdk::ModifierType::CONTROL_MASK);
         let normal_mode = st.borrow().input_mode == InputMode::Normal;
         if normal_mode
@@ -5587,6 +5595,12 @@ fn install_shortcuts(
     );
     let observed_input_mode_generation = Cell::new(w.input_mode_generation.get());
     controller.connect_key_pressed(move |_, key, _, mods| {
+        // GTK runs this later-added capture controller before the controller
+        // above. Keep modal link-hint input ahead of every normal-mode
+        // binding, including uppercase H/J navigation shortcuts.
+        if w.link_hints.handle_key(key, mods) {
+            return gtk::glib::Propagation::Stop;
+        }
         let cancel_pending_sequences = || {
             *pending_go.borrow_mut() = false;
             *pending_custom_search.borrow_mut() = false;
@@ -5970,6 +5984,9 @@ fn install_shortcuts(
             clear_numeric_prefix(&numeric_prefix);
             toggle_unread_selected(&opts, &w, &st, &undo);
             true
+        } else if shifted_shortcut_key(key, mods, gtk::gdk::Key::f, gtk::gdk::Key::F) {
+            clear_numeric_prefix(&numeric_prefix);
+            start_link_hint_mode(&opts, &w, &st)
         } else if key == gtk::gdk::Key::f {
             clear_numeric_prefix(&numeric_prefix);
             toggle_flagged_selected(&opts, &w, &st, &undo);
@@ -7941,6 +7958,9 @@ fn format_message_date(timestamp: i64) -> String {
 }
 
 fn set_active_message_view(widgets: &Widgets, active: MessageViewKind) {
+    if active != MessageViewKind::Html {
+        widgets.link_hints.cancel_silent();
+    }
     for button in [
         &widgets.view_text_button,
         &widgets.view_html_button,
@@ -8158,7 +8178,7 @@ fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, sta
             "remote images blocked"
         };
         widgets.html_policy_label.set_text(&format!(
-            "Sanitized HTML view: message JavaScript disabled; {image_policy}; links open externally."
+            "Sanitized HTML view: message JavaScript disabled; {image_policy}; links open externally (F shows link hints)."
         ));
     }
 
@@ -8197,6 +8217,36 @@ fn html_view_is_visible(widgets: &Widgets) -> bool {
         .message_stack
         .visible_child_name()
         .is_some_and(|name| name.as_str() == "html")
+}
+
+fn start_link_hint_mode(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) -> bool {
+    if !message_pane_shortcuts_available(widgets) {
+        widgets
+            .status_label
+            .set_text("Show the message pane before opening link hints");
+        return true;
+    }
+    if compose_view_is_visible(widgets) {
+        widgets
+            .status_label
+            .set_text("Link hints are unavailable while composing");
+        return true;
+    }
+    if !selected_message_has_html(state) {
+        widgets
+            .status_label
+            .set_text("The selected message has no Visual HTML links");
+        return true;
+    }
+    if !html_view_is_visible(widgets) {
+        state.borrow_mut().prefer_html_view = true;
+        show_visual_html_selected_message(options, widgets, state);
+        if state.borrow().last_error.is_some() {
+            return true;
+        }
+    }
+    widgets.link_hints.start();
+    true
 }
 
 fn compose_view_is_visible(widgets: &Widgets) -> bool {
@@ -8549,16 +8599,6 @@ fn html_link_failed_status(uri: &str, error: &str) -> String {
 
 fn html_link_status_uri(uri: &str) -> String {
     truncate_status_text(uri, HTML_LINK_STATUS_URI_MAX_CHARS)
-}
-
-fn html_link_scheme_is_external_safe(uri: &str) -> bool {
-    let Some((scheme, _)) = uri.split_once(':') else {
-        return false;
-    };
-    matches!(
-        scheme.to_ascii_lowercase().as_str(),
-        "http" | "https" | "mailto"
-    )
 }
 
 fn navigation_decision_uri(decision: &webkit6::PolicyDecision) -> Option<String> {
@@ -10265,6 +10305,7 @@ fn open_standalone_message_window(
                 scroll_web_view_to_edge(view, status_label, bottom);
             }
         });
+    let open_link: LinkHintOpener = Rc::new(open_html_link_externally);
     let response_options = options.clone();
     let response_widgets = widgets.clone();
     let response_state = state.clone();
@@ -10287,6 +10328,7 @@ fn open_standalone_message_window(
         render_html,
         initialize_html_view,
         scroll_html,
+        open_link,
         respond,
     })
 }
@@ -14120,6 +14162,37 @@ fn handle_automation_request(
                 "last_error": state.borrow().last_error,
             })
         }
+        "start_link_hints" => {
+            let ok = start_link_hint_mode(options, widgets, state);
+            json!({
+                "ok": ok,
+                "link_hints": widgets.link_hints.snapshot(),
+                "status_text": widgets.status_label.text().to_string(),
+            })
+        }
+        "link_hint_state" => link_hint_state_json(widgets),
+        "input_link_hint" => {
+            let input = req
+                .args
+                .get("key")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| {
+                    let mut chars = value.chars();
+                    let first = chars.next()?;
+                    chars.next().is_none().then_some(first)
+                });
+            match input {
+                Some(input) => {
+                    widgets.link_hints.input_char(input);
+                    link_hint_state_json(widgets)
+                }
+                None => json!({"ok": false, "error": "key must contain exactly one character"}),
+            }
+        }
+        "cancel_link_hints" => {
+            widgets.link_hints.cancel();
+            link_hint_state_json(widgets)
+        }
         "html_scroll_state" => html_scroll_state(widgets),
         "scroll_html_view_lines" => {
             let lines = req
@@ -14451,6 +14524,7 @@ fn automation_command_allowed_while_confirmation_pending(command: &str) -> bool 
             | "html_scroll_state"
             | "trusted_image_senders"
             | "html_view_state"
+            | "link_hint_state"
             | "message_view_text"
             | "thread_ui_details"
             | "thread_list_rows"
@@ -14685,6 +14759,15 @@ fn standalone_message_windows_json(widgets: &Widgets, state: &SharedState) -> se
         "windows": windows,
         "main_selected_thread": state.borrow().selected_thread,
         "main_selected_message": state.borrow().selected_message,
+    })
+}
+
+fn link_hint_state_json(widgets: &Widgets) -> serde_json::Value {
+    json!({
+        "ok": true,
+        "link_hints": widgets.link_hints.snapshot(),
+        "status_text": widgets.status_label.text().to_string(),
+        "html_visible": html_view_is_visible(widgets),
     })
 }
 
@@ -15058,6 +15141,14 @@ fn run_named_command(
                 "last_error": state.borrow().last_error,
             })
         }
+        "link_hints" | "links" => {
+            let ok = start_link_hint_mode(options, widgets, state);
+            json!({
+                "ok": ok,
+                "link_hints": widgets.link_hints.snapshot(),
+                "status_text": widgets.status_label.text().to_string(),
+            })
+        }
         "image_policy" => {
             activate_image_policy_button(options, widgets, state);
             json!({
@@ -15351,6 +15442,7 @@ fn command_name_candidates() -> &'static [&'static str] {
         "full_headers",
         "text",
         "visual_html",
+        "link_hints",
         "image_policy",
         "load_images_once",
         "trust_sender_images",
@@ -15945,6 +16037,11 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
         },
         HelpEntry {
             section: "Message actions",
+            key: "F",
+            description: "Label visible links in Visual HTML; type a label to open that link externally.",
+        },
+        HelpEntry {
+            section: "Message actions",
             key: "y m/t/f/o/c/s",
             description: "Copy message id, thread id, from, to, cc, or subject.",
         },
@@ -16152,6 +16249,11 @@ fn command_help_entries() -> &'static [HelpEntry] {
             section: "Message view commands",
             key: ":collapse_quotes",
             description: "Toggle collapsed quoted text.",
+        },
+        HelpEntry {
+            section: "Message view commands",
+            key: ":link_hints",
+            description: "Label visible links and wait for a label key to open one externally.",
         },
         HelpEntry {
             section: "Thread list display commands",

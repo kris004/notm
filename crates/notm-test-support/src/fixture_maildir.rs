@@ -243,7 +243,7 @@ fn msg(
 
 fn html_msg() -> FixtureMessage {
     FixtureMessage {
-        raw: "From: html@example.test\r\nTo: fixture@example.test\r\nSubject: HTML message\r\nDate: Thu, 18 Jun 2026 20:00:00 -0600\r\nMessage-ID: <html-message@fixture.test>\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><h1>Hello</h1><script>alert(1)</script><p>Safe <b>HTML</b>.</p><img src=\"https://example.test/pixel\"></body></html>".to_string(),
+        raw: "From: html@example.test\r\nTo: fixture@example.test\r\nSubject: HTML message\r\nDate: Thu, 18 Jun 2026 20:00:00 -0600\r\nMessage-ID: <html-message@fixture.test>\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><h1>Hello</h1><script>alert(1)</script><p>Safe <b>HTML</b>.</p><p><a href=\"https://example.test/first\">First fixture link</a> and <a href=\"mailto:fixture@example.test\">fixture email link</a>.</p><img src=\"https://example.test/pixel\"></body></html>".to_string(),
         tags: vec!["inbox", "unread"],
     }
 }

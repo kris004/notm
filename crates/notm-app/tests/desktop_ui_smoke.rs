@@ -2763,6 +2763,63 @@ fn fixture_malformed_text_shows_a_decode_warning() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn fixture_html_link_hints_label_visible_links_and_cancel() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_html_link_hints_label_visible_links_and_cancel: no DISPLAY or \
+             WAYLAND_DISPLAY is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running HTML link-hint desktop UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-link-hints-ui-{run_id}"));
+    let token = format!("notm-link-hints-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+    select_first_thread(&mut driver, "id:html-message@fixture.test")?;
+
+    let started = driver.command("start_link_hints", json!({}))?;
+    assert_eq!(started["ok"], true, "link hints did not start: {started}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let hints = loop {
+        let state = driver.command("link_hint_state", json!({}))?;
+        if state["link_hints"]["active"] == true || state["link_hints"]["loading"] == false {
+            break state;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "link hints did not finish loading: {state}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+    assert_eq!(hints["link_hints"]["active"], true, "{hints}");
+    assert_eq!(hints["link_hints"]["candidate_count"], 2, "{hints}");
+    assert_eq!(hints["link_hints"]["overlay_count"], 2, "{hints}");
+    let labels = json_array_at(&hints, &["link_hints", "labels"])?;
+    ensure!(
+        labels.len() == 2
+            && labels
+                .iter()
+                .all(|label| label.as_str().is_some_and(|label| label.len() == 1))
+            && labels[0] != labels[1],
+        "visible links did not receive distinct single-key labels: {hints}"
+    );
+
+    let invalid = driver.command("input_link_hint", json!({"key": "1"}))?;
+    assert_eq!(
+        invalid["link_hints"]["active"], true,
+        "invalid input unexpectedly closed link hints: {invalid}"
+    );
+    let cancelled = driver.command("cancel_link_hints", json!({}))?;
+    assert_eq!(cancelled["link_hints"]["phase"], "idle", "{cancelled}");
+    assert_eq!(cancelled["link_hints"]["overlay_count"], 0, "{cancelled}");
+
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn external_file_arg_send_reports_existing_sent_copy() -> anyhow::Result<()> {

@@ -11,6 +11,8 @@ use notm_notmuch::MessageSummary;
 use serde::Serialize;
 use webkit6::prelude::WebViewExt;
 
+use super::link_hints::{LinkHintController, LinkHintOpener, LinkHintSnapshot};
+
 const MESSAGE_HEADER_VALUE_LINES: i32 = 1;
 const STATUS_BAR_MAX_WIDTH_CHARS: i32 = 120;
 
@@ -80,6 +82,7 @@ pub(crate) struct StandaloneOpenOptions {
     pub(crate) render_html: StandaloneHtmlRenderer,
     pub(crate) initialize_html_view: StandaloneHtmlViewInitializer,
     pub(crate) scroll_html: StandaloneHtmlScrollHandler,
+    pub(crate) open_link: LinkHintOpener,
     pub(crate) respond: StandaloneResponseHandler,
 }
 
@@ -95,6 +98,7 @@ pub(crate) struct StandaloneWindowSnapshot {
     pub(crate) image_policy: String,
     pub(crate) title: Option<String>,
     pub(crate) status: String,
+    pub(crate) link_hints: LinkHintSnapshot,
 }
 
 #[derive(Clone)]
@@ -273,6 +277,8 @@ impl StandaloneMessageController {
         html_view.set_vexpand(true);
         let policy = (options.policy)();
         (options.initialize_html_view)(&html_view, &status_label, policy.remote_images);
+        let link_hints =
+            LinkHintController::new(&html_view, &status_label, options.open_link.clone());
         let html_scrolled = gtk::ScrolledWindow::builder()
             .hexpand(true)
             .vexpand(true)
@@ -323,6 +329,7 @@ impl StandaloneMessageController {
             text_view,
             text_scrolled,
             html_view,
+            link_hints,
             status_label,
             copy_menu_button,
             copy_menu_box,
@@ -449,6 +456,7 @@ struct StandaloneMessageWindow {
     text_view: gtk::TextView,
     text_scrolled: gtk::ScrolledWindow,
     html_view: webkit6::WebView,
+    link_hints: LinkHintController,
     status_label: gtk::Label,
     copy_menu_button: gtk::MenuButton,
     copy_menu_box: gtk::Box,
@@ -490,6 +498,7 @@ impl StandaloneMessageWindow {
             image_policy: format!("{:?}", state.image_policy).to_ascii_lowercase(),
             title: self.window.title().map(|title| title.to_string()),
             status: self.status_label.text().to_string(),
+            link_hints: self.link_hints.snapshot(),
         }
     }
 }
@@ -724,6 +733,9 @@ fn standalone_key_controller(
         let Some(standalone) = standalone.upgrade() else {
             return gtk::glib::Propagation::Proceed;
         };
+        if standalone.link_hints.handle_key(key, mods) {
+            return gtk::glib::Propagation::Stop;
+        }
         let ctrl = mods.contains(gtk::gdk::ModifierType::CONTROL_MASK);
         if ctrl && (key == gtk::gdk::Key::d || key == gtk::gdk::Key::D) {
             scroll_message_pages(&standalone, 0.5);
@@ -816,6 +828,10 @@ fn standalone_key_controller(
         } else if key == gtk::gdk::Key::I {
             activate_image_policy_button(&standalone);
             true
+        } else if key == gtk::gdk::Key::F
+            || (key == gtk::gdk::Key::f && mods.contains(gtk::gdk::ModifierType::SHIFT_MASK))
+        {
+            start_link_hint_mode(&standalone)
         } else {
             false
         };
@@ -1090,6 +1106,24 @@ fn show_message_view(standalone: &StandaloneMessageWindow, view: MessageViewKind
     update_message_buttons(standalone, &message);
 }
 
+fn start_link_hint_mode(standalone: &StandaloneMessageWindow) -> bool {
+    let Some(message) = current_message(standalone) else {
+        standalone.status_label.set_text("No message selected");
+        return true;
+    };
+    if !(standalone.message_has_html)(&message) {
+        standalone
+            .status_label
+            .set_text("The selected message has no Visual HTML links");
+        return true;
+    }
+    if !html_view_is_visible(standalone) {
+        show_message_view(standalone, MessageViewKind::Html);
+    }
+    standalone.link_hints.start();
+    true
+}
+
 fn show_text_message(standalone: &StandaloneMessageWindow, message: &MessageSummary) {
     let collapse_quotes = standalone.state.borrow().collapse_quotes;
     match (standalone.render_text)(message, collapse_quotes) {
@@ -1161,6 +1195,9 @@ fn show_raw(standalone: &StandaloneMessageWindow, message: &MessageSummary) {
 }
 
 fn set_active_message_view(standalone: &StandaloneMessageWindow, active: MessageViewKind) {
+    if active != MessageViewKind::Html {
+        standalone.link_hints.cancel_silent();
+    }
     for button in [
         &standalone.view_text_button,
         &standalone.view_html_button,
@@ -1259,7 +1296,7 @@ fn update_message_buttons(standalone: &StandaloneMessageWindow, message: &Messag
             "remote images blocked"
         };
         standalone.html_policy_label.set_text(&format!(
-            "Sanitized HTML view: message JavaScript disabled; {image_policy}; links open externally."
+            "Sanitized HTML view: message JavaScript disabled; {image_policy}; links open externally (F shows link hints)."
         ));
     }
     if message_allows_images(&policy, message) {

@@ -29,6 +29,7 @@ TARGET_TAGS = ["inbox", "unread"]
 THREAD_QUERY = 'subject:"Three message thread"'
 THREAD_ROOT_ID = "thread-root-three-message@fixture.test"
 THREAD_REPLY1_ID = "thread-reply1-three-message@fixture.test"
+HTML_QUERY = "id:html-message@fixture.test"
 SINGLE_TAG = "ui-single-tag-smoke"
 MULTI_TAG = "ui-multi-tag-smoke"
 TOKEN = "notm-ui-text-focus-smoke"
@@ -521,6 +522,129 @@ def exercise_message_navigation(
     )
 
 
+def exercise_link_hints(
+    environment: dict[str, str], driver: WtypeDriver, harness: Harness, app_pid: int
+) -> None:
+    response = harness.request("run_search", {"query": HTML_QUERY})
+    if response.get("scheduled") is not True:
+        raise SmokeFailure(f"HTML fixture search was not scheduled: {response!r}")
+    state_value = harness.wait_for_search()
+    threads = state_value.get("thread_list_items")
+    if not isinstance(threads, list) or len(threads) != 1:
+        raise SmokeFailure(f"HTML link fixture was not unique: {state_value!r}")
+    harness.request("select_thread_by_index", {"index": 0})
+    harness.request("select_relative_thread", {"delta": 0})
+    focus_app_window(environment, app_pid)
+    driver.send("-k", "l")
+    wait_until(
+        "message pane focus before link hints",
+        lambda: (
+            state
+            if (state := harness.state()).get("active_pane") == "Message"
+            else None
+        ),
+        timeout=5,
+    )
+    before_tags = harness.state().get("selected_message", {}).get("tags")
+
+    driver.send("-M", "shift", "-k", "f", "-m", "shift")
+
+    last_hints: dict[str, Any] = {}
+
+    def hints_routed() -> dict[str, Any] | None:
+        response = harness.request("link_hint_state")
+        last_hints.clear()
+        last_hints.update(response)
+        hints = response.get("link_hints")
+        return (
+            response
+            if isinstance(hints, dict)
+            and response.get("html_visible") is True
+            and (
+                (
+                    hints.get("active") is True
+                    and hints.get("candidate_count") == 2
+                    and hints.get("overlay_count") == 2
+                )
+                or (
+                    hints.get("phase") == "idle"
+                    and response.get("status_text")
+                    == "No visible links in this HTML message"
+                )
+            )
+            else None
+        )
+
+    try:
+        routed = wait_until("F link-hint routing", hints_routed, timeout=10)
+    except SmokeFailure as error:
+        raise SmokeFailure(f"{error}; last link-hint state: {last_hints!r}") from error
+    after_tags = harness.state().get("selected_message", {}).get("tags")
+    if after_tags != before_tags:
+        raise SmokeFailure(
+            f"Shift+F reached the lowercase flag action: before={before_tags!r}, "
+            f"after={after_tags!r}"
+        )
+    if routed.get("link_hints", {}).get("active") is True:
+        baseline = harness.state()
+        baseline_pane = baseline.get("active_pane")
+        baseline_message_id = baseline.get("selected_message", {}).get("message_id")
+
+        # Modal hint input must reach the link-hint controller before the
+        # application's existing h/j navigation bindings.  Alt keeps the
+        # label from being selected, so this checks precedence without opening
+        # an external application from the self-contained smoke environment.
+        for key in ("h", "j"):
+            driver.send("-M", "alt", "-k", key, "-m", "alt")
+
+            def conflicting_binding_suppressed() -> dict[str, Any] | None:
+                hints_state = harness.request("link_hint_state")
+                app_state = harness.state()
+                hints = hints_state.get("link_hints")
+                selected = app_state.get("selected_message")
+                return (
+                    app_state
+                    if isinstance(hints, dict)
+                    and hints.get("active") is True
+                    and app_state.get("active_pane") == baseline_pane
+                    and isinstance(selected, dict)
+                    and selected.get("message_id") == baseline_message_id
+                    and hints_state.get("status_text")
+                    == "Link hints: type a displayed letter, Backspace, or Esc"
+                    else None
+                )
+
+            wait_until(
+                f"link hints to override the existing {key.upper()} binding",
+                conflicting_binding_suppressed,
+                timeout=5,
+            )
+
+        driver.send("-k", "Escape")
+
+        def hints_cancelled() -> dict[str, Any] | None:
+            response = harness.request("link_hint_state")
+            hints = response.get("link_hints")
+            return (
+                response
+                if isinstance(hints, dict)
+                and hints.get("phase") == "idle"
+                and hints.get("overlay_count") == 0
+                else None
+            )
+
+        wait_until("Esc to cancel link hints", hints_cancelled, timeout=5)
+        print(
+            "[ui-link-hints] F labels visible links, overrides H/J, and Esc cancels",
+            flush=True,
+        )
+    else:
+        print(
+            "[ui-link-hints] F reached link-hint mode; headless WebKit exposed no link geometry",
+            flush=True,
+        )
+
+
 def exercise_ui(
     environment: dict[str, str], driver: WtypeDriver, harness: Harness, app_pid: int
 ) -> None:
@@ -900,6 +1024,7 @@ def run_inside_dbus(args: argparse.Namespace) -> int:
         driver.send("-k", "Escape")
         focus_app_window(environment, app_process.pid)
         exercise_message_navigation(environment, driver, harness, app_process.pid)
+        exercise_link_hints(environment, driver, harness, app_process.pid)
         exercise_ui(environment, driver, harness, app_process.pid)
         exercise_tag_editor(environment, driver, harness, app_process.pid)
         print("[ui-text-focus] PASS", flush=True)

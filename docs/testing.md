@@ -125,11 +125,22 @@ NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
   -- --exact --nocapture --test-threads=1
 ```
 
+Visual-HTML link hints have a fixture-backed GTK smoke that verifies visible
+links receive distinct labels and that cancelling clears the mode:
+
+```sh
+NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
+  cargo test -p notm-app --test desktop_ui_smoke \
+  fixture_html_link_hints_label_visible_links_and_cancel \
+  -- --exact --nocapture --test-threads=1
+```
+
 The focused-text and physical-key shortcut regressions have a self-contained
 headless Sway check. It covers J/K message navigation, lowercase j/k scrolling,
-the M current-message menu and its two-key actions, and normal/insert-mode
-tag-editor safety. It requires `dbus-run-session`, `sway`, `swaymsg`, and
-`wtype`:
+the M current-message menu and its two-key actions, physical Shift+F routing to
+link hints (with overlay behavior covered by the GTK smoke above), and
+normal/insert-mode tag-editor safety. It requires
+`dbus-run-session`, `sway`, `swaymsg`, and `wtype`:
 
 ```sh
 CARGO_HOME=$PWD/.cargo-home cargo build -p notm-app
