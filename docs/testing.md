@@ -43,10 +43,11 @@ interactive desktop and prevents unrelated fixtures from being tiled together.
 `sway` must be available in `PATH`; tests skip with a clear reason when it is
 missing, or fail when `NOTM_REQUIRE_GTK_DISPLAY=1` is set. For intentional
 interactive debugging, set `NOTM_GUI_TEST_DISPLAY=provided` to use the existing
-`WAYLAND_DISPLAY` or `DISPLAY`. CI uses this mode with its private Xvfb server,
-explicitly removing inherited Wayland variables and selecting the GTK X11
-backend so Sway is not a CI dependency and a local reproduction cannot reach an
-interactive Wayland compositor. The older `live` value remains an alias for
+`WAYLAND_DISPLAY` or `DISPLAY`. CI runs the suite through
+`tests/run_with_headless_weston.sh`, which starts a private software-rendered
+Weston display with a native Wayland GTK backend. This makes neither Sway nor an
+X11 server a CI dependency and prevents a local CI reproduction from reaching
+the interactive compositor. The older `live` value remains an alias for
 `provided`.
 
 Use fixture data first when validating UI behavior. Start the app with the local

@@ -44,8 +44,7 @@ jobs:
             libnotmuch-dev \
             libwebkitgtk-6.0-dev \
             pkg-config \
-            xauth \
-            xvfb
+            weston
 
           packages=(
             build-essential
@@ -57,11 +56,10 @@ jobs:
             libnotmuch-dev
             libwebkitgtk-6.0-dev
             pkg-config
-            xauth
-            xvfb
+            weston
           )
           dpkg-query --show --showformat='${binary:Package}\t${Version}\n' "${packages[@]}"
-          for executable in cc clang dbus-run-session pkg-config xauth xvfb-run; do
+          for executable in cc clang dbus-run-session pkg-config weston; do
             command -v "$executable"
           done
           pkg-config --modversion gtk4 gtksourceview-5 webkitgtk-6.0
@@ -122,11 +120,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          env -u WAYLAND_DISPLAY -u SWAYSOCK \
-            GDK_BACKEND=x11 \
-            NOTM_GUI_TEST_DISPLAY=provided \
-            NOTM_REQUIRE_GTK_DISPLAY=1 \
+          tests/run_with_headless_weston.sh \
             dbus-run-session -- \
-            xvfb-run -a \
             cargo test -p notm-app --test desktop_ui_smoke -- \
               --nocapture --test-threads=1
