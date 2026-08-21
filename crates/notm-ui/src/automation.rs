@@ -251,7 +251,7 @@ fn default_socket_path_for(runtime_dir: Option<&Path>, process_id: u32) -> PathB
 mod tests {
     use std::os::unix::{
         fs::{MetadataExt, PermissionsExt, symlink},
-        net::UnixListener,
+        net::{UnixListener, UnixStream},
     };
 
     use super::*;
@@ -307,12 +307,13 @@ mod tests {
         let socket_path = directory.path().join("automation.sock");
         let stale_listener = UnixListener::bind(&socket_path).expect("stale listener");
         drop(stale_listener);
-        let stale = fs::symlink_metadata(&socket_path).expect("stale socket metadata");
+        let stale_error = UnixStream::connect(&socket_path).expect_err("socket must be stale");
+        assert_eq!(stale_error.kind(), std::io::ErrorKind::ConnectionRefused);
 
         let (_listener, guard) = bind_listener(&socket_path).expect("replacement listener");
 
         let current = fs::symlink_metadata(&socket_path).expect("replacement metadata");
-        assert_ne!((current.dev(), current.ino()), (stale.dev(), stale.ino()));
+        UnixStream::connect(&socket_path).expect("replacement listener must accept connections");
         assert_eq!(current.permissions().mode() & 0o777, 0o600);
         drop(guard);
         assert!(!socket_path.exists());
