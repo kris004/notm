@@ -38,18 +38,17 @@ impl UiDriver {
         loop {
             let status = self.command("search_status", json!({}))?;
             anyhow::ensure!(status["ok"] == true, "search status failed: {status}");
-            let loading = status["loading"]
-                .as_bool()
-                .ok_or_else(|| anyhow::anyhow!("search status has no loading flag: {status}"))?;
-            if !loading {
+            let state = self.command("app_state", json!({}))?;
+            anyhow::ensure!(state["ok"] == true, "app state failed: {state}");
+            if search_snapshots_are_settled(&status, &state)? {
                 if let Some(error) = status["error"].as_str() {
                     anyhow::bail!("search failed: {error}");
                 }
-                return self.command("app_state", json!({}));
+                return Ok(state);
             }
             anyhow::ensure!(
                 Instant::now() < deadline,
-                "search did not complete within {timeout:?}: {status}"
+                "search did not complete within {timeout:?}: status={status}, state={state}"
             );
             thread::sleep(Duration::from_millis(25));
         }
@@ -74,5 +73,52 @@ impl UiDriver {
             );
             thread::sleep(Duration::from_millis(25));
         }
+    }
+}
+
+fn search_snapshots_are_settled(status: &Value, state: &Value) -> anyhow::Result<bool> {
+    let status_loading = status["loading"]
+        .as_bool()
+        .ok_or_else(|| anyhow::anyhow!("search status has no loading flag: {status}"))?;
+    let status_generation = status["generation"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("search status has no generation: {status}"))?;
+    let state_loading = state["state"]["search_loading"]
+        .as_bool()
+        .ok_or_else(|| anyhow::anyhow!("app state has no search-loading flag: {state}"))?;
+    let state_generation = state["state"]["search_generation"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("app state has no search generation: {state}"))?;
+
+    Ok(status_generation > 0
+        && status_generation == state_generation
+        && !status_loading
+        && !state_loading)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::search_snapshots_are_settled;
+    use serde_json::json;
+
+    #[test]
+    fn search_wait_rejects_startup_and_between_snapshot_races() {
+        let idle_before_startup = json!({"loading": false, "generation": 0});
+        let idle_state = json!({
+            "state": {"search_loading": false, "search_generation": 0}
+        });
+        assert!(!search_snapshots_are_settled(&idle_before_startup, &idle_state).unwrap());
+
+        let prior_status = json!({"loading": false, "generation": 1});
+        let newer_search_state = json!({
+            "state": {"search_loading": true, "search_generation": 2}
+        });
+        assert!(!search_snapshots_are_settled(&prior_status, &newer_search_state).unwrap());
+
+        let settled_status = json!({"loading": false, "generation": 2});
+        let settled_state = json!({
+            "state": {"search_loading": false, "search_generation": 2}
+        });
+        assert!(search_snapshots_are_settled(&settled_status, &settled_state).unwrap());
     }
 }

@@ -2290,8 +2290,18 @@ fn fixture_indexed_draft_delete_removes_row_without_missing_body() -> anyhow::Re
     let mut app = FixtureApp::spawn(work_dir, &token)?;
     let mut driver = app.connect(&token)?;
 
+    let startup = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let startup_generation = startup["state"]["search_generation"]
+        .as_u64()
+        .with_context(|| format!("startup state had no search generation: {startup}"))?;
     let search = driver.command("run_search", json!({"query": "tag:draft"}))?;
     assert_eq!(search["ok"], true, "draft search failed: {search}");
+    ensure!(
+        search["generation"]
+            .as_u64()
+            .is_some_and(|generation| generation > startup_generation),
+        "draft search did not supersede the settled startup search: {search}"
+    );
     driver.wait_for_search(STARTUP_TIMEOUT)?;
     let open_deadline = Instant::now() + STARTUP_TIMEOUT;
     let opened = loop {
