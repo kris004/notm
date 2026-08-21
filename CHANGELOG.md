@@ -1,9 +1,10 @@
 # Changelog
 
-Notable user-facing changes are recorded here. The project has not published a
-tagged release yet.
+Notable user-facing changes are recorded here.
 
 ## Unreleased
+
+## [0.1.0] - 2026-08-20
 
 - Initial GTK desktop client for searching, reading, tagging, composing, and
   managing mail in a Notmuch database.
@@ -37,3 +38,5 @@ tagged release yet.
   its row immediately, and no longer renders the deleted file as a missing
   message body while results refresh.
 - Sender-default view actions now use compact labels and the `V a` shortcut.
+
+[0.1.0]: https://github.com/kris004/notm/releases/tag/v0.1.0
