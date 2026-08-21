@@ -1,0 +1,169 @@
+name: Release Linux binary
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing GitHub release tag to build and update
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-linux-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  build:
+    name: Build x86_64 GNU/Linux bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Check out release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: release-tools
+          persist-credentials: false
+          ref: ${{ github.workflow_sha }}
+
+      - name: Validate release source
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          version="${RELEASE_TAG#v}"
+          package_version="$(
+            cargo metadata \
+              --manifest-path source/Cargo.toml \
+              --no-deps \
+              --format-version 1 |
+              jq -r '.packages[] | select(.name == "notm-app") | .version'
+          )"
+          test "$package_version" = "$version"
+          test "$(git -C source cat-file -t "$RELEASE_TAG")" = tag
+          source_commit="$(git -C source rev-list -n 1 "$RELEASE_TAG")"
+          test "$(git -C source rev-parse HEAD)" = "$source_commit"
+          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = false
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'source_commit=%s\n' "$source_commit" >> "$GITHUB_OUTPUT"
+          printf 'archive=dist/notm-%s-x86_64-unknown-linux-gnu.tar.gz\n' \
+            "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Install native dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            appstream \
+            build-essential \
+            clang \
+            desktop-file-utils \
+            libclang-dev \
+            libgtk-4-dev \
+            libgtksourceview-5-dev \
+            libnotmuch-dev \
+            libwebkitgtk-6.0-dev \
+            pkg-config
+
+      - name: Select the stable Rust toolchain
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version --verbose
+          cargo --version --verbose
+
+      - name: Build release binary
+        working-directory: source
+        run: cargo build --release --locked -p notm-app
+
+      - name: Inspect and package release binary
+        env:
+          SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          binary=source/target/release/notm
+          test "$(uname -m)" = x86_64
+          test "$("$binary" --version)" = "notm $VERSION"
+          file "$binary" | grep -F 'ELF 64-bit LSB pie executable, x86-64'
+          mkdir -p dist
+          ldd "$binary" | tee dist/ldd.txt
+          ! grep -F 'not found' dist/ldd.txt
+          strip --strip-unneeded "$binary"
+
+          {
+            printf 'Version: %s\n' "$VERSION"
+            printf 'Source tag: %s\n' "$RELEASE_TAG"
+            printf 'Source commit: %s\n' "$SOURCE_COMMIT"
+            printf 'Target: x86_64-unknown-linux-gnu\n'
+            printf 'Build image: ubuntu-24.04\n'
+            rustc --version
+            cargo --version
+            printf '\nNative build packages:\n'
+            dpkg-query --show --showformat='${binary:Package}\t${Version}\n' \
+              libgtk-4-dev \
+              libgtksourceview-5-dev \
+              libnotmuch-dev \
+              libwebkitgtk-6.0-dev
+            printf '\nDirect ELF dependencies:\n'
+            readelf -d "$binary" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | sort
+          } > dist/BUILD-INFO.txt
+
+          SOURCE_DATE_EPOCH="$(git -C source show -s --format=%ct HEAD)" \
+            release-tools/packaging/build-linux-release.sh \
+              source \
+              "$VERSION" \
+              x86_64-unknown-linux-gnu \
+              "$binary" \
+              dist/BUILD-INFO.txt \
+              dist
+
+          mkdir -p verify
+          tar -xzf "${{ steps.release.outputs.archive }}" -C verify
+          verify/notm-"$RELEASE_TAG"-x86_64-unknown-linux-gnu/bin/notm --version
+          (cd dist && sha256sum --check SHA256SUMS)
+
+      - name: Attest release archive
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ steps.release.outputs.archive }}
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gh release upload "$RELEASE_TAG" \
+            "${{ steps.release.outputs.archive }}" \
+            dist/SHA256SUMS \
+            --clobber \
+            --repo "$GITHUB_REPOSITORY"

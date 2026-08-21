@@ -15,6 +15,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features
 cargo run -p notm-app -- fixture-smoke
 ./tests/packaging_install_smoke.sh
+./tests/release_bundle_smoke.sh
 ```
 
 To exercise `probe-send` without depending on a contributor's mail setup, use a

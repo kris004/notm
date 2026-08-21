@@ -35,9 +35,11 @@ jobs:
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes \
+            appstream \
             build-essential \
             clang \
             dbus-daemon \
+            desktop-file-utils \
             libclang-dev \
             libgtk-4-dev \
             libgtksourceview-5-dev \
@@ -49,9 +51,11 @@ jobs:
             xvfb
 
           packages=(
+            appstream
             build-essential
             clang
             dbus-daemon
+            desktop-file-utils
             libclang-dev
             libgtk-4-dev
             libgtksourceview-5-dev
@@ -115,6 +119,9 @@ jobs:
           mode = "stdin_rfc5322"
           EOF
           cargo run -p notm-app -- --config "$probe_config" probe-send
+
+      - name: Validate install and release packaging
+        run: make check-packaging
 
       - name: Run the complete Wayland GTK smoke with a required display
         # GitHub-hosted runners block the user namespace required by WebKitGTK's

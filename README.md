@@ -66,8 +66,13 @@ Package names differ on other distributions.
 
 ## Build and install
 
-There are no prebuilt packages or release binaries yet. To install the current
-checkout for your user:
+GitHub releases include a prebuilt `x86_64-unknown-linux-gnu` bundle produced on
+Ubuntu 24.04. The bundle is dynamically linked rather than fully portable; its
+`INSTALL.md` lists the required runtime libraries and user-install command.
+Checksums and GitHub build-provenance attestations are published with the
+bundle.
+
+To build and install the current checkout for your user:
 
 ```sh
 git clone https://github.com/kris004/notm.git
@@ -169,8 +174,9 @@ before reporting a vulnerability.
 
 ## Current limitations
 
-- Linux is the only supported platform, and releases do not yet include binary
-  packages.
+- Linux is the only supported platform. The prebuilt x86_64 bundle targets
+  Ubuntu 24.04 or a compatible GNU/Linux system; other systems should build
+  from source.
 - Account setup, mail retrieval, and SMTP are intentionally delegated to
   Notmuch, Maildir tools, and user-configured helper commands.
 - The project has no formal minimum supported Rust version yet; CI tracks the
