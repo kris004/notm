@@ -3,6 +3,7 @@ name = "notm-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [[bin]]
 name = "notm"
@@ -12,7 +13,6 @@ path = "src/main.rs"
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
-directories.workspace = true
 notm-mail = { path = "../notm-mail" }
 notm-notmuch = { path = "../notm-notmuch" }
 notm-test-support = { path = "../notm-test-support" }

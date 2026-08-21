@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>dev.notm.Notm</id>
+  <id>io.github.kris004.notm</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
   <name>notm</name>
@@ -13,8 +13,8 @@
       and synchronization under the user's control.
     </p>
   </description>
-  <launchable type="desktop-id">dev.notm.Notm.desktop</launchable>
-  <icon type="stock">dev.notm.Notm</icon>
+  <launchable type="desktop-id">io.github.kris004.notm.desktop</launchable>
+  <icon type="stock">io.github.kris004.notm</icon>
   <categories>
     <category>Network</category>
     <category>Email</category>
@@ -30,11 +30,8 @@
   </screenshots>
   <url type="homepage">https://github.com/kris004/notm</url>
   <url type="bugtracker">https://github.com/kris004/notm/issues</url>
-  <developer id="dev.notm">
+  <developer id="io.github.kris004">
     <name>notm contributors</name>
   </developer>
   <content_rating type="oars-1.1"/>
-  <releases>
-    <release version="0.1.0" date="2026-08-09"/>
-  </releases>
 </component>

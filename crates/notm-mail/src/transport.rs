@@ -2,22 +2,17 @@ use std::{
     collections::BTreeMap,
     env,
     ffi::OsStr,
-    io,
     path::{Component, Path, PathBuf},
-    process::{Output, Stdio},
+    process::Output,
     time::Duration,
 };
 
-use anyhow::Context;
 use async_trait::async_trait;
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    process::{Child, ChildStdin, Command},
-    time::timeout,
-};
+use tokio::process::Command;
 
 use crate::{
     compose::ComposedMessage,
+    external_command::run_external_command,
     send::{ProbeReport, SendReport, TransportDescription},
 };
 
@@ -206,12 +201,9 @@ fn is_executable_file(path: &Path) -> bool {
 impl ExternalCommandTransport {
     async fn send_stdin(&self, message: ComposedMessage) -> anyhow::Result<SendReport> {
         let mut command = self.base_command();
-        command
-            .args(&self.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let output = run_command_with_timeout(
+        command.args(&self.args);
+        let output = run_external_command(
+            "send",
             command,
             Some(message.to_rfc5322().into_bytes()),
             self.timeout,
@@ -225,12 +217,8 @@ impl ExternalCommandTransport {
         let path = dir.path().join("message.eml");
         std::fs::write(&path, message.to_rfc5322())?;
         let mut command = self.base_command();
-        command
-            .args(&self.args)
-            .arg(&path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let output = run_command_with_timeout(command, None, self.timeout).await?;
+        command.args(&self.args).arg(&path);
+        let output = run_external_command("send", command, None, self.timeout).await?;
         Ok(report_from_output(output))
     }
 
@@ -249,11 +237,8 @@ impl ExternalCommandTransport {
             .map(|arg| arg.replace("{file}", &path.display().to_string()))
             .collect::<Vec<_>>();
         let mut command = self.base_command();
-        command
-            .args(rendered_args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let output = run_command_with_timeout(command, None, self.timeout).await?;
+        command.args(rendered_args);
+        let output = run_external_command("send", command, None, self.timeout).await?;
         Ok(report_from_output(output))
     }
 
@@ -265,133 +250,6 @@ impl ExternalCommandTransport {
         command.envs(&self.env);
         command
     }
-}
-
-async fn run_command_with_timeout(
-    mut command: Command,
-    input: Option<Vec<u8>>,
-    timeout_duration: Duration,
-) -> anyhow::Result<Output> {
-    command.kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-
-    let mut child = command.spawn().context("starting send command")?;
-    let child_id = child.id();
-    let stdin = child.stdin.take();
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let execution = async {
-        let (status, (), stdout, stderr) = tokio::try_join!(
-            child.wait(),
-            write_child_stdin(stdin, input),
-            read_child_output(stdout),
-            read_child_output(stderr),
-        )?;
-        Ok::<Output, io::Error>(Output {
-            status,
-            stdout,
-            stderr,
-        })
-    };
-
-    match timeout(timeout_duration, execution).await {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(err)) => {
-            terminate_and_reap(&mut child, child_id)
-                .await
-                .context("cleaning up send command after an I/O failure")?;
-            Err(err).context("communicating with send command")
-        }
-        Err(_) => {
-            terminate_and_reap(&mut child, child_id)
-                .await
-                .with_context(|| {
-                    format!("send command timed out after {timeout_duration:?} and cleanup failed")
-                })?;
-            anyhow::bail!("send command timed out after {timeout_duration:?}");
-        }
-    }
-}
-
-async fn write_child_stdin(
-    mut stdin: Option<ChildStdin>,
-    input: Option<Vec<u8>>,
-) -> io::Result<()> {
-    if let Some(input) = input {
-        let stdin = stdin.as_mut().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "send command stdin was not configured as a pipe",
-            )
-        })?;
-        stdin.write_all(&input).await?;
-    }
-    Ok(())
-}
-
-async fn read_child_output<R>(mut output: Option<R>) -> io::Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut bytes = Vec::new();
-    if let Some(output) = output.as_mut() {
-        output.read_to_end(&mut bytes).await?;
-    }
-    Ok(bytes)
-}
-
-#[cfg(unix)]
-async fn terminate_and_reap(child: &mut Child, child_id: Option<u32>) -> io::Result<()> {
-    if let Some(child_id) = child_id {
-        if let Err(group_err) = kill_process_group(child_id) {
-            child.start_kill().map_err(|child_err| {
-                io::Error::new(
-                    child_err.kind(),
-                    format!(
-                        "could not kill send process group ({group_err}) or direct child ({child_err})"
-                    ),
-                )
-            })?;
-            child.wait().await?;
-            return Err(io::Error::new(
-                group_err.kind(),
-                format!("could not kill send process group: {group_err}"),
-            ));
-        }
-    } else {
-        child.start_kill()?;
-    }
-    child.wait().await.map(|_| ())
-}
-
-#[cfg(unix)]
-fn kill_process_group(child_id: u32) -> io::Result<()> {
-    let process_group = libc::pid_t::try_from(child_id).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("send command process ID {child_id} is outside pid_t range"),
-        )
-    })?;
-    // The command is placed into a new process group before it is spawned, so
-    // this signal is scoped to the helper and descendants that did not
-    // deliberately leave that group.
-    let result = unsafe { libc::killpg(process_group, libc::SIGKILL) };
-    if result == 0 {
-        return Ok(());
-    }
-    let err = io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(err)
-    }
-}
-
-#[cfg(not(unix))]
-async fn terminate_and_reap(child: &mut Child, _child_id: Option<u32>) -> io::Result<()> {
-    child.start_kill()?;
-    child.wait().await.map(|_| ())
 }
 
 fn report_from_output(output: Output) -> SendReport {
@@ -409,6 +267,8 @@ fn report_from_output(output: Output) -> SendReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::io;
 
     fn test_message(body: impl Into<String>) -> ComposedMessage {
         ComposedMessage::new(

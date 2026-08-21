@@ -22,18 +22,14 @@ env:
 jobs:
   test:
     name: Format, lint, test, and GTK smoke
-    if: >-
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, notm-private-runner]
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
 
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install native dependencies on a GitHub-hosted runner
-        if: runner.environment == 'github-hosted'
+      - name: Install native dependencies
         shell: bash
         run: |
           set -euxo pipefail
@@ -73,43 +69,13 @@ jobs:
           pkg-config --modversion gtk4 gtksourceview-5 webkitgtk-6.0
           test -r /usr/include/notmuch.h
 
-      - name: Verify preinstalled self-hosted dependencies
-        if: runner.environment == 'self-hosted'
-        shell: bash
-        run: |
-          set -euxo pipefail
-          for executable in \
-            Xvfb cargo cargo-clippy cc clang dbus-run-session pkg-config rustc \
-            rustfmt rustup weston xauth xvfb-run; do
-            command -v "$executable"
-          done
-          pkg-config --modversion gtk4 gtksourceview-5 webkitgtk-6.0
-          test -r /usr/include/notmuch.h
-          temporary_executable="$(mktemp)"
-          trap 'rm -f "$temporary_executable"' EXIT
-          printf '#!/usr/bin/bash\nexit 0\n' >"$temporary_executable"
-          chmod 0700 "$temporary_executable"
-          "$temporary_executable"
-          rm "$temporary_executable"
-          trap - EXIT
-
       - name: Select the stable Rust toolchain
-        if: runner.environment == 'github-hosted'
         shell: bash
         run: |
           set -euxo pipefail
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
           rustup component add clippy rustfmt
-          rustc --version --verbose
-          cargo --version --verbose
-
-      - name: Report the pinned self-hosted Rust toolchain
-        if: runner.environment == 'self-hosted'
-        shell: bash
-        run: |
-          set -euxo pipefail
-          rustup show active-toolchain
           rustc --version --verbose
           cargo --version --verbose
 

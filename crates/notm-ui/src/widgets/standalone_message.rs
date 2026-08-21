@@ -212,8 +212,7 @@ impl StandaloneMessageController {
             view_menu_box.append(button);
         }
         view_menu_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        let sender_view_preference_button =
-            gtk::Button::with_label("Always show messages from this sender in this view");
+        let sender_view_preference_button = gtk::Button::with_label("Always");
         sender_view_preference_button
             .set_widget_name("notm-message-window-sender-view-preference-button");
         sender_view_preference_button.set_visible(false);
@@ -582,6 +581,12 @@ enum StandaloneCopyField {
     Subject,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StandaloneViewAction {
+    Show(MessageViewKind),
+    ToggleSenderDefault,
+}
+
 fn connect_message_window_actions(standalone: &Rc<StandaloneMessageWindow>) {
     for (button, action) in [
         (
@@ -629,30 +634,9 @@ fn connect_message_window_actions(standalone: &Rc<StandaloneMessageWindow>) {
     standalone
         .sender_view_preference_button
         .connect_clicked(move |_| {
-            let Some(standalone) = standalone_weak.upgrade() else {
-                return;
-            };
-            let Some(message) = current_message(&standalone) else {
-                standalone.status_label.set_text("No selected message");
-                standalone.view_menu_button.popdown();
-                return;
-            };
-            let preference = standalone.state.borrow().view.preference();
-            match (standalone.toggle_sender_view)(&message, preference) {
-                Ok(true) => standalone.status_label.set_text(&format!(
-                    "Messages from this sender will default to {}",
-                    preference.label()
-                )),
-                Ok(false) => standalone.status_label.set_text(&format!(
-                    "Removed the {} default for this sender",
-                    preference.label()
-                )),
-                Err(error) => standalone.status_label.set_text(&format!(
-                    "Sender view preference could not be saved: {error}"
-                )),
+            if let Some(standalone) = standalone_weak.upgrade() {
+                activate_sender_view_preference(&standalone);
             }
-            update_sender_view_preference_button(&standalone, &message);
-            standalone.view_menu_button.popdown();
         });
 
     let standalone_weak = Rc::downgrade(standalone);
@@ -733,6 +717,18 @@ fn update_button_binding_labels(standalone: &StandaloneMessageWindow) {
         standalone,
     );
     set_button_label(&standalone.view_raw_button, "Raw source", "V r", standalone);
+    let sender_view_base = strip_binding_suffix(
+        &standalone
+            .sender_view_preference_button
+            .label()
+            .unwrap_or_default(),
+    );
+    set_button_label(
+        &standalone.sender_view_preference_button,
+        &sender_view_base,
+        "V a",
+        standalone,
+    );
     set_button_label(
         &standalone.collapse_quotes_button,
         "Collapse quotes",
@@ -881,12 +877,12 @@ fn standalone_key_controller(
                 .status_label
                 .set_text("Respond: r reply, a reply all, f forward, A forward attached");
             true
-        } else if key == gtk::gdk::Key::V {
+        } else if is_view_prefix(key, mods) {
             shortcuts.pending_view.set(true);
             standalone.view_menu_button.popup();
             standalone
                 .status_label
-                .set_text("View: t text, v visual HTML, h headers, r raw source");
+                .set_text("View: t text, v visual HTML, h headers, r raw source, a sender default");
             true
         } else if key == gtk::gdk::Key::q {
             toggle_quote_collapse(&standalone);
@@ -1005,8 +1001,12 @@ fn response_sequence_action(key: gtk::gdk::Key) -> Option<StandaloneResponseActi
 }
 
 fn run_view_key(standalone: &StandaloneMessageWindow, key: gtk::gdk::Key) -> bool {
-    let Some(view) = view_sequence_action(key) else {
+    let Some(action) = view_sequence_action(key) else {
         return false;
+    };
+    let StandaloneViewAction::Show(view) = action else {
+        activate_sender_view_preference(standalone);
+        return true;
     };
     if view == MessageViewKind::Html
         && current_message(standalone)
@@ -1019,15 +1019,22 @@ fn run_view_key(standalone: &StandaloneMessageWindow, key: gtk::gdk::Key) -> boo
     true
 }
 
-fn view_sequence_action(key: gtk::gdk::Key) -> Option<MessageViewKind> {
+fn is_view_prefix(key: gtk::gdk::Key, mods: gtk::gdk::ModifierType) -> bool {
+    key == gtk::gdk::Key::V
+        || (key == gtk::gdk::Key::v && mods.contains(gtk::gdk::ModifierType::SHIFT_MASK))
+}
+
+fn view_sequence_action(key: gtk::gdk::Key) -> Option<StandaloneViewAction> {
     if key == gtk::gdk::Key::t {
-        Some(MessageViewKind::Text)
+        Some(StandaloneViewAction::Show(MessageViewKind::Text))
     } else if key == gtk::gdk::Key::v {
-        Some(MessageViewKind::Html)
+        Some(StandaloneViewAction::Show(MessageViewKind::Html))
     } else if key == gtk::gdk::Key::h {
-        Some(MessageViewKind::Headers)
+        Some(StandaloneViewAction::Show(MessageViewKind::Headers))
     } else if key == gtk::gdk::Key::r {
-        Some(MessageViewKind::Raw)
+        Some(StandaloneViewAction::Show(MessageViewKind::Raw))
+    } else if key == gtk::gdk::Key::a {
+        Some(StandaloneViewAction::ToggleSenderDefault)
     } else {
         None
     }
@@ -1214,23 +1221,71 @@ fn update_sender_view_preference_button(
         standalone
             .sender_view_preference_button
             .set_tooltip_text(None);
+        standalone
+            .sender_view_preference_button
+            .remove_css_class("suggested-action");
         return;
     };
     let preference = standalone.state.borrow().view.preference();
     let enabled = (standalone.sender_view)(message) == Some(preference);
-    let label = if enabled {
-        format!("Stop always showing this sender as {}", preference.label())
+    let label = sender_view_preference_label(preference);
+    set_button_label(
+        &standalone.sender_view_preference_button,
+        &label,
+        "V a",
+        standalone,
+    );
+    if enabled {
+        standalone
+            .sender_view_preference_button
+            .add_css_class("suggested-action");
     } else {
-        format!("Always show this sender as {}", preference.label())
-    };
-    standalone.sender_view_preference_button.set_label(&label);
+        standalone
+            .sender_view_preference_button
+            .remove_css_class("suggested-action");
+    }
     standalone
         .sender_view_preference_button
-        .set_tooltip_text(Some(&format!(
-            "Sender: {sender}. A per-message view choice still takes precedence."
-        )));
+        .set_tooltip_text(Some(&sender_view_preference_tooltip(&sender, enabled)));
     standalone.sender_view_preference_button.set_visible(true);
     standalone.sender_view_preference_button.set_sensitive(true);
+}
+
+fn sender_view_preference_label(preference: MessageViewPreference) -> String {
+    format!("Always: {}", preference.label())
+}
+
+fn sender_view_preference_tooltip(sender: &str, enabled: bool) -> String {
+    let action = if enabled {
+        "Activate to remove this sender default."
+    } else {
+        "Activate to use this view by default for this sender."
+    };
+    format!("Sender: {sender}. {action} A per-message view choice still takes precedence.")
+}
+
+fn activate_sender_view_preference(standalone: &StandaloneMessageWindow) {
+    let Some(message) = current_message(standalone) else {
+        standalone.status_label.set_text("No selected message");
+        standalone.view_menu_button.popdown();
+        return;
+    };
+    let preference = standalone.state.borrow().view.preference();
+    match (standalone.toggle_sender_view)(&message, preference) {
+        Ok(true) => standalone.status_label.set_text(&format!(
+            "Messages from this sender will default to {}",
+            preference.label()
+        )),
+        Ok(false) => standalone.status_label.set_text(&format!(
+            "Removed the {} default for this sender",
+            preference.label()
+        )),
+        Err(error) => standalone.status_label.set_text(&format!(
+            "Sender view preference could not be saved: {error}"
+        )),
+    }
+    update_sender_view_preference_button(standalone, &message);
+    standalone.view_menu_button.popdown();
 }
 
 fn start_link_hint_mode(standalone: &StandaloneMessageWindow) -> bool {
@@ -1880,6 +1935,9 @@ mod tests {
         assert_eq!(relative_message_index(2, 3, 8), Some(2));
         assert_eq!(relative_message_index(0, 3, -8), Some(0));
         assert_eq!(relative_message_index(0, 0, 1), None);
+        assert!(is_view_prefix(gtk::gdk::Key::V, none));
+        assert!(is_view_prefix(gtk::gdk::Key::v, shift));
+        assert!(!is_view_prefix(gtk::gdk::Key::v, none));
         assert_eq!(
             response_sequence_action(gtk::gdk::Key::r),
             Some(StandaloneResponseAction::Reply(ReplyKind::Sender))
@@ -1898,19 +1956,23 @@ mod tests {
         );
         assert_eq!(
             view_sequence_action(gtk::gdk::Key::t),
-            Some(MessageViewKind::Text)
+            Some(StandaloneViewAction::Show(MessageViewKind::Text))
         );
         assert_eq!(
             view_sequence_action(gtk::gdk::Key::v),
-            Some(MessageViewKind::Html)
+            Some(StandaloneViewAction::Show(MessageViewKind::Html))
         );
         assert_eq!(
             view_sequence_action(gtk::gdk::Key::h),
-            Some(MessageViewKind::Headers)
+            Some(StandaloneViewAction::Show(MessageViewKind::Headers))
         );
         assert_eq!(
             view_sequence_action(gtk::gdk::Key::r),
-            Some(MessageViewKind::Raw)
+            Some(StandaloneViewAction::Show(MessageViewKind::Raw))
+        );
+        assert_eq!(
+            view_sequence_action(gtk::gdk::Key::a),
+            Some(StandaloneViewAction::ToggleSenderDefault)
         );
         assert_eq!(
             copy_sequence_field(gtk::gdk::Key::m),
@@ -1938,5 +2000,17 @@ mod tests {
         );
         assert_eq!(view_sequence_action(gtk::gdk::Key::j), None);
         assert_eq!(copy_sequence_field(gtk::gdk::Key::j), None);
+        assert_eq!(
+            sender_view_preference_label(MessageViewPreference::VisualHtml),
+            "Always: Visual HTML"
+        );
+        assert_eq!(
+            sender_view_preference_tooltip("sender@example.test", false),
+            "Sender: sender@example.test. Activate to use this view by default for this sender. A per-message view choice still takes precedence."
+        );
+        assert_eq!(
+            sender_view_preference_tooltip("sender@example.test", true),
+            "Sender: sender@example.test. Activate to remove this sender default. A per-message view choice still takes precedence."
+        );
     }
 }

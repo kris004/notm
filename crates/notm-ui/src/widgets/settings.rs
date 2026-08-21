@@ -9,15 +9,22 @@
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
+    ffi::OsStr,
+    fs::OpenOptions,
+    io::Write,
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, Mutex},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+
 use gtk::prelude::*;
 use gtk4 as gtk;
 use notm_mail::TransportMode;
 use serde::Serialize;
+use uuid::Uuid;
 
 use crate::model::{LayoutPreference, MAX_THREAD_PREVIEW_LINES, ThemePreference};
 
@@ -689,7 +696,7 @@ impl SettingsController {
             &form,
             "Socket path",
             &option_path_text(&seed.automation_socket),
-            "Optional Unix socket path. Blank uses a temporary default.",
+            "Optional Unix socket path. Blank uses a per-process path under XDG_RUNTIME_DIR, falling back to the system temporary directory.",
         );
         let automation_token = settings_entry_row(
             &form,
@@ -1404,6 +1411,34 @@ fn read_settings_toml(path: Option<&Path>) -> toml::Value {
         .unwrap_or_else(|| toml::Value::Table(Default::default()))
 }
 
+fn read_settings_toml_for_update(path: &Path) -> anyhow::Result<toml::Value> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(toml::Value::Table(Default::default()));
+        }
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "reading existing app config {}: {err}",
+                path.display()
+            ));
+        }
+    };
+    let value = text
+        .parse::<toml::Value>()
+        .map_err(|err| anyhow::anyhow!("parsing existing app config {}: {err}", path.display()))?;
+    ensure_settings_root_table(path, value)
+}
+
+fn ensure_settings_root_table(path: &Path, value: toml::Value) -> anyhow::Result<toml::Value> {
+    anyhow::ensure!(
+        value.is_table(),
+        "existing app config {} must contain a TOML table",
+        path.display()
+    );
+    Ok(value)
+}
+
 fn toml_section<'a>(
     value: &'a toml::Value,
     section: &str,
@@ -1531,10 +1566,7 @@ fn persist_settings_values(path: Option<&Path>, values: &SettingsValues) -> anyh
     let Some(path) = path else {
         anyhow::bail!("app config path is not configured");
     };
-    let mut value = read_settings_toml(Some(path));
-    if !value.is_table() {
-        value = toml::Value::Table(Default::default());
-    }
+    let mut value = read_settings_toml_for_update(path)?;
     let root = value.as_table_mut().expect("value is table");
 
     set_optional_string(root, "notmuch", "database_path", &values.database_path);
@@ -1723,11 +1755,7 @@ fn persist_settings_values(path: Option<&Path>, values: &SettingsValues) -> anyh
         values.allow_live_tag_test,
     );
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, toml::to_string_pretty(&value)?)?;
-    Ok(())
+    persist_private_settings_toml(path, &value)
 }
 
 fn set_string(
@@ -1809,16 +1837,7 @@ pub fn persist_basic_settings(
     let Some(path) = path else {
         return Ok(());
     };
-    let mut value = if path.exists() {
-        std::fs::read_to_string(path)?
-            .parse::<toml::Value>()
-            .unwrap_or_else(|_| toml::Value::Table(Default::default()))
-    } else {
-        toml::Value::Table(Default::default())
-    };
-    if !value.is_table() {
-        value = toml::Value::Table(Default::default());
-    }
+    let mut value = read_settings_toml_for_update(path)?;
     let root = value.as_table_mut().expect("value is table");
     table_entry(root, "notmuch").insert(
         "default_query".to_string(),
@@ -1835,11 +1854,7 @@ pub fn persist_basic_settings(
             toml::Value::String(send_command.trim().to_string()),
         );
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, toml::to_string_pretty(&value)?)?;
-    Ok(())
+    persist_private_settings_toml(path, &value)
 }
 
 /// Persist one live UI-domain value while retaining unrelated valid TOML keys.
@@ -1851,22 +1866,60 @@ pub fn persist_ui_value(
     let Some(path) = path else {
         return Ok(());
     };
-    let mut value = if path.exists() {
-        std::fs::read_to_string(path)?
-            .parse::<toml::Value>()
-            .unwrap_or_else(|_| toml::Value::Table(Default::default()))
-    } else {
-        toml::Value::Table(Default::default())
-    };
-    if !value.is_table() {
-        value = toml::Value::Table(Default::default());
-    }
+    let mut value = read_settings_toml_for_update(path)?;
     table_entry(value.as_table_mut().expect("value is table"), "ui")
         .insert(key.to_string(), setting);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    persist_private_settings_toml(path, &value)
+}
+
+fn persist_private_settings_toml(path: &Path, value: &toml::Value) -> anyhow::Result<()> {
+    let contents = toml::to_string_pretty(value)?;
+    atomic_write_private(path, contents.as_bytes())
+}
+
+fn atomic_write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let configured_parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = configured_parent.unwrap_or_else(|| Path::new("."));
+    if let Some(parent) = configured_parent {
+        ensure_private_directory(parent)?;
     }
-    std::fs::write(path, toml::to_string_pretty(&value)?)?;
+    let filename = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("notm-config");
+    let temporary_path = parent.join(format!(".{filename}.{}.tmp", Uuid::new_v4()));
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut temporary = options.open(&temporary_path)?;
+        #[cfg(unix)]
+        temporary.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        temporary.write_all(bytes)?;
+        temporary.sync_all()?;
+        drop(temporary);
+        std::fs::rename(&temporary_path, path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    write_result
+        .map_err(|err| anyhow::anyhow!("writing app config {} atomically: {err}", path.display()))
+}
+
+fn ensure_private_directory(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path)?;
     Ok(())
 }
 
@@ -1988,12 +2041,21 @@ mod tests {
     #[test]
     fn live_ui_persistence_retains_unrelated_toml_keys() {
         let directory = tempfile::tempdir().expect("temporary settings directory");
-        let path = directory.path().join("config.toml");
+        let config_directory = directory.path().join("notm");
+        std::fs::create_dir(&config_directory).expect("create app config directory");
+        let path = config_directory.join("config.toml");
         std::fs::write(
             &path,
             "[unrelated]\nkeep = \"yes\"\n\n[ui]\nshow_sidebar = true\n",
         )
         .expect("seed settings");
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(&config_directory, std::fs::Permissions::from_mode(0o755))
+                .expect("make config directory non-private");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .expect("make config file non-private");
+        }
 
         persist_ui_value(
             Some(&path),
@@ -2009,6 +2071,96 @@ mod tests {
         assert_eq!(value["unrelated"]["keep"].as_str(), Some("yes"));
         assert_eq!(value["ui"]["show_sidebar"].as_bool(), Some(true));
         assert_eq!(value["ui"]["hidden_tag_searches"][0].as_str(), Some("sent"));
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                std::fs::metadata(&config_directory)
+                    .expect("config directory metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755,
+                "saving an explicitly located config must not change its existing parent directory"
+            );
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("config file metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let entries = std::fs::read_dir(&config_directory)
+            .expect("list config directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read config directory entries");
+        assert_eq!(
+            entries.len(),
+            1,
+            "atomic save must remove its temporary file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_persistence_creates_private_parent_and_file() {
+        let directory = tempfile::tempdir().expect("temporary settings directory");
+        let config_directory = directory.path().join("notm");
+        let path = config_directory.join("config.toml");
+
+        persist_ui_value(Some(&path), "show_sidebar", toml::Value::Boolean(true))
+            .expect("persist new app config");
+
+        assert_eq!(
+            std::fs::metadata(&config_directory)
+                .expect("config directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("config file metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn settings_updates_reject_invalid_existing_content_without_overwriting_it() {
+        let directory = tempfile::tempdir().expect("temporary settings directory");
+        let path = directory.path().join("config.toml");
+        let malformed = b"[ui\nshow_sidebar = true\n";
+        std::fs::write(&path, malformed).expect("seed malformed settings");
+
+        let error = persist_ui_value(Some(&path), "show_sidebar", toml::Value::Boolean(false))
+            .expect_err("malformed settings must be rejected");
+
+        assert!(error.to_string().contains("parsing existing app config"));
+        assert_eq!(
+            std::fs::read(&path).expect("read rejected settings"),
+            malformed
+        );
+        let entries = std::fs::read_dir(directory.path())
+            .expect("list settings directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read settings directory entries");
+        assert_eq!(
+            entries.len(),
+            1,
+            "a rejected save must not leave a temp file"
+        );
+
+        let error = ensure_settings_root_table(
+            &path,
+            toml::Value::String("not a document table".to_string()),
+        )
+        .expect_err("non-table settings must be rejected");
+        assert!(error.to_string().contains("must contain a TOML table"));
     }
 
     #[test]

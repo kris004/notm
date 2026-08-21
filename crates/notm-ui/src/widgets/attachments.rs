@@ -6,7 +6,7 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
 use gtk::prelude::*;
 use gtk4 as gtk;
@@ -720,7 +720,7 @@ pub(crate) fn cache_composer_attachments(
     if attachments.is_empty() {
         return Ok(Vec::new());
     }
-    std::fs::create_dir_all(directory)?;
+    ensure_private_directory(directory)?;
     attachments
         .iter()
         .map(|attachment| {
@@ -735,9 +735,24 @@ pub(crate) fn cache_composer_attachments(
                 safe_filename(&attachment.filename)
             ));
             write(&path, &attachment.bytes)?;
+            #[cfg(unix)]
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
             Ok(path.display().to_string())
         })
         .collect()
+}
+
+fn ensure_private_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path)?;
+    Ok(())
 }
 
 fn attachment_content_type(path: &Path) -> String {
@@ -804,5 +819,45 @@ mod tests {
             & 0o777;
 
         assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_compose_attachments_have_private_unix_permissions() {
+        let root = tempfile::tempdir().expect("temporary attachment cache root");
+        let directory = root.path().join("notm/compose-attachments");
+        std::fs::create_dir_all(&directory).expect("create non-private cache directory");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))
+            .expect("make cache directory non-private");
+        let attachment = AttachmentInput {
+            filename: "private.txt".to_string(),
+            content_type: "text/plain".to_string(),
+            bytes: b"private attachment".to_vec(),
+            source_path: None,
+        };
+
+        let cached = cache_composer_attachments(&[attachment], &directory, |path, bytes| {
+            std::fs::write(path, bytes)?;
+            Ok(())
+        })
+        .expect("cache compose attachment");
+
+        assert_eq!(cached.len(), 1);
+        assert_eq!(
+            std::fs::metadata(&directory)
+                .expect("cache directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&cached[0])
+                .expect("cached attachment metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 }

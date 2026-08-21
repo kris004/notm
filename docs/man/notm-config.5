@@ -1,15 +1,22 @@
-.TH NOTM-CONFIG 5 "2026-06-26" "notm 0.1.0" "File Formats"
+.TH NOTM-CONFIG 5 "2026-08-19" "notm 0.1.0" "File Formats"
 .SH NAME
 notm-config \- configuration file for notm
 .SH SYNOPSIS
-.I ~/.config/notm/config.toml
+.I ${XDG_CONFIG_HOME:-$HOME/.config}/notm/config.toml
 .SH DESCRIPTION
 .B notm
-uses TOML configuration.  If the file is absent, notm starts with safe defaults
-and tries to discover the user's Notmuch config from
-.I $XDG_CONFIG_HOME/notmuch/default/config
-or
-.IR ~/.notmuch-config .
+uses TOML configuration.  If the file is absent, notm starts with safe
+defaults.  Explicit
+.B notmuch.config_path,
+.B notmuch.database_path,
+and
+.B notmuch.profile
+values take precedence.  Otherwise libnotmuch follows the standard
+.BR NOTMUCH_CONFIG ,
+.BR NOTMUCH_DATABASE ,
+and
+.B NOTMUCH_PROFILE
+environment variables and Notmuch's XDG/profile/legacy discovery rules.
 .PP
 An alternate file can be selected with
 .B --config
@@ -45,14 +52,18 @@ mode = "stdin_rfc5322"
 .SS [notmuch]
 .TP
 .B database_path
-Path to the Notmuch database/mail root.
-If unset, notm tries to read it from the Notmuch config.
+Path to the Notmuch database or index.  This may differ from
+.BR database.mail_root .
+If unset, libnotmuch resolves it from the environment and effective Notmuch
+configuration.
 .TP
 .B config_path
-Path to a Notmuch config file.
+Path to a Notmuch config file.  If unset, standard Notmuch discovery applies.
 .TP
 .B profile
-Optional Notmuch profile name.
+Optional Notmuch profile name.  If unset,
+.B NOTMUCH_PROFILE
+and standard Notmuch defaults apply.
 .TP
 .B default_query
 Startup query.  The default is
@@ -259,7 +270,10 @@ Save accepted sent mail to a local Maildir.  Defaults to false.
 .B sent_maildir
 Sent Maildir path.  Defaults to
 .I Sent
-under the database path when sent saving is enabled.
+under Notmuch's effective
+.B database.mail_root
+when sent saving is enabled, with the database path as a fallback for older
+configurations.
 .TP
 .B sent_tags
 Tags applied to indexed sent mail.  Defaults to:
@@ -278,7 +292,9 @@ Save explicit drafts as local Maildir messages.  Defaults to true.
 .B maildir
 Draft Maildir path.  Defaults to
 .I Drafts
-under the database path when Maildir drafts are enabled.
+under Notmuch's effective
+.B database.mail_root
+when Maildir drafts are enabled, with the database path as a legacy fallback.
 .TP
 .B tags
 Tags applied to indexed draft messages.  Defaults to:
@@ -297,6 +313,10 @@ Sync action and runs no configured sync commands.  Defaults to false.
 .B manual_action_label
 Text shown on the sidebar Sync action.  Defaults to
 .BR Sync .
+.TP
+.B timeout_seconds
+Per-command wall-clock timeout.  Defaults to 300 seconds.  On timeout, notm
+terminates the helper process group and reaps the direct child.
 .TP
 .B external_receive_enabled
 Make the external receive command eligible for the manual Sync action and for
@@ -338,6 +358,20 @@ three gates and its own
 flag are all true.  Eligible receive and database-update commands run in that
 order.  After the selected commands succeed, the current search is refreshed.
 Fixture mode never executes configured external sync commands.
+.PP
+Each configured value runs non-interactively as
+.BR "sh -c COMMAND" .
+The command inherits notm's environment, PATH, and current working directory.
+.B notm
+exports its effective database as
+.B NOTMUCH_DATABASE
+to both commands.  It also exports
+.B NOTMUCH_CONFIG
+and
+.B NOTMUCH_PROFILE
+when those were selected explicitly or through the environment; otherwise the
+child inherits the same standard Notmuch discovery environment as the UI.
+Output capture and UI diagnostics are bounded.
 .SH TESTING AND DEBUGGING SECTIONS
 .SS [automation]
 The developer test harness is disabled by default.
@@ -347,6 +381,23 @@ section controls its local socket path, token, screenshot directory, and
 live-test gates.  This section is for development and smoke-test support, not
 normal mail operation.  See
 .BR notm-test-harness (7).
+.TP
+.B enabled
+Enable the local developer test harness.  Defaults to false.
+.TP
+.B socket_path
+Unix socket path.  When omitted, notm uses a per-process path under
+.B XDG_RUNTIME_DIR
+when that variable names an absolute directory, falling back to
+.IR /tmp .
+.TP
+.B token
+Token required on test-harness requests.  An ephemeral token is generated and
+printed locally when omitted.
+.TP
+.B screenshot_dir
+Screenshot output directory.  Defaults to
+.IR artifacts/screenshots .
 .TP
 .B allow_live_send_test
 Permit developer-test-harness sends against a non-fixture account and permit

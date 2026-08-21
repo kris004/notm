@@ -33,6 +33,7 @@ HTML_QUERY = "id:html-message@fixture.test"
 SINGLE_TAG = "ui-single-tag-smoke"
 MULTI_TAG = "ui-multi-tag-smoke"
 TOKEN = "notm-ui-text-focus-smoke"
+COMPOSER_BODY_MARKER = "physical composer shortcut smoke"
 
 
 class SmokeFailure(RuntimeError):
@@ -195,47 +196,70 @@ class WtypeDriver:
             terminate_process_group(process)
 
 
-def focus_app_window(environment: dict[str, str], app_pid: int) -> dict[str, Any]:
-    def sway_tree() -> dict[str, Any]:
-        result = subprocess.run(
-            ["swaymsg", "-t", "get_tree"],
-            env=environment,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=10,
-            check=False,
+def sway_tree(environment: dict[str, str]) -> dict[str, Any]:
+    result = subprocess.run(
+        ["swaymsg", "-t", "get_tree"],
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SmokeFailure(
+            "could not inspect the private Sway tree: "
+            f"{result.stderr.strip() or result.stdout.strip()}"
         )
-        if result.returncode != 0:
-            raise SmokeFailure(
-                "could not inspect the private Sway tree: "
-                f"{result.stderr.strip() or result.stdout.strip()}"
-            )
-        try:
-            value = json.loads(result.stdout)
-        except json.JSONDecodeError as error:
-            raise SmokeFailure(f"swaymsg returned invalid tree JSON: {result.stdout!r}") from error
-        if not isinstance(value, dict):
-            raise SmokeFailure(f"swaymsg returned an invalid tree: {value!r}")
-        return value
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise SmokeFailure(f"swaymsg returned invalid tree JSON: {result.stdout!r}") from error
+    if not isinstance(value, dict):
+        raise SmokeFailure(f"swaymsg returned an invalid tree: {value!r}")
+    return value
 
+
+def find_sway_node(
+    node: dict[str, Any], predicate: Callable[[dict[str, Any]], bool]
+) -> dict[str, Any] | None:
+    if predicate(node):
+        return node
+    for child_group in ("nodes", "floating_nodes"):
+        children = node.get(child_group, [])
+        if not isinstance(children, list):
+            continue
+        for child in children:
+            if isinstance(child, dict):
+                found = find_sway_node(child, predicate)
+                if found is not None:
+                    return found
+    return None
+
+
+def sway_node_title(node: dict[str, Any]) -> str:
+    name = node.get("name")
+    if isinstance(name, str):
+        return name
+    properties = node.get("window_properties")
+    if isinstance(properties, dict):
+        title = properties.get("title")
+        if isinstance(title, str):
+            return title
+    return ""
+
+
+def focus_app_window(environment: dict[str, str], app_pid: int) -> dict[str, Any]:
     def app_node(node: dict[str, Any]) -> dict[str, Any] | None:
-        if node.get("pid") == app_pid and node.get("type") in {"con", "floating_con"}:
-            return node
-        for child_group in ("nodes", "floating_nodes"):
-            children = node.get(child_group, [])
-            if not isinstance(children, list):
-                continue
-            for child in children:
-                if isinstance(child, dict):
-                    found = app_node(child)
-                    if found is not None:
-                        return found
-        return None
+        return find_sway_node(
+            node,
+            lambda candidate: candidate.get("pid") == app_pid
+            and candidate.get("type") in {"con", "floating_con"},
+        )
 
     wait_until(
         f"notm pid {app_pid} to map a Sway window",
-        lambda: app_node(sway_tree()),
+        lambda: app_node(sway_tree(environment)),
         timeout=15,
     )
     command = ["swaymsg", f'[pid="{app_pid}"]', "focus"]
@@ -264,7 +288,7 @@ def focus_app_window(environment: dict[str, str], app_pid: int) -> dict[str, Any
         raise SmokeFailure(f"private Sway did not focus notm pid {app_pid}: {responses!r}")
 
     def focused_app_node() -> dict[str, Any] | None:
-        node = app_node(sway_tree())
+        node = app_node(sway_tree(environment))
         return node if node is not None and node.get("focused") is True else None
 
     return wait_until(
@@ -336,6 +360,16 @@ def assert_message_tags(message: dict[str, Any], phase: str) -> None:
             f"{phase}: {TARGET_MESSAGE_ID} tags changed; "
             f"expected {expected!r}, got {actual!r}"
         )
+
+
+def assert_selected_target_tags_unchanged(harness: Harness, phase: str) -> dict[str, Any]:
+    selected = harness.state().get("selected_message")
+    if not isinstance(selected, dict) or selected.get("message_id") != TARGET_MESSAGE_ID:
+        raise SmokeFailure(
+            f"{phase}: composer shortcut changed the selected fixture message: {selected!r}"
+        )
+    assert_message_tags(selected, phase)
+    return selected
 
 
 def wait_for_target_tag(harness: Harness, tag: str, present: bool) -> dict[str, Any]:
@@ -752,6 +786,389 @@ def exercise_link_hints(
         )
 
 
+def exercise_composer_shortcuts(
+    environment: dict[str, str], driver: WtypeDriver, harness: Harness, app_pid: int
+) -> None:
+    load_target(harness)
+    focus_selected_thread(harness)
+    focus_app_window(environment, app_pid)
+
+    # Open the composer and reach its GtkSourceView through normal-mode keyboard
+    # navigation rather than through the test harness or a synthetic router call.
+    driver.send("-k", "c")
+
+    def composer_opened() -> dict[str, Any] | None:
+        entry = harness.entry_state()
+        draft = harness.request("draft_list_state")
+        return (
+            entry
+            if entry.get("input_mode") == "Normal"
+            and entry.get("active_pane") == "Message"
+            and draft.get("section", {}).get("mapped") is True
+            else None
+        )
+
+    wait_until("physical c to open the composer", composer_opened, timeout=5)
+    assert_selected_target_tags_unchanged(harness, "opened physical-key composer")
+
+    # The focus order is From, To, Cc, Bcc, Subject, Body.  Repeated physical
+    # j navigation must therefore enter the Vim-backed body without a harness
+    # focus command.  `i` then enters Vim insert mode before typing the marker.
+    driver.send(
+        "-k",
+        "j",
+        "-k",
+        "j",
+        "-k",
+        "j",
+        "-k",
+        "j",
+        "-k",
+        "j",
+    )
+    wait_until(
+        "normal-mode composer navigation to focus the body",
+        lambda: (
+            entry
+            if (entry := harness.entry_state()).get("input_mode") == "Insert"
+            and entry.get("active_pane") == "Message"
+            else None
+        ),
+        timeout=5,
+    )
+    driver.send("-k", "i", "-d", "20", COMPOSER_BODY_MARKER)
+
+    def body_marker_entered() -> dict[str, Any] | None:
+        entry = harness.entry_state()
+        fields = entry.get("compose_fields")
+        if not isinstance(fields, dict):
+            return None
+        body = fields.get("body")
+        return (
+            entry
+            if isinstance(body, str)
+            and body.endswith(COMPOSER_BODY_MARKER)
+            and entry.get("input_mode") == "Insert"
+            else None
+        )
+
+    wait_until("physical typing in the Vim composer body", body_marker_entered, timeout=5)
+
+    # The first Esc belongs to GtkSourceView's Vim context; only the second Esc
+    # leaves notm's Insert mode.  This is the exact focus transition that
+    # exposed the composer/global-shortcut conflict in the live application.
+    driver.send("-k", "Escape")
+    wait_until(
+        "first Escape to leave Vim insert mode",
+        lambda: (
+            entry
+            if (entry := harness.entry_state()).get("input_mode") == "Insert"
+            and entry.get("status") == "Vim composer"
+            else None
+        ),
+        timeout=5,
+    )
+    driver.send("-k", "Escape")
+    wait_until(
+        "second Escape to leave notm Insert mode",
+        lambda: (
+            entry
+            if (entry := harness.entry_state()).get("input_mode") == "Normal"
+            else None
+        ),
+        timeout=5,
+    )
+
+    tags_before = assert_selected_target_tags_unchanged(
+        harness, "before physical composer actions"
+    ).get("tags")
+
+    # Physical lowercase-s plus Shift must save this composer, not apply the
+    # global spam action to the selected message.
+    driver.send("-M", "shift", "-k", "s", "-m", "shift")
+
+    def saved_draft() -> dict[str, Any] | None:
+        assert_selected_target_tags_unchanged(
+            harness, "physical Shift+S while composer is visible"
+        )
+        draft = harness.request("draft_list_state")
+        active = draft.get("active_draft")
+        saved_fields = active.get("saved_fields") if isinstance(active, dict) else None
+        path = active.get("path") if isinstance(active, dict) else None
+        return (
+            draft
+            if isinstance(saved_fields, dict)
+            and isinstance(saved_fields.get("body"), str)
+            and saved_fields["body"].endswith(COMPOSER_BODY_MARKER)
+            and isinstance(path, str)
+            and Path(path).is_file()
+            else None
+        )
+
+    saved = wait_until("physical Shift+S to save the composer", saved_draft, timeout=10)
+    active_draft = saved.get("active_draft")
+    if not isinstance(active_draft, dict) or not isinstance(active_draft.get("path"), str):
+        raise SmokeFailure(f"saved draft did not expose its persisted path: {saved!r}")
+    saved_path = Path(active_draft["path"])
+
+    # Make the saved draft deliberately dirty so physical x has one exact,
+    # inspectable result: the composer clear confirmation.  Reject it through
+    # the harness to preserve this composer for the final Shift+A assertion.
+    dirty_subject = "physical x confirmation smoke"
+    dirtied = harness.request("compose_set_subject", {"value": dirty_subject})
+    if dirtied.get("ok") is not True:
+        raise SmokeFailure(f"could not dirty the saved composer before x: {dirtied!r}")
+    driver.send("-k", "x")
+
+    def composer_clear_confirmation() -> dict[str, Any] | None:
+        assert_selected_target_tags_unchanged(
+            harness, "physical x while composer is visible"
+        )
+        pending = harness.request("pending_confirmation")
+        pending_action = pending.get("pending")
+        if isinstance(pending_action, dict):
+            if pending_action.get("kind") != "clear_composer":
+                raise SmokeFailure(
+                    f"physical x opened an unexpected confirmation: {pending!r}"
+                )
+            return pending
+        return None
+
+    clear_state = wait_until(
+        "physical x to request clearing the dirty composer",
+        composer_clear_confirmation,
+        timeout=5,
+    )
+    pending = clear_state.get("pending")
+    confirmation_id = pending.get("id") if isinstance(pending, dict) else None
+    if not isinstance(confirmation_id, int):
+        raise SmokeFailure(f"composer clear confirmation had no id: {clear_state!r}")
+    rejected = harness.request(
+        "respond_confirmation", {"response": "reject", "id": confirmation_id}
+    )
+    completion = rejected.get("last_completion")
+    if (
+        rejected.get("ok") is not True
+        or not isinstance(completion, dict)
+        or completion.get("accepted") is not False
+        or completion.get("succeeded") is not True
+    ):
+        raise SmokeFailure(f"composer clear rejection failed: {rejected!r}")
+    preserved = harness.request("draft_list_state")
+    preserved_active = preserved.get("active_draft")
+    preserved_fields = preserved.get("compose_fields")
+    if (
+        not isinstance(preserved_active, dict)
+        or preserved_active.get("path") != str(saved_path)
+        or not isinstance(preserved_fields, dict)
+        or preserved_fields.get("subject") != dirty_subject
+        or preserved.get("section", {}).get("mapped") is not True
+    ):
+        raise SmokeFailure(
+            f"rejecting physical x did not preserve the dirty composer: {preserved!r}"
+        )
+    if not saved_path.is_file():
+        raise SmokeFailure(f"physical x deleted the saved draft at {saved_path}")
+    if (
+        assert_selected_target_tags_unchanged(
+            harness, "completed physical composer actions"
+        ).get("tags")
+        != tags_before
+    ):
+        raise SmokeFailure("composer actions changed the selected message tags")
+
+    # Verify physical lowercase-a plus Shift last on the preserved composer.
+    # Native portal choosers do not consistently honor synthetic Escape in a
+    # nested compositor, so observe the real chooser and let the isolated
+    # fixture-process teardown close it without selecting any host file.
+    focus_app_window(environment, app_pid)
+    if harness.entry_state().get("input_mode") == "Insert":
+        # Returning focus to the Vim body after closing a modal re-enters the
+        # application input layer.  Leave it again before asserting a Normal-
+        # mode shortcut, just as a user would after returning to the editor.
+        driver.send("-k", "Escape")
+        wait_until(
+            "notm Normal mode after rejecting the composer confirmation",
+            lambda: (
+                entry
+                if (entry := harness.entry_state()).get("input_mode") == "Normal"
+                else None
+            ),
+            timeout=5,
+        )
+
+    def attachment_chooser() -> dict[str, Any] | None:
+        assert_selected_target_tags_unchanged(
+            harness, "physical Shift+A while composer is visible"
+        )
+        return find_sway_node(
+            sway_tree(environment),
+            lambda node: node.get("type") in {"con", "floating_con"}
+            and "add attachment" in sway_node_title(node).lower(),
+        )
+
+    driver.send("-M", "shift", "-k", "a", "-m", "shift")
+    chooser = wait_until(
+        "physical Shift+A to open the Add attachment chooser",
+        attachment_chooser,
+        timeout=10,
+    )
+    if "add attachment" not in sway_node_title(chooser).lower():
+        raise SmokeFailure(f"unexpected attachment chooser node: {chooser!r}")
+    if (
+        assert_selected_target_tags_unchanged(
+            harness, "observed physical attachment chooser"
+        ).get("tags")
+        != tags_before
+    ):
+        raise SmokeFailure("physical Shift+A changed the selected message tags")
+    print(
+        "[ui-composer-shortcuts] Vim Esc/Esc and physical S/x/A composer actions passed",
+        flush=True,
+    )
+
+
+def exercise_indexed_draft_delete_shortcut(
+    environment: dict[str, str], driver: WtypeDriver, harness: Harness, app_pid: int
+) -> None:
+    load_target(harness)
+    focus_selected_thread(harness)
+    focus_app_window(environment, app_pid)
+    driver.send("-k", "c")
+    wait_until(
+        "composer message pane before g d",
+        lambda: (
+            entry
+            if (entry := harness.entry_state()).get("active_pane") == "Message"
+            and entry.get("input_mode") == "Normal"
+            and harness.request("draft_list_state").get("section", {}).get("mapped")
+            is True
+            else None
+        ),
+        timeout=5,
+    )
+    focused = harness.request("focus_compose_field", {"field": "from"})
+    if focused.get("ok") is not True:
+        raise SmokeFailure(f"could not focus the composer header before g d: {focused!r}")
+    focus_app_window(environment, app_pid)
+    driver.send("-k", "g", "-k", "d")
+
+    def draft_search_finished() -> dict[str, Any] | None:
+        status = harness.request("search_status")
+        if status.get("loading") is True:
+            return None
+        state_value = harness.state()
+        return state_value if state_value.get("current_query") == "tag:draft" else None
+
+    wait_until(
+        "physical g d to open Drafts from the message pane",
+        draft_search_finished,
+        timeout=10,
+    )
+
+    def indexed_draft_opened() -> dict[str, Any] | None:
+        state_value = harness.state()
+        active = state_value.get("active_draft")
+        return (
+            state_value
+            if isinstance(active, dict) and active.get("indexed") is True
+            else None
+        )
+
+    opened = wait_until("fixture indexed draft to open", indexed_draft_opened, timeout=5)
+    active = opened.get("active_draft")
+    if not isinstance(active, dict):
+        raise SmokeFailure(f"indexed draft had no active state: {opened!r}")
+    path_value = active.get("path")
+    message_id = active.get("message_id")
+    if not isinstance(path_value, str) or not isinstance(message_id, str):
+        raise SmokeFailure(f"indexed draft identity was incomplete: {active!r}")
+    draft_path = Path(path_value)
+    if not draft_path.is_file():
+        raise SmokeFailure(f"indexed fixture draft is missing at {draft_path}")
+
+    focus_app_window(environment, app_pid)
+    entry = harness.entry_state()
+    if entry.get("input_mode") == "Insert":
+        driver.send("-k", "Escape")
+        time.sleep(0.1)
+        if harness.entry_state().get("input_mode") == "Insert":
+            driver.send("-k", "Escape")
+    wait_until(
+        "indexed draft composer to enter Normal mode",
+        lambda: (
+            state
+            if (state := harness.entry_state()).get("input_mode") == "Normal"
+            else None
+        ),
+        timeout=5,
+    )
+
+    # Exercise the physical lowercase-d plus Shift path.  Accept through the
+    # fixture harness so the check is independent of compositor focus moving
+    # from the main window to GTK's modal surface.
+    driver.send("-M", "shift", "-k", "d", "-m", "shift")
+
+    def delete_confirmation() -> dict[str, Any] | None:
+        pending = harness.request("pending_confirmation")
+        action = pending.get("pending")
+        if isinstance(action, dict):
+            if action.get("kind") != "delete_active_draft":
+                raise SmokeFailure(
+                    f"physical Shift+D opened an unexpected confirmation: {pending!r}"
+                )
+            if action.get("visible") is not True:
+                raise SmokeFailure(
+                    f"physical Shift+D confirmation was not visible: {pending!r}"
+                )
+            return pending
+        return None
+
+    pending = wait_until(
+        "physical Shift+D to request indexed draft deletion",
+        delete_confirmation,
+        timeout=5,
+    )
+    action = pending.get("pending")
+    confirmation_id = action.get("id") if isinstance(action, dict) else None
+    if not isinstance(confirmation_id, int):
+        raise SmokeFailure(f"draft deletion confirmation had no id: {pending!r}")
+    accepted = harness.request(
+        "respond_confirmation", {"response": "accept", "id": confirmation_id}
+    )
+    completion = accepted.get("last_completion")
+    if (
+        not isinstance(completion, dict)
+        or completion.get("accepted") is not True
+        or completion.get("succeeded") is not True
+    ):
+        raise SmokeFailure(f"physical Shift+D deletion failed: {accepted!r}")
+
+    def deletion_visible() -> dict[str, Any] | None:
+        state_value = harness.state()
+        rows = state_value.get("thread_list_items")
+        if not isinstance(rows, list):
+            return None
+        retained = any(
+            isinstance(row, dict) and row.get("thread_id") == message_id for row in rows
+        )
+        view = harness.request("message_view_text").get("text")
+        if isinstance(view, str) and "Could not parse body" in view:
+            raise SmokeFailure(f"physical Shift+D rendered a missing body: {view!r}")
+        return state_value if not retained and not draft_path.exists() else None
+
+    wait_until(
+        "physical Shift+D to remove the indexed draft row and file",
+        deletion_visible,
+        timeout=10,
+    )
+    harness.wait_for_search()
+    print(
+        "[ui-composer-shortcuts] physical Shift+D deleted an indexed draft",
+        flush=True,
+    )
+
+
 def exercise_ui(
     environment: dict[str, str], driver: WtypeDriver, harness: Harness, app_pid: int
 ) -> None:
@@ -1137,6 +1554,10 @@ def run_inside_dbus(args: argparse.Namespace) -> int:
         exercise_link_hints(environment, driver, harness, app_process.pid)
         exercise_ui(environment, driver, harness, app_process.pid)
         exercise_tag_editor(environment, driver, harness, app_process.pid)
+        exercise_indexed_draft_delete_shortcut(
+            environment, driver, harness, app_process.pid
+        )
+        exercise_composer_shortcuts(environment, driver, harness, app_process.pid)
         print("[ui-text-focus] PASS", flush=True)
         return 0
     except BaseException as error:

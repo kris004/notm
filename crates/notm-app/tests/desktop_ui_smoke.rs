@@ -179,6 +179,15 @@ impl FixtureApp {
         if let Some(application_id) = application_id {
             command.env(TEST_HARNESS_APPLICATION_ID_ENV, application_id);
         }
+        // Keep non-fixture smokes independent of the invoking account's
+        // Notmuch selection and libnotmuch's NAME/EMAIL identity defaults.
+        command
+            .env_remove("NOTMUCH_CONFIG")
+            .env_remove("NOTMUCH_DATABASE")
+            .env_remove("NOTMUCH_PROFILE")
+            .env_remove("MAILDIR")
+            .env("EMAIL", "")
+            .env("NAME", "");
         command.env_remove("GTK_THEME");
         if system_prefers_dark.is_some() {
             command.env("GDK_DEBUG", "default-settings");
@@ -1139,6 +1148,144 @@ fn slow_manual_sync_keeps_desktop_responsive() -> anyhow::Result<()> {
 
 #[cfg(unix)]
 #[test]
+fn startup_sync_runs_receive_then_database_update() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP startup_sync_runs_receive_then_database_update: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running startup-sync order and completion UI smoke with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-startup-sync-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let marker = work_dir.join("sync-order");
+    let receive_command =
+        toml::Value::String(format!("printf receive > {:?}; printf receive-ok", marker))
+            .to_string();
+    let update_command = toml::Value::String(format!(
+        "test \"$(cat {:?})\" = receive && printf -- '-update' >> {:?} && printf update-ok",
+        marker, marker
+    ))
+    .to_string();
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+             \n[sync]\nenabled = true\ntimeout_seconds = 5\n\
+             external_receive_enabled = true\nexternal_receive_on_startup = true\nexternal_receive_command = {}\n\
+             notmuch_database_update_enabled = true\nnotmuch_database_update_on_startup = true\nnotmuch_database_update_command = {}\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+            receive_command,
+            update_command,
+        ),
+    )?;
+
+    let token = format!("notm-startup-sync-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let completed = loop {
+        let state = driver.command("app_state", json!({}))?;
+        let order = fs::read_to_string(&marker).unwrap_or_default();
+        if order == "receive-update" && state["state"]["sync_in_progress"] == false {
+            break state;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "startup sync did not complete in order: marker={order:?} state={state}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+
+    assert_eq!(completed["state"]["last_error"], Value::Null, "{completed}");
+    let operation = completed["state"]["last_operation"]
+        .as_str()
+        .with_context(|| format!("startup sync has no completion report: {completed}"))?;
+    ensure!(operation.starts_with("startup sync:"), "{operation}");
+    ensure!(operation.contains("stdout=receive-ok"), "{operation}");
+    ensure!(operation.contains("stdout=update-ok"), "{operation}");
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_manual_sync_reports_stderr_and_recovers() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP failed_manual_sync_reports_stderr_and_recovers: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running manual-sync failure recovery UI smoke with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-failed-sync-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+             \n[sync]\nenabled = true\ntimeout_seconds = 5\n\
+             external_receive_enabled = true\nexternal_receive_on_startup = false\n\
+             external_receive_command = \"printf 'fetch diagnostic' >&2; exit 7\"\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+        ),
+    )?;
+
+    let token = format!("notm-failed-sync-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+
+    for attempt in 1..=2 {
+        let started = driver.command("run_manual_sync", json!({}))?;
+        assert_eq!(started["ok"], true, "attempt {attempt}: {started}");
+        assert_eq!(started["pending"], true, "attempt {attempt}: {started}");
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        let completed = loop {
+            let state = driver.command("app_state", json!({}))?;
+            if state["state"]["sync_in_progress"] == false {
+                break state;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "failed sync attempt {attempt} stayed pending: {state}\n{}",
+                app.logs()
+            );
+            thread::sleep(STARTUP_POLL_INTERVAL);
+        };
+        let error = completed["state"]["last_error"]
+            .as_str()
+            .with_context(|| format!("attempt {attempt} reported no sync error: {completed}"))?;
+        ensure!(error.contains("status=7"), "attempt {attempt}: {error}");
+        ensure!(
+            error.contains("stderr=fetch diagnostic"),
+            "attempt {attempt}: {error}"
+        );
+    }
+
+    let search = driver.command("run_search", json!({"query": "tag:inbox"}))?;
+    assert_eq!(
+        search["scheduled"], true,
+        "UI stayed blocked after sync: {search}"
+    );
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn closing_main_window_waits_for_manual_sync() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1362,7 +1509,7 @@ fn default_draft_recovery_migrates_clears_and_reports_autosave_failures() -> any
     fs::write(
         &config_path,
         format!(
-            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:notm-recovery-smoke-empty\"\n\
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
              \n[identity]\nname = \"Fixture User\"\nprimary_email = \"fixture@example.test\"\n\
              \n[drafts]\nsave_maildir = false\nindex_after_save = false\n",
             toml_path(&fixture.root),
@@ -1381,6 +1528,18 @@ fn default_draft_recovery_migrates_clears_and_reports_autosave_failures() -> any
     assert_eq!(
         recovered["state"]["compose_fields"]["body"], "Recovery body",
         "legacy cache draft body was not recovered: {recovered}"
+    );
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let recovery_confirmation = driver.command("pending_confirmation", json!({}))?;
+    assert_eq!(
+        recovery_confirmation["pending"],
+        Value::Null,
+        "startup message selection displaced a legitimate recovered draft: {recovery_confirmation}"
+    );
+    let recovered_after_search = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        recovered_after_search["state"]["compose_fields"]["subject"], "Recovered legacy draft",
+        "startup search replaced the recovered composer: {recovered_after_search}"
     );
     ensure!(
         recovery_path.is_file() && !legacy_path.exists(),
@@ -1458,6 +1617,36 @@ fn default_draft_recovery_migrates_clears_and_reports_autosave_failures() -> any
         recovery_path.is_file(),
         "recovered autosave did not recreate persistent draft state"
     );
+
+    fs::remove_file(&recovery_path)?;
+    fs::create_dir(&recovery_path)?;
+    let saved_with_warning = driver.command("save_draft", json!({}))?;
+    assert_eq!(
+        saved_with_warning["ok"], true,
+        "recovery cleanup failure was reported as a failed durable save: {saved_with_warning}"
+    );
+    let saved_path = saved_with_warning["report"]["local_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("partial-success save had no saved path: {saved_with_warning}"))?;
+    ensure!(
+        saved_path.is_file(),
+        "recovery cleanup failure removed the durable saved draft"
+    );
+    ensure!(
+        saved_with_warning["report"]["recovery_cleanup_warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("could not remove recovery draft")),
+        "partial-success save did not expose its cleanup warning: {saved_with_warning}"
+    );
+    let warning_state = driver.command("app_state", json!({}))?;
+    ensure!(
+        warning_state["state"]["last_error"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("could not remove recovery draft")),
+        "partial-success save did not retain its cleanup warning: {warning_state}"
+    );
+    fs::remove_dir(&recovery_path)?;
 
     Ok(())
 }
@@ -1636,7 +1825,7 @@ fn fixture_saved_drafts_are_visible_activatable_and_delete_safely() -> anyhow::R
         .as_str()
         .map(PathBuf::from)
         .with_context(|| format!("draft-list state had no recovery path: {activated}"))?;
-    let recovery_bytes = fs::read(&recovery_path)?;
+    let recovery_bytes = read_optional_file(&recovery_path)?;
     let draft_dir = saved_path.parent().context("saved draft parent")?;
     fs::set_permissions(draft_dir, fs::Permissions::from_mode(0o555))?;
     let requested = driver.command("click_delete_selected_draft", json!({}))?;
@@ -1671,7 +1860,8 @@ fn fixture_saved_drafts_are_visible_activatable_and_delete_safely() -> anyhow::R
         "failed deletion cleared the active draft: {failed}"
     );
     ensure!(
-        fs::read(&saved_path)? == saved_bytes && fs::read(&recovery_path)? == recovery_bytes,
+        fs::read(&saved_path)? == saved_bytes
+            && read_optional_file(&recovery_path)? == recovery_bytes,
         "failed deletion changed persisted draft or recovery bytes"
     );
 
@@ -1707,6 +1897,483 @@ fn fixture_saved_drafts_are_visible_activatable_and_delete_safely() -> anyhow::R
     ensure!(
         !saved_path.exists(),
         "successful delete left {saved_path:?}"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn indexed_maildir_draft_refresh_stays_clean_during_message_navigation() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP indexed_maildir_draft_refresh_stays_clean_during_message_navigation: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running indexed Maildir draft refresh UI smoke with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-indexed-draft-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let draft_maildir = fixture.root.join("Drafts");
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+             \n[identity]\nname = \"Fixture Sender\"\nprimary_email = \"sender@example.test\"\n\
+             \n[drafts]\nsave_maildir = true\nmaildir = {}\ntags = [\"draft\"]\nindex_after_save = true\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+            toml_path(&draft_maildir),
+        ),
+    )?;
+
+    let token = format!("notm-indexed-draft-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    let startup = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let initial_generation = startup["state"]["search_generation"]
+        .as_u64()
+        .with_context(|| format!("startup state had no search generation: {startup}"))?;
+    ensure!(
+        json_array_at(&startup, &["state", "thread_list_items"])?.len() >= 2,
+        "indexed-draft navigation smoke needs at least two inbox threads: {startup}"
+    );
+    let initial_selection = driver.command("select_thread_by_index", json!({"index": 0}))?;
+    assert_eq!(
+        initial_selection["ok"], true,
+        "initial thread selection failed: {initial_selection}"
+    );
+
+    let opened = driver.command("open_compose", json!({}))?;
+    assert_eq!(opened["ok"], true, "composer did not open: {opened}");
+    for (command, value) in [
+        ("compose_set_from", "Fixture Sender <sender@example.test>"),
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Indexed draft refresh regression"),
+        (
+            "compose_set_body",
+            "Saving and indexing this draft must leave it clean and attached.",
+        ),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(response["ok"], true, "{command} failed: {response}");
+    }
+
+    let saved = driver.command("save_draft", json!({}))?;
+    assert_eq!(
+        saved["ok"], true,
+        "first indexed draft save failed: {saved}"
+    );
+    let saved_path = saved["report"]["maildir_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("indexed draft save had no Maildir path: {saved}"))?;
+    let saved_message_id = saved["report"]["indexed_message_id"]
+        .as_str()
+        .with_context(|| format!("draft save did not report an indexed Message-ID: {saved}"))?;
+    ensure!(
+        saved_path.starts_with(&draft_maildir) && saved_path.is_file(),
+        "indexed draft is not in the disposable Maildir: {}",
+        saved_path.display()
+    );
+    assert_eq!(saved["report"]["local_path"], Value::Null, "{saved}");
+    assert_eq!(
+        driver.command("health", json!({}))?["ok"],
+        true,
+        "application stopped after the first draft save"
+    );
+
+    let refresh_status = driver.command("search_status", json!({}))?;
+    let refresh_generation = refresh_status["generation"]
+        .as_u64()
+        .with_context(|| format!("draft refresh had no search generation: {refresh_status}"))?;
+    ensure!(
+        refresh_generation > initial_generation,
+        "indexed draft save did not schedule a search refresh: startup={initial_generation}, status={refresh_status}"
+    );
+    let refreshed = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    ensure!(
+        refreshed["state"]["full_search_outcome_generation"]
+            .as_u64()
+            .is_some_and(|generation| generation >= refresh_generation),
+        "post-index search refresh did not settle: {refreshed}"
+    );
+    assert_eq!(
+        refreshed["state"]["active_draft"]["path"],
+        saved_path.display().to_string(),
+        "post-index refresh silently detached the saved composer: {refreshed}"
+    );
+    assert_eq!(
+        refreshed["state"]["active_draft"]["message_id"], saved_message_id,
+        "post-index refresh changed the active draft identity: {refreshed}"
+    );
+    assert_eq!(
+        refreshed["state"]["active_draft"]["indexed"], true,
+        "Maildir draft was not retained as indexed: {refreshed}"
+    );
+    assert_eq!(
+        refreshed["state"]["active_draft"]["saved_fields"], refreshed["state"]["compose_fields"],
+        "post-index composer was dirty immediately after save: {refreshed}"
+    );
+
+    let query_options = notm_notmuch::QueryOptions {
+        excluded_tags: Vec::new(),
+        ..notm_notmuch::QueryOptions::default()
+    };
+    let indexed_count = fixture.open_readonly()?.count_messages(
+        &format!("id:{saved_message_id} and tag:draft"),
+        &query_options,
+    )?;
+    assert_eq!(
+        indexed_count, 1,
+        "saved Maildir draft was not indexed with its draft tag"
+    );
+
+    let resaved = driver.command("save_draft", json!({}))?;
+    assert_eq!(
+        resaved["ok"], true,
+        "repeated clean draft save failed: {resaved}"
+    );
+    assert_eq!(
+        resaved["report"]["maildir_path"],
+        saved_path.display().to_string(),
+        "repeated clean save created a different draft: {resaved}"
+    );
+    assert_eq!(
+        resaved["report"]["indexed_message_id"], saved_message_id,
+        "repeated clean save changed the draft Message-ID: {resaved}"
+    );
+    assert_eq!(
+        driver.command("health", json!({}))?["ok"],
+        true,
+        "application stopped after the repeated draft save"
+    );
+
+    let selected_other = driver.command("select_thread_by_index", json!({"index": 1}))?;
+    assert_eq!(
+        selected_other["ok"], true,
+        "clean saved draft prompted while selecting another message: {selected_other}"
+    );
+    let selected_again = driver.command("select_thread_by_index", json!({"index": 0}))?;
+    assert_eq!(
+        selected_again["ok"], true,
+        "first navigation left an unsaved-changes prompt behind: {selected_again}"
+    );
+    let reopened = driver.command("open_compose", json!({}))?;
+    assert_eq!(
+        reopened["ok"], true,
+        "second navigation left a stale hidden-composer prompt: {reopened}"
+    );
+    assert_eq!(
+        reopened["pending_confirmation"], false,
+        "opening a new composer found stale hidden draft changes: {reopened}"
+    );
+    assert_eq!(driver.command("health", json!({}))?["ok"], true);
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn indexed_maildir_saved_draft_restart_does_not_prompt_as_unsaved() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP indexed_maildir_saved_draft_restart_does_not_prompt_as_unsaved: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running indexed Maildir saved-draft restart UI smoke with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-draft-restart-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let draft_maildir = fixture.root.join("Drafts");
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+             \n[identity]\nname = \"Fixture Sender\"\nprimary_email = \"sender@example.test\"\n\
+             \n[drafts]\nsave_maildir = true\nmaildir = {}\ntags = [\"draft\"]\nindex_after_save = true\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+            toml_path(&draft_maildir),
+        ),
+    )?;
+
+    let token = format!("notm-draft-restart-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir.clone(), &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
+    for (command, value) in [
+        ("compose_set_from", "Fixture Sender <sender@example.test>"),
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Restarted indexed draft regression"),
+        (
+            "compose_set_body",
+            "A saved draft must not become unsaved recovery state after restart.",
+        ),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(response["ok"], true, "{command} failed: {response}");
+    }
+
+    let saved = driver.command("save_draft", json!({}))?;
+    assert_eq!(saved["ok"], true, "indexed draft save failed: {saved}");
+    let saved_path = saved["report"]["maildir_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("indexed draft save had no Maildir path: {saved}"))?;
+    let saved_message_id = saved["report"]["indexed_message_id"]
+        .as_str()
+        .with_context(|| format!("indexed draft save had no Message-ID: {saved}"))?
+        .to_string();
+    let recovery_path = work_dir.join("state/notm/draft.json");
+    ensure!(saved_path.is_file(), "saved draft file is missing");
+    ensure!(
+        !recovery_path.exists(),
+        "successful save left clean fields in transient recovery state at {}",
+        recovery_path.display()
+    );
+
+    let edited = driver.command(
+        "compose_set_body",
+        json!({"value": "A later edit must recreate transient recovery state."}),
+    )?;
+    assert_eq!(edited["ok"], true, "post-save edit failed: {edited}");
+    ensure!(
+        recovery_path.is_file(),
+        "a post-save edit did not recreate transient recovery state"
+    );
+    let reverted = driver.command(
+        "compose_set_body",
+        json!({"value": "A saved draft must not become unsaved recovery state after restart."}),
+    )?;
+    assert_eq!(reverted["ok"], true, "post-save revert failed: {reverted}");
+    ensure!(
+        !recovery_path.exists(),
+        "returning exactly to saved fields left transient recovery state"
+    );
+
+    let closed = driver.command("close_main_window", json!({}))?;
+    assert_eq!(
+        closed["ok"], true,
+        "clean saved draft blocked normal close: {closed}"
+    );
+    drop(driver);
+    let status = app.wait_for_exit(Duration::from_secs(3))?;
+    ensure!(
+        status.success(),
+        "first app process did not exit normally: {status}\n{}",
+        app.logs()
+    );
+    ensure!(
+        saved_path.is_file(),
+        "normal close deleted the saved draft at {}",
+        saved_path.display()
+    );
+    ensure!(
+        !recovery_path.exists(),
+        "normal close recreated recovery state for a clean saved draft at {}",
+        recovery_path.display()
+    );
+
+    // Preserve the first process's XDG state while replacing its private display and
+    // harness artifacts so the second process observes a genuine application restart.
+    drop(app.display.take());
+    for path in [&app.socket_path, &app.log_path] {
+        if path.exists() {
+            fs::remove_file(path)
+                .with_context(|| format!("removing first-run artifact {}", path.display()))?;
+        }
+    }
+    let display_dir = work_dir.join("gui-display");
+    if display_dir.exists() {
+        fs::remove_dir_all(&display_dir)
+            .with_context(|| format!("removing first-run display {}", display_dir.display()))?;
+    }
+
+    let restart_token = format!("notm-draft-restart-second-ui-{run_id}");
+    let mut restarted = FixtureApp::spawn_with_config(work_dir, &restart_token, &config_path)?;
+    let mut restarted_driver = restarted.connect(&restart_token)?;
+    restarted_driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let startup_deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let startup_state = restarted_driver.command("app_state", json!({}))?;
+        if startup_state["state"]["selected_thread"] != Value::Null {
+            break;
+        }
+        ensure!(
+            Instant::now() < startup_deadline,
+            "restart did not settle on its initial message: {startup_state}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+    // Let the search result's GTK selection callback finish before checking that a
+    // normal action remains available; a stale prompt blocks all harness mutations.
+    thread::sleep(Duration::from_secs(1));
+    let restart_state = restarted_driver.command("app_state", json!({}))?;
+    let drafts_search = restarted_driver.command("run_search", json!({"query": "tag:draft"}))?;
+    assert_eq!(
+        drafts_search["ok"],
+        true,
+        "an unchanged saved draft became an unsaved-composer prompt after restart: \
+         recovery_exists={}, state={restart_state}, action={drafts_search}",
+        recovery_path.exists()
+    );
+    let draft_search_result = restarted_driver.wait_for_search(STARTUP_TIMEOUT)?;
+    ensure!(
+        json_array_at(&draft_search_result, &["state", "thread_list_items"])?
+            .iter()
+            .any(|thread| thread["subject"] == "Restarted indexed draft regression"),
+        "saved indexed draft was not accessible through tag:draft after restart: {draft_search_result}"
+    );
+    let draft_open_deadline = Instant::now() + STARTUP_TIMEOUT;
+    let draft_result = loop {
+        let current = restarted_driver.command("app_state", json!({}))?;
+        if current["state"]["active_draft"]["path"] == saved_path.display().to_string() {
+            break current;
+        }
+        ensure!(
+            Instant::now() < draft_open_deadline,
+            "saved indexed draft search never opened its composer: {current}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+    assert_eq!(
+        draft_result["state"]["active_draft"]["path"],
+        saved_path.display().to_string(),
+        "opening the saved indexed draft did not restore its active context: {draft_result}"
+    );
+    assert_eq!(
+        draft_result["state"]["active_draft"]["message_id"], saved_message_id,
+        "opening the saved indexed draft changed its Message-ID: {draft_result}"
+    );
+    assert_eq!(
+        draft_result["state"]["compose_fields"]["subject"], "Restarted indexed draft regression",
+        "opening the saved indexed draft lost its fields: {draft_result}"
+    );
+    ensure!(
+        !recovery_path.exists(),
+        "opening a clean saved draft recreated transient recovery state at {}",
+        recovery_path.display()
+    );
+    let final_confirmation = restarted_driver.command("pending_confirmation", json!({}))?;
+    assert_eq!(
+        final_confirmation["pending"],
+        Value::Null,
+        "opening the persisted draft triggered an unsaved-composer warning: {final_confirmation}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn fixture_indexed_draft_delete_removes_row_without_missing_body() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_indexed_draft_delete_removes_row_without_missing_body: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running indexed-draft delete UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-indexed-draft-delete-ui-{run_id}"));
+    let token = format!("notm-indexed-draft-delete-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+
+    let search = driver.command("run_search", json!({"query": "tag:draft"}))?;
+    assert_eq!(search["ok"], true, "draft search failed: {search}");
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let open_deadline = Instant::now() + STARTUP_TIMEOUT;
+    let opened = loop {
+        let state = driver.command("app_state", json!({}))?;
+        if state["state"]["active_draft"]["indexed"] == true {
+            break state;
+        }
+        ensure!(
+            Instant::now() < open_deadline,
+            "fixture indexed draft did not open: {state}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+    let draft_path = opened["state"]["active_draft"]["path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("opened indexed draft had no path: {opened}"))?;
+    let message_id = opened["state"]["active_draft"]["message_id"]
+        .as_str()
+        .with_context(|| format!("opened indexed draft had no Message-ID: {opened}"))?
+        .to_string();
+    let thread_id = opened["state"]["selected_thread"]["thread_id"]
+        .as_str()
+        .with_context(|| format!("opened indexed draft had no thread ID: {opened}"))?
+        .to_string();
+    assert_eq!(
+        opened["state"]["selected_message"]["message_id"], message_id,
+        "active draft and selected message identities diverged: {opened}"
+    );
+    ensure!(
+        draft_path.is_file(),
+        "fixture indexed draft file is missing"
+    );
+
+    let delete = driver.command("delete_active_draft", json!({}))?;
+    assert_eq!(
+        delete["pending_confirmation"], true,
+        "indexed draft delete did not request confirmation: {delete}"
+    );
+    let delete_id = pending_confirmation_id(&mut driver, "delete_active_draft")?;
+    let deleted = driver.command(
+        "respond_confirmation",
+        json!({"response": "accept", "id": delete_id}),
+    )?;
+    assert_eq!(
+        deleted["ok"], true,
+        "indexed draft delete failed: {deleted}"
+    );
+    let immediate_view = driver.command("message_view_text", json!({}))?;
+    let rendered_missing_body = immediate_view["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("Could not parse body"));
+    let immediate_state = driver.command("app_state", json!({}))?;
+    let deleted_row_still_present =
+        json_array_at(&immediate_state, &["state", "thread_list_items"])?
+            .iter()
+            .any(|thread| thread["thread_id"] == thread_id);
+
+    let refreshed = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    ensure!(
+        !json_array_at(&refreshed, &["state", "thread_list_items"])?
+            .iter()
+            .any(|thread| thread["thread_id"] == thread_id),
+        "deleted indexed draft remained in the message list: {refreshed}"
+    );
+    ensure!(
+        !draft_path.exists(),
+        "indexed draft file survived confirmed local deletion"
+    );
+    let final_view = driver.command("message_view_text", json!({}))?;
+    ensure!(
+        !deleted_row_still_present,
+        "deleted draft remained in the message list while results reloaded: {immediate_state}"
+    );
+    ensure!(
+        !rendered_missing_body,
+        "deleting the selected draft rendered its now-missing file: {immediate_view}"
+    );
+    ensure!(
+        final_view["text"].as_str().is_none_or(str::is_empty),
+        "empty draft results retained stale message text: {final_view}"
     );
 
     Ok(())
@@ -2324,7 +2991,7 @@ fn fixture_existing_instance_message_id_request_reaches_primary() -> anyhow::Res
     let run_id = unique_run_id()?;
     let work_dir = std::env::temp_dir().join(format!("notm-message-id-remote-ui-{run_id}"));
     let token = format!("notm-message-id-remote-ui-{run_id}");
-    let application_id = format!("dev.notm.Notm.Test.r{}", run_id.replace('-', ""));
+    let application_id = format!("io.github.kris004.notm.test.r{}", run_id.replace('-', ""));
     let target = "thread-root-three-message@fixture.test";
     let mut app = FixtureApp::spawn_with_application_id(work_dir, &token, &application_id)?;
     let mut driver = app.connect(&token)?;
@@ -3027,18 +3694,37 @@ fn fixture_message_and_sender_views_persist_with_message_precedence() -> anyhow:
     ensure!(
         before_sender["sender_button"]["label"]
             .as_str()
-            .is_some_and(|label| label.contains("Always show this sender as Raw source")),
+            .is_some_and(|label| label == "Always: Raw source (V a)"),
         "sender button did not describe the selected view: {before_sender}"
     );
-    let sender_set = driver.command("click_sender_view_preference", json!({}))?;
-    assert_eq!(sender_set["ok"], true, "{sender_set}");
     assert_eq!(
-        sender_set["sender_button_was_visible"], true,
-        "sender action was not rendered in the open View menu: {sender_set}"
+        before_sender["sender_button"]["active"], false,
+        "unset sender rule was styled as active: {before_sender}"
     );
+    let view_prefix = driver.command("send_key", json!({"key": "v", "modifiers": ["shift"]}))?;
+    assert_eq!(
+        view_prefix["handled"], true,
+        "physical Shift+V did not open the View shortcut namespace: {view_prefix}"
+    );
+    ensure!(
+        view_prefix["status_text"]
+            .as_str()
+            .is_some_and(|status| status.contains("a sender default")),
+        "View shortcut prompt omitted the sender-default action: {view_prefix}"
+    );
+    let sender_key = driver.command("send_key", json!({"key": "a"}))?;
+    assert_eq!(
+        sender_key["handled"], true,
+        "V a did not toggle the sender default: {sender_key}"
+    );
+    let sender_set = driver.command("view_preference_state", json!({}))?;
     assert_eq!(
         sender_set["sender_view_preferences"]["fixture@example.test"], "raw_source",
         "{sender_set}"
+    );
+    assert_eq!(
+        sender_set["sender_button"]["active"], true,
+        "enabled sender rule was not styled as active: {sender_set}"
     );
     fs::copy(fixture_app_config_path(&mut driver)?, &config_path)?;
     drop(driver);
@@ -3069,8 +3755,12 @@ fn fixture_message_and_sender_views_persist_with_message_precedence() -> anyhow:
     ensure!(
         sender_restored["sender_button"]["label"]
             .as_str()
-            .is_some_and(|label| label.contains("Stop always showing this sender as Raw source")),
+            .is_some_and(|label| label == "Always: Raw source (V a)"),
         "restored sender rule was not reflected in the View menu: {sender_restored}"
+    );
+    assert_eq!(
+        sender_restored["sender_button"]["active"], true,
+        "restored sender rule was not styled as active: {sender_restored}"
     );
 
     let headers = driver.command("show_full_headers", json!({}))?;
@@ -3623,7 +4313,10 @@ fn closing_main_window_waits_for_send_finalization() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .with_context(|| format!("saved draft had no local path: {saved}"))?;
     let recovery_path = work_dir.join("state/notm/draft.json");
-    ensure!(saved_draft_path.is_file() && recovery_path.is_file());
+    ensure!(
+        saved_draft_path.is_file() && !recovery_path.exists(),
+        "clean saved draft retained transient recovery state"
+    );
 
     let started = driver.command("compose_send", json!({}))?;
     assert_eq!(
@@ -3648,8 +4341,8 @@ fn closing_main_window_waits_for_send_finalization() -> anyhow::Result<()> {
         "slow transport completed unexpectedly early"
     );
     ensure!(
-        saved_draft_path.is_file() && recovery_path.is_file(),
-        "draft cleanup ran before the transport accepted the message"
+        saved_draft_path.is_file() && !recovery_path.exists(),
+        "draft source or clean recovery state changed before transport acceptance"
     );
 
     let status = app.wait_for_exit(Duration::from_secs(8))?;
@@ -3720,7 +4413,7 @@ fn reactivating_during_send_reuses_the_pending_window_session() -> anyhow::Resul
     )?;
 
     let token = format!("notm-send-reactivate-ui-{run_id}");
-    let application_id = format!("dev.notm.Notm.Test.r{}", run_id.replace('-', ""));
+    let application_id = format!("io.github.kris004.notm.test.r{}", run_id.replace('-', ""));
     let mut app = FixtureApp::spawn_with_config_and_application_id(
         work_dir,
         &token,
@@ -3864,7 +4557,10 @@ fn accepted_send_aggregates_cleanup_failures_and_preserves_recovery() -> anyhow:
     assert_eq!(started["pending"], false);
     accept_send_confirmation(&mut driver)?;
     let recovery_path = work_dir.join("state/notm/draft.json");
-    fs::remove_file(&recovery_path)?;
+    ensure!(
+        !recovery_path.exists(),
+        "clean saved draft unexpectedly retained recovery state"
+    );
     fs::create_dir(&recovery_path)?;
 
     let send = driver.wait_for_send(Duration::from_secs(8));

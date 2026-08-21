@@ -52,7 +52,9 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Command::ProbeSend => {
-            let cfg = config::load(cli.config)?;
+            // Probing a send helper does not need to discover or read a live
+            // Notmuch configuration or database.
+            let cfg = config::load_app_config(cli.config)?;
             let transport = external_transport(&cfg)?;
             let rt = tokio::runtime::Runtime::new()?;
             let report = rt.block_on(transport.probe())?;
@@ -75,6 +77,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
 fn launch_options(cfg: &config::AppConfig, app_config_path: Option<PathBuf>) -> LaunchOptions {
     LaunchOptions {
         database_path: cfg.notmuch.database_path.clone(),
+        mail_root: cfg.notmuch.resolved_mail_root.clone(),
         config_path: cfg.notmuch.config_path.clone(),
         profile: cfg.notmuch.profile.clone(),
         default_query: cfg.notmuch.default_query.clone(),
@@ -107,6 +110,7 @@ fn launch_options(cfg: &config::AppConfig, app_config_path: Option<PathBuf>) -> 
         index_draft_after_save: cfg.drafts.index_after_save,
         sync_enabled: cfg.sync.enabled,
         manual_sync_label: cfg.sync.manual_action_label.clone(),
+        sync_timeout_seconds: cfg.sync.timeout_seconds,
         notmuch_database_update_enabled: cfg.sync.notmuch_database_update_enabled,
         notmuch_database_update_on_startup: cfg.sync.notmuch_database_update_on_startup,
         notmuch_database_update_command: cfg.sync.notmuch_database_update_command.clone(),
@@ -159,6 +163,7 @@ fn apply_fixture_mode(options: &mut LaunchOptions, fixture: &notm_test_support::
     let identity = notm_notmuch::config::parse_notmuch_config_identity(&fixture.config_path);
     options.fixture_mode = true;
     options.database_path = Some(fixture.root.clone());
+    options.mail_root = Some(fixture.root.clone());
     options.config_path = Some(fixture.config_path.clone());
     options.profile = None;
     options.default_query = "tag:inbox".to_string();

@@ -1,4 +1,4 @@
-.TH NOTM 1 "2026-06-26" "notm 0.1.0" "User Commands"
+.TH NOTM 1 "2026-08-19" "notm 0.1.0" "User Commands"
 .SH NAME
 notm \- native GTK4 client for Notmuch mail stores
 .SH SYNOPSIS
@@ -25,8 +25,8 @@ command-line client.
 .BI --config " path"
 Read configuration from
 .I path
-instead of the default
-.IR ~/.config/notm/config.toml .
+instead of the default application configuration described under
+.BR FILES .
 .SH NORMAL OPERATION
 .TP
 .B launch
@@ -49,7 +49,8 @@ for deliberate private local inspection.
 .TP
 .B probe-send
 Probe the configured external send transport without sending mail.  This is a
-safe way to check send-command configuration.
+safe way to check send-command configuration and does not load a Notmuch
+database.
 .SH TESTING AND DEBUGGING
 These commands and flags are for development, smoke testing, or automated
 validation.  They are not needed for normal mail use.
@@ -76,15 +77,19 @@ wait briefly for it to appear in Notmuch.  This sends real mail and does not
 force sync.
 .SH FILES
 .TP
-.I ~/.config/notm/config.toml
+.I ${XDG_CONFIG_HOME:-$HOME/.config}/notm/config.toml
 Default application configuration.
 .TP
-.I $XDG_CONFIG_HOME/notmuch/default/config
-Preferred Notmuch configuration discovery path when no explicit Notmuch config
-is set.
+.I ${XDG_STATE_HOME:-$HOME/.local/state}/notm/
+Private composer recovery, local named drafts, cached compose attachments, and
+tag-undo history.
 .TP
-.I ~/.notmuch-config
-Fallback Notmuch configuration discovery path.
+.I Notmuch configuration and database
+Explicit notm fields take precedence; otherwise libnotmuch uses the standard
+.BR NOTMUCH_CONFIG ,
+.BR NOTMUCH_DATABASE ,
+.B NOTMUCH_PROFILE,
+XDG, profile, and legacy discovery rules.
 .SH SAFETY
 .B notm
 does not run startup sync or automatic
@@ -100,6 +105,9 @@ command-specific
 .B *_on_startup
 flag is also true.  Eligible receive and database-update commands run in that
 order.  After the selected commands succeed, the current search is refreshed.
+Each command runs as
+.B sh -c
+with a configurable timeout and the selected Notmuch context in its environment.
 Fixture mode never runs configured external sync commands.  Archive, trash,
 and spam are tag operations; they do not delete ordinary message files.
 .SH SEE ALSO

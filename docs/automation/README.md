@@ -1,9 +1,5 @@
 # Developer test harness
 
-This document lives under `docs/automation/` for historical reasons: older
-flags, config keys, and internal module names used the word "automation". The
-current user-facing name is **developer test harness**.
-
 This is not mail automation, filtering, or rules support. It is a local
 UI-driving test harness for developers and automated checks working on `notm`.
 
@@ -51,6 +47,9 @@ rejected for non-fixture runs.
 ## Safety boundaries
 
 - Keep the harness socket local-only. Do not expose it outside the user session.
+- The default is a mode-0600 per-process socket under an absolute
+  `$XDG_RUNTIME_DIR`, with `/tmp` as a fallback. Existing regular files,
+  symlinks, and active sockets are not replaced.
 - Always use a token for non-fixture runs.
 - Prefer fixture runs before live mailbox runs.
 - Fixture mode never runs configured receive/database-update commands or an

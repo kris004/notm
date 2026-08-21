@@ -47,15 +47,18 @@ as the current user, and it treats message content as untrusted input.
   message files. Deleting a locally saved draft is a separate, explicit action.
 - Sending and synchronization are delegated to user-configured programs. Those
   programs run with the user's permissions and must be treated as trusted local
-  configuration.
+  configuration. Helper output is bounded, and timed-out helpers are terminated
+  and reaped.
 - Attachment saving and opening are user-initiated. Opened attachments are
   passed to the desktop's configured application.
-- Draft recovery and saved drafts are stored locally. Optional sent-mail saving
-  and indexing are disabled unless configured.
+- Draft recovery and saved drafts are stored locally. On Unix, notm-created
+  state directories and private message/configuration files are restricted to
+  the user. Optional sent-mail saving and indexing are disabled unless
+  configured.
 - The developer test harness is disabled by default. When enabled, it uses a
-  local Unix-domain socket and a token, and its live send/tag operations have
-  additional opt-in gates. It is intended for a controlled user session, not as
-  a service exposed to other users or hosts.
+  owner-only local Unix-domain socket and a token, and its live send/tag
+  operations have additional opt-in gates. It is intended for a controlled
+  user session, not as a service exposed to other users or hosts.
 - Logs omit message bodies by default. `notm print-config` redacts command
   arguments, environment values, sync commands, and harness tokens unless the
   user explicitly asks to show them.

@@ -2,7 +2,10 @@ use std::{
     cell::Cell,
     collections::{BTreeMap, BTreeSet},
     rc::Rc,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -350,6 +353,7 @@ pub(crate) fn reduce_search_error(error: anyhow::Error, has_threads: bool) -> Se
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SearchCacheKey {
+    cache_epoch: u64,
     database_path: String,
     database_uuid: String,
     database_revision: u64,
@@ -361,6 +365,7 @@ struct SearchCacheKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ThreadDetailCacheKey {
+    cache_epoch: u64,
     database_path: String,
     database_uuid: String,
     database_revision: u64,
@@ -371,6 +376,7 @@ static SEARCH_CACHE: OnceLock<Mutex<BoundedLruCache<SearchCacheKey, SearchData>>
 static THREAD_DETAIL_CACHE: OnceLock<
     Mutex<BoundedLruCache<ThreadDetailCacheKey, ThreadUiDetails>>,
 > = OnceLock::new();
+static CACHE_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 fn search_cache() -> &'static Mutex<BoundedLruCache<SearchCacheKey, SearchData>> {
     SEARCH_CACHE.get_or_init(|| Mutex::new(BoundedLruCache::new(SEARCH_PAGE_CACHE_CAPACITY)))
@@ -379,6 +385,15 @@ fn search_cache() -> &'static Mutex<BoundedLruCache<SearchCacheKey, SearchData>>
 fn thread_detail_cache() -> &'static Mutex<BoundedLruCache<ThreadDetailCacheKey, ThreadUiDetails>> {
     THREAD_DETAIL_CACHE
         .get_or_init(|| Mutex::new(BoundedLruCache::new(THREAD_DETAIL_CACHE_CAPACITY)))
+}
+
+pub(crate) fn invalidate_search_caches() {
+    CACHE_EPOCH.fetch_add(1, Ordering::AcqRel);
+    search_cache().lock().expect("search cache lock").clear();
+    thread_detail_cache()
+        .lock()
+        .expect("thread detail cache lock")
+        .clear();
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -872,6 +887,10 @@ pub(crate) fn execute_search_page(
     excluded_tags: Vec<String>,
 ) -> anyhow::Result<SearchData> {
     let limit = limit.max(1);
+    // Capture the epoch before opening the database. A mutation that commits
+    // afterward bumps the epoch, so this worker cannot publish its older
+    // snapshot under the post-mutation cache generation.
+    let cache_epoch = CACHE_EPOCH.load(Ordering::Acquire);
     let db = Database::open(open_config, DatabaseMode::ReadOnly)?;
     let revision = db.revision();
     let db_path = db.path();
@@ -882,6 +901,7 @@ pub(crate) fn execute_search_page(
         offset,
         limit,
         excluded_tags.clone(),
+        cache_epoch,
     );
     let cached = {
         let mut cache = search_cache().lock().expect("search cache lock");
@@ -903,7 +923,7 @@ pub(crate) fn execute_search_page(
     let count = db
         .count_threads(query, &options)
         .unwrap_or(threads.len() as u32);
-    let details = thread_details_for_threads(&db, &db_path, &revision, &threads);
+    let details = thread_details_for_threads(&db, &db_path, &revision, &threads, cache_epoch);
     let data = SearchData {
         query: query.to_string(),
         threads,
@@ -1336,10 +1356,11 @@ fn thread_details_for_threads(
     database_path: &str,
     revision: &Revision,
     threads: &[ThreadSummary],
+    cache_epoch: u64,
 ) -> BTreeMap<String, ThreadUiDetails> {
     let mut out = BTreeMap::new();
     for thread in threads {
-        let key = thread_detail_cache_key(database_path, revision, &thread.thread_id);
+        let key = thread_detail_cache_key(database_path, revision, &thread.thread_id, cache_epoch);
         let cached = {
             let mut cache = thread_detail_cache()
                 .lock()
@@ -1411,8 +1432,10 @@ fn search_cache_key(
     offset: usize,
     limit: usize,
     excluded_tags: Vec<String>,
+    cache_epoch: u64,
 ) -> SearchCacheKey {
     SearchCacheKey {
+        cache_epoch,
         database_path: db_path.to_string(),
         database_uuid: revision.uuid.clone(),
         database_revision: revision.revision,
@@ -1427,8 +1450,10 @@ fn thread_detail_cache_key(
     db_path: &str,
     revision: &Revision,
     thread_id: &str,
+    cache_epoch: u64,
 ) -> ThreadDetailCacheKey {
     ThreadDetailCacheKey {
+        cache_epoch,
         database_path: db_path.to_string(),
         database_uuid: revision.uuid.clone(),
         database_revision: revision.revision,
@@ -1439,6 +1464,7 @@ fn thread_detail_cache_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn test_revision(uuid: &str, revision: u64) -> Revision {
         Revision {
@@ -1626,8 +1652,21 @@ mod tests {
             25,
             25,
             vec!["a,b".to_string(), "c".to_string()],
+            0,
         );
         let variants = [
+            (
+                "cache epoch",
+                search_cache_key(
+                    "tag:inbox",
+                    "/mail/a",
+                    &base_revision,
+                    25,
+                    25,
+                    vec!["a,b".to_string(), "c".to_string()],
+                    1,
+                ),
+            ),
             (
                 "path",
                 search_cache_key(
@@ -1637,6 +1676,7 @@ mod tests {
                     25,
                     25,
                     vec!["a,b".to_string(), "c".to_string()],
+                    0,
                 ),
             ),
             (
@@ -1648,6 +1688,7 @@ mod tests {
                     25,
                     25,
                     vec!["a,b".to_string(), "c".to_string()],
+                    0,
                 ),
             ),
             (
@@ -1659,6 +1700,7 @@ mod tests {
                     25,
                     25,
                     vec!["a,b".to_string(), "c".to_string()],
+                    0,
                 ),
             ),
             (
@@ -1670,6 +1712,7 @@ mod tests {
                     25,
                     25,
                     vec!["a,b".to_string(), "c".to_string()],
+                    0,
                 ),
             ),
             (
@@ -1681,6 +1724,7 @@ mod tests {
                     50,
                     25,
                     vec!["a,b".to_string(), "c".to_string()],
+                    0,
                 ),
             ),
             (
@@ -1692,6 +1736,7 @@ mod tests {
                     25,
                     50,
                     vec!["a,b".to_string(), "c".to_string()],
+                    0,
                 ),
             ),
             (
@@ -1703,6 +1748,7 @@ mod tests {
                     25,
                     25,
                     vec!["a".to_string(), "b,c".to_string()],
+                    0,
                 ),
             ),
             (
@@ -1714,6 +1760,7 @@ mod tests {
                     25,
                     25,
                     vec!["c".to_string(), "a,b".to_string()],
+                    0,
                 ),
             ),
         ];
@@ -1734,23 +1781,27 @@ mod tests {
     #[test]
     fn thread_detail_cache_key_isolates_path_uuid_revision_and_thread() {
         let base_revision = test_revision("database-a", 7);
-        let base = thread_detail_cache_key("/mail/a", &base_revision, "thread-a");
+        let base = thread_detail_cache_key("/mail/a", &base_revision, "thread-a", 0);
         let variants = [
             (
+                "cache epoch",
+                thread_detail_cache_key("/mail/a", &base_revision, "thread-a", 1),
+            ),
+            (
                 "path",
-                thread_detail_cache_key("/mail/b", &base_revision, "thread-a"),
+                thread_detail_cache_key("/mail/b", &base_revision, "thread-a", 0),
             ),
             (
                 "UUID",
-                thread_detail_cache_key("/mail/a", &test_revision("database-b", 7), "thread-a"),
+                thread_detail_cache_key("/mail/a", &test_revision("database-b", 7), "thread-a", 0),
             ),
             (
                 "revision",
-                thread_detail_cache_key("/mail/a", &test_revision("database-a", 8), "thread-a"),
+                thread_detail_cache_key("/mail/a", &test_revision("database-a", 8), "thread-a", 0),
             ),
             (
                 "thread ID",
-                thread_detail_cache_key("/mail/a", &base_revision, "thread-b"),
+                thread_detail_cache_key("/mail/a", &base_revision, "thread-b", 0),
             ),
         ];
         let mut cache = BoundedLruCache::new(variants.len() + 1);
@@ -1777,6 +1828,7 @@ mod tests {
                 0,
                 25,
                 vec!["deleted".to_string()],
+                0,
             )
         };
         let old = make_key(1);
@@ -1796,6 +1848,66 @@ mod tests {
     }
 
     #[test]
+    fn invalidated_search_does_not_return_a_removed_newly_indexed_message() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("mail");
+        let maildir = root.join("Drafts/cur");
+        fs::create_dir_all(&maildir)?;
+        let config_path = temp.path().join("notmuch-config");
+        fs::write(
+            &config_path,
+            format!(
+                "[database]\npath={}\n\n[user]\nname=Fixture User\nprimary_email=fixture@example.test\n",
+                root.display()
+            ),
+        )?;
+        let open_config = OpenConfig {
+            database_path: Some(root),
+            config_path: Some(config_path),
+            profile: None,
+        };
+        let db = Database::create(&open_config)?;
+        let message_id = format!("{}@fixture.test", uuid::Uuid::new_v4());
+        let path = maildir.join("newly-indexed:2,D");
+        fs::write(
+            &path,
+            format!(
+                "From: Fixture User <fixture@example.test>\nTo: recipient@example.test\nSubject: Cached removal regression\nMessage-ID: <{message_id}>\nDate: Tue, 19 Aug 2026 12:00:00 -0600\n\nDraft body.\n"
+            ),
+        )?;
+        db.index_file_with_tags(&path, &["draft"])?;
+        let retained_path = maildir.join("retained:2,S");
+        fs::write(
+            &retained_path,
+            format!(
+                "From: Fixture User <fixture@example.test>\nTo: recipient@example.test\nSubject: Retained message\nMessage-ID: <{}@fixture.test>\nDate: Tue, 19 Aug 2026 12:01:00 -0600\n\nRetained body.\n",
+                uuid::Uuid::new_v4()
+            ),
+        )?;
+        db.index_file_with_tags(&retained_path, &["inbox"])?;
+        drop(db);
+
+        let first = execute_search_page(&open_config, "tag:draft", 0, 100, Vec::new())?;
+        assert_eq!(first.threads.len(), 1);
+        assert!(!first.cached);
+
+        let db = Database::open(&open_config, DatabaseMode::ReadWrite)?;
+        db.remove_message_file(&path)?;
+        drop(db);
+        fs::remove_file(&path)?;
+        invalidate_search_caches();
+
+        let second = execute_search_page(&open_config, "tag:draft", 0, 100, Vec::new())?;
+        assert!(
+            second.threads.is_empty(),
+            "removed draft was returned after cache invalidation; result revision={:?}, cached={}",
+            second.revision,
+            second.cached
+        );
+        Ok(())
+    }
+
+    #[test]
     fn typed_search_cache_enforces_named_capacity_and_lru() {
         let revision = test_revision("database-a", 7);
         let keys = (0..SEARCH_PAGE_CACHE_CAPACITY)
@@ -1807,6 +1919,7 @@ mod tests {
                     offset,
                     1,
                     vec!["deleted".to_string()],
+                    0,
                 )
             })
             .collect::<Vec<_>>();
@@ -1827,6 +1940,7 @@ mod tests {
             0,
             1,
             vec!["deleted".to_string()],
+            0,
         );
         cache.insert(new_generation.clone(), 1_000);
 
@@ -1841,7 +1955,9 @@ mod tests {
     fn typed_thread_detail_cache_enforces_named_capacity_and_lru() {
         let revision = test_revision("database-a", 7);
         let keys = (0..THREAD_DETAIL_CACHE_CAPACITY)
-            .map(|index| thread_detail_cache_key("/mail/a", &revision, &format!("thread-{index}")))
+            .map(|index| {
+                thread_detail_cache_key("/mail/a", &revision, &format!("thread-{index}"), 0)
+            })
             .collect::<Vec<_>>();
         let mut cache = BoundedLruCache::new(THREAD_DETAIL_CACHE_CAPACITY);
         for (value, key) in keys.iter().cloned().enumerate() {
@@ -1852,7 +1968,7 @@ mod tests {
 
         assert_eq!(cache.get(&keys[0]), Some(&0));
         let new_generation =
-            thread_detail_cache_key("/mail/a", &test_revision("database-b", 8), "thread-0");
+            thread_detail_cache_key("/mail/a", &test_revision("database-b", 8), "thread-0", 0);
         cache.insert(new_generation.clone(), 10_000);
 
         assert_eq!(cache.len(), THREAD_DETAIL_CACHE_CAPACITY);

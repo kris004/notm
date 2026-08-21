@@ -1,4 +1,4 @@
-.TH NOTM-TEST-HARNESS 7 "2026-08-09" "notm 0.1.0" "Miscellaneous"
+.TH NOTM-TEST-HARNESS 7 "2026-08-19" "notm 0.1.0" "Miscellaneous"
 .SH NAME
 notm-test-harness \- developer test harness for notm
 .SH DESCRIPTION
@@ -313,7 +313,7 @@ defaults to the current pending action and protects against responding to a
 different dialog.  For example:
 .PP
 .nf
-{"command":"respond_confirmation","args":{"id":1,"response":"reject"}}
+{"token":"dev-token","command":"respond_confirmation","args":{"id":1,"response":"reject"}}
 .fi
 .PP
 The command emits the real GTK dialog response rather than calling the action
@@ -345,7 +345,7 @@ reports the pending chooser identifier, sanitized suggested name, visibility,
 private Open directory, and fake-opener calls.  A test can then send:
 .PP
 .nf
-{"command":"respond_attachment_save","args":{"id":1,"response":"accept","path":"/full/target"}}
+{"token":"dev-token","command":"respond_attachment_save","args":{"id":1,"response":"accept","path":"/full/target"}}
 .fi
 .PP
 or use
@@ -390,7 +390,7 @@ or
 For example:
 .PP
 .nf
-{"command":"respond_settings","args":{"response":"apply","theme":"dark","thread_preview_lines":3,"show_thread_preview":true}}
+{"token":"dev-token","command":"respond_settings","args":{"response":"apply","theme":"dark","thread_preview_lines":3,"show_thread_preview":true}}
 .fi
 .PP
 Invalid theme or preview values leave the dialog open and change neither
@@ -427,6 +427,13 @@ both are intentionally outside the send/tag gates.  The explicit attachment
 bypass writes to the requested directory and should be used only when that
 local change is intended.
 .SH FILES
+.TP
+.I $XDG_RUNTIME_DIR/notm-PID.sock
+Default per-process socket when
+.B XDG_RUNTIME_DIR
+is absolute.  Otherwise notm falls back to the system temporary directory.
+The socket is created with mode 0600 on Unix; existing regular files, symlinks,
+and active sockets are never replaced.
 .TP
 .I artifacts/screenshots/
 Default screenshot output directory for test-harness screenshots.

@@ -14,12 +14,10 @@ fn main() {
         }
         Err(err) => {
             eprintln!(
-                "notm-notmuch: pkg-config notmuch failed: {err}; falling back to system header/library"
+                "notm-notmuch: pkg-config notmuch failed: {err}; falling back to the compiler and linker's default system search paths"
             );
             println!("cargo:rustc-link-lib=notmuch");
-            println!("cargo:rustc-link-search=native=/usr/lib64");
             println!("cargo:rustc-env=NOTM_NOTMUCH_LINK_MODE=fallback-system");
-            clang_args.push("-I/usr/include".to_string());
         }
     }
 

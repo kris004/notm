@@ -42,7 +42,21 @@ mod unix {
 
     fn run_probe(config: &Path, path: Option<std::ffi::OsString>) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_notm"));
-        command.arg("--config").arg(config).arg("probe-send");
+        command
+            .arg("--config")
+            .arg(config)
+            .arg("probe-send")
+            // A send probe must not depend on—or even try to load—the
+            // invoking account's Notmuch selection.
+            .env(
+                "NOTMUCH_CONFIG",
+                config.with_file_name("missing-notmuch-config"),
+            )
+            .env(
+                "NOTMUCH_DATABASE",
+                config.with_file_name("missing-notmuch-database"),
+            )
+            .env("NOTMUCH_PROFILE", "unavailable-probe-profile");
         if let Some(path) = path {
             command.env("PATH", path);
         }

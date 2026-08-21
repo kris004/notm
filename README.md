@@ -50,8 +50,8 @@ The supported build target is Linux. Building requires:
 - a current stable Rust toolchain;
 - GTK 4.12 or newer;
 - GtkSourceView 5.4 or newer;
-- WebKitGTK 6;
-- `libnotmuch` and its development headers;
+- WebKitGTK 2.40 or newer with the 6.0 API;
+- Notmuch 0.38 or newer, including `libnotmuch` development headers;
 - `pkg-config`, Clang/libclang, and a C toolchain.
 
 On Ubuntu 24.04, the native dependencies used by CI can be installed with:
@@ -97,9 +97,9 @@ user identity, start with:
 notm launch
 ```
 
-`notm` looks for Notmuch configuration at
-`$XDG_CONFIG_HOME/notmuch/default/config` and then `~/.notmuch-config`. Its own
-optional configuration lives at `~/.config/notm/config.toml`.
+`notm` follows Notmuch's standard configuration, profile, and environment
+discovery. Its own optional configuration lives at
+`${XDG_CONFIG_HOME:-$HOME/.config}/notm/config.toml`.
 
 A small explicit configuration looks like this:
 
@@ -121,9 +121,11 @@ Use `notm print-config` to inspect the effective configuration. Sensitive
 command arguments, environment values, test-harness tokens, and sync commands
 are redacted unless `--show-secrets` is explicitly requested.
 
-The complete reference is in [`notm-config(5)`](docs/man/notm-config.5). See
-[Sending mail](docs/send-transport.md) for transport examples and failure
-behavior.
+See [Configuration](docs/configuration.md) for discovery rules and examples,
+[Sending mail](docs/send-transport.md) for transport behavior, and
+[Synchronization](docs/sync.md) for the optional receive/database-update
+commands. The installed `notm-config(5)` manual is the exhaustive reference for
+that build.
 
 ## Keyboard basics
 
@@ -135,6 +137,8 @@ Press `?` in the application for searchable shortcut help. A few useful keys:
 - `Ctrl+e`/`Ctrl+y` scroll the message-list viewport down or up one line without
   changing which message is selected.
 - `h`/`l` move between panes; `Ctrl+1`, `Ctrl+2`, and `Ctrl+3` toggle them.
+- `g i`, `g u`, `g f`, `g s`, `g d`, `g t`, and `g a` open Inbox, Unread,
+  Flagged, Sent, Drafts, Trash, and All Mail.
 - `a`, `t`, `s`, `u`, and `f` archive, trash, spam, mark read/unread, and flag.
 - `M` opens actions that tag only the currently displayed message. Follow it
   with `a`, `t`, `s`, `u`, or `f` to mirror the corresponding thread action;
@@ -144,12 +148,13 @@ Press `?` in the application for searchable shortcut help. A few useful keys:
   as an attachment.
 - `F` labels every visible link in an HTML message; type a displayed label to
   open that link externally. `Esc` cancels the link-hint mode.
-- `c` composes, `Ctrl+Enter` sends, and `S` saves a draft.
+- `c` composes. In the composer, `A` adds an attachment, `S` saves the draft,
+  `x` discards it, `D` deletes an opened local draft, and `Ctrl+Enter` sends.
 
 Choosing Text, Visual HTML, Full headers, or Raw source remembers that view for
 the current Message-ID. The View menu can also make the currently selected view
-the default for that sender; a per-message choice takes precedence, and the
-same button removes a matching sender default.
+the default for that sender with `V a`; a per-message choice takes precedence,
+and the same action removes a matching sender default.
 
 ## Security and privacy
 
@@ -162,10 +167,33 @@ Email is untrusted input, and sanitization is not a substitute for keeping GTK,
 WebKitGTK, Notmuch, and `notm` updated. Read the [security policy](SECURITY.md)
 before reporting a vulnerability.
 
+## Current limitations
+
+- Linux is the only supported platform, and releases do not yet include binary
+  packages.
+- Account setup, mail retrieval, and SMTP are intentionally delegated to
+  Notmuch, Maildir tools, and user-configured helper commands.
+- The project has no formal minimum supported Rust version yet; CI tracks the
+  current stable toolchain.
+
+## Troubleshooting
+
+- Run `notm print-config` to confirm the effective database, profile, identity,
+  and feature gates without exposing secret-bearing values.
+- Run `notm probe-send` to validate a configured send helper without submitting
+  a message.
+- Start with `RUST_LOG=notm=debug notm launch` for diagnostic logging. Remove
+  private mail, paths, and command values before sharing logs.
+- For reproducible reports, use the synthetic fixture and checks in
+  [Testing](docs/testing.md).
+
 ## Documentation
 
 - [`notm(1)`](docs/man/notm.1) — commands and normal operation.
-- [`notm-config(5)`](docs/man/notm-config.5) — configuration reference.
+- [Configuration](docs/configuration.md) — setup, discovery, and option guide.
+- [Sending mail](docs/send-transport.md) — external transport behavior.
+- [Synchronization](docs/sync.md) — optional receive and index-update commands.
+- [`notm-config(5)`](docs/man/notm-config.5) — exhaustive installed reference.
 - [Architecture](docs/architecture.md) — crate layout and runtime model.
 - [Testing](docs/testing.md) — fixture, integration, and GTK smoke tests.
 - [Developer test harness](docs/automation/README.md) — local UI-driving API.

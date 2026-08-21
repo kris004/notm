@@ -11,7 +11,8 @@ body:
 
         Report security issues through [private vulnerability
         reporting](https://github.com/kris004/notm/security/advisories/new)
-        instead.
+        instead. If that form is unavailable, open an issue requesting a
+        private contact channel without including vulnerability details.
   - type: input
     id: version
     attributes:
@@ -27,7 +28,7 @@ body:
       description: >-
         Linux distribution, desktop/session, and relevant GTK, WebKitGTK, and
         Notmuch versions.
-      placeholder: Gentoo, Sway/Wayland, GTK 4.x, WebKitGTK 6.x, Notmuch 0.x
+      placeholder: Fedora, GNOME/Wayland, GTK 4.x, WebKitGTK 2.x, Notmuch 0.x
     validations:
       required: true
   - type: textarea

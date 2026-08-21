@@ -13,7 +13,9 @@ use gtk::glib::translate::IntoGlib;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use notm_mail::{
-    ComposedMessage, ReplyKind, build_reply,
+    ComposedMessage, ReplyKind,
+    address::{format_address, parse_address_list_checked, parse_one_checked},
+    build_reply,
     compose::{AttachmentInput, Identity},
     forward::{build_attachment_forward, build_inline_forward},
     mime::parse_file,
@@ -25,6 +27,9 @@ use uuid::Uuid;
 use crate::model::{ActiveDraft, ComposeFields};
 
 use super::attachments;
+
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
 const COMPOSE_BODY_MIN_HEIGHT: i32 = 96;
 const COMPOSE_BODY_NATURAL_HEIGHT: i32 = 260;
@@ -268,14 +273,19 @@ pub(crate) fn format_send_cleanup_issues(issues: &[SendCleanupIssue]) -> Option<
 pub(crate) fn composed_message_from_fields(
     fields: &ComposeFields,
 ) -> anyhow::Result<ComposedMessage> {
-    let mut message = ComposedMessage::new(
-        fields.from.clone(),
-        split_recipients(&fields.to),
-        fields.subject.clone(),
-        fields.body.clone(),
+    let from = parse_one_checked(&fields.from)
+        .map(|address| format_address(&address))
+        .map_err(|err| anyhow::anyhow!("invalid From address: {err}"))?;
+    let to = checked_recipient_field("To", &fields.to)?;
+    let cc = checked_recipient_field("Cc", &fields.cc)?;
+    let bcc = checked_recipient_field("Bcc", &fields.bcc)?;
+    anyhow::ensure!(
+        !to.is_empty() || !cc.is_empty() || !bcc.is_empty(),
+        "at least one To, Cc, or Bcc recipient is required"
     );
-    message.cc = split_recipients(&fields.cc);
-    message.bcc = split_recipients(&fields.bcc);
+    let mut message = ComposedMessage::new(from, to, fields.subject.clone(), fields.body.clone());
+    message.cc = cc;
+    message.bcc = bcc;
     message.in_reply_to = fields
         .in_reply_to
         .as_ref()
@@ -293,13 +303,10 @@ pub(crate) fn composed_message_from_fields(
     Ok(message)
 }
 
-fn split_recipients(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .collect()
+fn checked_recipient_field(label: &str, value: &str) -> anyhow::Result<Vec<String>> {
+    parse_address_list_checked(value)
+        .map(|addresses| addresses.iter().map(format_address).collect::<Vec<_>>())
+        .map_err(|err| anyhow::anyhow!("invalid {label} recipients: {err}"))
 }
 
 pub(crate) fn prepare_draft_fields_from_message_file(
@@ -556,23 +563,23 @@ fn xdg_home_path(
     fallback: &str,
 ) -> PathBuf {
     configured_home
-        .filter(|path| !path.is_empty())
+        .filter(|path| !path.is_empty() && Path::new(path).is_absolute())
         .map(PathBuf::from)
         .or_else(|| {
-            home.filter(|path| !path.is_empty())
+            home.filter(|path| !path.is_empty() && Path::new(path).is_absolute())
                 .map(|path| PathBuf::from(path).join(home_suffix))
         })
         .unwrap_or_else(|| PathBuf::from(fallback))
 }
 
-fn default_state_home() -> PathBuf {
+pub(crate) fn default_state_home() -> PathBuf {
     let configured_home = std::env::var_os("XDG_STATE_HOME");
     let home = std::env::var_os("HOME");
     xdg_home_path(
         configured_home.as_deref(),
         home.as_deref(),
         ".local/state",
-        "target/notm-state",
+        ".local/state",
     )
 }
 
@@ -583,7 +590,7 @@ fn legacy_default_cache_home() -> PathBuf {
         configured_home.as_deref(),
         home.as_deref(),
         ".cache",
-        "target/notm-cache",
+        ".cache",
     )
 }
 
@@ -641,21 +648,26 @@ pub(crate) fn atomic_write_durable(path: &Path, bytes: &[u8]) -> anyhow::Result<
 }
 
 fn atomic_write_with_sync(path: &Path, bytes: &[u8], sync_to_disk: bool) -> anyhow::Result<()> {
-    let parent = path
+    let configured_parent = path
         .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = configured_parent.unwrap_or_else(|| Path::new("."));
+    if let Some(parent) = configured_parent {
+        ensure_private_directory(parent)?;
+    }
     let filename = path
         .file_name()
         .and_then(OsStr::to_str)
         .unwrap_or("notm-state");
     let temporary_path = parent.join(format!(".{filename}.{}.tmp", Uuid::new_v4()));
     let write_result = (|| -> anyhow::Result<()> {
-        let mut temporary = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary_path)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut temporary = options.open(&temporary_path)?;
+        #[cfg(unix)]
+        temporary.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         temporary.write_all(bytes)?;
         if sync_to_disk {
             temporary.sync_all()?;
@@ -670,12 +682,25 @@ fn atomic_write_with_sync(path: &Path, bytes: &[u8], sync_to_disk: bool) -> anyh
     write_result.map_err(|err| anyhow::anyhow!("writing {} atomically: {err}", path.display()))
 }
 
+fn ensure_private_directory(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path)?;
+    Ok(())
+}
+
 pub(crate) fn save_named_draft_fields(
     dir: &Path,
     fields: &ComposeFields,
 ) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(fields_has_content(fields), "draft has no content");
-    std::fs::create_dir_all(dir)?;
+    ensure_private_directory(dir)?;
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
     let slug = widget_token(&fields.subject);
     let slug = if slug.is_empty() {
@@ -694,6 +719,8 @@ pub(crate) struct DraftSaveReport {
     pub(crate) maildir_path: Option<PathBuf>,
     pub(crate) indexed_message_id: Option<String>,
     pub(crate) replaced_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) recovery_cleanup_warning: Option<String>,
 }
 
 pub(crate) fn migrate_legacy_named_drafts(dir: &Path, legacy_dir: &Path) -> anyhow::Result<usize> {
@@ -710,7 +737,7 @@ pub(crate) fn migrate_legacy_named_drafts(dir: &Path, legacy_dir: &Path) -> anyh
             continue;
         }
         let bytes = std::fs::read(&legacy_path)?;
-        std::fs::create_dir_all(dir)?;
+        ensure_private_directory(dir)?;
         let filename = entry.file_name();
         let mut destination = dir.join(&filename);
         if destination.exists() {
@@ -1612,7 +1639,7 @@ impl ComposerController {
         self.move_cursor_to_start();
     }
 
-    pub(crate) fn reset_after_send(&self) -> ComposeFields {
+    pub(crate) fn reset_fields(&self) -> ComposeFields {
         let fields = ComposeFields {
             from: self.from.text().to_string(),
             ..ComposeFields::default()
@@ -2248,6 +2275,66 @@ mod tests {
     }
 
     #[test]
+    fn composed_message_validates_and_canonically_formats_mailboxes() {
+        let fields = ComposeFields {
+            from: r#""Doe, Alice" <alice@example.test>"#.to_string(),
+            to: r#""Smith, Bob" <bob@example.test>, carol@example.test"#.to_string(),
+            subject: "Address formatting".to_string(),
+            ..ComposeFields::default()
+        };
+
+        let message = composed_message_from_fields(&fields).expect("valid mailbox fields");
+
+        assert_eq!(message.from, r#""Doe, Alice" <alice@example.test>"#);
+        assert_eq!(
+            message.to,
+            [
+                r#""Smith, Bob" <bob@example.test>"#.to_string(),
+                "carol@example.test".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn composed_message_rejects_invalid_or_missing_mailboxes() {
+        let base = ComposeFields {
+            from: "sender@example.test".to_string(),
+            to: "recipient@example.test".to_string(),
+            ..ComposeFields::default()
+        };
+        for (fields, expected) in [
+            (
+                ComposeFields {
+                    from: "not-an-address".to_string(),
+                    ..base.clone()
+                },
+                "invalid From address",
+            ),
+            (
+                ComposeFields {
+                    to: "Valid <valid@example.test>, Bad <bad@>".to_string(),
+                    ..base.clone()
+                },
+                "invalid To recipients",
+            ),
+            (
+                ComposeFields {
+                    to: String::new(),
+                    ..base
+                },
+                "at least one To, Cc, or Bcc recipient",
+            ),
+        ] {
+            let error = composed_message_from_fields(&fields)
+                .expect_err("malformed composer addresses must not be sent");
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected error for {fields:?}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
     fn draft_fields_load_from_saved_rfc5322_message() {
         let path = std::env::temp_dir().join(format!("notm-draft-{}.eml", Uuid::new_v4()));
         let raw = "From: Me <me@example.test>\r\nTo: You <you@example.test>\r\nCc: Other <other@example.test>\r\nBcc: Hidden <hidden@example.test>\r\nSubject: Draft subject\r\nMessage-ID: <draft@example.test>\r\nIn-Reply-To: <parent@example.test>\r\nReferences: <root@example.test> <parent@example.test>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nDraft body.";
@@ -2276,7 +2363,7 @@ mod tests {
             Some(OsStr::new("/tmp/notm-xdg-state")),
             Some(OsStr::new("/tmp/notm-home")),
             ".local/state",
-            "target/notm-state",
+            ".local/state",
         );
         assert_eq!(state_home, PathBuf::from("/tmp/notm-xdg-state"));
         for (name, expected) in [
@@ -2297,28 +2384,99 @@ mod tests {
                 Some(OsStr::new("")),
                 Some(OsStr::new("/tmp/notm-home")),
                 ".local/state",
-                "target/notm-state",
+                ".local/state",
             ),
             PathBuf::from("/tmp/notm-home/.local/state")
+        );
+        assert_eq!(
+            xdg_home_path(
+                Some(OsStr::new("relative-state")),
+                Some(OsStr::new("/tmp/notm-home")),
+                ".local/state",
+                ".local/state",
+            ),
+            PathBuf::from("/tmp/notm-home/.local/state")
+        );
+        assert_eq!(
+            xdg_home_path(None, None, ".local/state", ".local/state"),
+            PathBuf::from(".local/state")
         );
     }
 
     #[test]
     fn atomic_state_write_replaces_complete_file_without_temporary_artifacts() {
         let directory = tempfile::tempdir().expect("temporary state directory");
-        let path = directory.path().join("draft.json");
-        atomic_write(&path, b"old draft").expect("write initial draft");
+        let state_directory = directory.path().join("notm");
+        std::fs::create_dir(&state_directory).expect("create state directory");
+        let path = state_directory.join("draft.json");
+        std::fs::write(&path, b"old draft").expect("seed initial draft");
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(&state_directory, std::fs::Permissions::from_mode(0o755))
+                .expect("make state directory non-private");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .expect("make initial draft non-private");
+        }
         atomic_write_durable(&path, b"complete replacement").expect("replace durable draft");
         assert_eq!(
             std::fs::read(&path).expect("read replaced draft"),
             b"complete replacement"
         );
-        let entries = std::fs::read_dir(directory.path())
+        let entries = std::fs::read_dir(&state_directory)
             .expect("list state directory")
             .collect::<Result<Vec<_>, _>>()
             .expect("read state entries");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path(), path);
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                std::fs::metadata(&state_directory)
+                    .expect("state directory metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("draft metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_drafts_are_created_in_a_private_directory() {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let drafts_directory = directory.path().join("notm/drafts");
+        let fields = ComposeFields {
+            subject: "Private draft".to_string(),
+            ..ComposeFields::default()
+        };
+
+        let path = save_named_draft_fields(&drafts_directory, &fields).expect("save named draft");
+
+        assert_eq!(
+            std::fs::metadata(&drafts_directory)
+                .expect("draft directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(path)
+                .expect("named draft metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[test]

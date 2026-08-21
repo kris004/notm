@@ -87,6 +87,11 @@ where
         None
     }
 
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.recency = 0;
+    }
+
     fn evict_lru(&mut self) {
         let Some(oldest_recency) = self.entries.values().map(|entry| entry.last_used).min() else {
             return;
@@ -190,6 +195,20 @@ mod tests {
         assert_eq!(cache.get(&"first"), Some(&10));
         assert_eq!(cache.get(&"second"), None);
         assert_eq!(cache.get(&"third"), Some(&3));
+    }
+
+    #[test]
+    fn clear_removes_entries_and_resets_recency() {
+        let mut cache = BoundedLruCache::new(2);
+        cache.insert("first", 1);
+        cache.insert("second", 2);
+        assert!(cache.recency > 0);
+
+        cache.clear();
+
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.recency, 0);
+        assert_eq!(cache.get(&"first"), None);
     }
 
     #[test]

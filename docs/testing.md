@@ -10,14 +10,29 @@ can be driven through the local developer test harness described in
 ## Routine checks
 
 ```sh
-CARGO_HOME=$PWD/.cargo-home cargo fmt --all -- --check
-CARGO_HOME=$PWD/.cargo-home cargo clippy --workspace --all-targets --all-features -- -D warnings
-CARGO_HOME=$PWD/.cargo-home cargo test --workspace --all-targets --all-features
-CARGO_HOME=$PWD/.cargo-home cargo run -p notm-app -- fixture-smoke
-CARGO_HOME=$PWD/.cargo-home cargo run -p notm-app -- probe-send
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features
+cargo run -p notm-app -- fixture-smoke
+./tests/packaging_install_smoke.sh
 ```
 
-`probe-send` checks the configured transport behavior without sending mail.
+To exercise `probe-send` without depending on a contributor's mail setup, use a
+disposable helper configuration:
+
+```sh
+probe_config=$(mktemp)
+trap 'rm -f "$probe_config"' EXIT
+cat >"$probe_config" <<'EOF'
+[send]
+command = "true"
+mode = "stdin_rfc5322"
+EOF
+cargo run -p notm-app -- --config "$probe_config" probe-send
+```
+
+The probe resolves the command and checks its working directory; it does not
+submit a message.
 
 ## Live smoke commands
 
@@ -25,14 +40,43 @@ Live smoke commands use the user's configured Notmuch database and/or send
 transport. Run them only when that is intentional.
 
 ```sh
-CARGO_HOME=$PWD/.cargo-home cargo run -p notm-app -- live-readonly-smoke
-CARGO_HOME=$PWD/.cargo-home cargo run -p notm-app -- live-self-send
+cargo run -p notm-app -- live-readonly-smoke
+cargo run -p notm-app -- live-self-send
 ```
 
 `live-readonly-smoke` opens the configured Notmuch database read-only and runs
 the configured default query. `live-self-send` sends one unique message through
 the configured transport and then waits briefly for it to appear in Notmuch; it
 does not force sync.
+
+## Sync checks
+
+The sync unit coverage verifies manual/startup gates, receive-before-update
+ordering, selected `NOTMUCH_*` environment propagation, nonzero-exit handling,
+bounded diagnostics, and timeout cleanup:
+
+```sh
+cargo test -p notm-ui main_window::tests::sync_ --lib -- --nocapture
+```
+
+Four required-display smokes exercise the real GTK startup/manual actions,
+responsiveness, post-sync refresh, failure recovery, and application lifetime:
+
+```sh
+for test in \
+  slow_manual_sync_keeps_desktop_responsive \
+  startup_sync_runs_receive_then_database_update \
+  failed_manual_sync_reports_stderr_and_recovers \
+  closing_main_window_waits_for_manual_sync
+do
+  NOTM_REQUIRE_GTK_DISPLAY=1 \
+    cargo test -p notm-app --test desktop_ui_smoke "$test" -- \
+      --exact --nocapture --test-threads=1
+done
+```
+
+These tests use disposable helpers and databases. Live fetch commands are never
+required.
 
 ## GUI smoke checks
 
@@ -98,11 +142,11 @@ The Settings dialog has two named, fixture-backed GTK smokes. Required-display
 mode turns a missing display into a failure instead of a skip:
 
 ```sh
-NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
+NOTM_REQUIRE_GTK_DISPLAY=1 \
   cargo test -p notm-app --test desktop_ui_smoke \
   fixture_settings_preview_limits_apply_without_partial_persistence \
   -- --exact --nocapture --test-threads=1
-NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
+NOTM_REQUIRE_GTK_DISPLAY=1 \
   cargo test -p notm-app --test desktop_ui_smoke \
   fixture_theme_modes_follow_both_simulated_system_preferences \
   -- --exact --nocapture --test-threads=1
@@ -123,9 +167,42 @@ fixture-only except for the narrowly gated saved-draft Send flow documented in
 `docs/automation/README.md`:
 
 ```sh
-NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
+NOTM_REQUIRE_GTK_DISPLAY=1 \
   cargo test -p notm-app --test desktop_ui_smoke \
   fixture_draft_confirmations_preserve_rejected_state \
+  -- --exact --nocapture --test-threads=1
+```
+
+A separate non-fixture smoke uses a disposable Notmuch database and Maildir to
+verify first and repeated indexed draft saves, the background search refresh,
+and clean navigation away from the saved composer:
+
+```sh
+NOTM_REQUIRE_GTK_DISPLAY=1 \
+  cargo test -p notm-app --test desktop_ui_smoke \
+  indexed_maildir_draft_refresh_stays_clean_during_message_navigation \
+  -- --exact --nocapture --test-threads=1
+```
+
+A restart-backed variant verifies that a clean indexed save removes transient
+recovery state, survives a normal process exit, and reopens from `tag:draft`
+without an unsaved-composer prompt:
+
+```sh
+NOTM_REQUIRE_GTK_DISPLAY=1 \
+  cargo test -p notm-app --test desktop_ui_smoke \
+  indexed_maildir_saved_draft_restart_does_not_prompt_as_unsaved \
+  -- --exact --nocapture --test-threads=1
+```
+
+Indexed-draft deletion has a fixture-backed regression that confirms the row
+is removed, the file is deleted, and the message pane never attempts to render
+the now-missing body:
+
+```sh
+NOTM_REQUIRE_GTK_DISPLAY=1 \
+  cargo test -p notm-app --test desktop_ui_smoke \
+  fixture_indexed_draft_delete_removes_row_without_missing_body \
   -- --exact --nocapture --test-threads=1
 ```
 
@@ -135,7 +212,7 @@ custom-tag button, proves that only the selected message ID changes, and checks
 exact undo restoration:
 
 ```sh
-NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
+NOTM_REQUIRE_GTK_DISPLAY=1 \
   cargo test -p notm-app --test desktop_ui_smoke \
   fixture_current_message_navigation_and_tagging_are_explicit \
   -- --exact --nocapture --test-threads=1
@@ -145,7 +222,7 @@ Visual-HTML link hints have a fixture-backed GTK smoke that verifies visible
 links receive distinct labels and that cancelling clears the mode:
 
 ```sh
-NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
+NOTM_REQUIRE_GTK_DISPLAY=1 \
   cargo test -p notm-app --test desktop_ui_smoke \
   fixture_html_link_hints_label_visible_links_and_cancel \
   -- --exact --nocapture --test-threads=1
@@ -156,18 +233,19 @@ and `Ctrl+y` through the main shortcut router, verifies movement in both
 directions, and proves the selected message does not change:
 
 ```sh
-NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
+NOTM_REQUIRE_GTK_DISPLAY=1 \
   cargo test -p notm-app --test desktop_ui_smoke \
   fixture_ctrl_e_y_scroll_message_list_without_changing_selection \
   -- --exact --nocapture --test-threads=1
 ```
 
 Remembered message views have a restart-backed GTK smoke. It verifies all
-preference layers, drives the real sender button, checks Message-ID precedence,
-and confirms that standalone windows resolve their own selected message:
+preference layers, drives the sender-default button and `V a` shortcut, checks
+Message-ID precedence, and confirms that standalone windows resolve their own
+selected message:
 
 ```sh
-NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
+NOTM_REQUIRE_GTK_DISPLAY=1 \
   cargo test -p notm-app --test desktop_ui_smoke \
   fixture_message_and_sender_views_persist_with_message_precedence \
   -- --exact --nocapture --test-threads=1
@@ -177,14 +255,19 @@ Use the fixture-only test-harness `send_key` command for application shortcut
 checks that do not need compositor input; it calls the same ordered router as
 the main window without focusing or presenting a window. The focused-text and
 physical-key propagation regressions retain a self-contained headless Sway
-check. It covers J/K message navigation, lowercase j/k scrolling, the M
-current-message menu and its two-key actions, physical Shift+F routing to link
-hints (with overlay behavior covered by the GTK smoke above), and
-normal/insert-mode tag-editor safety. It requires
+check. It covers J/K message navigation, lowercase j/k message-body scrolling,
+physical `Ctrl+e`/`Ctrl+y` message-list viewport scrolling without changing the
+selection, the M current-message menu and its two-key actions, physical Shift+F
+routing to link hints (with overlay behavior covered by the GTK smoke above),
+and normal/insert-mode tag-editor safety. It also
+drives the composer's real Vim Esc/Esc transition, completes `g d` while a
+composer header field retains focus, deletes an indexed draft through physical
+`D` and the real confirmation, and verifies physical `A`, `S`, and `x` actions
+without allowing them to mutate the selected message. It requires
 `dbus-run-session`, `sway`, `swaymsg`, and `wtype`:
 
 ```sh
-CARGO_HOME=$PWD/.cargo-home cargo build -p notm-app
+cargo build -p notm-app
 python3 -B tests/ui_text_focus_smoke.py --binary target/debug/notm
 ```
 

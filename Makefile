@@ -9,7 +9,8 @@ CARGO ?= cargo
 INSTALL ?= install
 RM ?= rm -f
 BINARY ?= target/release/notm
-DESKTOP_ID := dev.notm.Notm
+DESKTOP_ID := io.github.kris004.notm
+LEGACY_DESKTOP_ID := dev.notm.Notm
 DESKTOP_FILE := $(DESKTOP_ID).desktop
 ICON_FILE := $(DESKTOP_ID).svg
 METAINFO_FILE := $(DESKTOP_ID).metainfo.xml
@@ -28,6 +29,9 @@ install: build install-man
 	    -e 's|^TryExec=.*|TryExec=$(BINDIR)/notm|' \
 	    "packaging/$(DESKTOP_FILE)" > "target/install/$(DESKTOP_FILE)"
 	$(RM) "$(DESTDIR)$(APPDIR)/notm.desktop"
+	$(RM) "$(DESTDIR)$(APPDIR)/$(LEGACY_DESKTOP_ID).desktop"
+	$(RM) "$(DESTDIR)$(ICONDIR)/$(LEGACY_DESKTOP_ID).svg"
+	$(RM) "$(DESTDIR)$(METAINFODIR)/$(LEGACY_DESKTOP_ID).metainfo.xml"
 	$(INSTALL) -Dm644 "target/install/$(DESKTOP_FILE)" "$(DESTDIR)$(APPDIR)/$(DESKTOP_FILE)"
 	$(INSTALL) -Dm644 "packaging/icons/hicolor/scalable/apps/$(ICON_FILE)" \
 	    "$(DESTDIR)$(ICONDIR)/$(ICON_FILE)"
@@ -46,9 +50,12 @@ install-user:
 uninstall: uninstall-man
 	$(RM) "$(DESTDIR)$(BINDIR)/notm"
 	$(RM) "$(DESTDIR)$(APPDIR)/$(DESKTOP_FILE)"
+	$(RM) "$(DESTDIR)$(APPDIR)/$(LEGACY_DESKTOP_ID).desktop"
 	$(RM) "$(DESTDIR)$(APPDIR)/notm.desktop"
 	$(RM) "$(DESTDIR)$(ICONDIR)/$(ICON_FILE)"
+	$(RM) "$(DESTDIR)$(ICONDIR)/$(LEGACY_DESKTOP_ID).svg"
 	$(RM) "$(DESTDIR)$(METAINFODIR)/$(METAINFO_FILE)"
+	$(RM) "$(DESTDIR)$(METAINFODIR)/$(LEGACY_DESKTOP_ID).metainfo.xml"
 
 uninstall-man:
 	$(RM) "$(DESTDIR)$(MANDIR)/man1/notm.1"

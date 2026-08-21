@@ -1,4 +1,3 @@
-use chrono::Utc;
 use uuid::Uuid;
 
 use crate::compose::ComposedMessage;
@@ -28,7 +27,7 @@ pub fn generate_message_id(domain: Option<&str>) -> String {
 
 pub fn render_message(message: &ComposedMessage) -> String {
     let mut out = String::new();
-    out.push_str(&format!("Date: {}\r\n", Utc::now().to_rfc2822()));
+    out.push_str(&format!("Date: {}\r\n", message.render_date.to_rfc2822()));
     out.push_str(&format!(
         "Message-ID: {}\r\n",
         sanitize_header(&message.message_id)
@@ -74,21 +73,21 @@ pub fn render_message(message: &ComposedMessage) -> String {
         out.push_str("Content-Transfer-Encoding: 8bit\r\n\r\n");
         out.push_str(&normalize_body(&text_body));
     } else if message.attachments.is_empty() {
-        let boundary = format!("notm-alt-{}", Uuid::new_v4());
+        let boundary = alternative_boundary(message);
         out.push_str(&format!(
             "Content-Type: multipart/alternative; boundary=\"{}\"\r\n\r\n",
             boundary
         ));
         render_alternative_parts(&mut out, &boundary, &text_body, html_body.as_deref());
     } else {
-        let boundary = format!("notm-{}", Uuid::new_v4());
+        let boundary = mixed_boundary(message);
         out.push_str(&format!(
             "Content-Type: multipart/mixed; boundary=\"{}\"\r\n\r\n",
             boundary
         ));
         out.push_str(&format!("--{}\r\n", boundary));
         if html_body.is_some() {
-            let alt_boundary = format!("notm-alt-{}", Uuid::new_v4());
+            let alt_boundary = alternative_boundary(message);
             out.push_str(&format!(
                 "Content-Type: multipart/alternative; boundary=\"{}\"\r\n\r\n",
                 alt_boundary
@@ -124,6 +123,14 @@ pub fn render_message(message: &ComposedMessage) -> String {
         out.push_str(&format!("--{}--\r\n", boundary));
     }
     out
+}
+
+fn mixed_boundary(message: &ComposedMessage) -> String {
+    format!("notm-mixed-{}", message.mime_boundary_id)
+}
+
+fn alternative_boundary(message: &ComposedMessage) -> String {
+    format!("notm-alt-{}", message.mime_boundary_id)
 }
 
 fn rendered_text_body(message: &ComposedMessage) -> String {
@@ -498,5 +505,34 @@ mod tests {
 
         assert!(rendered.ends_with("\r\n\r\nfirst\r\nsecond"));
         assert!(!rendered.contains("\r\r\n"));
+    }
+
+    #[test]
+    fn repeated_multipart_rendering_is_byte_identical_across_clones() {
+        let mut message = test_message();
+        message.body = "Plain body".to_string();
+        message.html_body = Some("<p>HTML body</p>".to_string());
+        message.attachments.push(AttachmentInput {
+            filename: "report.txt".to_string(),
+            content_type: "text/plain".to_string(),
+            bytes: b"attachment contents\n".to_vec(),
+            source_path: None,
+        });
+        // The send path clones the message before the transport renders its
+        // copy, then renders the original clone again for Sent persistence.
+        let persistence_copy = message.clone();
+
+        let submitted = message.to_rfc5322();
+        let submitted_again = message.to_rfc5322();
+        let persisted = persistence_copy.to_rfc5322();
+
+        assert_eq!(submitted, submitted_again);
+        assert_eq!(submitted, persisted);
+        let parsed = mailparse::parse_mail(submitted.as_bytes()).expect("parse rendered message");
+        assert_eq!(parsed.ctype.mimetype, "multipart/mixed");
+        assert_eq!(parsed.subparts.len(), 2);
+        assert_eq!(parsed.subparts[0].ctype.mimetype, "multipart/alternative");
+        assert_eq!(parsed.subparts[0].subparts.len(), 2);
+        assert_eq!(parsed.subparts[1].ctype.mimetype, "text/plain");
     }
 }

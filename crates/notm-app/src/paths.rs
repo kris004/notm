@@ -1,25 +1,47 @@
 use std::path::PathBuf;
 
 pub fn config_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(path).join("notm/config.toml");
+    config_path_from(
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+fn config_path_from(xdg_config_home: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    xdg_config_home
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            home.filter(|path| path.is_absolute())
+                .map(|path| path.join(".config"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".config"))
+        .join("notm/config.toml")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::config_path_from;
+    use std::path::PathBuf;
+
+    #[test]
+    fn config_path_uses_only_absolute_xdg_and_home_roots() {
+        assert_eq!(
+            config_path_from(
+                Some(PathBuf::from("/tmp/config")),
+                Some(PathBuf::from("/tmp/home"))
+            ),
+            PathBuf::from("/tmp/config/notm/config.toml")
+        );
+        assert_eq!(
+            config_path_from(
+                Some(PathBuf::from("relative-config")),
+                Some(PathBuf::from("/tmp/home"))
+            ),
+            PathBuf::from("/tmp/home/.config/notm/config.toml")
+        );
+        assert_eq!(
+            config_path_from(Some(PathBuf::new()), None),
+            PathBuf::from(".config/notm/config.toml")
+        );
     }
-    home_dir().join(".config/notm/config.toml")
-}
-
-pub fn notmuch_default_config_path() -> Option<PathBuf> {
-    let xdg = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".config"));
-    let candidates = [
-        xdg.join("notmuch/default/config"),
-        home_dir().join(".notmuch-config"),
-    ];
-    candidates.into_iter().find(|p| p.exists())
-}
-
-fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
 }

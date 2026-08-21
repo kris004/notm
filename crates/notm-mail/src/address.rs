@@ -14,8 +14,24 @@ pub fn parse_address_list(input: &str) -> Vec<MailAddress> {
     let Ok(addresses) = addrparse(input) else {
         return Vec::new();
     };
-
     addresses
+        .iter()
+        .flat_map(|address| match address {
+            MailAddr::Single(single) => std::slice::from_ref(single),
+            MailAddr::Group(group) => group.addrs.as_slice(),
+        })
+        .filter_map(mail_address_from_single)
+        .collect()
+}
+
+pub fn parse_address_list_checked(input: &str) -> anyhow::Result<Vec<MailAddress>> {
+    if input.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let addresses =
+        addrparse(input).map_err(|err| anyhow::anyhow!("invalid address list: {err}"))?;
+
+    let singles = addresses
         .iter()
         .flat_map(|address| match address {
             MailAddr::Single(single) => std::slice::from_ref(single),
@@ -24,13 +40,29 @@ pub fn parse_address_list(input: &str) -> Vec<MailAddress> {
             // group label because `MailAddress` intentionally models a mailbox.
             MailAddr::Group(group) => group.addrs.as_slice(),
         })
-        .filter_map(mail_address_from_single)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(!singles.is_empty(), "address list contains no mailboxes");
+    singles
+        .into_iter()
+        .map(|single| {
+            mail_address_from_single(single)
+                .ok_or_else(|| anyhow::anyhow!("address list contains an invalid mailbox"))
+        })
         .collect()
 }
 
 pub fn parse_one(input: &str) -> Option<MailAddress> {
     let single = addrparse(input).ok()?.extract_single_info()?;
     mail_address_from_single(&single)
+}
+
+pub fn parse_one_checked(input: &str) -> anyhow::Result<MailAddress> {
+    let mut addresses = parse_address_list_checked(input)?;
+    anyhow::ensure!(
+        addresses.len() == 1,
+        "address field must contain exactly one mailbox"
+    );
+    Ok(addresses.remove(0))
 }
 
 fn mail_address_from_single(single: &SingleInfo) -> Option<MailAddress> {
@@ -54,10 +86,16 @@ pub fn format_address(addr: &MailAddress) -> String {
 }
 
 pub fn quote_name(name: &str) -> String {
-    if name.contains(',') || name.contains('"') {
-        format!("\"{}\"", name.replace('"', "\\\""))
+    let name = name.replace(['\r', '\n'], " ");
+    let needs_quotes = name.chars().any(|character| {
+        !(character.is_ascii_alphanumeric()
+            || character.is_ascii_whitespace()
+            || "!#$%&'*+-/=?^_`{|}~".contains(character))
+    });
+    if needs_quotes {
+        format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
     } else {
-        name.to_string()
+        name
     }
 }
 
@@ -143,6 +181,22 @@ mod tests {
             parse_address_list("Valid <valid@example.test>, Bad <bad@>"),
             vec![address(Some("Valid"), "valid@example.test")]
         );
+        assert!(
+            parse_address_list_checked("Valid <valid@example.test>, Bad <bad@>").is_err(),
+            "checked parsing must not silently discard an invalid recipient"
+        );
+        assert!(parse_address_list_checked("Undisclosed recipients:;").is_err());
+    }
+
+    #[test]
+    fn checked_single_address_rejects_lists_and_formats_special_names() {
+        let parsed =
+            parse_one_checked(r#""Doe, Jane" <jane@example.test>"#).expect("one quoted address");
+        assert_eq!(
+            format_address(&parsed),
+            r#""Doe, Jane" <jane@example.test>"#
+        );
+        assert!(parse_one_checked("one@example.test, two@example.test").is_err());
     }
 
     #[test]
@@ -169,6 +223,10 @@ mod tests {
         assert_eq!(
             format_address(&address(Some("Doe, Jane"), "jane@example.test")),
             r#""Doe, Jane" <jane@example.test>"#
+        );
+        assert_eq!(
+            format_address(&address(Some(r#"Ops @ Home \ "West""#), "ops@example.test")),
+            r#""Ops @ Home \\ \"West\"" <ops@example.test>"#
         );
     }
 }

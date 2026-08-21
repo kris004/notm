@@ -1,8 +1,8 @@
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
+    io::Write,
     path::{Path, PathBuf},
-    process::Command,
     rc::Rc,
     sync::{Arc, mpsc},
     thread,
@@ -79,9 +79,9 @@ use crate::{
 
 pub use crate::widgets::settings::{RuntimeSettings, RuntimeSettingsStore};
 
-const NORMAL_APPLICATION_ID: &str = "dev.notm.Notm";
-const TEST_HARNESS_APPLICATION_ID_NAMESPACE: &str = "dev.notm.Notm.Test.";
-const TEST_HARNESS_APPLICATION_ID_PREFIX: &str = "dev.notm.Notm.Test.t";
+const NORMAL_APPLICATION_ID: &str = "io.github.kris004.notm";
+const TEST_HARNESS_APPLICATION_ID_NAMESPACE: &str = "io.github.kris004.notm.test.";
+const TEST_HARNESS_APPLICATION_ID_PREFIX: &str = "io.github.kris004.notm.test.t";
 const TEST_HARNESS_APPLICATION_ID_ENV: &str = "NOTM_TEST_HARNESS_APPLICATION_ID";
 const OPEN_MESSAGE_ID_ACTION: &str = "open-message-id";
 
@@ -94,6 +94,7 @@ pub struct SavedSearch {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaunchOptions {
     pub database_path: Option<PathBuf>,
+    pub mail_root: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
     pub profile: Option<String>,
     pub default_query: String,
@@ -122,6 +123,7 @@ pub struct LaunchOptions {
     pub index_draft_after_save: bool,
     pub sync_enabled: bool,
     pub manual_sync_label: String,
+    pub sync_timeout_seconds: u64,
     pub notmuch_database_update_enabled: bool,
     pub notmuch_database_update_on_startup: bool,
     pub notmuch_database_update_command: String,
@@ -166,6 +168,7 @@ impl Default for LaunchOptions {
     fn default() -> Self {
         Self {
             database_path: None,
+            mail_root: None,
             config_path: None,
             profile: None,
             default_query: "tag:inbox and not tag:trash and not tag:spam".to_string(),
@@ -194,6 +197,7 @@ impl Default for LaunchOptions {
             index_draft_after_save: true,
             sync_enabled: false,
             manual_sync_label: "Sync".to_string(),
+            sync_timeout_seconds: 300,
             notmuch_database_update_enabled: false,
             notmuch_database_update_on_startup: false,
             notmuch_database_update_command: String::new(),
@@ -614,6 +618,7 @@ enum PendingTransition {
         rejection_restore: Option<MessageSelectionSnapshot>,
         status: String,
         active_pane: ActivePane,
+        clear_saved_recovery: bool,
     },
     CloseMainWindow,
 }
@@ -1185,8 +1190,7 @@ fn build_ui(
     }
     let view_preference_separator = gtk::Separator::new(gtk::Orientation::Horizontal);
     view_menu_box.append(&view_preference_separator);
-    let sender_view_preference_button =
-        gtk::Button::with_label("Always show messages from this sender in this view");
+    let sender_view_preference_button = gtk::Button::with_label("Always");
     sender_view_preference_button.set_widget_name("notm-sender-view-preference-button");
     sender_view_preference_button.set_visible(false);
     view_menu_box.append(&sender_view_preference_button);
@@ -1584,7 +1588,12 @@ fn build_ui(
         );
     }
 
-    restore_draft_if_present(&options, &widgets, &state);
+    let recovered_draft = restore_draft_if_present(&options, &widgets, &state);
+    let preserve_recovered_composer = recovered_draft
+        && composer_requires_confirmation(
+            &compose_fields(&widgets, &state),
+            state.borrow().active_draft.as_ref(),
+        );
     migrate_legacy_named_drafts_from_ui(&widgets, &state);
     widgets.composer.refresh_draft_list();
     window.present();
@@ -1609,7 +1618,14 @@ fn build_ui(
         let st = state.clone();
         let query = options.default_query.clone();
         gtk::glib::timeout_add_local_once(Duration::from_millis(0), move || {
-            run_search(&opts, &w, &st, &query);
+            schedule_search(
+                &opts,
+                &w,
+                &st,
+                &query,
+                !preserve_recovered_composer,
+                Duration::ZERO,
+            );
             refresh_address_suggestions_async(&opts, &w, &st);
         });
     }
@@ -3231,8 +3247,14 @@ fn connect_compose_vim_context(options: &LaunchOptions, widgets: &Widgets, state
                     let suffix = path
                         .map(|requested| format!("; ignored Vim file path {requested}"))
                         .unwrap_or_default();
-                    w.status_label
-                        .set_text(&format!("Vim :w saved draft to {destination}{suffix}"));
+                    let warning = report
+                        .recovery_cleanup_warning
+                        .as_ref()
+                        .map(|warning| format!("; recovery cleanup failed: {warning}"))
+                        .unwrap_or_default();
+                    w.status_label.set_text(&format!(
+                        "Vim :w saved draft to {destination}{suffix}{warning}"
+                    ));
                 }
                 Ok(None) => {}
                 Err(err) => w.status_label.set_text(&format!("Vim :w failed: {err}")),
@@ -3277,23 +3299,7 @@ fn connect_compose_helpers(
     let st = state.clone();
     let opts = options.clone();
     save_draft_button.connect_clicked(move |_| {
-        match request_save_current_draft(&opts, &w, &st) {
-            Ok(Some(report)) => {
-                let destination = report
-                    .maildir_path
-                    .as_ref()
-                    .or(report.local_path.as_ref())
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "draft store".to_string());
-                w.status_label
-                    .set_text(&format!("Draft saved to {destination}"));
-            }
-            Ok(None) => {}
-            Err(err) => w
-                .status_label
-                .set_text(&format!("Draft save failed: {err}")),
-        }
-        w.composer.refresh_draft_list();
+        save_current_draft_from_ui(&opts, &w, &st);
     });
 
     let opts = options.clone();
@@ -3312,27 +3318,41 @@ fn connect_compose_helpers(
 
     let w = widgets.clone();
     let st = state.clone();
-    add_attachment_button.connect_clicked(move |_| {
-        let dialog = gtk::FileChooserNative::new(
-            Some("Add attachment"),
-            Some(&w.window),
-            gtk::FileChooserAction::Open,
-            Some("Attach"),
-            Some("Cancel"),
-        );
-        let w2 = w.clone();
-        let st2 = st.clone();
-        dialog.connect_response(move |dialog, response| {
-            if response == gtk::ResponseType::Accept
-                && let Some(file) = dialog.file()
-                && let Some(path) = file.path()
-            {
-                add_attachment_path(&w2, &st2, path);
-            }
-            dialog.destroy();
-        });
-        dialog.show();
+    add_attachment_button.connect_clicked(move |_| show_add_attachment_dialog(&w, &st));
+}
+
+fn save_current_draft_from_ui(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    match request_save_current_draft(options, widgets, state) {
+        Ok(Some(_)) => {}
+        Ok(None) => {}
+        Err(err) => widgets
+            .status_label
+            .set_text(&format!("Draft save failed: {err}")),
+    }
+    widgets.composer.refresh_draft_list();
+}
+
+#[allow(deprecated)]
+fn show_add_attachment_dialog(widgets: &Widgets, state: &SharedState) {
+    let dialog = gtk::FileChooserNative::new(
+        Some("Add attachment"),
+        Some(&widgets.window),
+        gtk::FileChooserAction::Open,
+        Some("Attach"),
+        Some("Cancel"),
+    );
+    let widgets = widgets.clone();
+    let state = state.clone();
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk::ResponseType::Accept
+            && let Some(file) = dialog.file()
+            && let Some(path) = file.path()
+        {
+            add_attachment_path(&widgets, &state, path);
+        }
+        dialog.destroy();
     });
+    dialog.show();
 }
 
 fn connect_draft_list(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -3420,38 +3440,7 @@ fn connect_message_actions(
     widgets
         .sender_view_preference_button
         .connect_clicked(move |_| {
-            let Some(sender) = selected_sender_email(&st) else {
-                w.status_label
-                    .set_text("The selected message sender could not be parsed");
-                w.view_menu_button.popdown();
-                return;
-            };
-            let preference = w.active_message_view.get().preference();
-            match toggle_sender_view_preference(&opts, &st, &sender, preference) {
-                Ok(true) => {
-                    w.status_label.set_text(&format!(
-                        "Messages from {sender} will default to {}",
-                        preference.label()
-                    ));
-                    st.borrow_mut().last_error = None;
-                }
-                Ok(false) => {
-                    w.status_label.set_text(&format!(
-                        "Removed the {} default for messages from {sender}",
-                        preference.label()
-                    ));
-                    st.borrow_mut().last_error = None;
-                }
-                Err(error) => {
-                    w.status_label.set_text(&format!(
-                        "Sender view preference could not be saved: {error}"
-                    ));
-                    st.borrow_mut().last_error = Some(error.to_string());
-                }
-            }
-            update_sender_view_preference_button(&w, &st);
-            update_debug(&w, &st);
-            w.view_menu_button.popdown();
+            activate_sender_view_preference(&opts, &w, &st);
         });
 
     let opts = options.clone();
@@ -3584,6 +3573,68 @@ fn connect_message_actions(
     widgets.message_custom_tag_entry.connect_activate(move |_| {
         apply_custom_tag_to_selected_message(&opts, &w, &st, &undo);
     });
+}
+
+fn activate_sender_view_preference(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) {
+    let Some(sender) = selected_sender_email(state) else {
+        widgets
+            .status_label
+            .set_text("The selected message sender could not be parsed");
+        widgets.view_menu_button.popdown();
+        return;
+    };
+    let preference = widgets.active_message_view.get().preference();
+    match toggle_sender_view_preference(options, state, &sender, preference) {
+        Ok(true) => {
+            widgets.status_label.set_text(&format!(
+                "Messages from {sender} will default to {}",
+                preference.label()
+            ));
+            state.borrow_mut().last_error = None;
+        }
+        Ok(false) => {
+            widgets.status_label.set_text(&format!(
+                "Removed the {} default for messages from {sender}",
+                preference.label()
+            ));
+            state.borrow_mut().last_error = None;
+        }
+        Err(error) => {
+            widgets.status_label.set_text(&format!(
+                "Sender view preference could not be saved: {error}"
+            ));
+            state.borrow_mut().last_error = Some(error.to_string());
+        }
+    }
+    update_sender_view_preference_button(widgets, state);
+    update_debug(widgets, state);
+    widgets.view_menu_button.popdown();
+}
+
+fn activate_message_view_sequence_key(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    key: gtk::gdk::Key,
+) -> bool {
+    if key == gtk::gdk::Key::t {
+        choose_selected_message_view(options, widgets, state, MessageViewKind::Text);
+    } else if key == gtk::gdk::Key::v {
+        choose_selected_message_view(options, widgets, state, MessageViewKind::Html);
+    } else if key == gtk::gdk::Key::h {
+        choose_selected_message_view(options, widgets, state, MessageViewKind::Headers);
+    } else if key == gtk::gdk::Key::r {
+        choose_selected_message_view(options, widgets, state, MessageViewKind::Raw);
+    } else if key == gtk::gdk::Key::a {
+        activate_sender_view_preference(options, widgets, state);
+    } else {
+        return false;
+    }
+    true
 }
 
 fn connect_message_tag_button(
@@ -4592,14 +4643,19 @@ fn active_message_scrolled(widgets: &Widgets) -> gtk::ScrolledWindow {
     }
 }
 
+fn scroll_message_view_lines(widgets: &Widgets, lines: f64) {
+    if html_view_is_visible(widgets) {
+        scroll_html_view_lines(widgets, lines);
+    } else {
+        scroll_window_lines(&active_message_scrolled(widgets), lines);
+    }
+}
+
 fn vim_scroll_lines(widgets: &Widgets, state: &SharedState, lines: f64) {
     match state.borrow().active_pane {
         ActivePane::Threads => {}
         ActivePane::Sidebar => scroll_window_lines(&widgets.thread_list.scrolled(), lines),
-        ActivePane::Message if html_view_is_visible(widgets) => {
-            scroll_html_view_lines(widgets, lines)
-        }
-        ActivePane::Message => scroll_window_lines(&active_message_scrolled(widgets), lines),
+        ActivePane::Message => scroll_message_view_lines(widgets, lines),
     }
 }
 
@@ -5312,6 +5368,7 @@ fn update_button_binding_labels(widgets: &Widgets, state: &SharedState) {
         visible_binding(message_bindings, "V r"),
         state,
     );
+    update_sender_view_preference_button(widgets, state);
     set_button_label(
         &widgets.collapse_quotes_button,
         "Collapse quotes",
@@ -5607,6 +5664,56 @@ where
 type MainShortcutHandler = dyn Fn(gtk::gdk::Key, gtk::gdk::ModifierType) -> gtk::glib::Propagation;
 const MAIN_SHORTCUT_CONTROLLER_NAME: &str = "notm-main-shortcut-router";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerShortcutAction {
+    AddAttachment,
+    SaveDraft,
+    ClearDraft,
+    DeleteLocalDraft,
+}
+
+fn composer_shortcut_action(
+    key: gtk::gdk::Key,
+    modifiers: gtk::gdk::ModifierType,
+) -> Option<ComposerShortcutAction> {
+    if modifiers.intersects(
+        gtk::gdk::ModifierType::CONTROL_MASK
+            | gtk::gdk::ModifierType::ALT_MASK
+            | gtk::gdk::ModifierType::SUPER_MASK,
+    ) {
+        return None;
+    }
+    if shifted_shortcut_key(key, modifiers, gtk::gdk::Key::a, gtk::gdk::Key::A) {
+        Some(ComposerShortcutAction::AddAttachment)
+    } else if shifted_shortcut_key(key, modifiers, gtk::gdk::Key::s, gtk::gdk::Key::S) {
+        Some(ComposerShortcutAction::SaveDraft)
+    } else if key == gtk::gdk::Key::x && !modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+        Some(ComposerShortcutAction::ClearDraft)
+    } else if shifted_shortcut_key(key, modifiers, gtk::gdk::Key::d, gtk::gdk::Key::D) {
+        Some(ComposerShortcutAction::DeleteLocalDraft)
+    } else {
+        None
+    }
+}
+
+fn activate_composer_shortcut(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    action: ComposerShortcutAction,
+) {
+    match action {
+        ComposerShortcutAction::AddAttachment => show_add_attachment_dialog(widgets, state),
+        ComposerShortcutAction::SaveDraft => save_current_draft_from_ui(options, widgets, state),
+        ComposerShortcutAction::ClearDraft => {
+            let _ = clear_current_draft_from_ui(options, widgets, state);
+        }
+        ComposerShortcutAction::DeleteLocalDraft => {
+            delete_active_draft_from_ui(options, widgets, state);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct MainShortcutRouter {
     handler: Rc<MainShortcutHandler>,
@@ -5850,6 +5957,93 @@ fn install_shortcuts(
         if st.borrow().input_mode == InputMode::Insert {
             return gtk::glib::Propagation::Proceed;
         }
+        if compose_view_is_visible(&w)
+            && let Some(action) = composer_shortcut_action(key, mods)
+        {
+            cancel_pending_sequences();
+            clear_numeric_prefix(&numeric_prefix);
+            activate_composer_shortcut(&opts, &w, &st, action);
+            return gtk::glib::Propagation::Stop;
+        }
+        if *pending_custom_search.borrow() {
+            *pending_custom_search.borrow_mut() = false;
+            clear_numeric_prefix(&numeric_prefix);
+            let handled = open_custom_saved_search_by_key(&opts, &w, &st, &saved, key);
+            clear_go_prompt_status(&w);
+            return if handled {
+                gtk::glib::Propagation::Stop
+            } else if main_text_entry_has_focus(&w) && normal_text_focus_blocks_key(key) {
+                w.status_label
+                    .set_text("Normal mode: press Enter or i to edit this field");
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            };
+        }
+        if *pending_go.borrow() {
+            *pending_go.borrow_mut() = false;
+            let count = take_numeric_prefix(&numeric_prefix);
+            let handled = if key == gtk::gdk::Key::g {
+                if let Some(count) = count {
+                    select_thread_absolute(&opts, &w, &st, count);
+                } else if st.borrow().active_pane == ActivePane::Message {
+                    vim_scroll_to_edge(&w, &st, false);
+                } else {
+                    select_thread_edge(&opts, &w, &st, false);
+                }
+                true
+            } else if key_to_digit(key).is_some()
+                && count.is_none()
+                && open_visible_tag_by_key(&opts, &w, &st, key)
+            {
+                true
+            } else if key == gtk::gdk::Key::i {
+                open_saved_search_name(&opts, &w, &st, "Inbox");
+                set_active_pane(&w, &st, ActivePane::Threads);
+                true
+            } else if key == gtk::gdk::Key::u {
+                open_saved_search_name(&opts, &w, &st, "Unread");
+                set_active_pane(&w, &st, ActivePane::Threads);
+                true
+            } else if key == gtk::gdk::Key::f {
+                open_saved_search_name(&opts, &w, &st, "Flagged");
+                set_active_pane(&w, &st, ActivePane::Threads);
+                true
+            } else if key == gtk::gdk::Key::s {
+                open_saved_search_name(&opts, &w, &st, "Sent");
+                set_active_pane(&w, &st, ActivePane::Threads);
+                true
+            } else if key == gtk::gdk::Key::d {
+                open_saved_search_name(&opts, &w, &st, "Drafts");
+                set_active_pane(&w, &st, ActivePane::Threads);
+                true
+            } else if key == gtk::gdk::Key::t {
+                open_saved_search_name(&opts, &w, &st, "Trash");
+                set_active_pane(&w, &st, ActivePane::Threads);
+                true
+            } else if key == gtk::gdk::Key::a {
+                open_saved_search_name(&opts, &w, &st, "All");
+                set_active_pane(&w, &st, ActivePane::Threads);
+                true
+            } else if key == gtk::gdk::Key::c {
+                *pending_custom_search.borrow_mut() = true;
+                w.status_label.set_text(&custom_saved_search_prompt(&saved));
+                true
+            } else {
+                false
+            };
+            return if handled {
+                clear_go_prompt_status(&w);
+                gtk::glib::Propagation::Stop
+            } else if main_text_entry_has_focus(&w) && normal_text_focus_blocks_key(key) {
+                w.status_label
+                    .set_text("Normal mode: press Enter or i to edit this field");
+                gtk::glib::Propagation::Stop
+            } else {
+                clear_go_prompt_status(&w);
+                gtk::glib::Propagation::Proceed
+            };
+        }
         if (key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter)
             && main_text_entry_has_focus(&w)
         {
@@ -5888,17 +6082,6 @@ fn install_shortcuts(
                 w.status_label.set_text("Normal mode");
             }
             return gtk::glib::Propagation::Stop;
-        }
-        if *pending_custom_search.borrow() {
-            *pending_custom_search.borrow_mut() = false;
-            clear_numeric_prefix(&numeric_prefix);
-            let handled = open_custom_saved_search_by_key(&opts, &w, &st, &saved, key);
-            clear_go_prompt_status(&w);
-            return if handled {
-                gtk::glib::Propagation::Stop
-            } else {
-                gtk::glib::Propagation::Proceed
-            };
         }
         if *pending_response.borrow() {
             if !message_pane_shortcuts_available(&w) {
@@ -5939,21 +6122,7 @@ fn install_shortcuts(
             *pending_view.borrow_mut() = false;
             w.view_menu_button.popdown();
             clear_numeric_prefix(&numeric_prefix);
-            let handled = if key == gtk::gdk::Key::t {
-                choose_selected_message_view(&opts, &w, &st, MessageViewKind::Text);
-                true
-            } else if key == gtk::gdk::Key::v {
-                choose_selected_message_view(&opts, &w, &st, MessageViewKind::Html);
-                true
-            } else if key == gtk::gdk::Key::h {
-                choose_selected_message_view(&opts, &w, &st, MessageViewKind::Headers);
-                true
-            } else if key == gtk::gdk::Key::r {
-                choose_selected_message_view(&opts, &w, &st, MessageViewKind::Raw);
-                true
-            } else {
-                false
-            };
+            let handled = activate_message_view_sequence_key(&opts, &w, &st, key);
             return if handled {
                 gtk::glib::Propagation::Stop
             } else {
@@ -6045,66 +6214,6 @@ fn install_shortcuts(
             return if handled {
                 gtk::glib::Propagation::Stop
             } else {
-                gtk::glib::Propagation::Proceed
-            };
-        }
-        if *pending_go.borrow() {
-            *pending_go.borrow_mut() = false;
-            let count = take_numeric_prefix(&numeric_prefix);
-            let handled = if key == gtk::gdk::Key::g {
-                if let Some(count) = count {
-                    select_thread_absolute(&opts, &w, &st, count);
-                } else if st.borrow().active_pane == ActivePane::Message {
-                    vim_scroll_to_edge(&w, &st, false);
-                } else {
-                    select_thread_edge(&opts, &w, &st, false);
-                }
-                true
-            } else if key_to_digit(key).is_some()
-                && count.is_none()
-                && open_visible_tag_by_key(&opts, &w, &st, key)
-            {
-                true
-            } else if key == gtk::gdk::Key::i {
-                open_saved_search_name(&opts, &w, &st, "Inbox");
-                set_active_pane(&w, &st, ActivePane::Threads);
-                true
-            } else if key == gtk::gdk::Key::u {
-                open_saved_search_name(&opts, &w, &st, "Unread");
-                set_active_pane(&w, &st, ActivePane::Threads);
-                true
-            } else if key == gtk::gdk::Key::f {
-                open_saved_search_name(&opts, &w, &st, "Flagged");
-                set_active_pane(&w, &st, ActivePane::Threads);
-                true
-            } else if key == gtk::gdk::Key::s {
-                open_saved_search_name(&opts, &w, &st, "Sent");
-                set_active_pane(&w, &st, ActivePane::Threads);
-                true
-            } else if key == gtk::gdk::Key::d {
-                open_saved_search_name(&opts, &w, &st, "Drafts");
-                set_active_pane(&w, &st, ActivePane::Threads);
-                true
-            } else if key == gtk::gdk::Key::t {
-                open_saved_search_name(&opts, &w, &st, "Trash");
-                set_active_pane(&w, &st, ActivePane::Threads);
-                true
-            } else if key == gtk::gdk::Key::a {
-                open_saved_search_name(&opts, &w, &st, "All");
-                set_active_pane(&w, &st, ActivePane::Threads);
-                true
-            } else if key == gtk::gdk::Key::c {
-                *pending_custom_search.borrow_mut() = true;
-                w.status_label.set_text(&custom_saved_search_prompt(&saved));
-                true
-            } else {
-                false
-            };
-            return if handled {
-                clear_go_prompt_status(&w);
-                gtk::glib::Propagation::Stop
-            } else {
-                clear_go_prompt_status(&w);
                 gtk::glib::Propagation::Proceed
             };
         }
@@ -6275,6 +6384,15 @@ fn install_shortcuts(
             w.status_label
                 .set_text("Undo: z last tag change, m choose from list");
             true
+        } else if shifted_shortcut_key(key, mods, gtk::gdk::Key::v, gtk::gdk::Key::V)
+            && message_pane_shortcuts_available(&w)
+        {
+            clear_numeric_prefix(&numeric_prefix);
+            *pending_view.borrow_mut() = true;
+            w.view_menu_button.popup();
+            w.status_label
+                .set_text("View: t text, v visual HTML, h headers, r raw source, a sender default");
+            true
         } else if key == gtk::gdk::Key::v {
             clear_numeric_prefix(&numeric_prefix);
             if st.borrow().active_pane == ActivePane::Threads {
@@ -6283,13 +6401,6 @@ fn install_shortcuts(
             } else {
                 false
             }
-        } else if key == gtk::gdk::Key::V && message_pane_shortcuts_available(&w) {
-            clear_numeric_prefix(&numeric_prefix);
-            *pending_view.borrow_mut() = true;
-            w.view_menu_button.popup();
-            w.status_label
-                .set_text("View: t text, v visual HTML, h headers, r raw source");
-            true
         } else if key == gtk::gdk::Key::q && message_pane_shortcuts_available(&w) {
             clear_numeric_prefix(&numeric_prefix);
             toggle_quote_collapse(&opts, &w, &st);
@@ -6304,25 +6415,6 @@ fn install_shortcuts(
         } else if key == gtk::gdk::Key::I && message_pane_shortcuts_available(&w) {
             clear_numeric_prefix(&numeric_prefix);
             activate_image_policy_button(&opts, &w, &st);
-            true
-        } else if key == gtk::gdk::Key::S && compose_view_is_visible(&w) {
-            clear_numeric_prefix(&numeric_prefix);
-            match request_save_current_draft(&opts, &w, &st) {
-                Ok(Some(_)) => w.status_label.set_text("Draft saved"),
-                Ok(None) => {}
-                Err(err) => w
-                    .status_label
-                    .set_text(&format!("Draft save failed: {err}")),
-            }
-            w.composer.refresh_draft_list();
-            true
-        } else if key == gtk::gdk::Key::x && compose_view_is_visible(&w) {
-            clear_numeric_prefix(&numeric_prefix);
-            let _ = clear_current_draft_from_ui(&opts, &w, &st);
-            true
-        } else if key == gtk::gdk::Key::D && compose_view_is_visible(&w) {
-            clear_numeric_prefix(&numeric_prefix);
-            delete_active_draft_from_ui(&opts, &w, &st);
             true
         } else if key == gtk::gdk::Key::d {
             clear_numeric_prefix(&numeric_prefix);
@@ -6430,21 +6522,7 @@ fn connect_dropdown_sequence_keys(
             w.view_menu_button.popdown();
             return gtk::glib::Propagation::Proceed;
         }
-        let handled = if key == gtk::gdk::Key::t {
-            choose_selected_message_view(&opts, &w, &st, MessageViewKind::Text);
-            true
-        } else if key == gtk::gdk::Key::v {
-            choose_selected_message_view(&opts, &w, &st, MessageViewKind::Html);
-            true
-        } else if key == gtk::gdk::Key::h {
-            choose_selected_message_view(&opts, &w, &st, MessageViewKind::Headers);
-            true
-        } else if key == gtk::gdk::Key::r {
-            choose_selected_message_view(&opts, &w, &st, MessageViewKind::Raw);
-            true
-        } else {
-            false
-        };
+        let handled = activate_message_view_sequence_key(&opts, &w, &st, key);
         if handled {
             *pending.borrow_mut() = false;
             w.view_menu_button.popdown();
@@ -6888,11 +6966,8 @@ fn persist_recovery_draft_from_ui(
     state: &SharedState,
     fields: &ComposeFields,
 ) -> bool {
-    match composer::persist_recovery_draft(
-        widgets.composer.recovery_path(),
-        widgets.composer.legacy_recovery_path(),
-        fields,
-    ) {
+    let clearing_saved_copy = active_draft_matches_fields(state, fields);
+    match reconcile_recovery_draft(widgets, state, fields) {
         Ok(()) => {
             let mut state = state.borrow_mut();
             if composer::clear_transient_autosave_error(&mut state.last_error) {
@@ -6901,9 +6976,41 @@ fn persist_recovery_draft_from_ui(
             true
         }
         Err(err) => {
-            report_draft_persistence_error(widgets, state, "Draft autosave failed", &err);
+            let action = if clearing_saved_copy {
+                "Saved draft recovery cleanup failed"
+            } else {
+                "Draft autosave failed"
+            };
+            report_draft_persistence_error(widgets, state, action, &err);
             false
         }
+    }
+}
+
+fn active_draft_matches_fields(state: &SharedState, fields: &ComposeFields) -> bool {
+    state
+        .borrow()
+        .active_draft
+        .as_ref()
+        .is_some_and(|active| active.saved_fields == *fields)
+}
+
+fn reconcile_recovery_draft(
+    widgets: &Widgets,
+    state: &SharedState,
+    fields: &ComposeFields,
+) -> anyhow::Result<()> {
+    if active_draft_matches_fields(state, fields) {
+        composer::clear_recovery_draft_files(
+            widgets.composer.recovery_path(),
+            widgets.composer.legacy_recovery_path(),
+        )
+    } else {
+        composer::persist_recovery_draft(
+            widgets.composer.recovery_path(),
+            widgets.composer.legacy_recovery_path(),
+            fields,
+        )
     }
 }
 
@@ -7254,14 +7361,30 @@ fn execute_pending_action(
             selection,
             status,
             active_pane,
+            clear_saved_recovery,
             ..
         } => {
             apply_message_selection_snapshot(options, widgets, state, selection);
-            set_active_draft(widgets, state, None);
+            let recovery_error = if clear_saved_recovery {
+                composer::clear_recovery_draft_files(
+                    widgets.composer.recovery_path(),
+                    widgets.composer.legacy_recovery_path(),
+                )
+                .err()
+            } else {
+                None
+            };
+            reset_composer_fields(widgets, state);
             show_preferred_selected_message_view(options, widgets, state);
             state.borrow_mut().active_pane = active_pane;
             focus_active_pane(widgets, state);
-            widgets.status_label.set_text(&status);
+            if let Some(err) = recovery_error {
+                let message = format!("{status}; saved-draft recovery cleanup failed: {err}");
+                state.borrow_mut().last_error = Some(message.clone());
+                widgets.status_label.set_text(&message);
+            } else {
+                widgets.status_label.set_text(&status);
+            }
             true
         }
         PendingTransition::CloseMainWindow => {
@@ -7289,6 +7412,12 @@ fn request_show_selected_message(
         widgets.status_label.set_text(&status);
         return true;
     }
+    let fields = compose_fields(widgets, state);
+    let clear_saved_recovery = state
+        .borrow()
+        .active_draft
+        .as_ref()
+        .is_some_and(|active| fields == active.saved_fields);
     request_pending_action(
         options,
         widgets,
@@ -7298,6 +7427,7 @@ fn request_show_selected_message(
             rejection_restore,
             status,
             active_pane,
+            clear_saved_recovery,
         },
     )
 }
@@ -7400,6 +7530,8 @@ fn apply_prepared_composer_replacement(
             });
             apply_compose_fields(widgets, state, fields);
             set_active_draft(widgets, state, active_draft);
+            let fields = compose_fields(widgets, state);
+            persist_recovery_draft_from_ui(widgets, state, &fields);
             show_compose_view(widgets);
         }
     }
@@ -7439,12 +7571,18 @@ fn request_save_current_draft(
     if let Some(previous) = previous_draft.as_ref()
         && fields == previous.saved_fields
     {
-        return Ok(Some(DraftSaveReport {
+        let recovery_cleanup_warning = reconcile_recovery_draft(widgets, state, &fields)
+            .err()
+            .map(|err| err.to_string());
+        let report = DraftSaveReport {
             local_path: (!previous.indexed).then(|| previous.path.clone()),
             maildir_path: previous.indexed.then(|| previous.path.clone()),
             indexed_message_id: previous.message_id.clone(),
             replaced_path: None,
-        }));
+            recovery_cleanup_warning,
+        };
+        announce_draft_save(widgets, state, &report);
+        return Ok(Some(report));
     }
     if let Some(previous) = previous_draft {
         let requested = request_pending_action(
@@ -7519,17 +7657,23 @@ fn finish_captured_draft_save(
         None
     };
     set_active_draft(widgets, state, Some(active_draft));
+    let recovery_cleanup_warning = reconcile_recovery_draft(widgets, state, &fields)
+        .err()
+        .map(|err| err.to_string());
     let report = DraftSaveReport {
         local_path,
         maildir_path: persisted.as_ref().map(|persisted| persisted.path.clone()),
         indexed_message_id: persisted.and_then(|persisted| persisted.indexed_message_id),
         replaced_path,
+        recovery_cleanup_warning,
     };
     widgets.composer.refresh_draft_list();
     announce_draft_save(widgets, state, &report);
-    if report.indexed_message_id.is_some() {
+    if report.indexed_message_id.is_some() && report.recovery_cleanup_warning.is_none() {
         let current = state.borrow().current_query.clone();
-        run_search(options, widgets, state, &current);
+        // Refresh indexed results without selecting a background message and
+        // making a successful draft save look like the composer disappeared.
+        schedule_search(options, widgets, state, &current, false, Duration::ZERO);
     }
     Ok(report)
 }
@@ -7541,10 +7685,13 @@ fn announce_draft_save(widgets: &Widgets, state: &SharedState, report: &DraftSav
         .or(report.local_path.as_ref())
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "draft store".to_string());
-    let message = format!("Draft saved to {destination}");
+    let mut message = format!("Draft saved to {destination}");
+    if let Some(warning) = &report.recovery_cleanup_warning {
+        message.push_str(&format!("; recovery cleanup failed: {warning}"));
+    }
     {
         let mut state = state.borrow_mut();
-        state.last_error = None;
+        state.last_error = report.recovery_cleanup_warning.clone();
         state.last_operation = Some(message.clone());
     }
     widgets.status_label.set_text(&message);
@@ -7558,8 +7705,14 @@ fn set_active_draft(widgets: &Widgets, state: &SharedState, active_draft: Option
 
 fn delete_draft_source(options: &LaunchOptions, draft: &ActiveDraft) -> anyhow::Result<()> {
     if draft.indexed {
-        let db = Database::open(&open_config(options), DatabaseMode::ReadWrite)?;
-        db.remove_message_file(&draft.path)?;
+        {
+            let db = Database::open(&open_config(options), DatabaseMode::ReadWrite)?;
+            db.remove_message_file(&draft.path)?;
+        }
+        // Notmuch's committed revision can remain unchanged when a document is
+        // deleted while other messages remain. Revision-keyed search pages
+        // therefore need explicit invalidation before the post-delete refresh.
+        thread_list::invalidate_search_caches();
     }
     if draft.path.exists() {
         std::fs::remove_file(&draft.path)?;
@@ -7595,6 +7748,7 @@ fn delete_captured_active_draft(
     match delete_draft_source(options, &draft) {
         Ok(()) => {
             if state.borrow().active_draft.as_ref() == Some(&draft) {
+                detach_deleted_indexed_draft_selection(widgets, state, &draft);
                 clear_draft_widgets(options, widgets, state);
                 if let Err(err) = composer::clear_recovery_draft_files(
                     widgets.composer.recovery_path(),
@@ -7610,6 +7764,9 @@ fn delete_captured_active_draft(
                 }
             }
             let current = state.borrow().current_query.clone();
+            if draft.indexed {
+                show_thread_list_loading(widgets, "Reloading after draft deletion…");
+            }
             run_search(options, widgets, state, &current);
             widgets.status_label.set_text(&format!(
                 "Deleted local draft {}; reloading search…",
@@ -7631,6 +7788,76 @@ fn delete_captured_active_draft(
             update_debug(widgets, state);
             false
         }
+    }
+}
+
+fn detach_deleted_indexed_draft_selection(
+    widgets: &Widgets,
+    state: &SharedState,
+    draft: &ActiveDraft,
+) {
+    if !draft.indexed {
+        return;
+    }
+    let selected_is_deleted = state
+        .borrow()
+        .selected_message
+        .as_ref()
+        .is_some_and(|message| {
+            draft
+                .message_id
+                .as_ref()
+                .is_some_and(|message_id| message.message_id == *message_id)
+                || message
+                    .filenames
+                    .iter()
+                    .any(|filename| Path::new(filename) == draft.path)
+        });
+    if !selected_is_deleted {
+        return;
+    }
+    let removed_thread = {
+        let mut state = state.borrow_mut();
+        state.messages.retain(|message| {
+            !draft
+                .message_id
+                .as_ref()
+                .is_some_and(|message_id| message.message_id == *message_id)
+                && !message
+                    .filenames
+                    .iter()
+                    .any(|filename| Path::new(filename) == draft.path)
+        });
+        state.selected_message = state.messages.last().cloned();
+        if state.selected_message.is_some() {
+            false
+        } else {
+            let selected_thread_id = state.selected_thread.take().map(|thread| thread.thread_id);
+            if let Some(thread_id) = selected_thread_id {
+                let before = state.thread_list_items.len();
+                state
+                    .thread_list_items
+                    .retain(|thread| thread.thread_id != thread_id);
+                state.thread_details.remove(&thread_id);
+                state.multi_selected_threads.remove(&thread_id);
+                state.visual_selected_threads.remove(&thread_id);
+                state.thread_loaded_count = state.thread_list_items.len();
+                if state.thread_list_items.len() < before {
+                    state.thread_total_count = state.thread_total_count.saturating_sub(1);
+                }
+                state.can_load_more_threads = state.thread_window_offset
+                    + state.thread_loaded_count
+                    < state.thread_total_count as usize;
+            }
+            true
+        }
+    };
+    if removed_thread {
+        widgets.thread_list.clear_selection_silently();
+        widgets
+            .thread_list
+            .apply_model_update(&thread_model_snapshot(state), ThreadModelUpdate::Replace);
+        update_thread_result_label(widgets, state);
     }
 }
 
@@ -7838,8 +8065,11 @@ fn restore_message_view_after_compose(
         widgets.status_label.set_text(&status);
     } else {
         widgets.message_stack.set_visible_child_name("text");
+        widgets.message_view.buffer().set_text("");
         widgets.message_header_box.set_visible(false);
         widgets.attachments.hide();
+        update_message_menu(options, widgets, state);
+        update_message_action_buttons(options, widgets, state);
     }
 }
 
@@ -8228,6 +8458,9 @@ fn update_sender_view_preference_button(widgets: &Widgets, state: &SharedState) 
     let Some(sender) = selected_sender_email(state) else {
         widgets.sender_view_preference_button.set_visible(false);
         widgets.sender_view_preference_button.set_tooltip_text(None);
+        widgets
+            .sender_view_preference_button
+            .remove_css_class("suggested-action");
         return;
     };
     let preference = widgets.active_message_view.get().preference();
@@ -8236,16 +8469,31 @@ fn update_sender_view_preference_button(widgets: &Widgets, state: &SharedState) 
         .sender_view_preferences
         .get(&sender)
         .is_some_and(|saved| *saved == preference);
-    let label = if enabled {
-        format!("Stop always showing this sender as {}", preference.label())
+    let label = format!("Always: {}", preference.label());
+    set_button_label(
+        &widgets.sender_view_preference_button,
+        &label,
+        visible_binding(message_pane_shortcuts_available(widgets), "V a"),
+        state,
+    );
+    if enabled {
+        widgets
+            .sender_view_preference_button
+            .add_css_class("suggested-action");
     } else {
-        format!("Always show this sender as {}", preference.label())
+        widgets
+            .sender_view_preference_button
+            .remove_css_class("suggested-action");
+    }
+    let action = if enabled {
+        "Activate to remove this sender default."
+    } else {
+        "Activate to use this view by default for this sender."
     };
-    widgets.sender_view_preference_button.set_label(&label);
     widgets
         .sender_view_preference_button
         .set_tooltip_text(Some(&format!(
-            "Sender: {sender}. A per-message view choice still takes precedence."
+            "Sender: {sender}. {action} A per-message view choice still takes precedence."
         )));
     widgets.sender_view_preference_button.set_visible(true);
     widgets.sender_view_preference_button.set_sensitive(true);
@@ -10895,10 +11143,7 @@ fn remove_undo_tag_action(undo_state: &UndoState, index: usize) -> Option<UndoTa
 }
 
 fn default_undo_history_path() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("."))
+    composer::default_state_home()
         .join("notm")
         .join("tag-undo.json")
 }
@@ -10915,15 +11160,15 @@ fn load_undo_tag_actions() -> Vec<UndoTagAction> {
 
 fn persist_undo_tag_actions(actions: &[UndoTagAction]) -> anyhow::Result<()> {
     let path = default_undo_history_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    persist_undo_tag_actions_to_path(&path, actions)
+}
+
+fn persist_undo_tag_actions_to_path(path: &Path, actions: &[UndoTagAction]) -> anyhow::Result<()> {
     let history = UndoTagHistory {
         version: UNDO_TAG_HISTORY_VERSION,
         actions: actions.to_vec(),
     };
-    std::fs::write(path, serde_json::to_string_pretty(&history)?)?;
-    Ok(())
+    composer::atomic_write_durable(path, serde_json::to_string_pretty(&history)?.as_bytes())
 }
 
 fn tag_undo_label(
@@ -12316,6 +12561,25 @@ struct SyncResponse {
     result: anyhow::Result<Vec<String>>,
 }
 
+#[derive(Debug, Clone)]
+struct SyncExecutionContext {
+    database_path: Option<PathBuf>,
+    config_path: Option<PathBuf>,
+    profile: Option<String>,
+    timeout: Duration,
+}
+
+impl From<&LaunchOptions> for SyncExecutionContext {
+    fn from(options: &LaunchOptions) -> Self {
+        Self {
+            database_path: options.database_path.clone(),
+            config_path: options.config_path.clone(),
+            profile: options.profile.clone(),
+            timeout: Duration::from_secs(options.sync_timeout_seconds),
+        }
+    }
+}
+
 fn run_manual_sync(
     options: &LaunchOptions,
     widgets: &Widgets,
@@ -12404,7 +12668,7 @@ fn run_sync_commands(
     update_background_activity_controls(options, widgets, state);
     update_debug(widgets, state);
 
-    let rx = spawn_sync_commands(label, commands);
+    let rx = spawn_sync_commands(label, commands, SyncExecutionContext::from(options));
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
@@ -12422,8 +12686,12 @@ fn run_sync_commands(
                         w.status_label
                             .set_text(&format!("{label}: refreshing messages…"));
                         let query = sync_refresh_query(&w, &st);
+                        let select_first = !composer_requires_confirmation(
+                            &compose_fields(&w, &st),
+                            st.borrow().active_draft.as_ref(),
+                        );
                         let generation =
-                            schedule_search(&opts, &w, &st, &query, true, refresh_delay);
+                            schedule_search(&opts, &w, &st, &query, select_first, refresh_delay);
                         w.sync_refresh_generation.set(Some(generation));
                         let application_hold = application_hold
                             .take()
@@ -12557,38 +12825,94 @@ fn close_main_window_after_background_activity(widgets: &Widgets, state: &Shared
 fn spawn_sync_commands(
     label: &'static str,
     commands: Vec<SyncCommandSpec>,
+    context: SyncExecutionContext,
 ) -> mpsc::Receiver<SyncResponse> {
     let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let result = execute_sync_commands(label, commands);
-        let _ = tx.send(SyncResponse { result });
-    });
+    let worker_tx = tx.clone();
+    let spawn_result = thread::Builder::new()
+        .name("notm-sync".to_string())
+        .spawn(move || {
+            let result = execute_sync_commands(label, commands, &context);
+            let _ = worker_tx.send(SyncResponse { result });
+        });
+    if let Err(err) = spawn_result {
+        let _ = tx.send(SyncResponse {
+            result: Err(anyhow::anyhow!("starting sync worker: {err}")),
+        });
+    }
     rx
 }
 
 fn execute_sync_commands(
     label: &str,
     commands: Vec<SyncCommandSpec>,
+    context: &SyncExecutionContext,
 ) -> anyhow::Result<Vec<String>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     let mut reports = Vec::new();
     for spec in commands {
-        let output = Command::new("sh").arg("-c").arg(&spec.command).output()?;
-        reports.push(format!(
-            "{}: status={:?} stdout={} stderr={}",
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(&spec.command);
+        if let Some(path) = &context.config_path {
+            command.env("NOTMUCH_CONFIG", path);
+        }
+        if let Some(path) = &context.database_path {
+            command.env("NOTMUCH_DATABASE", path);
+        }
+        if let Some(profile) = &context.profile {
+            command.env("NOTMUCH_PROFILE", profile);
+        }
+        let output = runtime.block_on(notm_mail::run_external_command(
             spec.name,
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-        anyhow::ensure!(
-            output.status.success(),
-            "{} command `{}` failed with status {:?}",
-            label,
-            spec.name,
-            output.status.code()
-        );
+            command,
+            None,
+            context.timeout,
+        ))?;
+        let report = sync_command_report(&spec, &output);
+        if !output.status.success() {
+            let details = report
+                .split_once(": ")
+                .map_or(report.as_str(), |(_, details)| details);
+            anyhow::bail!(
+                "{label} {} command failed with {details}",
+                spec.name.replace('_', " ")
+            );
+        }
+        reports.push(report);
     }
     Ok(reports)
+}
+
+const SYNC_UI_OUTPUT_LIMIT: usize = 4 * 1024;
+
+fn sync_command_report(spec: &SyncCommandSpec, output: &std::process::Output) -> String {
+    let status = output
+        .status
+        .code()
+        .map_or_else(|| "signal".to_string(), |code| code.to_string());
+    let mut report = format!("{}: status={status}", spec.name);
+    for (name, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+        let value = bounded_sync_output(bytes);
+        if !value.is_empty() {
+            report.push_str(&format!(" {name}={value}"));
+        }
+    }
+    report
+}
+
+fn bounded_sync_output(bytes: &[u8]) -> String {
+    let value = String::from_utf8_lossy(bytes);
+    let value = value.trim();
+    if value.len() <= SYNC_UI_OUTPUT_LIMIT {
+        return value.to_string();
+    }
+    let mut boundary = SYNC_UI_OUTPUT_LIMIT;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!("{}… [truncated]", &value[..boundary])
 }
 
 fn apply_sync_error(widgets: &Widgets, state: &SharedState, label: &str, err: anyhow::Error) {
@@ -13274,7 +13598,12 @@ fn finish_accepted_send_cleanup(
 }
 
 fn reset_composer_after_send(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
-    let fields = widgets.composer.reset_after_send();
+    reset_composer_fields(widgets, state);
+    restore_message_view_after_compose(options, widgets, state);
+}
+
+fn reset_composer_fields(widgets: &Widgets, state: &SharedState) {
+    let fields = widgets.composer.reset_fields();
     update_attachment_label(widgets, &[]);
     {
         let mut state = state.borrow_mut();
@@ -13283,7 +13612,6 @@ fn reset_composer_after_send(options: &LaunchOptions, widgets: &Widgets, state: 
         state.active_draft = None;
     }
     update_draft_action_buttons(widgets, state);
-    restore_message_view_after_compose(options, widgets, state);
 }
 
 fn send_operation_summary(success: &SendSuccess, issue_summary: Option<&str>) -> String {
@@ -13383,10 +13711,11 @@ fn persist_sent_message(
     let maildir = options
         .sent_maildir
         .clone()
+        .or_else(|| options.mail_root.as_ref().map(|path| path.join("Sent")))
         .or_else(|| options.database_path.as_ref().map(|path| path.join("Sent")))
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "send.save_sent=true but no sent_maildir or database path is configured"
+                "send.save_sent=true but no sent_maildir or Notmuch mail root/database path is available"
             )
         })?;
     let path = save_rfc5322_to_maildir(&maildir, message, "S")?;
@@ -13411,6 +13740,7 @@ fn persist_draft_message(
     let maildir = options
         .draft_maildir
         .clone()
+        .or_else(|| options.mail_root.as_ref().map(|path| path.join("Drafts")))
         .or_else(|| {
             options
                 .database_path
@@ -13420,7 +13750,7 @@ fn persist_draft_message(
         .or_else(|| default_database_maildir(options, "Drafts").ok())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "drafts.save_maildir=true but no draft maildir or database path is configured"
+                "drafts.save_maildir=true but no draft maildir or Notmuch mail root/database path is available"
             )
         })?;
     let path = save_rfc5322_to_maildir(&maildir, message, "D")?;
@@ -13437,7 +13767,13 @@ fn persist_draft_message(
 
 fn default_database_maildir(options: &LaunchOptions, name: &str) -> anyhow::Result<PathBuf> {
     let db = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
-    Ok(PathBuf::from(db.path()).join(name))
+    let root = db
+        .config_value("database.mail_root")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(db.path()));
+    Ok(root.join(name))
 }
 
 fn save_rfc5322_to_maildir(
@@ -13448,9 +13784,9 @@ fn save_rfc5322_to_maildir(
     let tmp = maildir.join("tmp");
     let cur = maildir.join("cur");
     let new = maildir.join("new");
-    std::fs::create_dir_all(&tmp)?;
-    std::fs::create_dir_all(&cur)?;
-    std::fs::create_dir_all(&new)?;
+    create_private_directory(&tmp)?;
+    create_private_directory(&cur)?;
+    create_private_directory(&new)?;
     let unique = format!(
         "{}.{}.{}.notm",
         Utc::now().timestamp(),
@@ -13458,10 +13794,38 @@ fn save_rfc5322_to_maildir(
         Uuid::new_v4()
     );
     let tmp_path = tmp.join(&unique);
-    std::fs::write(&tmp_path, message.to_rfc5322())?;
+    write_private_new_file(&tmp_path, message.to_rfc5322().as_bytes())?;
     let final_path = cur.join(format!("{unique}:2,{flags}"));
     std::fs::rename(&tmp_path, &final_path)?;
     Ok(final_path)
+}
+
+fn create_private_directory(path: &Path) -> anyhow::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    Ok(())
+}
+
+fn write_private_new_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents)?;
+    file.flush()?;
+    Ok(())
 }
 
 fn index_message_file(
@@ -14443,15 +14807,6 @@ fn handle_automation_request(
         "save_draft" => match request_save_current_draft(options, widgets, state) {
             Ok(Some(report)) => {
                 widgets.composer.refresh_draft_list();
-                let destination = report
-                    .maildir_path
-                    .as_ref()
-                    .or(report.local_path.as_ref())
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "draft store".to_string());
-                widgets
-                    .status_label
-                    .set_text(&format!("Draft saved to {destination}"));
                 json!({"ok": true, "report": report})
             }
             Ok(None) => json!({
@@ -15256,6 +15611,7 @@ fn view_preference_state_json(widgets: &Widgets, state: &SharedState) -> serde_j
         "sender_button": {
             "visible": widgets.sender_view_preference_button.is_visible(),
             "sensitive": widgets.sender_view_preference_button.is_sensitive(),
+            "active": widgets.sender_view_preference_button.has_css_class("suggested-action"),
             "label": widgets.sender_view_preference_button.label().map(|label| label.to_string()),
             "tooltip": widgets.sender_view_preference_button.tooltip_text().map(|text| text.to_string()),
         },
@@ -16579,6 +16935,11 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
         },
         HelpEntry {
             section: "Message actions",
+            key: "V a",
+            description: "Toggle the current view as this sender's default.",
+        },
+        HelpEntry {
+            section: "Message actions",
             key: "q",
             description: "Toggle quote collapse.",
         },
@@ -16606,6 +16967,11 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
             section: "Compose",
             key: "Ctrl+Enter",
             description: "Send compose.",
+        },
+        HelpEntry {
+            section: "Compose",
+            key: "A",
+            description: "Add an attachment in compose.",
         },
         HelpEntry {
             section: "Compose",
@@ -17191,6 +17557,45 @@ mod tests {
     }
 
     #[test]
+    fn composer_shortcuts_accept_physical_shifted_and_uppercase_keyvals() {
+        let none = gtk::gdk::ModifierType::empty();
+        let shift = gtk::gdk::ModifierType::SHIFT_MASK;
+        for (lowercase, uppercase, action) in [
+            (
+                gtk::gdk::Key::a,
+                gtk::gdk::Key::A,
+                ComposerShortcutAction::AddAttachment,
+            ),
+            (
+                gtk::gdk::Key::s,
+                gtk::gdk::Key::S,
+                ComposerShortcutAction::SaveDraft,
+            ),
+            (
+                gtk::gdk::Key::d,
+                gtk::gdk::Key::D,
+                ComposerShortcutAction::DeleteLocalDraft,
+            ),
+        ] {
+            assert_eq!(composer_shortcut_action(uppercase, none), Some(action));
+            assert_eq!(composer_shortcut_action(lowercase, shift), Some(action));
+            assert_eq!(composer_shortcut_action(lowercase, none), None);
+        }
+        assert_eq!(
+            composer_shortcut_action(gtk::gdk::Key::x, none),
+            Some(ComposerShortcutAction::ClearDraft)
+        );
+        assert_eq!(composer_shortcut_action(gtk::gdk::Key::x, shift), None);
+        assert_eq!(
+            composer_shortcut_action(
+                gtk::gdk::Key::s,
+                shift | gtk::gdk::ModifierType::CONTROL_MASK,
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn injected_shortcuts_parse_gdk_names_and_reject_ambiguous_input() {
         let (key, modifiers) = injected_shortcut(&json!({
             "key": "J",
@@ -17267,6 +17672,107 @@ mod tests {
             err.to_string().contains("refusing to fake-send"),
             "unexpected error: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maildir_persistence_creates_private_directories_and_message() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temporary parent");
+        let maildir = temp.path().join("Sent");
+        let message = ComposedMessage::new(
+            "sender@example.test".to_string(),
+            vec!["recipient@example.test".to_string()],
+            "private persistence".to_string(),
+            "body".to_string(),
+        );
+
+        let path =
+            save_rfc5322_to_maildir(&maildir, &message, "S").expect("persist message to Maildir");
+
+        for directory in [
+            &maildir,
+            &maildir.join("tmp"),
+            &maildir.join("cur"),
+            &maildir.join("new"),
+        ] {
+            let mode = std::fs::metadata(directory)
+                .expect("private Maildir metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "{directory:?} exposed group/other bits");
+        }
+        let mode = std::fs::metadata(&path)
+            .expect("private message metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o177, 0, "{path:?} was not a regular mode-0600 file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_history_is_replaced_with_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temporary state root");
+        let state_directory = temp.path().join("notm");
+        std::fs::create_dir(&state_directory).expect("create state directory");
+        std::fs::set_permissions(&state_directory, std::fs::Permissions::from_mode(0o755))
+            .expect("seed non-private state directory");
+        let path = state_directory.join("tag-undo.json");
+        std::fs::write(&path, "old history").expect("seed undo history");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("seed non-private undo history");
+
+        persist_undo_tag_actions_to_path(&path, &[]).expect("replace undo history");
+
+        assert_eq!(
+            std::fs::metadata(&state_directory)
+                .expect("state directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("undo history metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let stored: UndoTagHistory =
+            serde_json::from_slice(&std::fs::read(path).expect("read undo history"))
+                .expect("parse undo history");
+        assert!(stored.actions.is_empty());
+    }
+
+    #[test]
+    fn sent_persistence_defaults_to_mail_root_before_database_path() {
+        let temp = tempfile::tempdir().expect("temporary parent");
+        let mail_root = temp.path().join("mail-root");
+        let database_path = temp.path().join("separate-index");
+        let options = LaunchOptions {
+            database_path: Some(database_path.clone()),
+            mail_root: Some(mail_root.clone()),
+            save_sent: true,
+            ..LaunchOptions::default()
+        };
+        let message = ComposedMessage::new(
+            "sender@example.test".to_string(),
+            vec!["recipient@example.test".to_string()],
+            "split database".to_string(),
+            "body".to_string(),
+        );
+
+        let persisted = persist_sent_message(&options, &message)
+            .expect("persist sent message")
+            .expect("sent persistence enabled");
+
+        assert!(persisted.path.starts_with(mail_root.join("Sent/cur")));
+        assert!(!persisted.path.starts_with(database_path));
     }
 
     #[test]
@@ -18146,6 +18652,12 @@ mod tests {
                 name: "receive",
                 command: "sleep 1; printf done".to_string(),
             }],
+            SyncExecutionContext {
+                database_path: None,
+                config_path: None,
+                profile: None,
+                timeout: Duration::from_secs(3),
+            },
         );
 
         assert!(
@@ -18206,9 +18718,94 @@ mod tests {
             },
         ];
 
-        let error = execute_sync_commands("Test sync", commands)
-            .expect_err("failing receive command should fail the sync");
-        assert!(error.to_string().contains("failed with status Some(7)"));
+        let error = execute_sync_commands(
+            "Test sync",
+            commands,
+            &SyncExecutionContext {
+                database_path: None,
+                config_path: None,
+                profile: None,
+                timeout: Duration::from_secs(3),
+            },
+        )
+        .expect_err("failing receive command should fail the sync");
+        assert!(error.to_string().contains("failed with status=7"));
         assert!(!marker.exists(), "a command after the failure was executed");
+    }
+
+    #[test]
+    fn sync_commands_receive_notmuch_context_and_run_in_order() {
+        let directory = tempfile::tempdir().expect("temporary sync directory");
+        let marker = directory.path().join("order");
+        let first = format!("printf 1 > {:?}", marker);
+        let second = format!(
+            "test \"$(cat {:?})\" = 1 && printf 2 >> {:?}; \
+             printf '%s|%s|%s' \"$NOTMUCH_CONFIG\" \"$NOTMUCH_DATABASE\" \"$NOTMUCH_PROFILE\"",
+            marker, marker
+        );
+        let context = SyncExecutionContext {
+            database_path: Some(PathBuf::from("/tmp/notm-test-database")),
+            config_path: Some(PathBuf::from("/tmp/notm-test-config")),
+            profile: Some("work".to_string()),
+            timeout: Duration::from_secs(3),
+        };
+
+        let reports = execute_sync_commands(
+            "Test sync",
+            vec![
+                SyncCommandSpec {
+                    name: "receive",
+                    command: first,
+                },
+                SyncCommandSpec {
+                    name: "database_update",
+                    command: second,
+                },
+            ],
+            &context,
+        )
+        .expect("ordered sync commands");
+
+        assert_eq!(std::fs::read_to_string(marker).expect("order marker"), "12");
+        assert!(reports[1].contains("stdout=/tmp/notm-test-config|/tmp/notm-test-database|work"));
+    }
+
+    #[test]
+    fn sync_timeout_and_diagnostics_are_bounded_and_actionable() {
+        let timeout = execute_sync_commands(
+            "Test sync",
+            vec![SyncCommandSpec {
+                name: "receive",
+                command: "sleep 2".to_string(),
+            }],
+            &SyncExecutionContext {
+                database_path: None,
+                config_path: None,
+                profile: None,
+                timeout: Duration::from_millis(100),
+            },
+        )
+        .expect_err("slow sync should time out");
+        assert!(timeout.to_string().contains("receive command timed out"));
+
+        let failure = execute_sync_commands(
+            "Test sync",
+            vec![SyncCommandSpec {
+                name: "receive",
+                command: "head -c 10000 /dev/zero | tr '\\0' x >&2; exit 9".to_string(),
+            }],
+            &SyncExecutionContext {
+                database_path: None,
+                config_path: None,
+                profile: None,
+                timeout: Duration::from_secs(3),
+            },
+        )
+        .expect_err("failing sync should include diagnostics");
+        let failure = failure.to_string();
+        assert!(failure.contains("failed with status=9"));
+        assert!(failure.contains("stderr="));
+        assert!(failure.contains("[truncated]"));
+        assert!(failure.len() < SYNC_UI_OUTPUT_LIMIT + 256);
     }
 }

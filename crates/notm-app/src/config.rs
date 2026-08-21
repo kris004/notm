@@ -78,6 +78,10 @@ impl AppConfig {
                 || self.send.args.iter().any(|arg| arg.contains("{file}")),
             "send.args must include an entry containing {{file}} when send.mode is command_template"
         );
+        anyhow::ensure!(
+            self.sync.timeout_seconds > 0,
+            "sync.timeout_seconds must be greater than zero"
+        );
         Ok(())
     }
 
@@ -113,6 +117,9 @@ pub struct NotmuchConfig {
     pub config_path: Option<PathBuf>,
     #[serde(default)]
     pub profile: Option<String>,
+    /// Effective mail storage root loaded from Notmuch; not an app config key.
+    #[serde(skip)]
+    pub resolved_mail_root: Option<PathBuf>,
     #[serde(default = "default_notmuch_query")]
     pub default_query: String,
     #[serde(default = "default_excluded_tags")]
@@ -129,6 +136,7 @@ impl Default for NotmuchConfig {
             database_path: None,
             config_path: None,
             profile: None,
+            resolved_mail_root: None,
             default_query: "tag:inbox and not tag:trash and not tag:spam".to_string(),
             excluded_tags: vec!["trash".to_string(), "spam".to_string()],
             open_readwrite_only_for_mutations: true,
@@ -137,13 +145,38 @@ impl Default for NotmuchConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct IdentityConfig {
     pub name: Option<String>,
     pub primary_email: Option<String>,
     #[serde(default)]
     pub other_email: Vec<String>,
+    #[serde(skip)]
+    other_email_is_explicit: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityConfigInput {
+    name: Option<String>,
+    primary_email: Option<String>,
+    other_email: Option<Vec<String>>,
+}
+
+impl<'de> Deserialize<'de> for IdentityConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let input = IdentityConfigInput::deserialize(deserializer)?;
+        let other_email_is_explicit = input.other_email.is_some();
+        Ok(Self {
+            name: input.name,
+            primary_email: input.primary_email,
+            other_email: input.other_email.unwrap_or_default(),
+            other_email_is_explicit,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,6 +346,8 @@ pub struct SyncConfig {
     pub enabled: bool,
     #[serde(default = "default_sync_label")]
     pub manual_action_label: String,
+    #[serde(default = "default_sync_timeout")]
+    pub timeout_seconds: u64,
     #[serde(default)]
     pub notmuch_database_update_enabled: bool,
     #[serde(default)]
@@ -334,6 +369,7 @@ impl Default for SyncConfig {
         Self {
             enabled: false,
             manual_action_label: "Sync".to_string(),
+            timeout_seconds: 300,
             notmuch_database_update_enabled: false,
             notmuch_database_update_on_startup: false,
             notmuch_database_update_command: String::new(),
@@ -376,6 +412,12 @@ impl Default for AutomationConfig {
 }
 
 pub fn load(path_override: Option<PathBuf>) -> anyhow::Result<AppConfig> {
+    let mut config = load_app_config(path_override)?;
+    load_notmuch_context(&mut config)?;
+    Ok(config)
+}
+
+pub(crate) fn load_app_config(path_override: Option<PathBuf>) -> anyhow::Result<AppConfig> {
     let explicit_path = path_override.is_some();
     let path = path_override.unwrap_or_else(paths::config_path);
     anyhow::ensure!(
@@ -383,7 +425,7 @@ pub fn load(path_override: Option<PathBuf>) -> anyhow::Result<AppConfig> {
         "configuration file {} does not exist",
         path.display()
     );
-    let mut config = if path.exists() {
+    let config = if path.exists() {
         let contents = fs::read_to_string(&path)
             .with_context(|| format!("failed to read configuration file {}", path.display()))?;
         toml::from_str::<AppConfig>(&contents)
@@ -394,35 +436,96 @@ pub fn load(path_override: Option<PathBuf>) -> anyhow::Result<AppConfig> {
     config
         .validate()
         .with_context(|| format!("invalid configuration file {}", path.display()))?;
-    let notmuch_config = config
-        .notmuch
-        .config_path
-        .clone()
-        .or_else(paths::notmuch_default_config_path);
-    if config.notmuch.config_path.is_none() {
-        config.notmuch.config_path = notmuch_config.clone();
-    }
-    if config.notmuch.database_path.is_none()
-        && let Some(path) = &notmuch_config
-    {
-        config.notmuch.database_path =
-            notm_notmuch::config::parse_notmuch_config_database_path(path);
-    }
-    if (config.identity.primary_email.is_none() || config.identity.name.is_none())
-        && let Some(path) = &notmuch_config
-    {
-        let identity = notm_notmuch::config::parse_notmuch_config_identity(path);
-        if config.identity.name.is_none() {
-            config.identity.name = identity.name;
-        }
-        if config.identity.primary_email.is_none() {
-            config.identity.primary_email = identity.primary_email;
-        }
-        if config.identity.other_email.is_empty() {
-            config.identity.other_email = identity.other_email;
-        }
-    }
     Ok(config)
+}
+
+fn load_notmuch_context(config: &mut AppConfig) -> anyhow::Result<()> {
+    // Pass Notmuch's environment overrides explicitly so they retain their documented priority
+    // when libnotmuch merges the external file with database configuration metadata. Leaving an
+    // input unset delegates XDG, profile, legacy, MAILDIR, and HOME fallbacks to libnotmuch.
+    let environment_database = nonempty_environment_path("NOTMUCH_DATABASE");
+    let environment_config = nonempty_environment_path("NOTMUCH_CONFIG");
+    let environment_profile = nonempty_environment_string("NOTMUCH_PROFILE");
+    let open = notm_notmuch::OpenConfig {
+        database_path: config
+            .notmuch
+            .database_path
+            .clone()
+            .or_else(|| environment_database.clone()),
+        config_path: config
+            .notmuch
+            .config_path
+            .clone()
+            .or_else(|| environment_config.clone()),
+        profile: config
+            .notmuch
+            .profile
+            .clone()
+            .or_else(|| environment_profile.clone()),
+    };
+    let database = notm_notmuch::Database::load_config(&open)
+        .context("failed to load effective Notmuch configuration")?;
+
+    if config.notmuch.database_path.is_none() {
+        config.notmuch.database_path = nonempty_path(database.path());
+    }
+    if config.notmuch.config_path.is_none() {
+        config.notmuch.config_path = environment_config;
+    }
+    if config.notmuch.profile.is_none() {
+        config.notmuch.profile = environment_profile;
+    }
+    config.notmuch.resolved_mail_root = loaded_notmuch_value(&database, "database.mail_root")?
+        .map(PathBuf::from)
+        .or_else(|| config.notmuch.database_path.clone());
+
+    if config.identity.name.is_none() {
+        config.identity.name = loaded_notmuch_value(&database, "user.name")?;
+    }
+    if config.identity.primary_email.is_none() {
+        config.identity.primary_email = loaded_notmuch_value(&database, "user.primary_email")?;
+    }
+    if !config.identity.other_email_is_explicit
+        && config.identity.other_email.is_empty()
+        && let Some(other_email) = loaded_notmuch_value(&database, "user.other_email")?
+    {
+        config.identity.other_email = other_email
+            .split(';')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+    }
+    Ok(())
+}
+
+fn loaded_notmuch_value(
+    database: &notm_notmuch::Database,
+    key: &str,
+) -> anyhow::Result<Option<String>> {
+    let value = database
+        .config_value(key)
+        .with_context(|| format!("failed to read effective Notmuch setting {key}"))?;
+    Ok(nonempty_value(value))
+}
+
+fn nonempty_value(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn nonempty_path(value: String) -> Option<PathBuf> {
+    nonempty_value(value).map(PathBuf::from)
+}
+
+fn nonempty_environment_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn nonempty_environment_string(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 fn is_supported_layout(value: &str) -> bool {
@@ -513,12 +616,18 @@ fn default_sync_label() -> String {
     "Sync".to_string()
 }
 
+fn default_sync_timeout() -> u64 {
+    300
+}
+
 fn default_screenshot_dir() -> PathBuf {
     PathBuf::from("artifacts/screenshots")
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::{AppConfig, REDACTED_VALUE};
     use notm_ui::model::MessageViewPreference;
 
@@ -526,6 +635,36 @@ mod tests {
         let config = toml::from_str::<AppConfig>(contents)?;
         config.validate()?;
         Ok(config)
+    }
+
+    #[test]
+    fn load_captures_effective_mail_root_without_exposing_an_app_config_key() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let database_path = temp.path().join("index");
+        let mail_root = temp.path().join("mail");
+        let notmuch_config_path = temp.path().join("notmuch-config");
+        let app_config_path = temp.path().join("notm-config.toml");
+        fs::write(
+            &notmuch_config_path,
+            format!(
+                "[database]\npath={}\nmail_root={}\n",
+                database_path.display(),
+                mail_root.display()
+            ),
+        )
+        .expect("write Notmuch config");
+        fs::write(
+            &app_config_path,
+            format!("[notmuch]\nconfig_path = {:?}\n", notmuch_config_path),
+        )
+        .expect("write notm config");
+
+        let config = super::load(Some(app_config_path)).expect("load effective config");
+
+        assert_eq!(config.notmuch.database_path.as_ref(), Some(&database_path));
+        assert_eq!(config.notmuch.resolved_mail_root.as_ref(), Some(&mail_root));
+        let printed = serde_json::to_value(&config).expect("serialize config");
+        assert!(printed["notmuch"].get("resolved_mail_root").is_none());
     }
 
     #[test]
