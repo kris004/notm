@@ -522,6 +522,113 @@ def exercise_message_navigation(
     )
 
 
+def exercise_viewport_scroll_shortcuts(
+    environment: dict[str, str], driver: WtypeDriver, harness: Harness, app_pid: int
+) -> None:
+    response = harness.request("run_search", {"query": "*"})
+    if response.get("scheduled") is not True:
+        raise SmokeFailure(f"message-list fixture search was not scheduled: {response!r}")
+    state_value = harness.wait_for_search()
+    threads = state_value.get("thread_list_items")
+    if not isinstance(threads, list) or len(threads) < 8:
+        raise SmokeFailure(f"message-list fixture had too few rows: {state_value!r}")
+    harness.request("select_thread_by_index", {"index": 0})
+    time.sleep(0.3)
+
+    def list_viewport() -> dict[str, Any]:
+        return harness.request("thread_selection_view_state")
+
+    initial = wait_until(
+        "scrollable message-list viewport",
+        lambda: (
+            viewport
+            if isinstance((viewport := list_viewport()).get("scroll_value"), (int, float))
+            and isinstance(viewport.get("scroll_upper"), (int, float))
+            and isinstance(viewport.get("scroll_page_size"), (int, float))
+            and viewport["scroll_upper"] > viewport["scroll_page_size"]
+            and viewport.get("selected_abs") == 0
+            else None
+        ),
+        timeout=10,
+    )
+    initial_y = initial["scroll_value"]
+    selected_thread = harness.state().get("selected_thread", {}).get("thread_id")
+    if not isinstance(selected_thread, str):
+        raise SmokeFailure(f"message-list fixture had no selected thread: {initial!r}")
+
+    def assert_selection_unchanged(phase: str) -> None:
+        state = harness.state()
+        thread_id = state.get("selected_thread", {}).get("thread_id")
+        viewport = list_viewport()
+        if thread_id != selected_thread or viewport.get("selected_abs") != 0:
+            raise SmokeFailure(
+                f"{phase} changed the selected message: state={state!r}, viewport={viewport!r}"
+            )
+
+    def exercise_from_pane(pane: str) -> None:
+        entry = harness.entry_state()
+        if entry.get("input_mode") != "Normal" or entry.get("active_pane") != pane:
+            raise SmokeFailure(f"viewport fixture was not in {pane}: {entry!r}")
+        before = list_viewport().get("scroll_value")
+        if not isinstance(before, (int, float)):
+            raise SmokeFailure(f"message-list viewport had no baseline: {list_viewport()!r}")
+        focus_app_window(environment, app_pid)
+        driver.send("-M", "ctrl", "-k", "e", "-m", "ctrl")
+        down = wait_until(
+            f"physical Ctrl+e to scroll the message list from {pane}",
+            lambda: (
+                viewport
+                if isinstance(
+                    (value := (viewport := list_viewport()).get("scroll_value")),
+                    (int, float),
+                )
+                and value > before
+                else None
+            ),
+            timeout=5,
+        )
+        down_y = down["scroll_value"]
+        assert_selection_unchanged(f"Ctrl+e from {pane}")
+        driver.send("-M", "ctrl", "-k", "y", "-m", "ctrl")
+        wait_until(
+            f"physical Ctrl+y to scroll the message list from {pane}",
+            lambda: (
+                viewport
+                if isinstance(
+                    (value := (viewport := list_viewport()).get("scroll_value")),
+                    (int, float),
+                )
+                and value < down_y
+                else None
+            ),
+            timeout=5,
+        )
+        assert_selection_unchanged(f"Ctrl+y from {pane}")
+
+    # Search completion leaves the message list active.
+    exercise_from_pane("Threads")
+    driver.send("-k", "l")
+    wait_until(
+        "message pane before global message-list viewport shortcut",
+        lambda: (
+            entry
+            if (entry := harness.entry_state()).get("active_pane") == "Message"
+            else None
+        ),
+        timeout=5,
+    )
+    exercise_from_pane("Message")
+    final_y = list_viewport().get("scroll_value")
+    if not isinstance(final_y, (int, float)) or final_y > initial_y + 1.0:
+        raise SmokeFailure(
+            f"Ctrl+y did not restore the message-list viewport: {list_viewport()!r}"
+        )
+    print(
+        "[ui-viewport-scroll] physical Ctrl+e/Ctrl+y message-list scrolling passed",
+        flush=True,
+    )
+
+
 def exercise_link_hints(
     environment: dict[str, str], driver: WtypeDriver, harness: Harness, app_pid: int
 ) -> None:
@@ -1024,6 +1131,9 @@ def run_inside_dbus(args: argparse.Namespace) -> int:
         driver.send("-k", "Escape")
         focus_app_window(environment, app_process.pid)
         exercise_message_navigation(environment, driver, harness, app_process.pid)
+        exercise_viewport_scroll_shortcuts(
+            environment, driver, harness, app_process.pid
+        )
         exercise_link_hints(environment, driver, harness, app_process.pid)
         exercise_ui(environment, driver, harness, app_process.pid)
         exercise_tag_editor(environment, driver, harness, app_process.pid)

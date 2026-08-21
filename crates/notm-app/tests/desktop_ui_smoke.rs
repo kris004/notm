@@ -2850,87 +2850,97 @@ fn fixture_html_link_hints_label_visible_links_and_cancel() -> anyhow::Result<()
 }
 
 #[test]
-fn fixture_ctrl_e_y_scroll_message_without_changing_selection() -> anyhow::Result<()> {
+fn fixture_ctrl_e_y_scroll_message_list_without_changing_selection() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_ctrl_e_y_scroll_message_without_changing_selection: no GUI test display is available"
+            "SKIP fixture_ctrl_e_y_scroll_message_list_without_changing_selection: no GUI test display is available"
         );
         return Ok(());
     };
-    eprintln!("running message viewport Ctrl+e/Ctrl+y UI smoke with {display}");
+    eprintln!("running message-list viewport Ctrl+e/Ctrl+y UI smoke with {display}");
 
     let run_id = unique_run_id()?;
-    let work_dir = std::env::temp_dir().join(format!("notm-message-scroll-ui-{run_id}"));
-    let token = format!("notm-message-scroll-ui-{run_id}");
+    let work_dir = std::env::temp_dir().join(format!("notm-message-list-scroll-ui-{run_id}"));
+    let token = format!("notm-message-list-scroll-ui-{run_id}");
     let mut app = FixtureApp::spawn(work_dir, &token)?;
     let mut driver = app.connect(&token)?;
-    select_first_thread(&mut driver, "id:long-html-message@fixture.test")?;
-    let selected = driver.command("select_message_by_index", json!({"index": 0}))?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    driver.command("resize_window", json!({"width": 1000, "height": 420}))?;
+    let scheduled = driver.command("run_search", json!({"query": "*"}))?;
     assert_eq!(
-        selected["selected_message"]["message_id"], "long-html-message@fixture.test",
-        "long HTML message was not selected: {selected}"
+        scheduled["scheduled"], true,
+        "search was not scheduled: {scheduled}"
     );
-    let selected_before =
-        driver.command("app_state", json!({}))?["state"]["selected_message"]["message_id"].clone();
+    let search = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    ensure!(
+        search["state"]["thread_list_items"]
+            .as_array()
+            .is_some_and(|rows| rows.len() >= 8),
+        "fixture did not provide enough message-list rows: {search}"
+    );
+    driver.command("select_thread_by_index", json!({"index": 0}))?;
+    thread::sleep(Duration::from_millis(350));
 
-    let visual = driver.command("show_visual_html", json!({}))?;
-    assert_eq!(visual["ok"], true, "long HTML did not render: {visual}");
     let deadline = Instant::now() + Duration::from_secs(5);
-    let initial_scroll = loop {
-        let scroll = driver.command("html_scroll_state", json!({}))?;
-        if scroll["ok"] == true && scroll["scroll"]["canScroll"] == true {
-            break scroll;
+    let initial = loop {
+        let viewport = driver.command("thread_selection_view_state", json!({}))?;
+        let scrollable = viewport["scroll_upper"].as_f64().unwrap_or_default()
+            > viewport["scroll_page_size"].as_f64().unwrap_or_default();
+        if viewport["selected_abs"] == 0 && scrollable {
+            break viewport;
         }
         ensure!(
             Instant::now() < deadline,
-            "long HTML never became scrollable: {scroll}"
+            "message-list viewport never became scrollable: {viewport}"
         );
         thread::sleep(STARTUP_POLL_INTERVAL);
     };
-    let initial_y = initial_scroll["scroll"]["y"]
+    let initial_y = initial["scroll_value"]
         .as_f64()
-        .with_context(|| format!("initial HTML scroll offset is missing: {initial_scroll}"))?;
+        .with_context(|| format!("initial list scroll offset is missing: {initial}"))?;
+    let selected_before =
+        driver.command("app_state", json!({}))?["state"]["selected_thread"]["thread_id"].clone();
 
     let down = driver.command("send_key", json!({"key": "e", "modifiers": ["control"]}))?;
     assert_eq!(down["handled"], true, "Ctrl+e was not handled: {down}");
     let deadline = Instant::now() + Duration::from_secs(5);
     let down_y = loop {
-        let scroll = driver.command("html_scroll_state", json!({}))?;
-        let y = scroll["scroll"]["y"].as_f64().unwrap_or(initial_y);
+        let viewport = driver.command("thread_selection_view_state", json!({}))?;
+        let y = viewport["scroll_value"].as_f64().unwrap_or(initial_y);
         if y > initial_y {
             break y;
         }
         ensure!(
             Instant::now() < deadline,
-            "Ctrl+e did not scroll down: {scroll}"
+            "Ctrl+e did not scroll the message list down: {viewport}"
         );
         thread::sleep(STARTUP_POLL_INTERVAL);
     };
     assert_eq!(
-        driver.command("app_state", json!({}))?["state"]["selected_message"]["message_id"],
+        driver.command("app_state", json!({}))?["state"]["selected_thread"]["thread_id"],
         selected_before,
-        "Ctrl+e changed the selected message"
+        "Ctrl+e changed the selected message-list row"
     );
 
     let up = driver.command("send_key", json!({"key": "y", "modifiers": ["control"]}))?;
     assert_eq!(up["handled"], true, "Ctrl+y was not handled: {up}");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let scroll = driver.command("html_scroll_state", json!({}))?;
-        let y = scroll["scroll"]["y"].as_f64().unwrap_or(down_y);
+        let viewport = driver.command("thread_selection_view_state", json!({}))?;
+        let y = viewport["scroll_value"].as_f64().unwrap_or(down_y);
         if y < down_y {
             break;
         }
         ensure!(
             Instant::now() < deadline,
-            "Ctrl+y did not scroll up: {scroll}"
+            "Ctrl+y did not scroll the message list up: {viewport}"
         );
         thread::sleep(STARTUP_POLL_INTERVAL);
     }
     assert_eq!(
-        driver.command("app_state", json!({}))?["state"]["selected_message"]["message_id"],
+        driver.command("app_state", json!({}))?["state"]["selected_thread"]["thread_id"],
         selected_before,
-        "Ctrl+y changed the selected message"
+        "Ctrl+y changed the selected message-list row"
     );
 
     Ok(())

@@ -151,14 +151,14 @@ NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
   -- --exact --nocapture --test-threads=1
 ```
 
-Vim-style message viewport scrolling has a long-HTML GTK smoke. It routes
-`Ctrl+e` and `Ctrl+y` through the main shortcut router, verifies movement in
-both directions, and proves the selected message does not change:
+Vim-style message-list viewport scrolling has a GTK smoke. It routes `Ctrl+e`
+and `Ctrl+y` through the main shortcut router, verifies movement in both
+directions, and proves the selected message does not change:
 
 ```sh
 NOTM_REQUIRE_GTK_DISPLAY=1 CARGO_HOME=$PWD/.cargo-home \
   cargo test -p notm-app --test desktop_ui_smoke \
-  fixture_ctrl_e_y_scroll_message_without_changing_selection \
+  fixture_ctrl_e_y_scroll_message_list_without_changing_selection \
   -- --exact --nocapture --test-threads=1
 ```
 
