@@ -14,12 +14,13 @@ use gtk::glib::variant::{StaticVariantType, ToVariant};
 use gtk::prelude::*;
 use gtk4 as gtk;
 use notm_mail::{
-    ComposedMessage, ExternalCommandTransport, FakeSendTransport, ReplyKind, SendTransport,
-    TransportMode,
+    ComposedMessage, ExternalCommandTransport, FakeSendTransport, MailtoRequest, ReplyKind,
+    SendTransport, TransportMode,
     address::{dedupe_addresses, format_address, parse_address_list},
     compose::{AttachmentInput, Identity},
     html_sanitize::sanitize_html,
     mime::parse_file,
+    parse_mailto_uri,
 };
 use notm_notmuch::{
     Database, DatabaseMode, MessageTagMutation, OpenConfig, QueryOptions, SortOrder, TagMutation,
@@ -84,6 +85,7 @@ const TEST_HARNESS_APPLICATION_ID_NAMESPACE: &str = "io.github.kris004.notm.test
 const TEST_HARNESS_APPLICATION_ID_PREFIX: &str = "io.github.kris004.notm.test.t";
 const TEST_HARNESS_APPLICATION_ID_ENV: &str = "NOTM_TEST_HARNESS_APPLICATION_ID";
 const OPEN_MESSAGE_ID_ACTION: &str = "open-message-id";
+const COMPOSE_MAILTO_ACTION: &str = "compose-mailto";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedSearch {
@@ -160,6 +162,7 @@ pub struct LaunchOptions {
     pub app_config_path: Option<PathBuf>,
     pub custom_saved_searches: Vec<SavedSearch>,
     pub open_message_id: Option<String>,
+    pub mailto_uri: Option<String>,
     #[serde(skip)]
     pub runtime_settings: RuntimeSettingsStore,
 }
@@ -234,6 +237,7 @@ impl Default for LaunchOptions {
             app_config_path: None,
             custom_saved_searches: Vec::new(),
             open_message_id: None,
+            mailto_uri: None,
             runtime_settings: Default::default(),
         }
     }
@@ -251,6 +255,7 @@ pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
     let main_window = Rc::new(RefCell::new(None::<MainWindowHandle>));
 
     add_open_message_id_action(&app, &options, &main_window, &attachment_open_dir);
+    add_compose_mailto_action(&app, &options, &main_window, &attachment_open_dir);
     let activate_options = options.clone();
     let activate_main_window = main_window.clone();
     let activate_attachment_open_dir = attachment_open_dir.clone();
@@ -261,18 +266,28 @@ pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
             &activate_main_window,
             &activate_attachment_open_dir,
             None,
+            None,
         );
     });
 
-    if let Some(message_id) = &options.open_message_id {
+    if options.open_message_id.is_some() || options.mailto_uri.is_some() {
         app.register(gtk::gio::Cancellable::NONE)?;
         if app.is_remote() {
-            anyhow::ensure!(
-                app.has_action(OPEN_MESSAGE_ID_ACTION),
-                "the running notm instance does not support message-id routing; restart it and \
-                 try again"
-            );
-            app.activate_action(OPEN_MESSAGE_ID_ACTION, Some(&message_id.to_variant()));
+            if let Some(message_id) = &options.open_message_id {
+                anyhow::ensure!(
+                    app.has_action(OPEN_MESSAGE_ID_ACTION),
+                    "the running notm instance does not support message-id routing; restart it \
+                     and try again"
+                );
+                app.activate_action(OPEN_MESSAGE_ID_ACTION, Some(&message_id.to_variant()));
+            } else if let Some(mailto_uri) = &options.mailto_uri {
+                anyhow::ensure!(
+                    app.has_action(COMPOSE_MAILTO_ACTION),
+                    "the running notm instance does not support mailto routing; restart it and \
+                     try again"
+                );
+                app.activate_action(COMPOSE_MAILTO_ACTION, Some(&mailto_uri.to_variant()));
+            }
             let connection = app
                 .dbus_connection()
                 .ok_or_else(|| anyhow::anyhow!("remote notm instance has no D-Bus connection"))?;
@@ -288,6 +303,13 @@ pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
 
 fn validate_launch_options(options: &LaunchOptions) -> anyhow::Result<()> {
     settings::validate_thread_preview_lines(options.thread_preview_lines)?;
+    anyhow::ensure!(
+        options.open_message_id.is_none() || options.mailto_uri.is_none(),
+        "message-id and mailto launch targets cannot be combined"
+    );
+    if let Some(uri) = options.mailto_uri.as_deref() {
+        parse_mailto_uri(uri).map_err(|error| anyhow::anyhow!("invalid mailto URI: {error}"))?;
+    }
     Ok(())
 }
 
@@ -344,6 +366,42 @@ fn add_open_message_id_action(
             &action_main_window,
             &action_attachment_open_dir,
             Some(message_id),
+            None,
+        );
+    });
+    app.add_action(&action);
+}
+
+fn add_compose_mailto_action(
+    app: &gtk::Application,
+    options: &LaunchOptions,
+    main_window: &Rc<RefCell<Option<MainWindowHandle>>>,
+    attachment_open_dir: &Path,
+) {
+    let action =
+        gtk::gio::SimpleAction::new(COMPOSE_MAILTO_ACTION, Some(&String::static_variant_type()));
+    let action_app = app.clone();
+    let action_options = options.clone();
+    let action_main_window = main_window.clone();
+    let action_attachment_open_dir = attachment_open_dir.to_path_buf();
+    action.connect_activate(move |_, parameter| {
+        let Some(mailto_uri) = parameter.and_then(|value| value.get::<String>()) else {
+            return;
+        };
+        if let Err(error) = parse_mailto_uri(&mailto_uri) {
+            tracing::warn!(%error, "ignored invalid mailto application action");
+            if let Some(handle) = action_main_window.borrow().as_ref() {
+                report_mailto_error(&handle.widgets, &handle.state, &error);
+            }
+            return;
+        }
+        open_or_present_main_window(
+            &action_app,
+            &action_options,
+            &action_main_window,
+            &action_attachment_open_dir,
+            None,
+            Some(mailto_uri),
         );
     });
     app.add_action(&action);
@@ -356,17 +414,28 @@ fn resolved_new_window_message_id(
     requested_message_id.or_else(|| launch_message_id.map(ToOwned::to_owned))
 }
 
+fn resolved_new_window_mailto_uri(
+    requested_mailto_uri: Option<String>,
+    launch_mailto_uri: Option<&str>,
+) -> Option<String> {
+    requested_mailto_uri.or_else(|| launch_mailto_uri.map(ToOwned::to_owned))
+}
+
 fn open_or_present_main_window(
     app: &gtk::Application,
     options: &LaunchOptions,
     main_window: &Rc<RefCell<Option<MainWindowHandle>>>,
     attachment_open_dir: &Path,
     open_message_id: Option<String>,
+    mailto_uri: Option<String>,
 ) {
     if let Some(handle) = main_window.borrow().as_ref().cloned() {
         handle.widgets.close_when_idle.set(false);
         if let Some(message_id) = open_message_id {
             open_message_id_request(options, &handle.widgets, &handle.state, &message_id);
+        }
+        if let Some(mailto_uri) = mailto_uri {
+            let _ = open_mailto_uri_request(options, &handle.widgets, &handle.state, &mailto_uri);
         }
         handle.window.present();
         return;
@@ -375,6 +444,8 @@ fn open_or_present_main_window(
     let mut launch_options = options.clone();
     launch_options.open_message_id =
         resolved_new_window_message_id(open_message_id, options.open_message_id.as_deref());
+    launch_options.mailto_uri =
+        resolved_new_window_mailto_uri(mailto_uri, options.mailto_uri.as_deref());
     let handle = build_ui(app, launch_options, attachment_open_dir.to_path_buf());
     let main_window_weak = Rc::downgrade(main_window);
     handle.window.connect_destroy(move |window| {
@@ -660,6 +731,7 @@ struct MessageSelectionSnapshot {
 
 enum ComposerReplacementPayload {
     Empty,
+    Fields(Box<ComposeFields>),
     Message(Box<ComposedMessage>),
     Draft(Box<PreparedDraftReplacement>),
 }
@@ -1597,6 +1669,11 @@ fn build_ui(
     migrate_legacy_named_drafts_from_ui(&widgets, &state);
     widgets.composer.refresh_draft_list();
     window.present();
+    let initial_mailto_opened = options
+        .mailto_uri
+        .as_deref()
+        .is_some_and(|uri| open_mailto_uri_request(&options, &widgets, &state, uri));
+    let preserve_startup_composer = preserve_recovered_composer || initial_mailto_opened;
     {
         let w = widgets.clone();
         let st = state.clone();
@@ -1605,9 +1682,11 @@ fn build_ui(
             sync_pane_button_classes(&w, &st);
         });
     }
-    widgets
-        .status_label
-        .set_text("Starting notm; loading mail…");
+    if !initial_mailto_opened {
+        widgets
+            .status_label
+            .set_text("Starting notm; loading mail…");
+    }
     widgets
         .thread_list
         .set_result_label("Loading initial search…");
@@ -1623,7 +1702,7 @@ fn build_ui(
                 &w,
                 &st,
                 &query,
-                !preserve_recovered_composer,
+                !preserve_startup_composer,
                 Duration::ZERO,
             );
             refresh_address_suggestions_async(&opts, &w, &st);
@@ -7500,6 +7579,11 @@ fn apply_prepared_composer_replacement(
             set_active_draft(widgets, state, None);
             show_compose_view(widgets);
         }
+        ComposerReplacementPayload::Fields(fields) => {
+            apply_compose_fields(widgets, state, *fields);
+            set_active_draft(widgets, state, None);
+            show_compose_view(widgets);
+        }
         ComposerReplacementPayload::Message(message) => fill_composer(widgets, state, *message),
         ComposerReplacementPayload::Draft(draft) => {
             let PreparedDraftReplacement {
@@ -13023,6 +13107,62 @@ fn open_compose(options: &LaunchOptions, widgets: &Widgets, state: &SharedState)
     )
 }
 
+fn open_mailto_uri_request(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    uri: &str,
+) -> bool {
+    let request = match parse_mailto_uri(uri) {
+        Ok(request) => request,
+        Err(error) => {
+            report_mailto_error(widgets, state, &error);
+            return false;
+        }
+    };
+    let fields =
+        compose_fields_from_mailto(widgets.composer.sender_entry().text().to_string(), request);
+    request_pending_action(
+        options,
+        widgets,
+        state,
+        PendingTransition::ReplaceComposer(PreparedComposerReplacement {
+            kind: ComposerReplacementKind::Mailto,
+            payload: ComposerReplacementPayload::Fields(Box::new(fields)),
+            selection: None,
+            rejection_restore: None,
+            status: "Mailto composer opened".to_string(),
+            source_status: None,
+            present_main_window: true,
+            show_message_pane: true,
+            active_pane: ActivePane::Message,
+        }),
+    )
+}
+
+fn compose_fields_from_mailto(sender: String, request: MailtoRequest) -> ComposeFields {
+    ComposeFields {
+        from: sender,
+        to: request.to.join(", "),
+        cc: request.cc.join(", "),
+        bcc: request.bcc.join(", "),
+        subject: request.subject,
+        body: request.body,
+        ..ComposeFields::default()
+    }
+}
+
+fn report_mailto_error(widgets: &Widgets, state: &SharedState, error: &anyhow::Error) {
+    let message = format!("Could not open mailto URI: {error}");
+    widgets.status_label.set_text(&message);
+    {
+        let mut state = state.borrow_mut();
+        state.last_error = Some(message.clone());
+        state.last_operation = Some("mailto URI rejected".to_string());
+    }
+    update_debug(widgets, state);
+}
+
 fn reply_selected(
     options: &LaunchOptions,
     widgets: &Widgets,
@@ -17430,6 +17570,62 @@ fn apply_pane_visibility_values(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mailto_requests_map_to_editable_composer_fields() {
+        let fields = compose_fields_from_mailto(
+            "Fixture User <fixture@example.test>".to_string(),
+            MailtoRequest {
+                to: vec![
+                    "one@example.test".to_string(),
+                    "two@example.test".to_string(),
+                ],
+                cc: vec!["copy@example.test".to_string()],
+                bcc: vec!["hidden@example.test".to_string()],
+                subject: "Hello".to_string(),
+                body: "Message body".to_string(),
+            },
+        );
+
+        assert_eq!(
+            fields,
+            ComposeFields {
+                from: "Fixture User <fixture@example.test>".to_string(),
+                to: "one@example.test, two@example.test".to_string(),
+                cc: "copy@example.test".to_string(),
+                bcc: "hidden@example.test".to_string(),
+                subject: "Hello".to_string(),
+                body: "Message body".to_string(),
+                ..ComposeFields::default()
+            }
+        );
+    }
+
+    #[test]
+    fn launch_validation_rejects_invalid_or_conflicting_open_targets() {
+        let invalid_mailto = LaunchOptions {
+            mailto_uri: Some("https://example.test".to_string()),
+            ..LaunchOptions::default()
+        };
+        assert!(
+            validate_launch_options(&invalid_mailto)
+                .expect_err("non-mailto URI should be rejected")
+                .to_string()
+                .contains("invalid mailto URI")
+        );
+
+        let conflicting = LaunchOptions {
+            open_message_id: Some("message@example.test".to_string()),
+            mailto_uri: Some("mailto:person@example.test".to_string()),
+            ..LaunchOptions::default()
+        };
+        assert!(
+            validate_launch_options(&conflicting)
+                .expect_err("two launch targets should be rejected")
+                .to_string()
+                .contains("cannot be combined")
+        );
+    }
 
     #[test]
     fn message_view_preferences_use_message_then_sender_then_global_precedence() {

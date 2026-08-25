@@ -4,6 +4,10 @@ Notable user-facing changes are recorded here.
 
 ## Unreleased
 
+- The installed desktop entry can act as the default `mailto` handler. RFC 6068
+  recipient, Cc, Bcc, subject, and plain-text body fields open in an editable
+  composer and are routed to an existing notm instance when one is running.
+
 ## [0.1.0] - 2026-08-20
 
 - Initial GTK desktop client for searching, reading, tagging, composing, and

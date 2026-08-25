@@ -4,6 +4,7 @@ pub mod compose;
 pub mod external_command;
 pub mod forward;
 pub mod html_sanitize;
+pub mod mailto;
 pub mod mime;
 pub mod reply;
 pub mod rfc5322;
@@ -12,6 +13,7 @@ pub mod transport;
 
 pub use compose::{AttachmentInput, ComposedMessage, Identity};
 pub use external_command::{EXTERNAL_COMMAND_OUTPUT_LIMIT, run_external_command};
+pub use mailto::{MailtoRequest, parse_mailto_uri};
 pub use mime::{Attachment, ParsedMessage};
 pub use reply::{ReplyKind, build_reply};
 pub use send::{ProbeReport, SendReport, TransportDescription};

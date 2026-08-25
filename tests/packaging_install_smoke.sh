@@ -69,10 +69,14 @@ test -f "$data_dir/man/man5/notm-config.5"
 test -f "$data_dir/man/man7/notm-test-harness.7"
 test -f "$data_dir/man/man7/notm-automation.7"
 desktop-file-validate "$data_dir/applications/io.github.kris004.notm.desktop"
-grep -Fx 'Exec=/usr/bin/notm launch' \
+grep -Fx 'Exec=/usr/bin/notm launch %u' \
   "$data_dir/applications/io.github.kris004.notm.desktop" > /dev/null
 grep -Fx 'TryExec=/usr/bin/notm' \
   "$data_dir/applications/io.github.kris004.notm.desktop" > /dev/null
+grep -Fx 'MimeType=x-scheme-handler/mailto;' \
+  "$data_dir/applications/io.github.kris004.notm.desktop" > /dev/null
+grep -Fx '    <mediatype>x-scheme-handler/mailto</mediatype>' \
+  "$data_dir/metainfo/io.github.kris004.notm.metainfo.xml" > /dev/null
 appstreamcli validate-tree --strict --pedantic --no-net "$STAGE_ROOT"
 
 # Exercise legacy cleanup in uninstall independently from install migration.

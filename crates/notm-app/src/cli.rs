@@ -45,9 +45,16 @@ pub enum Command {
         #[arg(
             long,
             value_name = "MESSAGE_ID",
+            conflicts_with = "mailto_uri",
             help = "Open a specific Notmuch message ID after launch"
         )]
         message_id: Option<String>,
+        #[arg(
+            value_name = "MAILTO_URI",
+            conflicts_with = "message_id",
+            help = "Open an RFC 6068 mailto URI in the composer"
+        )]
+        mailto_uri: Option<String>,
     },
     #[command(about = "Print effective configuration as JSON with secrets redacted by default")]
     PrintConfig {
@@ -88,6 +95,38 @@ mod tests {
             }
             other => panic!("expected launch command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn launch_accepts_a_mailto_uri_target() {
+        let uri = "mailto:person@example.test?subject=Hello%20there";
+        let cli = Cli::try_parse_from(["notm", "launch", uri])
+            .expect("launch should accept a mailto URI");
+
+        match cli.command {
+            Command::Launch { mailto_uri, .. } => {
+                assert_eq!(mailto_uri.as_deref(), Some(uri));
+            }
+            other => panic!("expected launch command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn launch_rejects_two_distinct_open_targets() {
+        let error = Cli::try_parse_from([
+            "notm",
+            "launch",
+            "--message-id",
+            "abc@example.test",
+            "mailto:person@example.test",
+        ])
+        .expect_err("message-id and mailto targets should conflict")
+        .to_string();
+
+        assert!(
+            error.contains("cannot be used with"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

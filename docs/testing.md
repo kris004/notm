@@ -229,6 +229,21 @@ NOTM_REQUIRE_GTK_DISPLAY=1 \
   -- --exact --nocapture --test-threads=1
 ```
 
+Desktop `mailto` handling has cold-start and existing-instance GTK smokes. The
+first verifies RFC 6068 fields remain visible while the startup search loads;
+the second verifies D-Bus routing and the dirty-composer replacement prompt:
+
+```sh
+for test in \
+  fixture_cold_mailto_launch_opens_prefilled_composer \
+  fixture_existing_instance_mailto_request_confirms_dirty_replacement
+do
+  NOTM_REQUIRE_GTK_DISPLAY=1 \
+    cargo test -p notm-app --test desktop_ui_smoke "$test" -- \
+      --exact --nocapture --test-threads=1
+done
+```
+
 Vim-style message-list viewport scrolling has a GTK smoke. It routes `Ctrl+e`
 and `Ctrl+y` through the main shortcut router, verifies movement in both
 directions, and proves the selected message does not change:

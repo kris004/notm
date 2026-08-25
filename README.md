@@ -24,6 +24,8 @@ real mail or account data.
   actions, with undo support.
 - Reply, reply-all, forwarding, attachments, address completion, and recoverable
   local drafts.
+- Desktop `mailto` handling with editable recipient, Cc, Bcc, subject, and body
+  fields, including routing to an already-running notm instance.
 - External send and sync commands, so existing tools such as `sendmail`,
   `msmtp`, `mbsync`, or `gmi` can remain part of the mail setup.
 - Direct `libnotmuch` access for normal searches, message reads, and tag
@@ -101,6 +103,20 @@ user identity, start with:
 ```sh
 notm launch
 ```
+
+The installed desktop entry advertises notm as a `mailto` handler. To make it
+the default for the current desktop user, run:
+
+```sh
+xdg-mime default io.github.kris004.notm.desktop x-scheme-handler/mailto
+xdg-mime query default x-scheme-handler/mailto
+```
+
+Opening an RFC 6068 URI such as
+`mailto:alice@example.com?subject=Hello&body=Message` opens an editable
+composer; it never sends automatically. notm imports `to`, `cc`, `bcc`,
+`subject`, and plain-text `body` values and ignores header fields that its
+composer cannot safely represent.
 
 `notm` follows Notmuch's standard configuration, profile, and environment
 discovery. Its own optional configuration lives at

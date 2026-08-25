@@ -76,10 +76,14 @@ test -f "$bundle/share/man/man7/notm-automation.7"
 test "$(stat -c '%a' "$bundle/bin/notm")" = 755
 test "$(stat -c '%a' "$bundle/LICENSE")" = 644
 test "$("$bundle/bin/notm")" = 'notm 0.1.0-test'
-grep -Fx 'Exec=notm launch' \
+grep -Fx 'Exec=notm launch %u' \
   "$bundle/share/applications/io.github.kris004.notm.desktop" > /dev/null
 grep -Fx 'TryExec=notm' \
   "$bundle/share/applications/io.github.kris004.notm.desktop" > /dev/null
+grep -Fx 'MimeType=x-scheme-handler/mailto;' \
+  "$bundle/share/applications/io.github.kris004.notm.desktop" > /dev/null
+grep -Fx '    <mediatype>x-scheme-handler/mailto</mediatype>' \
+  "$bundle/share/metainfo/io.github.kris004.notm.metainfo.xml" > /dev/null
 desktop-file-validate \
   "$bundle/share/applications/io.github.kris004.notm.desktop"
 appstreamcli validate --strict --pedantic --no-net \

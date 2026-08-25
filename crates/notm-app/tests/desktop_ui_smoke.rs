@@ -30,6 +30,16 @@ struct FixtureApp {
 
 struct ChildGuard(Child);
 
+#[derive(Default)]
+struct FixtureLaunchOptions<'a> {
+    config_path: Option<&'a Path>,
+    message_id: Option<&'a str>,
+    mailto_uri: Option<&'a str>,
+    application_id: Option<&'a str>,
+    fixture: bool,
+    system_prefers_dark: Option<bool>,
+}
+
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -39,7 +49,14 @@ impl Drop for ChildGuard {
 
 impl FixtureApp {
     fn spawn(work_dir: PathBuf, token: &str) -> anyhow::Result<Self> {
-        Self::spawn_inner(work_dir, token, None, None, None, true, None)
+        Self::spawn_inner(
+            work_dir,
+            token,
+            FixtureLaunchOptions {
+                fixture: true,
+                ..FixtureLaunchOptions::default()
+            },
+        )
     }
 
     fn spawn_with_message_id(
@@ -47,7 +64,27 @@ impl FixtureApp {
         token: &str,
         message_id: &str,
     ) -> anyhow::Result<Self> {
-        Self::spawn_inner(work_dir, token, None, Some(message_id), None, true, None)
+        Self::spawn_inner(
+            work_dir,
+            token,
+            FixtureLaunchOptions {
+                message_id: Some(message_id),
+                fixture: true,
+                ..FixtureLaunchOptions::default()
+            },
+        )
+    }
+
+    fn spawn_with_mailto(work_dir: PathBuf, token: &str, mailto_uri: &str) -> anyhow::Result<Self> {
+        Self::spawn_inner(
+            work_dir,
+            token,
+            FixtureLaunchOptions {
+                mailto_uri: Some(mailto_uri),
+                fixture: true,
+                ..FixtureLaunchOptions::default()
+            },
+        )
     }
 
     fn spawn_with_application_id(
@@ -58,11 +95,11 @@ impl FixtureApp {
         Self::spawn_inner(
             work_dir,
             token,
-            None,
-            None,
-            Some(application_id),
-            true,
-            None,
+            FixtureLaunchOptions {
+                application_id: Some(application_id),
+                fixture: true,
+                ..FixtureLaunchOptions::default()
+            },
         )
     }
 
@@ -72,7 +109,14 @@ impl FixtureApp {
         token: &str,
         config_path: &std::path::Path,
     ) -> anyhow::Result<Self> {
-        Self::spawn_inner(work_dir, token, Some(config_path), None, None, false, None)
+        Self::spawn_inner(
+            work_dir,
+            token,
+            FixtureLaunchOptions {
+                config_path: Some(config_path),
+                ..FixtureLaunchOptions::default()
+            },
+        )
     }
 
     #[cfg(unix)]
@@ -85,11 +129,11 @@ impl FixtureApp {
         Self::spawn_inner(
             work_dir,
             token,
-            Some(config_path),
-            None,
-            Some(application_id),
-            false,
-            None,
+            FixtureLaunchOptions {
+                config_path: Some(config_path),
+                application_id: Some(application_id),
+                ..FixtureLaunchOptions::default()
+            },
         )
     }
 
@@ -99,7 +143,15 @@ impl FixtureApp {
         token: &str,
         config_path: &std::path::Path,
     ) -> anyhow::Result<Self> {
-        Self::spawn_inner(work_dir, token, Some(config_path), None, None, true, None)
+        Self::spawn_inner(
+            work_dir,
+            token,
+            FixtureLaunchOptions {
+                config_path: Some(config_path),
+                fixture: true,
+                ..FixtureLaunchOptions::default()
+            },
+        )
     }
 
     #[cfg(unix)]
@@ -112,22 +164,19 @@ impl FixtureApp {
         Self::spawn_inner(
             work_dir,
             token,
-            Some(config_path),
-            None,
-            None,
-            true,
-            Some(prefers_dark),
+            FixtureLaunchOptions {
+                config_path: Some(config_path),
+                fixture: true,
+                system_prefers_dark: Some(prefers_dark),
+                ..FixtureLaunchOptions::default()
+            },
         )
     }
 
     fn spawn_inner(
         work_dir: PathBuf,
         token: &str,
-        config_path: Option<&std::path::Path>,
-        message_id: Option<&str>,
-        application_id: Option<&str>,
-        fixture: bool,
-        system_prefers_dark: Option<bool>,
+        options: FixtureLaunchOptions<'_>,
     ) -> anyhow::Result<Self> {
         let socket_path = work_dir.join("h.sock");
         let log_path = work_dir.join("notm.log");
@@ -141,7 +190,7 @@ impl FixtureApp {
                 .with_context(|| format!("creating test directory {}", directory.display()))?;
         }
         let display = GuiTestDisplay::start(&work_dir)?;
-        if let Some(prefers_dark) = system_prefers_dark {
+        if let Some(prefers_dark) = options.system_prefers_dark {
             let gtk_config_home = config_home.join("gtk-4.0");
             fs::create_dir_all(&gtk_config_home)?;
             fs::write(
@@ -161,22 +210,25 @@ impl FixtureApp {
             .open(&log_path)
             .with_context(|| format!("creating app log {}", log_path.display()))?;
         let mut command = Command::new(env!("CARGO_BIN_EXE_notm"));
-        if let Some(config_path) = config_path {
+        if let Some(config_path) = options.config_path {
             command.arg("--config").arg(config_path);
         }
         command.arg("launch");
-        if fixture {
+        if options.fixture {
             command.arg("--fixture");
         }
         command.args(["--test-harness", "--test-harness-socket"]);
         command
             .arg(&socket_path)
             .args(["--test-harness-token", token]);
-        if let Some(message_id) = message_id {
+        if let Some(message_id) = options.message_id {
             command.args(["--message-id", message_id]);
         }
+        if let Some(mailto_uri) = options.mailto_uri {
+            command.arg(mailto_uri);
+        }
         command.env_remove(TEST_HARNESS_APPLICATION_ID_ENV);
-        if let Some(application_id) = application_id {
+        if let Some(application_id) = options.application_id {
             command.env(TEST_HARNESS_APPLICATION_ID_ENV, application_id);
         }
         // Keep non-fixture smokes independent of the invoking account's
@@ -189,7 +241,7 @@ impl FixtureApp {
             .env("EMAIL", "")
             .env("NAME", "");
         command.env_remove("GTK_THEME");
-        if system_prefers_dark.is_some() {
+        if options.system_prefers_dark.is_some() {
             command.env("GDK_DEBUG", "default-settings");
         }
         display.configure_command(&mut command);
@@ -280,6 +332,30 @@ impl FixtureApp {
         application_id: &str,
         message_id: &str,
     ) -> anyhow::Result<()> {
+        self.request_launch_target(
+            token,
+            application_id,
+            &["--message-id", message_id],
+            "message-id",
+        )
+    }
+
+    fn request_mailto(
+        &self,
+        token: &str,
+        application_id: &str,
+        mailto_uri: &str,
+    ) -> anyhow::Result<()> {
+        self.request_launch_target(token, application_id, &[mailto_uri], "mailto")
+    }
+
+    fn request_launch_target(
+        &self,
+        token: &str,
+        application_id: &str,
+        target_args: &[&str],
+        target_name: &str,
+    ) -> anyhow::Result<()> {
         let secondary = self.work_dir.join("secondary");
         let home = secondary.join("home");
         let config_home = secondary.join("config");
@@ -306,7 +382,8 @@ impl FixtureApp {
         ]);
         command
             .arg(&socket_path)
-            .args(["--test-harness-token", token, "--message-id", message_id])
+            .args(["--test-harness-token", token])
+            .args(target_args)
             .env(TEST_HARNESS_APPLICATION_ID_ENV, application_id)
             .env("HOME", home)
             .env("XDG_CONFIG_HOME", config_home)
@@ -332,14 +409,14 @@ impl FixtureApp {
             if let Some(status) = child.0.try_wait()? {
                 ensure!(
                     status.success(),
-                    "secondary message-id request failed with {status}\n{}",
+                    "secondary {target_name} request failed with {status}\n{}",
                     fs::read_to_string(&log_path).unwrap_or_default()
                 );
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 anyhow::bail!(
-                    "secondary message-id request did not exit within {STARTUP_TIMEOUT:?}\n{}",
+                    "secondary {target_name} request did not exit within {STARTUP_TIMEOUT:?}\n{}",
                     fs::read_to_string(&log_path).unwrap_or_default()
                 );
             }
@@ -3031,6 +3108,129 @@ fn fixture_existing_instance_message_id_request_reaches_primary() -> anyhow::Res
     assert_eq!(state["state"]["active_pane"], "Message", "{state}");
     assert_eq!(state["state"]["current_query"], "tag:inbox", "{state}");
     assert_target_message_rendered(&mut driver)?;
+
+    Ok(())
+}
+
+#[test]
+fn fixture_cold_mailto_launch_opens_prefilled_composer() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_cold_mailto_launch_opens_prefilled_composer: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running cold mailto desktop UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-mailto-ui-{run_id}"));
+    let token = format!("notm-mailto-ui-{run_id}");
+    let uri = "mailto:first@example.test?to=second@example.test&\
+               cc=copy@example.test&bcc=hidden@example.test&\
+               subject=caf%C3%A9+notes&body=first%20line%0D%0Asecond%20line";
+    let mut app = FixtureApp::spawn_with_mailto(work_dir, &token, uri)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+
+    let state = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        state["state"]["current_query"], "tag:inbox",
+        "mailto launch skipped or replaced the startup search: {state}"
+    );
+    assert_eq!(
+        state["state"]["selected_message"],
+        Value::Null,
+        "startup selection hid the mailto composer: {state}"
+    );
+    assert_eq!(
+        state["state"]["compose_fields"],
+        json!({
+            "from": "Fixture User <fixture@example.test>",
+            "to": "first@example.test, second@example.test",
+            "cc": "copy@example.test",
+            "bcc": "hidden@example.test",
+            "subject": "café+notes",
+            "body": "first line\nsecond line",
+            "attachments": [],
+            "in_reply_to": null,
+            "references": [],
+            "text_reply_quote": null,
+            "html_reply_quote": null,
+        }),
+        "mailto fields were not mapped into the composer: {state}"
+    );
+    assert_eq!(state["state"]["active_pane"], "Message", "{state}");
+    let visible = driver.command("html_view_state", json!({}))?;
+    assert_eq!(
+        visible["visible_child"], "compose",
+        "mailto composer was not visible after startup: {visible}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn fixture_existing_instance_mailto_request_confirms_dirty_replacement() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_existing_instance_mailto_request_confirms_dirty_replacement: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running existing-instance mailto desktop UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-mailto-remote-ui-{run_id}"));
+    let token = format!("notm-mailto-remote-ui-{run_id}");
+    let application_id = format!("io.github.kris004.notm.test.r{}", run_id.replace('-', ""));
+    let mut app = FixtureApp::spawn_with_application_id(work_dir, &token, &application_id)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
+    assert_eq!(
+        driver.command(
+            "compose_set_subject",
+            json!({"value": "Keep this draft until confirmed"}),
+        )?["ok"],
+        true
+    );
+
+    let uri = "mailto:new@example.test?subject=Replacement%20subject&body=Replacement%20body";
+    app.request_mailto(&token, &application_id, uri)?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let pending = loop {
+        let response = driver.command("pending_confirmation", json!({}))?;
+        if response["pending"]["kind"] == "mailto" {
+            break response;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "primary instance did not receive the mailto request: {response}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+    assert_eq!(
+        pending["compose_fields"]["subject"], "Keep this draft until confirmed",
+        "remote mailto request replaced dirty state before confirmation: {pending}"
+    );
+    let confirmation_id = pending["pending"]["id"]
+        .as_u64()
+        .context("mailto confirmation had no numeric id")?;
+    let accepted = driver.command(
+        "respond_confirmation",
+        json!({"response": "accept", "id": confirmation_id}),
+    )?;
+    assert_eq!(
+        accepted["ok"], true,
+        "mailto replacement failed: {accepted}"
+    );
+    assert_eq!(accepted["compose_fields"]["to"], "new@example.test");
+    assert_eq!(accepted["compose_fields"]["subject"], "Replacement subject");
+    assert_eq!(accepted["compose_fields"]["body"], "Replacement body");
+    assert_eq!(accepted["active_draft"], Value::Null);
+    let visible = driver.command("html_view_state", json!({}))?;
+    assert_eq!(visible["visible_child"], "compose", "{visible}");
 
     Ok(())
 }

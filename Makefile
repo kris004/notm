@@ -25,7 +25,7 @@ build:
 install: build install-man
 	$(INSTALL) -Dm755 "$(BINARY)" "$(DESTDIR)$(BINDIR)/notm"
 	$(INSTALL) -d target/install
-	sed -e 's|^Exec=.*|Exec=$(BINDIR)/notm launch|' \
+	sed -e 's|^Exec=.*|Exec=$(BINDIR)/notm launch %u|' \
 	    -e 's|^TryExec=.*|TryExec=$(BINDIR)/notm|' \
 	    "packaging/$(DESKTOP_FILE)" > "target/install/$(DESKTOP_FILE)"
 	$(RM) "$(DESTDIR)$(APPDIR)/notm.desktop"

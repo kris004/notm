@@ -86,7 +86,7 @@ install -Dm755 "$BINARY" "$BUNDLE_ROOT/bin/notm"
 
 mkdir -p -- "$BUNDLE_ROOT/share/applications"
 sed \
-  -e 's|^Exec=.*|Exec=notm launch|' \
+  -e 's|^Exec=.*|Exec=notm launch %u|' \
   -e 's|^TryExec=.*|TryExec=notm|' \
   "$SOURCE_ROOT/packaging/io.github.kris004.notm.desktop" \
   > "$BUNDLE_ROOT/share/applications/io.github.kris004.notm.desktop"

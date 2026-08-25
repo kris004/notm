@@ -1,7 +1,10 @@
 use std::{path::PathBuf, time::Duration};
 
+use anyhow::Context;
 use chrono::Utc;
-use notm_mail::{ComposedMessage, ExternalCommandTransport, FakeSendTransport, SendTransport};
+use notm_mail::{
+    ComposedMessage, ExternalCommandTransport, FakeSendTransport, SendTransport, parse_mailto_uri,
+};
 use notm_notmuch::{Database, DatabaseMode, OpenConfig, QueryOptions, SortOrder};
 use notm_ui::{LaunchOptions, SavedSearch, model::ThemePreference};
 use uuid::Uuid;
@@ -20,7 +23,11 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             automation_token,
             fixture,
             message_id,
+            mailto_uri,
         } => {
+            if let Some(uri) = mailto_uri.as_deref() {
+                parse_mailto_uri(uri).context("invalid mailto URI")?;
+            }
             let cfg = config::load(cli.config)?;
             let fixture_guard = if fixture {
                 Some(notm_test_support::FixtureDatabase::create()?)
@@ -34,6 +41,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             if let Some(message_id) = message_id {
                 apply_message_id_target(&mut options, &message_id)?;
             }
+            options.mailto_uri = mailto_uri;
             if automation {
                 options.automation_enabled = true;
                 options.automation_socket = automation_socket;
@@ -155,6 +163,7 @@ fn launch_options(cfg: &config::AppConfig, app_config_path: Option<PathBuf>) -> 
             })
             .collect(),
         open_message_id: None,
+        mailto_uri: None,
         runtime_settings: Default::default(),
     }
 }

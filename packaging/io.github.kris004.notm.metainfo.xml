@@ -21,6 +21,7 @@
   </categories>
   <provides>
     <binary>notm</binary>
+    <mediatype>x-scheme-handler/mailto</mediatype>
   </provides>
   <screenshots>
     <screenshot type="default">

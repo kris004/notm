@@ -1,4 +1,4 @@
-.TH NOTM 1 "2026-08-19" "notm 0.1.0" "User Commands"
+.TH NOTM 1 "2026-08-24" "notm 0.1.0" "User Commands"
 .SH NAME
 notm \- native GTK4 client for Notmuch mail stores
 .SH SYNOPSIS
@@ -31,6 +31,17 @@ instead of the default application configuration described under
 .TP
 .B launch
 Start the GTK application for normal desktop mail use.
+.TP
+.BI "launch " MAILTO_URI
+Open an RFC 6068
+.B mailto
+URI in an editable composer.  Recipient,
+.BR Cc ,
+.BR Bcc ,
+subject, and plain-text body values are imported; unsupported header fields are
+ignored and the message is never sent automatically.  If notm is already
+running, the request is routed to that instance.  Replacing unsaved composer
+contents still requires confirmation.
 .TP
 .BI "launch --message-id " MESSAGE_ID
 Start the GTK application with the normal startup search and select the specific

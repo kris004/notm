@@ -164,6 +164,7 @@ pub(crate) enum PendingOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ComposerReplacementKind {
     New,
+    Mailto,
     Reply,
     ReplyAll,
     Forward,
@@ -404,6 +405,7 @@ impl ComposerReplacementKind {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::New => "new",
+            Self::Mailto => "mailto",
             Self::Reply => "reply",
             Self::ReplyAll => "reply_all",
             Self::Forward => "forward",
@@ -2188,6 +2190,7 @@ mod tests {
     fn every_compose_replacement_kind_has_a_stable_distinct_harness_name() {
         let kinds = [
             ComposerReplacementKind::New,
+            ComposerReplacementKind::Mailto,
             ComposerReplacementKind::Reply,
             ComposerReplacementKind::ReplyAll,
             ComposerReplacementKind::Forward,
