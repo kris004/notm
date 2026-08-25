@@ -81,7 +81,10 @@ test -f "$bundle/share/man/man7/notm-test-harness.7"
 test -f "$bundle/share/man/man7/notm-automation.7"
 test -f "$source_bundle/Cargo.toml"
 test -f "$source_bundle/Cargo.lock"
+test -f "$source_bundle/docs/release-signing-key.asc"
 test -f "$source_bundle/packaging/build-linux-release.sh"
+test -x "$source_bundle/packaging/verify-release-tag.sh"
+test -x "$source_bundle/tests/release_tag_smoke.sh"
 
 test "$(stat -c '%a' "$bundle/bin/notm")" = 755
 test "$(stat -c '%a' "$bundle/LICENSE")" = 644

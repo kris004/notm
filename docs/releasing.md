@@ -49,7 +49,10 @@ archive` of the direct tag target.
 
 The repository uses the configured hardware-backed OpenPGP key with fingerprint
 `BE592562E6131A53F4BADE4A046928E9A919BAF9`. For the next legitimate version,
-record the exact protected-main commit and run:
+the corresponding minimal public key is pinned in
+`docs/release-signing-key.asc`. The release workflow verifies the tag against
+that key as well as GitHub's tag-object verification. Record the exact
+protected-main commit and run:
 
 ```sh
 repo=kris004/notm

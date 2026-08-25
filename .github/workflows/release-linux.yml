@@ -15,6 +15,7 @@ concurrency:
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
+  RELEASE_SIGNING_FINGERPRINT: BE592562E6131A53F4BADE4A046928E9A919BAF9
 
 jobs:
   build:
@@ -77,6 +78,12 @@ jobs:
                 echo 'release tag must be direct and GitHub-verified' >&2
                 exit 1
               }
+
+            packaging/verify-release-tag.sh \
+              . \
+              "$GITHUB_REF_NAME" \
+              docs/release-signing-key.asc \
+              "$RELEASE_SIGNING_FINGERPRINT"
 
             default_branch="$(
               gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch'
