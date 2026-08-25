@@ -73,6 +73,7 @@ check:
 check-packaging:
 	./tests/packaging_install_smoke.sh
 	./tests/release_bundle_smoke.sh
+	./tests/release_tag_smoke.sh
 
 test:
 	$(CARGO) test --workspace --all-targets --all-features

@@ -69,10 +69,30 @@ Package names differ on other distributions.
 ## Build and install
 
 GitHub releases include a prebuilt `x86_64-unknown-linux-gnu` bundle produced on
-Ubuntu 24.04. The bundle is dynamically linked rather than fully portable; its
-`INSTALL.md` lists the required runtime libraries and user-install command.
-Checksums and GitHub build-provenance attestations are published with the
-bundle.
+Ubuntu 24.04, an archive of the exact tagged source, and `SHA256SUMS` covering
+both archives. The binary bundle is dynamically linked rather than fully
+portable; its `INSTALL.md` lists the required runtime libraries and user-install
+command.
+
+Download all three assets before verifying them:
+
+```sh
+sha256sum --check SHA256SUMS
+gh attestation verify \
+  notm-vVERSION-x86_64-unknown-linux-gnu.tar.gz \
+  --repo kris004/notm
+gh attestation verify \
+  notm-vVERSION-src.tar.gz \
+  --repo kris004/notm
+gh attestation verify SHA256SUMS --repo kris004/notm
+```
+
+Future releases use hardware-backed signed annotated tags, attest the exact
+workflow artifacts, and are published only after every asset is attached.
+Repository release immutability then locks the public tag and assets. Historical
+releases retain the verification properties they had when published. See
+[the release procedure](docs/releasing.md) for the exact trust and recovery
+model.
 
 To build and install the current checkout for your user:
 

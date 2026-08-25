@@ -51,15 +51,22 @@ SOURCE_DATE_EPOCH=0 \
 archive_name=notm-v0.1.0-test-x86_64-unknown-linux-gnu.tar.gz
 archive="$DIST_DIR/$archive_name"
 second_archive="$SECOND_DIST_DIR/$archive_name"
+source_archive_name=notm-v0.1.0-test-src.tar.gz
+source_archive="$DIST_DIR/$source_archive_name"
+second_source_archive="$SECOND_DIST_DIR/$source_archive_name"
 bundle="$EXTRACT_DIR/notm-v0.1.0-test-x86_64-unknown-linux-gnu"
+source_bundle="$EXTRACT_DIR/notm-0.1.0-test"
 cmp "$archive" "$second_archive"
+cmp "$source_archive" "$second_source_archive"
 cmp "$DIST_DIR/SHA256SUMS" "$SECOND_DIST_DIR/SHA256SUMS"
+test "$(wc -l < "$DIST_DIR/SHA256SUMS")" -eq 2
 mkdir -p -- "$EXTRACT_DIR"
 (
   cd -- "$DIST_DIR"
   sha256sum --check SHA256SUMS
 )
 tar -xzf "$archive" -C "$EXTRACT_DIR"
+tar -xzf "$source_archive" -C "$EXTRACT_DIR"
 
 test -x "$bundle/bin/notm"
 test -f "$bundle/INSTALL.md"
@@ -72,6 +79,12 @@ test -f "$bundle/share/man/man1/notm.1"
 test -f "$bundle/share/man/man5/notm-config.5"
 test -f "$bundle/share/man/man7/notm-test-harness.7"
 test -f "$bundle/share/man/man7/notm-automation.7"
+test -f "$source_bundle/Cargo.toml"
+test -f "$source_bundle/Cargo.lock"
+test -f "$source_bundle/docs/release-signing-key.asc"
+test -f "$source_bundle/packaging/build-linux-release.sh"
+test -x "$source_bundle/packaging/verify-release-tag.sh"
+test -x "$source_bundle/tests/release_tag_smoke.sh"
 
 test "$(stat -c '%a' "$bundle/bin/notm")" = 755
 test "$(stat -c '%a' "$bundle/LICENSE")" = 644
@@ -92,3 +105,19 @@ appstreamcli validate --strict --pedantic --no-net \
 test "$(tar -tzf "$archive" | sed -n '1p')" = \
   'notm-v0.1.0-test-x86_64-unknown-linux-gnu/'
 test "$(tar -tvzf "$archive" | sed -n '2p' | awk '{print $2}')" = '0/0'
+test "$(tar -tzf "$source_archive" | sed -n '1p')" = \
+  'notm-0.1.0-test/'
+
+if SOURCE_DATE_EPOCH=0 \
+  "$PROJECT_ROOT/packaging/build-linux-release.sh" \
+    "$PROJECT_ROOT" \
+    0.1.0-test \
+    x86_64-unknown-linux-gnu \
+    "$FAKE_BINARY" \
+    "$BUILD_INFO" \
+    "$DIST_DIR" >"$WORK_ROOT/overwrite.out" 2>&1; then
+  printf '%s\n' 'release packaging unexpectedly overwrote an artifact' >&2
+  exit 1
+fi
+grep -F 'refusing to overwrite release artifact:' \
+  "$WORK_ROOT/overwrite.out" > /dev/null

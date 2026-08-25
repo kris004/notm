@@ -71,9 +71,17 @@ OUTPUT_DIR=$(
 
 BUNDLE_NAME="notm-v${VERSION}-${TARGET}"
 ARCHIVE="$OUTPUT_DIR/$BUNDLE_NAME.tar.gz"
+SOURCE_NAME="notm-${VERSION}"
+SOURCE_ARCHIVE="$OUTPUT_DIR/notm-v${VERSION}-src.tar.gz"
 CHECKSUM="$OUTPUT_DIR/SHA256SUMS"
+SOURCE_REF=${SOURCE_REF:-HEAD}
 WORK_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/notm-release.XXXXXX")
-readonly SOURCE_ROOT BINARY BUILD_INFO OUTPUT_DIR BUNDLE_NAME ARCHIVE CHECKSUM WORK_ROOT
+BUNDLE_TAR="$WORK_ROOT/$BUNDLE_NAME.tar"
+SOURCE_TAR="$WORK_ROOT/$SOURCE_NAME.tar"
+readonly \
+  SOURCE_ROOT BINARY BUILD_INFO OUTPUT_DIR BUNDLE_NAME ARCHIVE \
+  SOURCE_NAME SOURCE_ARCHIVE SOURCE_REF CHECKSUM WORK_ROOT \
+  BUNDLE_TAR SOURCE_TAR
 BUNDLE_ROOT="$WORK_ROOT/$BUNDLE_NAME"
 readonly BUNDLE_ROOT
 
@@ -81,6 +89,19 @@ cleanup() {
   rm -rf -- "$WORK_ROOT"
 }
 trap cleanup EXIT HUP INT TERM
+
+if ! git -C "$SOURCE_ROOT" rev-parse --verify "${SOURCE_REF}^{commit}" \
+  > /dev/null 2>&1; then
+  printf 'source ref does not resolve to a commit: %s\n' "$SOURCE_REF" >&2
+  exit 2
+fi
+
+for artifact in "$ARCHIVE" "$SOURCE_ARCHIVE" "$CHECKSUM"; do
+  if [ -e "$artifact" ] || [ -L "$artifact" ]; then
+    printf 'refusing to overwrite release artifact: %s\n' "$artifact" >&2
+    exit 1
+  fi
+done
 
 install -Dm755 "$BINARY" "$BUNDLE_ROOT/bin/notm"
 
@@ -157,7 +178,6 @@ else
   archive_mtime='@0'
 fi
 
-rm -f -- "$ARCHIVE" "$CHECKSUM"
 (
   cd -- "$WORK_ROOT"
   LC_ALL=C tar \
@@ -166,13 +186,24 @@ rm -f -- "$ARCHIVE" "$CHECKSUM"
     --group=0 \
     --numeric-owner \
     --mtime="$archive_mtime" \
-    -cf - \
+    -cf "$BUNDLE_TAR" \
     "$BUNDLE_NAME"
-) | gzip -n -9 > "$ARCHIVE"
+)
+gzip -n -9 -c "$BUNDLE_TAR" > "$ARCHIVE"
+
+git -C "$SOURCE_ROOT" archive \
+  --format=tar \
+  --prefix="$SOURCE_NAME/" \
+  --output="$SOURCE_TAR" \
+  "$SOURCE_REF"
+gzip -n -9 -c "$SOURCE_TAR" > "$SOURCE_ARCHIVE"
 
 (
   cd -- "$OUTPUT_DIR"
-  sha256sum "$(basename -- "$ARCHIVE")" > "$(basename -- "$CHECKSUM")"
+  sha256sum \
+    "$(basename -- "$ARCHIVE")" \
+    "$(basename -- "$SOURCE_ARCHIVE")" \
+    > "$(basename -- "$CHECKSUM")"
 )
 
-printf '%s\n' "$ARCHIVE" "$CHECKSUM"
+printf '%s\n' "$ARCHIVE" "$SOURCE_ARCHIVE" "$CHECKSUM"

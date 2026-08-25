@@ -1,77 +1,135 @@
 name: Release Linux binary
 
 on:
-  release:
-    types:
-      - published
+  push:
+    tags:
+      - "v*.*.*"
   workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing GitHub release tag to build and update
-        required: true
-        type: string
 
-permissions:
-  contents: write
-  id-token: write
-  attestations: write
+permissions: {}
 
 concurrency:
-  group: release-linux-${{ github.event.release.tag_name || inputs.tag }}
+  group: release-linux-${{ github.ref }}
   cancel-in-progress: false
 
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
-  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  RELEASE_SIGNING_FINGERPRINT: BE592562E6131A53F4BADE4A046928E9A919BAF9
 
 jobs:
   build:
-    name: Build x86_64 GNU/Linux bundle
+    name: Build release assets
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      release-artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      source-commit: ${{ steps.release.outputs.source-commit }}
+      version: ${{ steps.release.outputs.version }}
 
     steps:
-      - name: Check out release source
+      - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
-          path: source
+          fetch-depth: 1
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG }}
 
-      - name: Check out release tooling
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          path: release-tools
-          persist-credentials: false
-          ref: ${{ github.workflow_sha }}
-
-      - name: Validate release source
+      - name: Validate release source and authorization
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          set -euxo pipefail
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
-          version="${RELEASE_TAG#v}"
+          set -euo pipefail
+
           package_version="$(
-            cargo metadata \
-              --manifest-path source/Cargo.toml \
-              --no-deps \
-              --format-version 1 |
+            cargo metadata --no-deps --format-version 1 |
               jq -r '.packages[] | select(.name == "notm-app") | .version'
           )"
-          test "$package_version" = "$version"
-          test "$(git -C source cat-file -t "$RELEASE_TAG")" = tag
-          source_commit="$(git -C source rev-list -n 1 "$RELEASE_TAG")"
-          test "$(git -C source rev-parse HEAD)" = "$source_commit"
-          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = false
-          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
-          printf 'source_commit=%s\n' "$source_commit" >> "$GITHUB_OUTPUT"
-          printf 'archive=dist/notm-%s-x86_64-unknown-linux-gnu.tar.gz\n' \
-            "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          [[ "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          source_commit="$(git rev-parse HEAD)"
+
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            test "$GITHUB_REF_TYPE" = tag
+            [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+            test "${GITHUB_REF_NAME#v}" = "$package_version"
+
+            ref_api="repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}"
+            if [[ $(gh api "$ref_api" --jq '.object.type') != tag ]]; then
+              echo 'release tag must be an annotated tag object' >&2
+              exit 1
+            fi
+
+            tag_sha="$(gh api "$ref_api" --jq '.object.sha')"
+            tag_api="repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}"
+            tag_json="$(gh api "$tag_api")"
+            jq -e \
+              --arg name "$GITHUB_REF_NAME" \
+              --arg commit "$source_commit" \
+              '.tag == $name and
+               .object.type == "commit" and
+               .object.sha == $commit and
+               .verification.verified == true and
+               .verification.reason == "valid"' \
+              <<<"$tag_json" >/dev/null || {
+                jq '{tag, object, verification}' <<<"$tag_json" >&2
+                echo 'release tag must be direct and GitHub-verified' >&2
+                exit 1
+              }
+
+            packaging/verify-release-tag.sh \
+              . \
+              "$GITHUB_REF_NAME" \
+              docs/release-signing-key.asc \
+              "$RELEASE_SIGNING_FINGERPRINT"
+
+            default_branch="$(
+              gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch'
+            )"
+            comparison="$(
+              gh api \
+                "repos/${GITHUB_REPOSITORY}/compare/${source_commit}...${default_branch}" \
+                --jq '.status'
+            )"
+            if [[ "$comparison" != ahead && "$comparison" != identical ]]; then
+              echo 'release commit is not reachable from the default branch' >&2
+              exit 1
+            fi
+
+            check_runs="$(
+              gh api \
+                "repos/${GITHUB_REPOSITORY}/commits/${source_commit}/check-runs?per_page=100&filter=latest"
+            )"
+            required_checks=(
+              'Format, lint, test, and GTK smoke'
+              'Analyze Rust'
+            )
+            for required_check in "${required_checks[@]}"; do
+              jq -e --arg name "$required_check" '
+                [.check_runs[] | select(.name == $name)] as $runs |
+                ($runs | length) > 0 and
+                all($runs[];
+                  .status == "completed" and .conclusion == "success")
+              ' <<<"$check_runs" >/dev/null || {
+                echo "required check is not successful: $required_check" >&2
+                exit 1
+              }
+            done
+
+            if gh release view "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo 'release already exists; refusing to replace it' >&2
+              exit 1
+            fi
+          else
+            test "$GITHUB_EVENT_NAME" = workflow_dispatch
+            test "$GITHUB_REF_TYPE" = branch
+          fi
+
+          printf 'source-commit=%s\n' "$source_commit" >>"$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$package_version" >>"$GITHUB_OUTPUT"
 
       - name: Install native dependencies
         shell: bash
@@ -82,7 +140,9 @@ jobs:
             appstream \
             build-essential \
             clang \
+            dbus-daemon \
             desktop-file-utils \
+            file \
             libclang-dev \
             libgtk-4-dev \
             libgtksourceview-5-dev \
@@ -99,29 +159,39 @@ jobs:
           rustc --version --verbose
           cargo --version --verbose
 
+      - name: Test release source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo test --workspace --all-targets --all-features
+          cargo run -p notm-app -- fixture-smoke
+          make check-packaging
+
       - name: Build release binary
-        working-directory: source
         run: cargo build --release --locked -p notm-app
 
-      - name: Inspect and package release binary
+      - name: Inspect and package release assets
         env:
-          SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
+          SOURCE_COMMIT: ${{ steps.release.outputs.source-commit }}
           VERSION: ${{ steps.release.outputs.version }}
         shell: bash
         run: |
           set -euxo pipefail
-          binary=source/target/release/notm
+          binary=target/release/notm
           test "$(uname -m)" = x86_64
           test "$("$binary" --version)" = "notm $VERSION"
           file "$binary" | grep -F 'ELF 64-bit LSB pie executable, x86-64'
           mkdir -p dist
           ldd "$binary" | tee dist/ldd.txt
-          ! grep -F 'not found' dist/ldd.txt
+          if grep -F 'not found' dist/ldd.txt; then
+            echo 'release binary has an unresolved shared-library dependency' >&2
+            exit 1
+          fi
           strip --strip-unneeded "$binary"
 
           {
             printf 'Version: %s\n' "$VERSION"
-            printf 'Source tag: %s\n' "$RELEASE_TAG"
+            printf 'Source tag: v%s\n' "$VERSION"
             printf 'Source commit: %s\n' "$SOURCE_COMMIT"
             printf 'Target: x86_64-unknown-linux-gnu\n'
             printf 'Build image: ubuntu-24.04\n'
@@ -134,36 +204,125 @@ jobs:
               libnotmuch-dev \
               libwebkitgtk-6.0-dev
             printf '\nDirect ELF dependencies:\n'
-            readelf -d "$binary" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | sort
-          } > dist/BUILD-INFO.txt
+            readelf -d "$binary" |
+              sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | sort
+          } >dist/BUILD-INFO.txt
 
-          SOURCE_DATE_EPOCH="$(git -C source show -s --format=%ct HEAD)" \
-            release-tools/packaging/build-linux-release.sh \
-              source \
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$SOURCE_COMMIT")" \
+            SOURCE_REF="$SOURCE_COMMIT" \
+            packaging/build-linux-release.sh \
+              . \
               "$VERSION" \
               x86_64-unknown-linux-gnu \
               "$binary" \
               dist/BUILD-INFO.txt \
               dist
 
-          mkdir -p verify
-          tar -xzf "${{ steps.release.outputs.archive }}" -C verify
-          verify/notm-"$RELEASE_TAG"-x86_64-unknown-linux-gnu/bin/notm --version
+          rm dist/BUILD-INFO.txt dist/ldd.txt
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 3
           (cd dist && sha256sum --check SHA256SUMS)
 
-      - name: Attest release archive
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: ${{ steps.release.outputs.archive }}
+          mkdir -p verify/binary verify/source verify/tag
+          tar -xzf \
+            "dist/notm-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            -C verify/binary
+          tar -xzf "dist/notm-v${VERSION}-src.tar.gz" -C verify/source
+          git archive \
+            --format=tar \
+            --prefix="notm-${VERSION}/" \
+            "$SOURCE_COMMIT" |
+            tar -xf - -C verify/tag
+          diff -qr verify/source verify/tag
+          verify/binary/notm-v"${VERSION}"-x86_64-unknown-linux-gnu/bin/notm \
+            --version
 
       - name: Upload release assets
+        id: upload
+        # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-assets
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  attest:
+    name: Attest release assets
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write # Mint a short-lived Sigstore signing identity.
+      attestations: write # Store provenance in this repository.
+      artifact-metadata: write # Record metadata for attested artifacts.
+
+    steps:
+      - name: Download release assets
+        # v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.build.outputs.release-artifact-id }}
+          path: dist
+
+      - name: Verify release assets
+        run: |
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 3
+          (cd dist && sha256sum --check SHA256SUMS)
+
+      - name: Attest build provenance
+        # v4.2.2
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+
+  publish:
+    name: Publish release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [build, attest]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write # Create the release and upload its assets.
+
+    steps:
+      - name: Download release assets
+        # v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.build.outputs.release-artifact-id }}
+          path: dist
+
+      - name: Verify release assets
+        run: |
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 3
+          (cd dist && sha256sum --check SHA256SUMS)
+
+      - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
         shell: bash
         run: |
-          set -euxo pipefail
-          gh release upload "$RELEASE_TAG" \
-            "${{ steps.release.outputs.archive }}" \
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'release already exists; refusing to replace it' >&2
+            exit 1
+          fi
+
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/notm-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            "dist/notm-v${VERSION}-src.tar.gz" \
             dist/SHA256SUMS \
-            --clobber \
-            --repo "$GITHUB_REPOSITORY"
+            --generate-notes \
+            --latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "notm ${VERSION}" \
+            --verify-tag
