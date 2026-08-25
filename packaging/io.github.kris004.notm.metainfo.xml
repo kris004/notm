@@ -35,6 +35,11 @@
     <name>notm contributors</name>
   </developer>
   <releases>
+    <release version="0.1.1" date="2026-08-24">
+      <description>
+        <p>Add support for using notm as the default mailto handler.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-08-20">
       <description>
         <p>Initial public release.</p>

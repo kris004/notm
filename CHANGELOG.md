@@ -4,6 +4,8 @@ Notable user-facing changes are recorded here.
 
 ## Unreleased
 
+## [0.1.1] - 2026-08-24
+
 - The installed desktop entry can act as the default `mailto` handler. RFC 6068
   recipient, Cc, Bcc, subject, and plain-text body fields open in an editable
   composer and are routed to an existing notm instance when one is running.
@@ -43,4 +45,5 @@ Notable user-facing changes are recorded here.
   message body while results refresh.
 - Sender-default view actions now use compact labels and the `V a` shortcut.
 
+[0.1.1]: https://github.com/kris004/notm/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/kris004/notm/releases/tag/v0.1.0
