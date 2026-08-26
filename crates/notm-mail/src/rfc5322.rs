@@ -5,6 +5,7 @@ use uuid::Uuid;
 use crate::{
     address::{parse_one_checked, quote_name},
     compose::{AttachmentInput, ComposedMessage},
+    mime::{MimeLimits, parse_rfc5322_with_limits},
 };
 
 const RECOMMENDED_HEADER_LINE_LENGTH: usize = 78;
@@ -488,8 +489,23 @@ fn skip_message_id_cfws(field: &str, value: &str, mut index: usize) -> anyhow::R
             let Some(&byte) = bytes.get(index) else {
                 anyhow::bail!("{field} contains an unterminated comment");
             };
+            if !byte.is_ascii() {
+                // RFC 6532 extends ctext with UTF8-non-ascii. This string is
+                // already valid UTF-8; comments are discarded, never emitted
+                // as Message-ID syntax.
+                let character = value[index..]
+                    .chars()
+                    .next()
+                    .expect("a byte offset into valid UTF-8 has a character");
+                ensure!(
+                    !character.is_control(),
+                    "{field} contains an invalid character in a comment"
+                );
+                index += character.len_utf8();
+                continue;
+            }
             ensure!(
-                byte.is_ascii() && (matches!(byte, b' ' | b'\t') || byte.is_ascii_graphic()),
+                matches!(byte, b' ' | b'\t') || byte.is_ascii_graphic(),
                 "{field} contains an invalid character in a comment"
             );
             match byte {
@@ -498,10 +514,22 @@ fn skip_message_id_cfws(field: &str, value: &str, mut index: usize) -> anyhow::R
                     let Some(&escaped) = bytes.get(index) else {
                         anyhow::bail!("{field} contains an incomplete quoted pair in a comment");
                     };
-                    ensure!(
-                        matches!(escaped, b' ' | b'\t') || escaped.is_ascii_graphic(),
-                        "{field} contains an invalid quoted pair in a comment"
-                    );
+                    if escaped.is_ascii() {
+                        ensure!(
+                            matches!(escaped, b' ' | b'\t') || escaped.is_ascii_graphic(),
+                            "{field} contains an invalid quoted pair in a comment"
+                        );
+                    } else {
+                        let character = value[index..]
+                            .chars()
+                            .next()
+                            .expect("a byte offset into valid UTF-8 has a character");
+                        ensure!(
+                            !character.is_control(),
+                            "{field} contains an invalid quoted pair in a comment"
+                        );
+                        index += character.len_utf8() - 1;
+                    }
                 }
                 b'(' => depth += 1,
                 b')' => depth -= 1,
@@ -555,11 +583,13 @@ fn canonical_message_id_core(
     allow_obsolete_internal_cfws: bool,
 ) -> anyhow::Result<String> {
     ensure!(
-        value.is_ascii() && value.starts_with('<') && value.ends_with('>'),
+        value.starts_with('<')
+            && value.ends_with('>')
+            && (allow_obsolete_internal_cfws || value.is_ascii()),
         "{field} contains a non-ASCII or unbracketed message identifier: {value:?}"
     );
-    let source_inner = &value.as_bytes()[1..value.len() - 1];
-    let source_separator = message_id_separator(source_inner).ok_or_else(|| {
+    let source_inner = &value[1..value.len() - 1];
+    let source_separator = message_id_separator(source_inner.as_bytes()).ok_or_else(|| {
         anyhow::anyhow!(
             "{field} contains a message identifier without one valid @ separator: {value:?}"
         )
@@ -585,14 +615,14 @@ fn canonical_message_id_core(
         strip_obsolete_message_id_cfws(field, source_inner)?
     } else {
         ensure!(
-            valid_dot_atom(source_left),
+            valid_dot_atom(source_left.as_bytes()),
             "{field} contains an invalid id-left in {value:?}"
         );
         ensure!(
-            valid_id_right(source_right),
+            valid_id_right(source_right.as_bytes()),
             "{field} contains an invalid id-right in {value:?}"
         );
-        source_inner.to_vec()
+        source_inner.as_bytes().to_vec()
     };
     let separator = message_id_separator(&inner).ok_or_else(|| {
         anyhow::anyhow!(
@@ -615,14 +645,15 @@ fn canonical_message_id_core(
     ))
 }
 
-fn strip_obsolete_message_id_cfws(field: &str, value: &[u8]) -> anyhow::Result<Vec<u8>> {
+fn strip_obsolete_message_id_cfws(field: &str, value: &str) -> anyhow::Result<Vec<u8>> {
+    let bytes = value.as_bytes();
     let mut canonical = Vec::with_capacity(value.len());
     let mut index = 0;
     let mut quoted = false;
     let mut literal = false;
     let mut escaped = false;
-    while index < value.len() {
-        let byte = value[index];
+    while index < bytes.len() {
+        let byte = bytes[index];
         if escaped {
             canonical.push(byte);
             escaped = false;
@@ -673,24 +704,52 @@ fn strip_obsolete_message_id_cfws(field: &str, value: &[u8]) -> anyhow::Result<V
 
 fn skip_obsolete_message_id_comment(
     field: &str,
-    value: &[u8],
+    value: &str,
     mut index: usize,
 ) -> anyhow::Result<usize> {
+    let bytes = value.as_bytes();
     let mut depth = 1usize;
     index += 1;
     while depth != 0 {
-        let Some(&byte) = value.get(index) else {
+        let Some(&byte) = bytes.get(index) else {
             anyhow::bail!("{field} contains an unterminated comment");
         };
+        if !byte.is_ascii() {
+            // This is the internal-CFWS counterpart of skip_message_id_cfws:
+            // accept RFC 6532 UTF8-non-ascii only inside a discarded comment.
+            let character = value[index..]
+                .chars()
+                .next()
+                .expect("a byte offset into valid UTF-8 has a character");
+            ensure!(
+                !character.is_control(),
+                "{field} contains an invalid character in a comment"
+            );
+            index += character.len_utf8();
+            continue;
+        }
         match byte {
             b'\\' => {
                 index += 1;
-                ensure!(
-                    value.get(index).is_some_and(|escaped| {
-                        matches!(escaped, b' ' | b'\t') || escaped.is_ascii_graphic()
-                    }),
-                    "{field} contains an invalid quoted pair in a comment"
-                );
+                let Some(&escaped) = bytes.get(index) else {
+                    anyhow::bail!("{field} contains an incomplete quoted pair in a comment");
+                };
+                if escaped.is_ascii() {
+                    ensure!(
+                        matches!(escaped, b' ' | b'\t') || escaped.is_ascii_graphic(),
+                        "{field} contains an invalid quoted pair in a comment"
+                    );
+                } else {
+                    let character = value[index..]
+                        .chars()
+                        .next()
+                        .expect("a byte offset into valid UTF-8 has a character");
+                    ensure!(
+                        !character.is_control(),
+                        "{field} contains an invalid quoted pair in a comment"
+                    );
+                    index += character.len_utf8() - 1;
+                }
             }
             b'(' => depth += 1,
             b')' => depth -= 1,
@@ -740,10 +799,11 @@ fn message_id_separator(inner: &[u8]) -> Option<usize> {
         .flatten()
 }
 
-fn valid_obs_id_left_with_cfws(field: &str, value: &[u8]) -> anyhow::Result<bool> {
+fn valid_obs_id_left_with_cfws(field: &str, value: &str) -> anyhow::Result<bool> {
     if value.is_empty() {
         return Ok(false);
     }
+    let bytes = value.as_bytes();
     let mut index = 0;
     loop {
         let Some(next) = parse_obs_id_left_word(field, value, index)? else {
@@ -753,7 +813,7 @@ fn valid_obs_id_left_with_cfws(field: &str, value: &[u8]) -> anyhow::Result<bool
         if index == value.len() {
             return Ok(true);
         }
-        if value[index] != b'.' {
+        if bytes[index] != b'.' {
             return Ok(false);
         }
         index += 1;
@@ -763,19 +823,16 @@ fn valid_obs_id_left_with_cfws(field: &str, value: &[u8]) -> anyhow::Result<bool
     }
 }
 
-fn parse_obs_id_left_word(
-    field: &str,
-    value: &[u8],
-    index: usize,
-) -> anyhow::Result<Option<usize>> {
+fn parse_obs_id_left_word(field: &str, value: &str, index: usize) -> anyhow::Result<Option<usize>> {
     let index = skip_obsolete_message_id_cfws(field, value, index)?;
-    let Some(&first) = value.get(index) else {
+    let bytes = value.as_bytes();
+    let Some(&first) = bytes.get(index) else {
         return Ok(None);
     };
     let next = if first == b'"' {
-        parse_quoted_id_word(value, index)
+        parse_quoted_id_word(bytes, index)
     } else {
-        parse_id_left_atom(value, index)
+        parse_id_left_atom(bytes, index)
     };
     next.map(|next| skip_obsolete_message_id_cfws(field, value, next))
         .transpose()
@@ -789,12 +846,13 @@ fn parse_id_left_atom(value: &[u8], index: usize) -> Option<usize> {
     (end != index).then_some(end)
 }
 
-fn valid_obs_id_right_with_cfws(field: &str, value: &[u8]) -> anyhow::Result<bool> {
+fn valid_obs_id_right_with_cfws(field: &str, value: &str) -> anyhow::Result<bool> {
     if value.is_empty() {
         return Ok(false);
     }
+    let bytes = value.as_bytes();
     let start = skip_obsolete_message_id_cfws(field, value, 0)?;
-    if value.get(start) == Some(&b'[') {
+    if bytes.get(start) == Some(&b'[') {
         return valid_obs_domain_literal(field, value, start);
     }
 
@@ -807,7 +865,7 @@ fn valid_obs_id_right_with_cfws(field: &str, value: &[u8]) -> anyhow::Result<boo
         if index == value.len() {
             return Ok(true);
         }
-        if value[index] != b'.' {
+        if bytes[index] != b'.' {
             return Ok(false);
         }
         index += 1;
@@ -817,18 +875,19 @@ fn valid_obs_id_right_with_cfws(field: &str, value: &[u8]) -> anyhow::Result<boo
     }
 }
 
-fn parse_obs_domain_atom(field: &str, value: &[u8], index: usize) -> anyhow::Result<Option<usize>> {
+fn parse_obs_domain_atom(field: &str, value: &str, index: usize) -> anyhow::Result<Option<usize>> {
     let index = skip_obsolete_message_id_cfws(field, value, index)?;
-    let Some(next) = parse_id_left_atom(value, index) else {
+    let Some(next) = parse_id_left_atom(value.as_bytes(), index) else {
         return Ok(None);
     };
     Ok(Some(skip_obsolete_message_id_cfws(field, value, next)?))
 }
 
-fn valid_obs_domain_literal(field: &str, value: &[u8], mut index: usize) -> anyhow::Result<bool> {
+fn valid_obs_domain_literal(field: &str, value: &str, mut index: usize) -> anyhow::Result<bool> {
+    let bytes = value.as_bytes();
     index += 1;
     let mut has_content = false;
-    while let Some(&byte) = value.get(index) {
+    while let Some(&byte) = bytes.get(index) {
         match byte {
             b']' => {
                 if !has_content {
@@ -839,7 +898,7 @@ fn valid_obs_domain_literal(field: &str, value: &[u8], mut index: usize) -> anyh
             }
             b' ' | b'\t' => index += 1,
             b'\\' => {
-                let Some(&escaped) = value.get(index + 1) else {
+                let Some(&escaped) = bytes.get(index + 1) else {
                     return Ok(false);
                 };
                 if !matches!(escaped, b' ' | b'\t') && !escaped.is_ascii_graphic() {
@@ -860,17 +919,18 @@ fn valid_obs_domain_literal(field: &str, value: &[u8], mut index: usize) -> anyh
 
 fn skip_obsolete_message_id_cfws(
     field: &str,
-    value: &[u8],
+    value: &str,
     mut index: usize,
 ) -> anyhow::Result<usize> {
+    let bytes = value.as_bytes();
     loop {
-        while value
+        while bytes
             .get(index)
             .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
         {
             index += 1;
         }
-        if value.get(index) != Some(&b'(') {
+        if bytes.get(index) != Some(&b'(') {
             return Ok(index);
         }
         index = skip_obsolete_message_id_comment(field, value, index)?;
@@ -1177,7 +1237,7 @@ fn normalize_embedded_message(bytes: &[u8], content_type: &str) -> anyhow::Resul
             normalized.windows(4).any(|window| window == b"\r\n\r\n"),
             "message/rfc822 attachment does not contain a header/body separator"
         );
-        let parsed = mailparse::parse_mail(&normalized)
+        let parsed = parse_rfc5322_with_limits(&normalized, MimeLimits::default())
             .context("message/rfc822 attachment is not a parseable RFC 5322 message")?;
         ensure!(
             !parsed.headers.is_empty(),
@@ -1397,6 +1457,46 @@ mod tests {
 
     fn render(message: &ComposedMessage) -> Vec<u8> {
         render_message(message).expect("render valid test message")
+    }
+
+    fn nested_embedded_message(depth: usize) -> Vec<u8> {
+        let mut message = "Content-Type: text/plain\r\n\r\nleaf".to_string();
+        for index in 0..depth {
+            let boundary = format!("embedded-depth-{index}");
+            message = format!(
+                "MIME-Version: 1.0\r\n\
+                 Content-Type: multipart/mixed; boundary={boundary}\r\n\r\n\
+                 --{boundary}\r\n{message}\r\n--{boundary}--\r\n"
+            );
+        }
+        message.into_bytes()
+    }
+
+    fn embedded_message_with_siblings(parts: usize) -> Vec<u8> {
+        let boundary = "embedded-siblings";
+        let mut message = format!(
+            "MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary={boundary}\r\n\r\n"
+        )
+        .into_bytes();
+        for index in 0..parts {
+            message.extend_from_slice(
+                format!("--{boundary}\r\nContent-Type: text/plain\r\n\r\npart {index}\r\n")
+                    .as_bytes(),
+            );
+        }
+        message.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        message
+    }
+
+    fn message_with_embedded_attachment(bytes: Vec<u8>) -> ComposedMessage {
+        let mut message = test_message();
+        message.attachments.push(AttachmentInput {
+            filename: "forwarded.eml".to_string(),
+            content_type: "message/rfc822".to_string(),
+            bytes,
+            source_path: None,
+        });
+        message
     }
 
     #[test]
@@ -1708,6 +1808,44 @@ mod tests {
     }
 
     #[test]
+    fn message_rfc822_attachment_accepts_mime_depth_at_limit() {
+        let message = message_with_embedded_attachment(nested_embedded_message(
+            crate::mime::MIME_DEPTH_LIMIT,
+        ));
+
+        render_message(&message).expect("embedded MIME depth at the shared limit must render");
+    }
+
+    #[test]
+    fn message_rfc822_attachment_rejects_mime_depth_over_limit() {
+        let message = message_with_embedded_attachment(nested_embedded_message(
+            crate::mime::MIME_DEPTH_LIMIT + 1,
+        ));
+
+        let error = render_message(&message).expect_err("depth 33 must be rejected before parse");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("MIME nesting depth 33") && chain.contains("limit of 32"),
+            "unexpected depth error: {chain}"
+        );
+    }
+
+    #[test]
+    fn message_rfc822_attachment_rejects_excessive_part_count() {
+        let message = message_with_embedded_attachment(embedded_message_with_siblings(
+            crate::mime::MIME_PARTS_LIMIT + 1,
+        ));
+
+        let error = render_message(&message)
+            .expect_err("more than 2048 embedded siblings must be rejected before parse");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("more than the allowed 2048 MIME parts"),
+            "unexpected part-count error: {chain}"
+        );
+    }
+
+    #[test]
     fn threading_headers_fold_and_round_trip() {
         let mut message = test_message();
         message.in_reply_to =
@@ -1829,6 +1967,42 @@ mod tests {
                 message_id_tokens(field, &[sequence.to_string()])
                     .unwrap_or_else(|error| panic!("{field} rejected obsolete phrases: {error:#}")),
                 ["<first@example.test>", "<second@example.test>"]
+            );
+        }
+    }
+
+    #[test]
+    fn utf8_threading_comments_are_ignored_without_weakening_control_checks() {
+        let sequence = "(Привет (nested 日本語) \\界) \
+                        <root(внутри (CJK 日本語) \\界)@example.test> (хвост)";
+        for field in ["In-Reply-To", "References"] {
+            assert_eq!(
+                message_id_tokens(field, &[sequence.to_string()]).unwrap_or_else(|error| {
+                    panic!("{field} rejected valid RFC 6532 comments: {error:#}")
+                }),
+                ["<root@example.test>"]
+            );
+
+            for invalid in [
+                "(bad\u{0001}) <root@example.test>".to_string(),
+                "(bad\u{007f}) <root@example.test>".to_string(),
+                "(incomplete\\".to_string(),
+            ] {
+                assert!(
+                    message_id_tokens(field, std::slice::from_ref(&invalid)).is_err(),
+                    "{field} accepted invalid comment {invalid:?}"
+                );
+            }
+        }
+
+        for invalid in ["(bad\u{0085})", "(bad\\\u{0085})", "(incomplete\\"] {
+            assert!(
+                skip_message_id_cfws("References", invalid, 0).is_err(),
+                "outer CFWS scanner accepted {invalid:?}"
+            );
+            assert!(
+                skip_obsolete_message_id_comment("References", invalid, 0).is_err(),
+                "internal CFWS scanner accepted {invalid:?}"
             );
         }
     }
