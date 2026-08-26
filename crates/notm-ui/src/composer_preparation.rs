@@ -1,4 +1,5 @@
 use std::{
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -75,6 +76,8 @@ pub(crate) enum ComposerPreparationOutput {
     IndexedDraft {
         fields: ComposeFields,
         sources: Vec<ComposerAttachmentSource>,
+        source_path: PathBuf,
+        message_id: String,
     },
 }
 
@@ -277,7 +280,7 @@ fn prepare(request: ComposerPreparationRequest) -> anyhow::Result<ComposerPrepar
             }
         }
         ComposerPreparationAction::IndexedDraft => {
-            let fields = prepare_indexed_draft_fields(
+            let (fields, source_path) = prepare_indexed_draft_fields(
                 &token,
                 parsed,
                 prepared.source()?,
@@ -296,7 +299,12 @@ fn prepare(request: ComposerPreparationRequest) -> anyhow::Result<ComposerPrepar
                     )
                 })
                 .collect();
-            ComposerPreparationOutput::IndexedDraft { fields, sources }
+            ComposerPreparationOutput::IndexedDraft {
+                fields,
+                sources,
+                source_path,
+                message_id,
+            }
         }
     };
     token.ensure_current()?;
@@ -304,12 +312,27 @@ fn prepare(request: ComposerPreparationRequest) -> anyhow::Result<ComposerPrepar
     Ok(output)
 }
 
+#[cfg(test)]
+pub(crate) fn prepare_indexed_draft_for_test(
+    prepared_thread: Arc<PreparedThread>,
+    message_id: String,
+) -> anyhow::Result<ComposerPreparationOutput> {
+    let mut coordinator = ComposerPreparationCoordinator::default();
+    let token = coordinator.begin();
+    prepare(ComposerPreparationRequest::new(
+        token,
+        prepared_thread,
+        message_id,
+        ComposerPreparationAction::IndexedDraft,
+    ))
+}
+
 fn prepare_indexed_draft_fields(
     token: &ComposerPreparationToken,
     parsed: &notm_mail::ParsedMessage,
     source: &MessageSource,
     max_source_bytes: usize,
-) -> anyhow::Result<ComposeFields> {
+) -> anyhow::Result<(ComposeFields, PathBuf)> {
     token.ensure_current()?;
     anyhow::ensure!(
         source.source_bytes() <= max_source_bytes,
@@ -319,11 +342,11 @@ fn prepare_indexed_draft_fields(
     // This bounded file/Notmuch fallback read runs only on the composer worker.
     // The temporary raw buffer is dropped before the response is returned;
     // attachment payloads are neither decoded nor retained in the output.
-    let raw = source.read_bounded(max_source_bytes)?;
+    let (source_path, raw) = source.read_bounded_with_path(max_source_bytes)?;
     token.ensure_current()?;
     let fields = composer::prepare_draft_fields_from_message_bytes(parsed, &raw)?;
     token.ensure_current()?;
-    Ok(fields)
+    Ok((fields, source_path))
 }
 
 fn validate_output(
@@ -335,9 +358,9 @@ fn validate_output(
         ComposerPreparationOutput::MessageWithAttachments { message, sources } => {
             (message_text_bytes(message), sources.as_slice())
         }
-        ComposerPreparationOutput::IndexedDraft { fields, sources } => {
-            (compose_fields_text_bytes(fields), sources.as_slice())
-        }
+        ComposerPreparationOutput::IndexedDraft {
+            fields, sources, ..
+        } => (compose_fields_text_bytes(fields), sources.as_slice()),
     };
     anyhow::ensure!(
         text_bytes <= limits.text_bytes,
@@ -614,13 +637,15 @@ mod tests {
         let directory = tempfile::tempdir().expect("indexed-draft source directory");
         let path = directory.path().join("draft.eml");
         std::fs::write(&path, &raw).expect("write indexed-draft source");
-        let source = MessageSource::new(path, raw.len());
+        let source = MessageSource::new(path.clone(), raw.len());
         let mut coordinator = ComposerPreparationCoordinator::default();
         let token = coordinator.begin();
 
-        let fields = prepare_indexed_draft_fields(&token, &parsed, &source, raw.len())
-            .expect("prepare indexed draft from raw headers");
+        let (fields, source_path) =
+            prepare_indexed_draft_fields(&token, &parsed, &source, raw.len())
+                .expect("prepare indexed draft from raw headers");
 
+        assert_eq!(source_path, path);
         assert_eq!(fields.from, "sender@example.test");
         assert_eq!(
             fields.to,

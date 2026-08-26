@@ -88,8 +88,16 @@ impl MessageSource {
     }
 
     pub(crate) fn read_bounded(&self, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
+        self.read_bounded_with_path(max_bytes)
+            .map(|(_, bytes)| bytes)
+    }
+
+    pub(crate) fn read_bounded_with_path(
+        &self,
+        max_bytes: usize,
+    ) -> anyhow::Result<(PathBuf, Vec<u8>)> {
         match read_bounded(self.path(), max_bytes) {
-            Ok(bytes) => Ok(bytes),
+            Ok(bytes) => Ok((self.path().to_path_buf(), bytes)),
             Err(cached_error) => {
                 let Some(resolver) = self.resolver.as_deref() else {
                     return Err(cached_error);
@@ -98,13 +106,15 @@ impl MessageSource {
                 let source = database
                     .open_message_id_file(&resolver.message_id)
                     .map_err(anyhow::Error::from)?;
-                read_resolved_bounded(source, max_bytes).with_context(|| {
+                let (path, file) = source.into_parts();
+                let bytes = read_reader_bounded(file, max_bytes).with_context(|| {
                     format!(
                         "cached message path {} was unavailable ({cached_error}); resolving current file for {}",
                         self.path().display(),
                         resolver.message_id
                     )
-                })
+                })?;
+                Ok((path, bytes))
             }
         }
     }
@@ -749,13 +759,6 @@ fn read_bounded(path: &Path, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
     read_reader_bounded(file, max_bytes)
 }
 
-fn read_resolved_bounded(
-    source: notm_notmuch::ResolvedMessageFile,
-    max_bytes: usize,
-) -> anyhow::Result<Vec<u8>> {
-    read_reader_bounded(source, max_bytes)
-}
-
 fn read_reader_bounded(reader: impl Read, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
     let limit = u64::try_from(max_bytes)
         .unwrap_or(u64::MAX - 1)
@@ -785,6 +788,23 @@ where
         target_message_id,
         DEFAULT_PREPARATION_LIMITS,
         read,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_thread_from_summaries_for_test(
+    thread_id: String,
+    messages: Vec<MessageSummary>,
+    resolver_config: Option<&OpenConfig>,
+) -> anyhow::Result<PreparedThread> {
+    prepare_thread_with_resolution(
+        thread_id,
+        messages,
+        None,
+        DEFAULT_PREPARATION_LIMITS,
+        resolver_config,
+        read_bounded,
+        || false,
     )
 }
 
@@ -2182,15 +2202,15 @@ BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nEND:VCALENDAR\r\n\
             config_path: Some(temp.path().join("missing-config")),
             profile: None,
         };
-        let source = MessageSource::new(cached_path, cached.len())
+        let source = MessageSource::new(cached_path.clone(), cached.len())
             .with_resolver(&unavailable, "removed-message@fixture.test");
 
-        assert_eq!(
-            source
-                .read_bounded(DEFAULT_PREPARATION_LIMITS.source_bytes)
-                .expect("readable cached source must not require Notmuch"),
-            cached
-        );
+        let (resolved_path, bytes) = source
+            .read_bounded_with_path(DEFAULT_PREPARATION_LIMITS.source_bytes)
+            .expect("readable cached source must not require Notmuch");
+
+        assert_eq!(resolved_path, cached_path);
+        assert_eq!(bytes, cached);
     }
 
     #[test]
@@ -2211,12 +2231,12 @@ Subject: Resolved source\r\n\r\ncurrent database source\r\n";
         let source = MessageSource::new(stale_path, 0)
             .with_resolver(&config, "resolved-source@fixture.test");
 
-        assert_eq!(
-            source
-                .read_bounded(DEFAULT_PREPARATION_LIMITS.source_bytes)
-                .expect("stale source must resolve through current Notmuch state"),
-            current
-        );
+        let (resolved_path, bytes) = source
+            .read_bounded_with_path(DEFAULT_PREPARATION_LIMITS.source_bytes)
+            .expect("stale source must resolve through current Notmuch state");
+
+        assert_eq!(resolved_path, current_path);
+        assert_eq!(bytes, current);
     }
 
     #[test]

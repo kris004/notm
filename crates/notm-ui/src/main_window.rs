@@ -817,7 +817,6 @@ struct ComposerPreparationIntent {
     present_main_window: bool,
     show_message_pane: bool,
     active_pane: ActivePane,
-    active_source: Option<PreparedActiveDraft>,
 }
 
 struct PreparedActiveDraft {
@@ -8235,13 +8234,20 @@ fn prepared_composer_replacement_from_output(
                 sources,
             }
         }
-        ComposerPreparationOutput::IndexedDraft { fields, sources } => {
-            ComposerReplacementPayload::Draft(Box::new(PreparedDraftReplacement {
-                fields,
-                active_source: intent.active_source,
-                attachment_sources: sources,
-            }))
-        }
+        ComposerPreparationOutput::IndexedDraft {
+            fields,
+            sources,
+            source_path,
+            message_id,
+        } => ComposerReplacementPayload::Draft(Box::new(PreparedDraftReplacement {
+            fields,
+            active_source: Some(PreparedActiveDraft {
+                path: source_path,
+                message_id: Some(message_id),
+                indexed: true,
+            }),
+            attachment_sources: sources,
+        })),
     };
     Ok(PreparedComposerReplacement {
         kind: intent.kind,
@@ -10486,17 +10492,7 @@ fn open_selected_draft_message(
         .selected_message
         .clone()
         .ok_or_else(|| anyhow::anyhow!("no selected draft message"))?;
-    let filename = message
-        .filenames
-        .first()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("selected draft has no file"))?;
     let prepared_thread = prepared_thread_for_selected(widgets, state)?;
-    let active_source = PreparedActiveDraft {
-        path: PathBuf::from(filename),
-        message_id: Some(message.message_id.clone()),
-        indexed: true,
-    };
     Ok(schedule_composer_preparation(
         options,
         widgets,
@@ -10513,7 +10509,6 @@ fn open_selected_draft_message(
             present_main_window: false,
             show_message_pane: false,
             active_pane,
-            active_source: Some(active_source),
         },
     ))
 }
@@ -12831,7 +12826,6 @@ fn run_standalone_response_request(
             present_main_window: true,
             show_message_pane: true,
             active_pane: ActivePane::Message,
-            active_source: None,
         },
     )
 }
@@ -15069,7 +15063,6 @@ fn reply_selected(
             present_main_window: false,
             show_message_pane: false,
             active_pane: ActivePane::Message,
-            active_source: None,
         },
     )
 }
@@ -15110,7 +15103,6 @@ fn forward_selected(options: &LaunchOptions, widgets: &Widgets, state: &SharedSt
             present_main_window: false,
             show_message_pane: false,
             active_pane: ActivePane::Message,
-            active_source: None,
         },
     )
 }
@@ -15155,7 +15147,6 @@ fn forward_as_attachment_selected(
             present_main_window: false,
             show_message_pane: false,
             active_pane: ActivePane::Message,
-            active_source: None,
         },
     )
 }
@@ -19977,6 +19968,89 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn indexed_draft_test_options(temp: &tempfile::TempDir) -> (LaunchOptions, PathBuf) {
+        let database_path = temp.path().join("mail");
+        let maildir = database_path.join("Drafts/cur");
+        fs::create_dir_all(&maildir).expect("create draft Maildir");
+        let config_path = temp.path().join("notmuch-config");
+        fs::write(
+            &config_path,
+            format!(
+                "[database]\npath={}\n\n[user]\nname=Fixture User\nprimary_email=fixture@example.test\n\n[new]\ntags=\nignore=\n\n[search]\nexclude_tags=\n\n[maildir]\nsynchronize_flags=true\n",
+                database_path.display()
+            ),
+        )
+        .expect("write Notmuch config");
+        (
+            LaunchOptions {
+                database_path: Some(database_path),
+                config_path: Some(config_path),
+                ..LaunchOptions::default()
+            },
+            maildir,
+        )
+    }
+
+    fn indexed_draft_message(message_id: &str, subject: &str) -> Vec<u8> {
+        format!(
+            "From: Fixture User <fixture@example.test>\r\n\
+             To: recipient@example.test\r\n\
+             Subject: {subject}\r\n\
+             Message-ID: <{message_id}>\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\r\n\
+             Indexed draft body.\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn prepare_indexed_draft_thread(
+        options: &LaunchOptions,
+        summary: notm_notmuch::MessageSummary,
+    ) -> Arc<PreparedThread> {
+        Arc::new(
+            crate::thread_loader::prepare_thread_from_summaries_for_test(
+                summary.thread_id.clone(),
+                vec![summary],
+                Some(&open_config(options)),
+            )
+            .expect("prepare indexed draft thread"),
+        )
+    }
+
+    fn prepared_indexed_draft_active_source(
+        prepared_thread: Arc<PreparedThread>,
+        message_id: &str,
+    ) -> PreparedActiveDraft {
+        let output = composer_preparation::prepare_indexed_draft_for_test(
+            prepared_thread,
+            message_id.to_string(),
+        )
+        .expect("prepare indexed draft composer output");
+        let replacement = match prepared_composer_replacement_from_output(
+            ComposerPreparationIntent {
+                kind: ComposerReplacementKind::IndexedDraft,
+                selection: None,
+                rejection_restore: None,
+                status: "Loaded indexed draft".to_string(),
+                source_status: None,
+                present_main_window: false,
+                show_message_pane: false,
+                active_pane: ActivePane::Message,
+            },
+            output,
+        ) {
+            Ok(replacement) => replacement,
+            Err(error) => panic!("indexed draft output must build a replacement: {}", error.1),
+        };
+        let ComposerReplacementPayload::Draft(draft) = replacement.payload else {
+            panic!("indexed draft output built a non-draft replacement");
+        };
+        draft
+            .active_source
+            .expect("indexed draft replacement must retain its active source")
+    }
+
     #[test]
     fn mailto_requests_map_to_editable_composer_fields() {
         let fields = compose_fields_from_mailto(
@@ -20030,6 +20104,152 @@ mod tests {
                 .expect_err("two launch targets should be rejected")
                 .to_string()
                 .contains("cannot be combined")
+        );
+    }
+
+    #[test]
+    fn indexed_draft_replacement_retains_later_readable_candidate_for_cleanup() {
+        let temp = tempfile::tempdir().expect("temporary indexed-draft root");
+        let (options, maildir) = indexed_draft_test_options(&temp);
+        let message_id = "later-readable@fixture.test";
+        let stale_first = maildir.join("a-stale-draft:2,D");
+        let readable_later = maildir.join("b-readable-draft:2,D");
+        let raw = indexed_draft_message(message_id, "Later readable draft");
+        fs::write(&stale_first, &raw).expect("write first indexed draft copy");
+        fs::hard_link(&stale_first, &readable_later)
+            .expect("create later readable indexed draft copy");
+        let database = Database::create(&open_config(&options)).expect("create Notmuch database");
+        database
+            .index_file_with_tags(&stale_first, &["draft"])
+            .expect("index first draft copy");
+        database
+            .index_file_with_tags(&readable_later, &["draft"])
+            .expect("index later draft copy");
+        let summary = database
+            .find_message(message_id)
+            .expect("look up duplicate draft")
+            .expect("duplicate draft summary");
+        drop(database);
+        assert!(
+            summary
+                .filenames
+                .iter()
+                .any(|path| Path::new(path) == stale_first)
+        );
+        assert!(
+            summary
+                .filenames
+                .iter()
+                .any(|path| Path::new(path) == readable_later)
+        );
+        fs::remove_file(&stale_first).expect("remove first indexed draft copy");
+
+        let prepared_thread = prepare_indexed_draft_thread(&options, summary);
+        let active = prepared_indexed_draft_active_source(prepared_thread, message_id);
+
+        assert_ne!(active.path, stale_first);
+        assert_eq!(active.path, readable_later);
+        assert_eq!(active.message_id.as_deref(), Some(message_id));
+        assert!(active.indexed);
+        delete_draft_source(
+            &options,
+            &ActiveDraft {
+                path: active.path,
+                message_id: active.message_id,
+                indexed: active.indexed,
+                saved_fields: ComposeFields::default(),
+            },
+        )
+        .expect("delete the later readable indexed draft source");
+        assert!(
+            !readable_later.exists(),
+            "later readable indexed draft survived cleanup"
+        );
+    }
+
+    #[test]
+    fn indexed_draft_replacement_retains_message_id_refresh_path_for_cleanup() {
+        let temp = tempfile::tempdir().expect("temporary indexed-draft root");
+        let (options, maildir) = indexed_draft_test_options(&temp);
+        let message_id = "refreshed-draft@fixture.test";
+        let stale_summary_path = maildir.join("a-stale-before-load:2,D");
+        let refreshed_for_thread = maildir.join("b-refreshed-for-thread:2,D");
+        let resolved_for_composer = maildir.join("c-resolved-for-composer:2,D");
+        fs::write(
+            &stale_summary_path,
+            indexed_draft_message(message_id, "Message-ID refreshed draft"),
+        )
+        .expect("write original indexed draft");
+        let database = Database::create(&open_config(&options)).expect("create Notmuch database");
+        database
+            .index_file_with_tags(&stale_summary_path, &["draft"])
+            .expect("index original draft");
+        let summary = database
+            .find_message(message_id)
+            .expect("look up original draft")
+            .expect("original draft summary");
+        drop(database);
+
+        fs::rename(&stale_summary_path, &refreshed_for_thread)
+            .expect("move draft before thread preparation");
+        let database = Database::open(&open_config(&options), DatabaseMode::ReadWrite)
+            .expect("open Notmuch for first draft move");
+        database
+            .remove_message_file(&stale_summary_path)
+            .expect("remove stale pre-load path from Notmuch");
+        database
+            .index_file_with_tags(&refreshed_for_thread, &["draft"])
+            .expect("index first refreshed draft path");
+        drop(database);
+        assert!(
+            summary
+                .filenames
+                .iter()
+                .all(|path| !Path::new(path).exists()),
+            "summary unexpectedly retained a readable path"
+        );
+
+        let prepared_thread = prepare_indexed_draft_thread(&options, summary);
+        assert_eq!(
+            prepared_thread.message_contents[message_id]
+                .source()
+                .expect("prepared draft source")
+                .path(),
+            refreshed_for_thread
+        );
+
+        fs::rename(&refreshed_for_thread, &resolved_for_composer)
+            .expect("move draft before composer preparation");
+        let database = Database::open(&open_config(&options), DatabaseMode::ReadWrite)
+            .expect("open Notmuch for second draft move");
+        database
+            .remove_message_file(&refreshed_for_thread)
+            .expect("remove stale prepared path from Notmuch");
+        database
+            .index_file_with_tags(&resolved_for_composer, &["draft"])
+            .expect("index composer-resolved draft path");
+        drop(database);
+
+        let active = prepared_indexed_draft_active_source(prepared_thread, message_id);
+
+        assert_ne!(active.path, stale_summary_path);
+        assert_ne!(active.path, refreshed_for_thread);
+        assert_eq!(active.path, resolved_for_composer);
+        assert_eq!(active.message_id.as_deref(), Some(message_id));
+        assert!(active.indexed);
+        delete_draft_source(
+            &options,
+            &ActiveDraft {
+                path: active.path,
+                message_id: active.message_id,
+                indexed: active.indexed,
+                saved_fields: ComposeFields::default(),
+            },
+        )
+        .expect("delete the Message-ID-resolved indexed draft source");
+        assert!(
+            !resolved_for_composer.exists(),
+            "Message-ID-resolved indexed draft survived cleanup"
         );
     }
 
