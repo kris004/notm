@@ -1,3 +1,4 @@
+use mailparse::MailHeaderMap;
 use notm_mail::{ReplyKind, build_reply, compose::Identity, mime::parse_rfc5322};
 
 #[test]
@@ -22,6 +23,42 @@ fn reply_all_excludes_own_identity_and_sets_thread_headers() -> anyhow::Result<(
         reply
             .references
             .contains(&"<orig@example.test>".to_string())
+    );
+    Ok(())
+}
+
+#[test]
+fn reply_preserves_references_with_whitespace_inside_message_ids() -> anyhow::Result<()> {
+    let raw = br#"From: Alice <alice@example.test>
+To: Me <me@example.test>
+Subject: Legacy threading
+Message-ID: <current@example.test>
+References: <root@example.test> <"quoted id"@example.test>
+Content-Type: text/plain; charset=utf-8
+
+Body"#;
+    let parsed = parse_rfc5322(raw)?;
+    let identity = Identity {
+        name: Some("Me".into()),
+        email: "me@example.test".into(),
+    };
+
+    let reply = build_reply(
+        &parsed,
+        &identity,
+        &["me@example.test".into()],
+        ReplyKind::Sender,
+    );
+    let rendered = reply.to_rfc5322()?;
+    let reparsed = mailparse::parse_mail(&rendered)?;
+
+    assert_eq!(
+        reparsed.headers.get_first_value("References").as_deref(),
+        Some("<root@example.test> <\"quoted id\"@example.test> <current@example.test>")
+    );
+    assert_eq!(
+        reparsed.headers.get_first_value("In-Reply-To").as_deref(),
+        Some("<current@example.test>")
     );
     Ok(())
 }

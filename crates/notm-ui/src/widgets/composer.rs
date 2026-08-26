@@ -464,12 +464,15 @@ fn nonempty_string(value: String) -> Option<String> {
 }
 
 fn references_from_header(value: &str) -> Vec<String> {
-    value
-        .split_whitespace()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .collect()
+    let value = value.trim();
+    if value.is_empty() {
+        Vec::new()
+    } else {
+        // Keep the complete sequence intact until the RFC 5322 renderer parses
+        // it. Whitespace can be part of a quoted id-left or obsolete CFWS, so
+        // splitting here can corrupt an otherwise valid message identifier.
+        vec![value.to_string()]
+    }
 }
 
 fn persisted_draft_deletion_requires_confirmation(_deletion: PersistedDraftDeletion) -> bool {
@@ -2122,6 +2125,7 @@ fn focus_widget_at(targets: &[gtk::Widget], index: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mailparse::MailHeaderMap;
 
     fn hooks() -> TransitionHooks {
         TransitionHooks::new(|| true, || {})
@@ -2416,7 +2420,7 @@ mod tests {
     #[test]
     fn draft_fields_load_from_saved_rfc5322_message() {
         let path = std::env::temp_dir().join(format!("notm-draft-{}.eml", Uuid::new_v4()));
-        let raw = "From: Me <me@example.test>\r\nTo: You <you@example.test>\r\nCc: Other <other@example.test>\r\nBcc: Hidden <hidden@example.test>\r\nSubject: Draft subject\r\nMessage-ID: <draft@example.test>\r\nIn-Reply-To: <parent@example.test>\r\nReferences: <root@example.test> <parent@example.test>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nDraft body.";
+        let raw = "From: Me <me@example.test>\r\nTo: You <you@example.test>\r\nCc: Other <other@example.test>\r\nBcc: Hidden <hidden@example.test>\r\nSubject: Draft subject\r\nMessage-ID: <draft@example.test>\r\nIn-Reply-To: <parent@example.test>\r\nReferences: <root@example.test> (between) < (old) \"quoted id\" (left) @ [ IPv6:2001:db8::1 ] > <parent@example.test>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nDraft body.";
         std::fs::write(&path, raw).expect("write draft");
         let fields = draft_fields_from_message_file(&path).expect("draft fields");
         assert_eq!(fields.from, "Me <me@example.test>");
@@ -2429,9 +2433,17 @@ mod tests {
         assert_eq!(
             fields.references,
             vec![
-                "<root@example.test>".to_string(),
-                "<parent@example.test>".to_string()
+                "<root@example.test> (between) < (old) \"quoted id\" (left) @ [ IPv6:2001:db8::1 ] > <parent@example.test>".to_string()
             ]
+        );
+        let rendered = composed_message_from_fields(&fields)
+            .expect("recompose draft fields")
+            .to_rfc5322()
+            .expect("render draft with quoted threading identifier");
+        let reparsed = mailparse::parse_mail(&rendered).expect("parse rendered draft");
+        assert_eq!(
+            reparsed.headers.get_first_value("References").as_deref(),
+            Some("<root@example.test> <\"quoted id\"@[IPv6:2001:db8::1]> <parent@example.test>")
         );
         let _ = std::fs::remove_file(path);
     }
