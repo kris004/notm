@@ -109,6 +109,9 @@ new_expiry=YYYY-MM-DD
 gpg --list-secret-keys --with-subkey-fingerprint "$fingerprint"
 gpg --quick-set-expire \
   "$fingerprint" \
+  "$new_expiry"
+gpg --quick-set-expire \
+  "$fingerprint" \
   "$new_expiry" \
   "$authentication_subkey" \
   "$encryption_subkey"
@@ -122,15 +125,17 @@ gpg --batch --show-keys --with-subkey-fingerprints "$updated_key"
 install -m 0644 "$updated_key" docs/release-signing-key.asc
 ```
 
-The expiry update and export require no new key or fingerprint, but GnuPG may
-request the hardware-key PIN and touch. If the certification-capable primary
-key is unavailable, stop; do not generate a replacement or weaken the policy as
-a workaround. Re-run the complete delivery gate, publish the refreshed public
-certificate through the GitHub account's **SSH and GPG keys** settings, and
-confirm GitHub reports the same fingerprint and new expiry before signing a
-tag. If GitHub requires deleting and re-adding the existing public key, treat
-that account change as a separate human-approved handoff and verify historical
-signature records before and after it.
+The first expiry command updates the primary key; the second updates the named
+authentication and encryption subkeys. Supplying subkey fingerprints does not
+also update the primary key. The expiry update and export require no new key or
+fingerprint, but GnuPG may request the hardware-key PIN and touch. If the
+certification-capable primary key is unavailable, stop; do not generate a
+replacement or weaken the policy as a workaround. Re-run the complete delivery
+gate, publish the refreshed public certificate through the GitHub account's
+**SSH and GPG keys** settings, and confirm GitHub reports the same fingerprint
+and new expiry before signing a tag. If GitHub requires deleting and re-adding
+the existing public key, treat that account change as a separate human-approved
+handoff and verify historical signature records before and after it.
 
 If extension is intentionally replaced by rotation, use a separately reviewed
 change to update the pinned public certificate, workflow fingerprint, Git
