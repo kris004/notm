@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::Read,
+    io::{self, Read},
     path::{Path, PathBuf},
     sync::mpsc,
     thread,
@@ -20,6 +20,9 @@ pub(crate) const MAX_NAMED_DRAFT_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const MAX_FIXTURE_DELAY: Duration = Duration::from_secs(5);
 const MAX_NAMED_DRAFT_WARNING_DETAILS: usize = 3;
 const MAX_NAMED_DRAFT_WARNING_BYTES: usize = 1024;
+
+type NamedDraftReader = Box<dyn Read>;
+type NamedDraftReaderFactory<'a> = dyn FnMut(&Path) -> io::Result<NamedDraftReader> + 'a;
 
 #[derive(Debug, Clone)]
 pub(crate) struct NamedDraftLoadRequest {
@@ -269,6 +272,15 @@ fn migrate_legacy_named_drafts(
     dir: &Path,
     legacy_dir: &Path,
 ) -> Result<usize, LegacyMigrationError> {
+    let mut reader_factory = open_named_draft_reader;
+    migrate_legacy_named_drafts_with_reader(dir, legacy_dir, &mut reader_factory)
+}
+
+fn migrate_legacy_named_drafts_with_reader(
+    dir: &Path,
+    legacy_dir: &Path,
+    reader_factory: &mut NamedDraftReaderFactory<'_>,
+) -> Result<usize, LegacyMigrationError> {
     struct LegacyMigration {
         source: PathBuf,
         destination: Option<PathBuf>,
@@ -286,7 +298,7 @@ fn migrate_legacy_named_drafts(
             .context("current draft has no filename")
             .map_err(LegacyMigrationError::fatal)?
             .to_os_string();
-        let bytes = read_bounded_for_migration(&path, &mut current_total_bytes)?;
+        let bytes = read_bounded_for_migration(&path, &mut current_total_bytes, reader_factory)?;
         occupied_destinations.insert(path);
         current_by_name.insert(filename, bytes);
     }
@@ -300,26 +312,27 @@ fn migrate_legacy_named_drafts(
     let mut migrations = Vec::with_capacity(legacy_entries.len());
     for source in legacy_entries {
         let total_before = legacy_total_bytes;
-        let bytes = match read_bounded_for_migration(&source, &mut legacy_total_bytes) {
-            Ok(bytes) => bytes,
-            Err(error) if error.recoverable_entry => {
-                preserved_legacy_bytes = preserved_legacy_bytes
-                    .checked_add(legacy_total_bytes.saturating_sub(total_before))
-                    .ok_or_else(|| {
-                        LegacyMigrationError::fatal(anyhow::anyhow!(
-                            "named draft migration preserved byte count overflowed"
-                        ))
-                    })?;
-                preserved_legacy_count =
-                    preserved_legacy_count.checked_add(1).ok_or_else(|| {
-                        LegacyMigrationError::fatal(anyhow::anyhow!(
-                            "named draft migration preserved count overflowed"
-                        ))
-                    })?;
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
+        let bytes =
+            match read_bounded_for_migration(&source, &mut legacy_total_bytes, reader_factory) {
+                Ok(bytes) => bytes,
+                Err(error) if error.recoverable_entry => {
+                    preserved_legacy_bytes = preserved_legacy_bytes
+                        .checked_add(legacy_total_bytes.saturating_sub(total_before))
+                        .ok_or_else(|| {
+                            LegacyMigrationError::fatal(anyhow::anyhow!(
+                                "named draft migration preserved byte count overflowed"
+                            ))
+                        })?;
+                    preserved_legacy_count =
+                        preserved_legacy_count.checked_add(1).ok_or_else(|| {
+                            LegacyMigrationError::fatal(anyhow::anyhow!(
+                                "named draft migration preserved count overflowed"
+                            ))
+                        })?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
         if serde_json::from_slice::<crate::model::ComposeFields>(&bytes).is_err() {
             preserved_legacy_bytes =
                 preserved_legacy_bytes
@@ -422,6 +435,15 @@ fn scan_named_drafts(
     dir: &Path,
     legacy_dir: Option<&Path>,
 ) -> anyhow::Result<NamedDraftScanResult> {
+    let mut reader_factory = open_named_draft_reader;
+    scan_named_drafts_with_reader(dir, legacy_dir, &mut reader_factory)
+}
+
+fn scan_named_drafts_with_reader(
+    dir: &Path,
+    legacy_dir: Option<&Path>,
+    reader_factory: &mut NamedDraftReaderFactory<'_>,
+) -> anyhow::Result<NamedDraftScanResult> {
     let mut paths = json_entries(dir)?;
     if let Some(legacy_dir) = legacy_dir {
         paths.extend(json_entries(legacy_dir)?);
@@ -444,26 +466,14 @@ fn scan_named_drafts(
                 continue;
             }
         };
-        let mut bytes = Vec::new();
-        let read_result = fs::File::open(&path)
-            .with_context(|| format!("opening named draft {}", path.display()))
-            .and_then(|file| {
-                file.take((MAX_NAMED_DRAFT_BYTES + 1) as u64)
-                    .read_to_end(&mut bytes)
-                    .with_context(|| format!("reading named draft {}", path.display()))
-            });
-        total_bytes = total_bytes
-            .checked_add(bytes.len())
-            .context("named draft byte count overflowed")?;
-        anyhow::ensure!(
-            total_bytes <= MAX_NAMED_DRAFT_TOTAL_BYTES,
-            "named draft store exceeds the {}-byte total limit",
-            MAX_NAMED_DRAFT_TOTAL_BYTES
-        );
-        if let Err(error) = read_result {
-            warnings.reject(&path, format!("{error:#}"));
-            continue;
-        }
+        let bytes = match read_named_draft(&path, reader_factory) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warnings.reject(&path, format!("{error:#}"));
+                continue;
+            }
+        };
+        charge_named_draft_bytes(&mut total_bytes, bytes.len())?;
         if bytes.len() > MAX_NAMED_DRAFT_BYTES {
             warnings.reject(
                 &path,
@@ -605,25 +615,11 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 fn read_bounded_for_migration(
     path: &Path,
     total_bytes: &mut usize,
+    reader_factory: &mut NamedDraftReaderFactory<'_>,
 ) -> Result<Vec<u8>, LegacyMigrationError> {
-    let file = fs::File::open(path)
-        .with_context(|| format!("opening named draft {}", path.display()))
-        .map_err(LegacyMigrationError::rejected_entry)?;
-    let mut bytes = Vec::new();
-    let read_result = file
-        .take((MAX_NAMED_DRAFT_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("reading named draft {}", path.display()));
-    *total_bytes = total_bytes.checked_add(bytes.len()).ok_or_else(|| {
-        LegacyMigrationError::fatal(anyhow::anyhow!("named draft byte count overflowed"))
-    })?;
-    if *total_bytes > MAX_NAMED_DRAFT_TOTAL_BYTES {
-        return Err(LegacyMigrationError::fatal(anyhow::anyhow!(
-            "named draft store exceeds the {}-byte total limit",
-            MAX_NAMED_DRAFT_TOTAL_BYTES
-        )));
-    }
-    read_result.map_err(LegacyMigrationError::rejected_entry)?;
+    let bytes =
+        read_named_draft(path, reader_factory).map_err(LegacyMigrationError::rejected_entry)?;
+    charge_named_draft_bytes(total_bytes, bytes.len()).map_err(LegacyMigrationError::fatal)?;
     if bytes.len() > MAX_NAMED_DRAFT_BYTES {
         return Err(LegacyMigrationError::rejected_entry(anyhow::anyhow!(
             "named draft {} exceeds the {}-byte limit",
@@ -632,6 +628,37 @@ fn read_bounded_for_migration(
         )));
     }
     Ok(bytes)
+}
+
+fn open_named_draft_reader(path: &Path) -> io::Result<NamedDraftReader> {
+    fs::File::open(path).map(|file| Box::new(file) as NamedDraftReader)
+}
+
+fn read_named_draft(
+    path: &Path,
+    reader_factory: &mut NamedDraftReaderFactory<'_>,
+) -> anyhow::Result<Vec<u8>> {
+    let reader =
+        reader_factory(path).with_context(|| format!("opening named draft {}", path.display()))?;
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_NAMED_DRAFT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading named draft {}", path.display()))?;
+    Ok(bytes)
+}
+
+fn charge_named_draft_bytes(total_bytes: &mut usize, bytes: usize) -> anyhow::Result<()> {
+    let updated_total = total_bytes
+        .checked_add(bytes)
+        .context("named draft byte count overflowed")?;
+    anyhow::ensure!(
+        updated_total <= MAX_NAMED_DRAFT_TOTAL_BYTES,
+        "named draft store exceeds the {}-byte total limit",
+        MAX_NAMED_DRAFT_TOTAL_BYTES
+    );
+    *total_bytes = updated_total;
+    Ok(())
 }
 
 fn read_bounded(path: &Path, total_bytes: &mut usize) -> anyhow::Result<Vec<u8>> {
@@ -662,12 +689,88 @@ fn read_bounded(path: &Path, total_bytes: &mut usize) -> anyhow::Result<Vec<u8>>
 mod tests {
     use super::*;
     use crate::model::ComposeFields;
+    use std::{cell::Cell, io::Cursor, rc::Rc};
+
+    struct PartialThenError {
+        remaining: usize,
+        emitted: Rc<Cell<usize>>,
+    }
+
+    impl Read for PartialThenError {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::other("injected read failure after partial data"));
+            }
+            let count = self.remaining.min(buffer.len());
+            buffer[..count].fill(b'p');
+            self.remaining -= count;
+            self.emitted.set(self.emitted.get().saturating_add(count));
+            Ok(count)
+        }
+    }
 
     fn fields(subject: &str) -> ComposeFields {
         ComposeFields {
             subject: subject.to_string(),
             body: "body".to_string(),
             ..ComposeFields::default()
+        }
+    }
+
+    fn create_partial_read_budget_fixture(dir: &Path) -> Vec<u8> {
+        let valid = serde_json::to_vec(&fields("valid-after-partial-error"))
+            .expect("serialize valid draft");
+        let full_entries = MAX_NAMED_DRAFT_TOTAL_BYTES / MAX_NAMED_DRAFT_BYTES - 1;
+        let tail_bytes = MAX_NAMED_DRAFT_BYTES
+            .checked_sub(valid.len())
+            .expect("valid draft fits one entry");
+        assert_eq!(
+            full_entries * MAX_NAMED_DRAFT_BYTES + tail_bytes + valid.len(),
+            MAX_NAMED_DRAFT_TOTAL_BYTES
+        );
+
+        for index in 0..full_entries {
+            fs::write(
+                dir.join(format!("malformed-full-{index:02}.json")),
+                b"fixture",
+            )
+            .expect("write synthetic full entry placeholder");
+        }
+        fs::write(dir.join("malformed-tail.json"), b"fixture")
+            .expect("write synthetic tail entry placeholder");
+        fs::write(dir.join("partial.json"), b"fixture")
+            .expect("write partial-read entry placeholder");
+        fs::write(dir.join("valid.json"), b"fixture").expect("write valid entry placeholder");
+        valid
+    }
+
+    fn partial_read_budget_reader(
+        valid: Vec<u8>,
+        partial_emitted: Rc<Cell<usize>>,
+    ) -> impl FnMut(&Path) -> io::Result<NamedDraftReader> {
+        let tail_bytes = MAX_NAMED_DRAFT_BYTES - valid.len();
+        move |path| {
+            let filename = path
+                .file_name()
+                .and_then(|filename| filename.to_str())
+                .ok_or_else(|| io::Error::other("synthetic entry has no UTF-8 filename"))?;
+            let reader: NamedDraftReader = match filename {
+                "valid.json" => Box::new(Cursor::new(valid.clone())),
+                "malformed-tail.json" => Box::new(io::repeat(b'x').take(tail_bytes as u64)),
+                "partial.json" => Box::new(PartialThenError {
+                    remaining: MAX_NAMED_DRAFT_BYTES,
+                    emitted: Rc::clone(&partial_emitted),
+                }),
+                filename if filename.starts_with("malformed-full-") => {
+                    Box::new(io::repeat(b'x').take(MAX_NAMED_DRAFT_BYTES as u64))
+                }
+                _ => {
+                    return Err(io::Error::other(format!(
+                        "unexpected synthetic entry {filename}"
+                    )));
+                }
+            };
+            Ok(reader)
         }
     }
 
@@ -780,6 +883,53 @@ mod tests {
         let error = scan_named_drafts(root.path(), None)
             .expect_err("malformed entry reads must enforce the aggregate limit");
         assert!(error.to_string().contains("total limit"), "{error:#}");
+    }
+
+    #[test]
+    fn partial_read_error_does_not_charge_scan_budget_or_hide_valid_draft() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let valid = create_partial_read_budget_fixture(root.path());
+        let partial_emitted = Rc::new(Cell::new(0));
+        let mut reader_factory = partial_read_budget_reader(valid, Rc::clone(&partial_emitted));
+
+        let scan = scan_named_drafts_with_reader(root.path(), None, &mut reader_factory)
+            .expect("partial read bytes must not consume aggregate scan budget");
+
+        assert!(
+            partial_emitted.get() > 0,
+            "injected reader emitted no bytes"
+        );
+        assert_eq!(scan.drafts.len(), 1);
+        assert_eq!(scan.drafts[0].fields.subject, "valid-after-partial-error");
+        assert_eq!(scan.warnings.rejected_entries, 17);
+    }
+
+    #[test]
+    fn partial_read_error_does_not_charge_migration_budget_or_block_valid_draft() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let current = root.path().join("current");
+        let legacy = root.path().join("legacy");
+        fs::create_dir_all(&current).expect("current dir");
+        fs::create_dir_all(&legacy).expect("legacy dir");
+        let valid = create_partial_read_budget_fixture(&legacy);
+        let partial_emitted = Rc::new(Cell::new(0));
+        let mut reader_factory = partial_read_budget_reader(valid, Rc::clone(&partial_emitted));
+
+        let migrated =
+            migrate_legacy_named_drafts_with_reader(&current, &legacy, &mut reader_factory)
+                .expect("partial read bytes must not consume aggregate migration budget");
+
+        assert!(
+            partial_emitted.get() > 0,
+            "injected reader emitted no bytes"
+        );
+        assert_eq!(migrated, 1);
+        let migrated_fields: ComposeFields = serde_json::from_slice(
+            &fs::read(current.join("valid.json")).expect("read migrated valid draft"),
+        )
+        .expect("parse migrated valid draft");
+        assert_eq!(migrated_fields.subject, "valid-after-partial-error");
+        assert!(legacy.join("partial.json").exists());
     }
 
     #[test]

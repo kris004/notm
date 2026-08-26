@@ -146,7 +146,12 @@ index_sent_after_send = false
 `transport = "external"` is currently required. `mode` accepts `auto`,
 `stdin_rfc5322`, `file_arg`, or `command_template`; `auto` currently behaves as
 `stdin_rfc5322`. For `command_template`, at least one argument must contain
-`{file}`. See [Sending mail](send-transport.md) for mode behavior, Bcc handling,
+`{file}`. `timeout_seconds` must be a whole number from 1 through
+946080000 (30 fixed 365-day years). This cap keeps the timeout representable as
+a monotonic timer deadline. Config loading and the Settings dialog reject zero,
+negative, nonnumeric, or larger values instead of substituting a default or
+wrapping the stored value; a rejected Settings save leaves the previous config
+unchanged. See [Sending mail](send-transport.md) for mode behavior, Bcc handling,
 timeouts, and failure reporting.
 
 When `save_sent` is enabled and `sent_maildir` is omitted, the default is

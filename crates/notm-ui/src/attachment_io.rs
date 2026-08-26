@@ -11,6 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
 use anyhow::Context as _;
 use notm_mail::attachments::{
     sanitize_attachment_filename, save_attachment_to_target_without_overwrite,
@@ -521,13 +524,13 @@ pub(crate) struct ComposerAttachmentCacheResponse {
     pub(crate) result: anyhow::Result<ComposerAttachmentCacheLease>,
 }
 
-/// Owns files produced by one cache request until the UI accepts its
-/// replacement. Dropping a stale completion removes only request-created
-/// files; reused user-selected paths are never removed.
+/// Owns the private directory produced by one cache request until the UI
+/// accepts its replacement. Dropping a stale completion removes only that
+/// request-owned tree; reused user-selected paths are never removed.
 #[derive(Debug)]
 pub(crate) struct ComposerAttachmentCacheLease {
     paths: Vec<String>,
-    created_paths: Vec<PathBuf>,
+    owned_directory: Option<PathBuf>,
 }
 
 impl ComposerAttachmentCacheLease {
@@ -536,14 +539,14 @@ impl ComposerAttachmentCacheLease {
     }
 
     pub(crate) fn commit(mut self) -> Vec<String> {
-        self.created_paths.clear();
+        self.owned_directory = None;
         std::mem::take(&mut self.paths)
     }
 }
 
 impl Drop for ComposerAttachmentCacheLease {
     fn drop(&mut self) {
-        cleanup_cache_files_best_effort(&self.created_paths);
+        cleanup_cache_directory_best_effort(self.owned_directory.as_deref());
     }
 }
 
@@ -831,7 +834,8 @@ fn cache_composer_attachments_cancellable_with_limit(
 
     let fixture_step_delay = request.fixture_step_delay();
     let mut paths = Vec::with_capacity(request.sources.len());
-    let mut created_paths = Vec::with_capacity(request.sources.len());
+    let mut owned_directory = None;
+    let mut materialized_sources = 0_usize;
     let mut cached_bytes = 0_usize;
     let cache_result = (|| -> anyhow::Result<()> {
         for source in request.sources {
@@ -840,10 +844,6 @@ fn cache_composer_attachments_cancellable_with_limit(
                 paths.push(path.display().to_string());
                 continue;
             }
-            let filename = sanitize_attachment_filename(source.filename());
-            let path = request
-                .directory
-                .join(format!("{}-{filename}", Uuid::new_v4()));
             let bytes = load_composer_attachment_source(&source)?;
             cached_bytes = cached_bytes.saturating_add(bytes.len());
             anyhow::ensure!(
@@ -851,11 +851,21 @@ fn cache_composer_attachments_cancellable_with_limit(
                 "composer attachment cache loaded {cached_bytes} bytes; limit is {max_cache_bytes} bytes"
             );
             ensure_composer_cache_current(cancelled)?;
+            let cache_directory = match owned_directory.as_ref() {
+                Some(directory) => directory,
+                None => {
+                    let directory = create_composer_cache_request_directory(&request.directory)?;
+                    owned_directory.insert(directory)
+                }
+            };
+            let source_directory =
+                create_composer_cache_source_directory(cache_directory, materialized_sources)?;
+            materialized_sources = materialized_sources.saturating_add(1);
+            let path = source_directory.join(sanitize_attachment_filename(source.filename()));
             // The atomic writer can report a durability failure after rename.
-            // Track this request-owned UUID path before the write so every
-            // error path removes the visible cache file as well as any
-            // temporary file the writer already cleans up.
-            created_paths.push(path.clone());
+            // The enclosing UUID directory is request-owned, so every error
+            // path can remove the visible cache file, its source directory,
+            // and any temporary file the writer already tries to clean up.
             composer::atomic_write_durable(&path, &bytes)
                 .with_context(|| format!("caching composer attachment at {}", path.display()))?;
             wait_for_composer_cache_delay(fixture_step_delay, cancelled)?;
@@ -865,12 +875,80 @@ fn cache_composer_attachments_cancellable_with_limit(
         ensure_composer_cache_current(cancelled)
     })();
     if let Err(error) = cache_result {
-        return Err(cleanup_cache_files_after_error(&created_paths, error));
+        return Err(cleanup_cache_directory_after_error(
+            owned_directory.as_deref(),
+            error,
+        ));
     }
     Ok(ComposerAttachmentCacheLease {
         paths,
-        created_paths,
+        owned_directory,
     })
+}
+
+fn create_composer_cache_request_directory(root: &Path) -> anyhow::Result<PathBuf> {
+    composer::ensure_private_directory(root)
+        .with_context(|| format!("preparing composer attachment cache at {}", root.display()))?;
+    loop {
+        let directory = root.join(Uuid::new_v4().to_string());
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        match builder.create(&directory) {
+            Ok(()) => {
+                #[cfg(unix)]
+                if let Err(error) =
+                    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                {
+                    let _ = std::fs::remove_dir(&directory);
+                    return Err(error).with_context(|| {
+                        format!(
+                            "setting private composer attachment cache permissions on {}",
+                            directory.display()
+                        )
+                    });
+                }
+                return Ok(directory);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "creating private composer attachment cache directory in {}",
+                        root.display()
+                    )
+                });
+            }
+        }
+    }
+}
+
+fn create_composer_cache_source_directory(
+    request_directory: &Path,
+    source_index: usize,
+) -> anyhow::Result<PathBuf> {
+    let directory = request_directory.join(source_index.to_string());
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(&directory).with_context(|| {
+        format!(
+            "creating private composer attachment source directory {}",
+            directory.display()
+        )
+    })?;
+    #[cfg(unix)]
+    if let Err(error) = std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+    {
+        let _ = std::fs::remove_dir(&directory);
+        return Err(error).with_context(|| {
+            format!(
+                "setting private composer attachment cache permissions on {}",
+                directory.display()
+            )
+        });
+    }
+    Ok(directory)
 }
 
 fn load_composer_attachment_source(source: &ComposerAttachmentSource) -> anyhow::Result<Vec<u8>> {
@@ -916,8 +994,11 @@ fn wait_for_composer_cache_delay(delay: Duration, cancelled: &AtomicBool) -> any
     }
 }
 
-fn cleanup_cache_files_after_error(paths: &[PathBuf], error: anyhow::Error) -> anyhow::Error {
-    match cleanup_cache_files(paths) {
+fn cleanup_cache_directory_after_error(
+    owned_directory: Option<&Path>,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match cleanup_cache_directory(owned_directory) {
         Ok(()) => error,
         Err(cleanup_error) => error.context(format!(
             "cleaning partial composer attachment cache failed: {cleanup_error:#}"
@@ -925,27 +1006,24 @@ fn cleanup_cache_files_after_error(paths: &[PathBuf], error: anyhow::Error) -> a
     }
 }
 
-fn cleanup_cache_files(paths: &[PathBuf]) -> anyhow::Result<()> {
-    let mut first_error = None;
-    for path in paths.iter().rev() {
-        if let Err(error) = std::fs::remove_file(path)
-            && error.kind() != io::ErrorKind::NotFound
-            && first_error.is_none()
-        {
-            first_error = Some(anyhow::Error::new(error).context(format!(
-                "removing stale composer attachment cache {}",
-                path.display()
-            )));
-        }
-    }
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
+fn cleanup_cache_directory(owned_directory: Option<&Path>) -> anyhow::Result<()> {
+    let Some(directory) = owned_directory else {
+        return Ok(());
+    };
+    match std::fs::remove_dir_all(directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "removing stale composer attachment cache directory {}",
+                directory.display()
+            )
+        }),
     }
 }
 
-fn cleanup_cache_files_best_effort(paths: &[PathBuf]) {
-    if let Err(error) = cleanup_cache_files(paths) {
+fn cleanup_cache_directory_best_effort(owned_directory: Option<&Path>) {
+    if let Err(error) = cleanup_cache_directory(owned_directory) {
         tracing::warn!(%error, "could not remove stale composer attachment cache");
     }
 }
@@ -1159,12 +1237,24 @@ fn extract_requested_part_with_limits(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, sync::mpsc::TryRecvError, time::Instant};
+    use std::{ffi::OsStr, fs, sync::mpsc::TryRecvError, time::Instant};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
 
     fn bytes(value: &'static [u8]) -> Arc<[u8]> {
         Arc::from(value)
+    }
+
+    fn tree_contains_file(directory: &Path) -> bool {
+        fs::read_dir(directory).ok().is_some_and(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                let path = entry.path();
+                path.is_file() || (path.is_dir() && tree_contains_file(&path))
+            })
+        })
     }
 
     #[test]
@@ -1414,18 +1504,19 @@ Content-Type: multipart/mixed; boundary=x\r\n\r\n\
     }
 
     #[test]
-    fn composer_cache_moves_shared_bytes_to_a_delayed_worker() {
+    fn composer_cache_moves_shared_bytes_to_a_private_request_directory() {
         let directory = tempfile::tempdir().expect("composer cache directory");
         let service = ComposerAttachmentCacheService::default();
         let source_bytes = bytes(b"shared composer attachment");
         let retained = source_bytes.clone();
+        let cache_root = directory.path().join("cache");
         let request = ComposerAttachmentCacheRequest::new(
             41,
             vec![ComposerAttachmentSource::shared(
                 "forwarded.eml".to_string(),
                 source_bytes,
             )],
-            directory.path().join("cache"),
+            cache_root.clone(),
         )
         .with_fixture_delay(Duration::from_millis(80));
 
@@ -1439,10 +1530,120 @@ Content-Type: multipart/mixed; boundary=x\r\n\r\n\
         assert_eq!(response.generation, 41);
         let paths = response.result.expect("cache composer attachment").commit();
         assert_eq!(paths.len(), 1);
+        let path = Path::new(&paths[0]);
         assert_eq!(
-            fs::read(&paths[0]).expect("read cached composer attachment"),
+            path.file_name().and_then(OsStr::to_str),
+            Some("forwarded.eml")
+        );
+        let source_directory = path.parent().expect("source cache directory");
+        let request_directory = source_directory.parent().expect("request cache directory");
+        assert_eq!(request_directory.parent(), Some(cache_root.as_path()));
+        Uuid::parse_str(
+            request_directory
+                .file_name()
+                .and_then(OsStr::to_str)
+                .expect("UTF-8 request cache directory"),
+        )
+        .expect("UUID request cache directory");
+        assert_eq!(
+            fs::read(path).expect("read cached composer attachment"),
             retained.as_ref()
         );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                fs::metadata(&cache_root)
+                    .expect("cache root metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(request_directory)
+                    .expect("request cache directory metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(source_directory)
+                    .expect("source cache directory metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(path)
+                    .expect("cached attachment metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn composer_cache_preserves_duplicate_sanitized_basenames_in_source_directories() {
+        let directory = tempfile::tempdir().expect("composer cache directory");
+        let cache_root = directory.path().join("cache");
+        let service = ComposerAttachmentCacheService::default();
+        let response = service.submit(ComposerAttachmentCacheRequest::new(
+            42,
+            vec![
+                ComposerAttachmentSource::shared("report.txt".to_string(), bytes(b"first")),
+                ComposerAttachmentSource::shared("report.txt".to_string(), bytes(b"second")),
+                ComposerAttachmentSource::shared(
+                    "folder/report.txt".to_string(),
+                    bytes(b"sanitized"),
+                ),
+            ],
+            cache_root.clone(),
+        ));
+
+        let lease = response
+            .recv_timeout(Duration::from_secs(1))
+            .expect("duplicate basename response")
+            .result
+            .expect("cache duplicate basenames");
+        let paths = lease.paths().iter().map(PathBuf::from).collect::<Vec<_>>();
+        assert_eq!(
+            paths
+                .iter()
+                .map(|path| path.file_name().and_then(OsStr::to_str))
+                .collect::<Vec<_>>(),
+            vec![
+                Some("report.txt"),
+                Some("report.txt"),
+                Some("folder_report.txt")
+            ]
+        );
+        assert_ne!(paths[0].parent(), paths[1].parent());
+        assert_ne!(paths[0].parent(), paths[2].parent());
+        let request_directory = paths[0]
+            .parent()
+            .and_then(Path::parent)
+            .expect("request cache directory");
+        assert_eq!(request_directory.parent(), Some(cache_root.as_path()));
+        assert!(
+            paths
+                .iter()
+                .all(|path| { path.parent().and_then(Path::parent) == Some(request_directory) })
+        );
+        assert_eq!(fs::read(&paths[0]).expect("read first duplicate"), b"first");
+        assert_eq!(
+            fs::read(&paths[1]).expect("read second duplicate"),
+            b"second"
+        );
+        assert_eq!(
+            fs::read(&paths[2]).expect("read sanitized basename"),
+            b"sanitized"
+        );
+        let committed = lease.commit();
+        assert_eq!(committed.len(), 3);
     }
 
     #[test]
@@ -1654,10 +1855,7 @@ Content-Type: multipart/mixed; boundary=x\r\n\r\n\
         );
         let file_deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            let has_file = fs::read_dir(&cache_directory)
-                .ok()
-                .is_some_and(|mut entries| entries.next().is_some());
-            if has_file {
+            if tree_contains_file(&cache_directory) {
                 break;
             }
             assert!(
@@ -1686,6 +1884,80 @@ Content-Type: multipart/mixed; boundary=x\r\n\r\n\
                 .count(),
             0,
             "cancelled request left a cache file"
+        );
+    }
+
+    #[test]
+    fn composer_cache_replacement_removes_the_superseded_request_directory() {
+        let directory = tempfile::tempdir().expect("composer cache directory");
+        let cache_directory = directory.path().join("cache");
+        let service = ComposerAttachmentCacheService::default();
+        let superseded = service.submit(
+            ComposerAttachmentCacheRequest::new(
+                18,
+                vec![ComposerAttachmentSource::shared(
+                    "superseded.txt".to_string(),
+                    bytes(b"superseded"),
+                )],
+                cache_directory.clone(),
+            )
+            .with_fixture_step_delay(Duration::from_secs(2)),
+        );
+        let file_deadline = Instant::now() + Duration::from_secs(1);
+        while !tree_contains_file(&cache_directory) {
+            assert!(
+                Instant::now() < file_deadline,
+                "superseded cache file was not created"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        let superseded_directory = fs::read_dir(&cache_directory)
+            .expect("read cache root")
+            .next()
+            .expect("superseded request directory")
+            .expect("read superseded request directory")
+            .path();
+
+        let replacement = service.submit(ComposerAttachmentCacheRequest::new(
+            19,
+            vec![ComposerAttachmentSource::shared(
+                "replacement.txt".to_string(),
+                bytes(b"replacement"),
+            )],
+            cache_directory.clone(),
+        ));
+        let superseded = superseded
+            .recv_timeout(Duration::from_secs(1))
+            .expect("superseded cache response");
+        assert!(
+            superseded
+                .result
+                .expect_err("old request must be cancelled")
+                .to_string()
+                .contains("cancelled")
+        );
+        let replacement_path = replacement
+            .recv_timeout(Duration::from_secs(1))
+            .expect("replacement cache response")
+            .result
+            .expect("replacement cache succeeds")
+            .commit()
+            .remove(0);
+
+        assert!(
+            !superseded_directory.exists(),
+            "superseded request directory survived replacement"
+        );
+        assert_eq!(
+            fs::read(replacement_path).expect("read replacement cache"),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::read_dir(cache_directory)
+                .expect("read cache root after replacement")
+                .count(),
+            1,
+            "replacement left more than its committed request directory"
         );
     }
 
@@ -1739,10 +2011,26 @@ Content-Type: multipart/mixed; boundary=x\r\n\r\n\
             .result
             .expect("cache stale replacement");
         let created = PathBuf::from(&lease.paths()[0]);
+        let source_directory = created
+            .parent()
+            .expect("request-owned source cache directory")
+            .to_path_buf();
+        let request_directory = source_directory
+            .parent()
+            .expect("request-owned cache directory")
+            .to_path_buf();
         assert!(created.is_file());
         assert_eq!(lease.paths()[1], existing.display().to_string());
         drop(lease);
         assert!(!created.exists(), "uncommitted cache file survived");
+        assert!(
+            !source_directory.exists(),
+            "uncommitted source cache directory survived"
+        );
+        assert!(
+            !request_directory.exists(),
+            "uncommitted request cache directory survived"
+        );
         assert_eq!(
             fs::read(existing).expect("read existing source"),
             b"existing"

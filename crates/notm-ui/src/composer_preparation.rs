@@ -15,7 +15,9 @@ use notm_mail::{
 };
 
 use crate::{
-    attachment_io::ComposerAttachmentSource, model::ComposeFields, thread_loader::PreparedThread,
+    attachment_io::ComposerAttachmentSource,
+    model::ComposeFields,
+    thread_loader::{MessageSource, PreparedThread},
     widgets::composer,
 };
 
@@ -29,6 +31,9 @@ const MAX_COMPOSER_ATTACHMENT_COUNT: usize = 256;
 /// Forwarded source and indexed-draft attachments stay as lazy locators, but
 /// their eventual decoded/copied payload still needs an aggregate budget.
 const MAX_COMPOSER_ATTACHMENT_BYTES: usize = 32 * 1024 * 1024;
+/// Indexed drafts are reparsed only for their top-level address headers, but
+/// their source read still needs the same hard cap as thread preparation.
+const MAX_INDEXED_DRAFT_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_FIXTURE_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy)]
@@ -272,7 +277,12 @@ fn prepare(request: ComposerPreparationRequest) -> anyhow::Result<ComposerPrepar
             }
         }
         ComposerPreparationAction::IndexedDraft => {
-            let (fields, _) = composer::prepare_draft_fields_from_message(parsed, Vec::new());
+            let fields = prepare_indexed_draft_fields(
+                &token,
+                parsed,
+                prepared.source()?,
+                MAX_INDEXED_DRAFT_SOURCE_BYTES,
+            )?;
             let sources = prepared_thread
                 .attachments
                 .iter()
@@ -292,6 +302,28 @@ fn prepare(request: ComposerPreparationRequest) -> anyhow::Result<ComposerPrepar
     token.ensure_current()?;
     validate_output(&output, limits)?;
     Ok(output)
+}
+
+fn prepare_indexed_draft_fields(
+    token: &ComposerPreparationToken,
+    parsed: &notm_mail::ParsedMessage,
+    source: &MessageSource,
+    max_source_bytes: usize,
+) -> anyhow::Result<ComposeFields> {
+    token.ensure_current()?;
+    anyhow::ensure!(
+        source.source_bytes() <= max_source_bytes,
+        "indexed draft source is {} bytes; the responsive source limit is {max_source_bytes} bytes",
+        source.source_bytes()
+    );
+    // This bounded file/Notmuch fallback read runs only on the composer worker.
+    // The temporary raw buffer is dropped before the response is returned;
+    // attachment payloads are neither decoded nor retained in the output.
+    let raw = source.read_bounded(max_source_bytes)?;
+    token.ensure_current()?;
+    let fields = composer::prepare_draft_fields_from_message_bytes(parsed, &raw)?;
+    token.ensure_current()?;
+    Ok(fields)
 }
 
 fn validate_output(
@@ -544,5 +576,97 @@ mod tests {
         )
         .expect_err("attachment bytes must be bounded");
         assert!(bytes_error.to_string().contains("limit is 17 bytes"));
+    }
+
+    #[test]
+    fn indexed_draft_reads_bounded_raw_headers_without_eager_attachment_decode() {
+        let raw = concat!(
+            "From: sender@example.test\r\n",
+            "To: first@example.test\r\n",
+            "To: =?UTF-8?B?RG9lLCBab8Or?= <zoe@example.test>\r\n",
+            "Bcc: =?UTF-8?B?SGlkZGVuLCBDYWbDqQ==?= <hidden@example.test>\r\n",
+            "Subject: Indexed draft\r\n",
+            "Message-ID: <draft@example.test>\r\n",
+            "References: <root@example.test> (between) < (old) \"quoted id\" (left) @ [ IPv6:2001:db8::1 ] > <parent@example.test>\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=draft-boundary\r\n",
+            "\r\n",
+            "--draft-boundary\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "Draft body.\r\n",
+            "--draft-boundary\r\n",
+            "Content-Type: application/octet-stream\r\n",
+            "Content-Disposition: attachment; filename=broken.bin\r\n",
+            "Content-Transfer-Encoding: bas64\r\n",
+            "\r\n",
+            "payload that strict attachment extraction must reject\r\n",
+            "--draft-boundary--\r\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let parsed = notm_mail::mime::parse_rfc5322(&raw)
+            .expect("message preparation keeps readable parts despite attachment failure");
+        assert!(
+            notm_mail::mime::extract_attachments(&raw).is_err(),
+            "fixture must fail if indexed-draft preparation eagerly decodes attachments"
+        );
+        let directory = tempfile::tempdir().expect("indexed-draft source directory");
+        let path = directory.path().join("draft.eml");
+        std::fs::write(&path, &raw).expect("write indexed-draft source");
+        let source = MessageSource::new(path, raw.len());
+        let mut coordinator = ComposerPreparationCoordinator::default();
+        let token = coordinator.begin();
+
+        let fields = prepare_indexed_draft_fields(&token, &parsed, &source, raw.len())
+            .expect("prepare indexed draft from raw headers");
+
+        assert_eq!(fields.from, "sender@example.test");
+        assert_eq!(
+            fields.to,
+            r#"first@example.test, "Doe, Zoë" <zoe@example.test>"#
+        );
+        assert_eq!(fields.bcc, r#""Hidden, Café" <hidden@example.test>"#);
+        assert_eq!(fields.body, "Draft body.");
+        assert!(fields.attachments.is_empty());
+        assert_eq!(
+            fields.references,
+            vec![
+                "<root@example.test> (between) < (old) \"quoted id\" (left) @ [ IPv6:2001:db8::1 ] > <parent@example.test>"
+                    .to_string()
+            ]
+        );
+
+        let error =
+            prepare_indexed_draft_fields(&token, &parsed, &source, raw.len().saturating_sub(1))
+                .expect_err("indexed-draft source must respect its byte bound");
+        assert!(error.to_string().contains("responsive source limit"));
+    }
+
+    #[test]
+    fn indexed_draft_rejects_duplicate_from_in_raw_source() {
+        let raw = concat!(
+            "From: first@example.test\r\n",
+            "From: second@example.test\r\n",
+            "To: recipient@example.test\r\n",
+            "Subject: Duplicate sender\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "Draft body.\r\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let parsed = notm_mail::mime::parse_rfc5322(&raw).expect("parse duplicate-header source");
+        let directory = tempfile::tempdir().expect("indexed-draft source directory");
+        let path = directory.path().join("draft.eml");
+        std::fs::write(&path, &raw).expect("write indexed-draft source");
+        let source = MessageSource::new(path, raw.len());
+        let mut coordinator = ComposerPreparationCoordinator::default();
+        let token = coordinator.begin();
+
+        let error = prepare_indexed_draft_fields(&token, &parsed, &source, raw.len())
+            .expect_err("duplicate From headers must not enter the composer");
+
+        assert!(error.to_string().contains("multiple From headers"));
     }
 }

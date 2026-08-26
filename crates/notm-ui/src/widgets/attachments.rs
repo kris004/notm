@@ -16,7 +16,7 @@ use std::os::unix::fs::PermissionsExt;
 use gtk::prelude::*;
 use gtk4 as gtk;
 #[cfg(test)]
-use notm_mail::mime::extract_attachments_from_file;
+use notm_mail::mime::extract_attachments;
 use notm_mail::{attachments::sanitize_attachment_filename, compose::AttachmentInput};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1077,8 +1077,8 @@ pub(crate) fn load_compose_attachments(
 }
 
 #[cfg(test)]
-pub(crate) fn attachment_inputs_from_file(path: &Path) -> anyhow::Result<Vec<AttachmentInput>> {
-    Ok(extract_attachments_from_file(path)?
+pub(crate) fn attachment_inputs_from_bytes(bytes: &[u8]) -> anyhow::Result<Vec<AttachmentInput>> {
+    Ok(extract_attachments(bytes)?
         .into_iter()
         .map(|attachment| AttachmentInput {
             filename: attachment.filename,
@@ -1107,11 +1107,14 @@ pub(crate) fn cache_composer_attachments(
             {
                 return Ok(source_path.display().to_string());
             }
-            let path = directory.join(format!(
-                "{}-{}",
-                Uuid::new_v4(),
-                safe_filename(&attachment.filename)
-            ));
+            // Isolate cached files in unique private directories instead of
+            // prefixing their basenames. The composer derives the outgoing
+            // attachment filename from this path, so changing the basename
+            // would leak cache bookkeeping into saved/reopened messages.
+            let attachment_directory = directory.join(Uuid::new_v4().to_string());
+            ensure_private_directory(&attachment_directory)?;
+            let path =
+                attachment_directory.join(sanitize_attachment_filename(&attachment.filename));
             write(&path, &attachment.bytes)?;
             #[cfg(unix)]
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
@@ -1150,22 +1153,6 @@ fn attachment_content_type(path: &Path) -> String {
         _ => "application/octet-stream",
     }
     .to_string()
-}
-
-#[cfg(test)]
-fn safe_filename(filename: &str) -> String {
-    let cleaned = filename
-        .chars()
-        .map(|ch| match ch {
-            '/' | '\\' | '\0' => '_',
-            _ => ch,
-        })
-        .collect::<String>();
-    if cleaned.trim().is_empty() {
-        "attachment.bin".to_string()
-    } else {
-        cleaned
-    }
 }
 
 #[cfg(test)]
@@ -1224,10 +1211,29 @@ mod tests {
 
         assert_eq!(cached.len(), 1);
         assert_eq!(
+            Path::new(&cached[0])
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("private.txt"),
+            "cache bookkeeping changed the outgoing attachment filename"
+        );
+        assert_eq!(
             std::fs::metadata(&directory)
                 .expect("cache directory metadata")
                 .permissions()
                 .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(
+                Path::new(&cached[0])
+                    .parent()
+                    .expect("cached attachment directory"),
+            )
+            .expect("cached attachment directory metadata")
+            .permissions()
+            .mode()
                 & 0o777,
             0o700
         );
@@ -1239,5 +1245,29 @@ mod tests {
                 & 0o777,
             0o600
         );
+
+        for unsafe_name in [".", ".."] {
+            let attachment = AttachmentInput {
+                filename: unsafe_name.to_string(),
+                content_type: "application/octet-stream".to_string(),
+                bytes: b"unusual attachment".to_vec(),
+                source_path: None,
+            };
+            let cached = cache_composer_attachments(&[attachment], &directory, |path, bytes| {
+                std::fs::write(path, bytes)?;
+                Ok(())
+            })
+            .expect("cache dot attachment filename");
+            let cached_path = Path::new(&cached[0]);
+            assert_eq!(
+                cached_path.file_name().and_then(|name| name.to_str()),
+                Some("attachment.bin")
+            );
+            assert_eq!(
+                cached_path.parent().and_then(Path::parent),
+                Some(directory.as_path()),
+                "dot attachment escaped its unique cache directory"
+            );
+        }
     }
 }

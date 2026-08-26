@@ -16,9 +16,16 @@ use serde_json::{Value, json};
 mod gui_test_display;
 #[path = "support/local_http_tracker.rs"]
 mod local_http_tracker;
+#[cfg(unix)]
+#[path = "support/local_smtp.rs"]
+mod local_smtp;
 
 use gui_test_display::{GuiTestDisplay, gtk_display_environment};
 use local_http_tracker::LocalHttpTracker;
+#[cfg(unix)]
+use local_smtp::{
+    CapturedSmtpMessage, LocalSmtpCapture, parse_wire_with_python, write_python_submission_helper,
+};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -1042,10 +1049,10 @@ fn fixture_visual_selection_navigation_keeps_thread_list_responsive() -> anyhow:
 }
 
 #[test]
-fn fixture_compose_attachment_headers_are_safe_and_round_trip() -> anyhow::Result<()> {
+fn fixture_compose_rejects_attachment_header_injection() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_compose_attachment_headers_are_safe_and_round_trip: no GUI test display is available"
+            "SKIP fixture_compose_rejects_attachment_header_injection: no GUI test display is available"
         );
         return Ok(());
     };
@@ -1055,7 +1062,6 @@ fn fixture_compose_attachment_headers_are_safe_and_round_trip() -> anyhow::Resul
     let work_dir = std::env::temp_dir().join(format!("notm-attachment-header-ui-{run_id}"));
     fs::create_dir_all(&work_dir)?;
     let unsafe_filename = "résumé \"final\" \\ draft\r\nX-Injected-Filename: yes.txt";
-    let safe_filename = unsafe_filename.replace(['\r', '\n'], " ");
     let attachment_path = work_dir.join(unsafe_filename);
     fs::write(&attachment_path, b"attachment header smoke")?;
 
@@ -1093,35 +1099,29 @@ fn fixture_compose_attachment_headers_are_safe_and_round_trip() -> anyhow::Resul
         "fixture send did not report pending work: {started}"
     );
     let send = driver.wait_for_send(STARTUP_TIMEOUT)?;
-    assert_eq!(
-        send["state"]["last_send_report"]["accepted"], true,
-        "fixture composer send was not accepted: {send}"
-    );
-    let captured_path = send["state"]["last_send_report"]["captured_path"]
+    let error = send["state"]["last_error"]
         .as_str()
-        .with_context(|| format!("fixture send did not report a capture path: {send}"))?;
-    let captured = fs::read(captured_path)
-        .with_context(|| format!("reading fixture send capture {captured_path}"))?;
-    let captured_text = String::from_utf8_lossy(&captured);
+        .with_context(|| format!("attachment header injection reported no error: {send}"))?;
     ensure!(
-        !captured_text.contains("\r\nX-Injected-Filename:"),
-        "attachment filename injected an RFC5322 header:\n{captured_text}"
+        error.contains("attachment filename") && error.contains("control character U+000D"),
+        "attachment header injection error was not actionable: {error}"
     );
-    let encoded_filename =
-        "r%C3%A9sum%C3%A9%20%22final%22%20%5C%20draft%20%20X-Injected-Filename%3A%20yes.txt";
     ensure!(
-        captured_text.contains(&format!("name*=utf-8''{encoded_filename}\r\n"))
-            && captured_text.contains(&format!("filename*=utf-8''{encoded_filename}\r\n")),
-        "attachment filename was not rendered as safe RFC 2231 parameters:\n{captured_text}"
+        send["state"]["last_send_report"].is_null(),
+        "rejected attachment header injection produced a send report: {send}"
     );
-
-    let attachments = notm_mail::mime::extract_attachments(&captured)?;
+    let database_path = send["state"]["database_path"]
+        .as_str()
+        .with_context(|| format!("fixture send reported no database path: {send}"))?;
+    let capture_dir = Path::new(database_path).join("captured-send");
+    let captured_count = match fs::read_dir(&capture_dir) {
+        Ok(entries) => entries.filter_map(Result::ok).count(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error.into()),
+    };
     ensure!(
-        attachments.len() == 1
-            && attachments[0].filename == safe_filename
-            && attachments[0].content_type == "text/plain"
-            && attachments[0].bytes == b"attachment header smoke",
-        "captured attachment did not round-trip through the UI send path: {attachments:?}"
+        captured_count == 0,
+        "rejected attachment header injection wrote {captured_count} captured messages"
     );
 
     Ok(())
@@ -8536,6 +8536,1115 @@ fn fixture_settings_preview_limits_apply_without_partial_persistence() -> anyhow
         Some(3)
     );
     assert_eq!(persisted["ui"]["show_thread_preview"].as_bool(), Some(true));
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn bcc_only_local_smtp_submission_uses_hidden_envelope_recipient() -> anyhow::Result<()> {
+    let work_dir = tempfile::tempdir().context("creating Bcc-only SMTP work directory")?;
+    let smtp = LocalSmtpCapture::start()?;
+    let submit_helper = work_dir.path().join("submit-local-smtp");
+    write_python_submission_helper(&submit_helper, smtp.port())?;
+
+    let mut message = notm_mail::ComposedMessage::new(
+        "Jörg Sender <sender@example.test>".to_string(),
+        Vec::new(),
+        format!("Bcc-only Unicode submission {}", "秘密".repeat(60)),
+        "The sole recipient must remain private.".to_string(),
+    );
+    message.bcc = vec!["Hidden <hidden@example.test>".to_string()];
+    let raw = message.to_rfc5322()?;
+    ensure!(
+        !raw.starts_with(b"To:") && !raw.windows(b"\r\nTo:".len()).any(|line| line == b"\r\nTo:"),
+        "Bcc-only pre-submission message contained an empty To field"
+    );
+
+    let mut child = Command::new(&submit_helper)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting Bcc-only local SMTP helper")?;
+    std::io::Write::write_all(child.stdin.as_mut().context("opening helper stdin")?, &raw)?;
+    let output = child
+        .wait_with_output()
+        .context("waiting for Bcc-only local SMTP helper")?;
+    ensure!(
+        output.status.success(),
+        "Bcc-only local SMTP helper failed with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let captured = smtp
+        .wait_for_messages(1, Duration::from_secs(10))?
+        .pop()
+        .context("Bcc-only SMTP capture was empty")?;
+    assert_eq!(captured.rcpt_to, ["hidden@example.test"]);
+    let parsed = parse_captured_smtp_wire(
+        work_dir.path(),
+        "bcc-only",
+        &captured,
+        "sender@example.test",
+    )?;
+    ensure!(
+        parsed["to"].as_array().is_some_and(|to| to.is_empty())
+            && parsed["cc"].as_array().is_some_and(|cc| cc.is_empty())
+            && parsed["bcc"].as_array().is_some_and(|bcc| bcc.is_empty()),
+        "Bcc-only captured wire exposed a destination field: {parsed}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn clean_xdg_local_smtp_wire_interoperability() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP clean_xdg_local_smtp_wire_interoperability: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running clean-XDG local-SMTP wire interoperability E2E with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-local-smtp-e2e-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let smtp = LocalSmtpCapture::start()?;
+    let submit_helper = work_dir.join("submit-local-smtp");
+    write_python_submission_helper(&submit_helper, smtp.port())?;
+
+    let attachment_name = "résumé-überprüfung-非常に長い添付ファイル名-2026-final.bin";
+    let attachment_path = work_dir.join(attachment_name);
+    let attachment_bytes = b"notm-local-smtp-attachment\0\xff\n".repeat(4096);
+    fs::write(&attachment_path, &attachment_bytes)?;
+
+    let draft_maildir = fixture.root.join("Drafts");
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+             \n[identity]\nname = \"Jörg Sender\"\nprimary_email = \"sender@example.test\"\n\
+             \n[send]\nenabled = true\ntransport = \"external\"\ncommand = {}\nargs = []\nmode = \"stdin_rfc5322\"\ntimeout_seconds = 10\nsave_sent = false\n\
+             \n[drafts]\nsave_maildir = true\nmaildir = {}\ntags = [\"draft\"]\nindex_after_save = true\n\
+             \n[automation]\nallow_live_send_test = true\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+            toml_path(&submit_helper),
+            toml_path(&draft_maildir),
+        ),
+    )?;
+
+    let to_addresses = (0..14)
+        .map(|index| format!("recipient{index}+sorting@example.test"))
+        .collect::<Vec<_>>();
+    let to = to_addresses
+        .iter()
+        .enumerate()
+        .map(|(index, address)| format!("非常に長い Unicode Recipient Nummer {index} <{address}>"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let cc = "\"Doe, Zoë\" <zoe@example.test>, O'Hara <customer+tag@example.test>";
+    let bcc = "Miyuki 秘密 <hidden@example.test>, hidden+archive@example.test";
+    let subject = format!(
+        "Interoperability Grüße — {}",
+        "非常に長い件名 café Привет مرحبا ".repeat(14)
+    );
+    let long_body_line = "x".repeat(2500);
+    let body =
+        format!("Unicode body: café ☕ Привет مرحبا.\n\n{long_body_line}\n\nFinal paragraph.");
+
+    let first_token = format!("notm-local-smtp-first-{run_id}");
+    let mut first_app =
+        FixtureApp::spawn_with_config(work_dir.clone(), &first_token, &config_path)?;
+    let mut first_driver = first_app.connect(&first_token)?;
+    first_driver.wait_for_search(STARTUP_TIMEOUT)?;
+    assert_eq!(first_driver.command("open_compose", json!({}))?["ok"], true);
+    for (command, value) in [
+        ("compose_set_from", "Jörg Sender <sender@example.test>"),
+        ("compose_set_to", to.as_str()),
+        ("compose_set_cc", cc),
+        ("compose_set_bcc", bcc),
+        ("compose_set_body", body.as_str()),
+    ] {
+        let response = first_driver.command(command, json!({"value": value}))?;
+        assert_eq!(response["ok"], true, "{command} failed: {response}");
+    }
+
+    let injection_subject = "ordinary subject\r\nBcc: injected@example.test";
+    assert_eq!(
+        first_driver.command("compose_set_subject", json!({"value": injection_subject}),)?["ok"],
+        true
+    );
+    let injection_start = first_driver.command("compose_send", json!({}))?;
+    let injection_error = if injection_start["pending"] == true {
+        let failed = first_driver.wait_for_send(STARTUP_TIMEOUT)?;
+        ensure!(
+            failed["state"]["last_send_report"].is_null(),
+            "header injection unexpectedly produced a send report: {failed}"
+        );
+        failed["state"]["last_error"]
+            .as_str()
+            .with_context(|| format!("header injection had no actionable error: {failed}"))?
+            .to_string()
+    } else {
+        ensure!(
+            injection_start["ok"] == false,
+            "header injection neither failed nor started: {injection_start}"
+        );
+        injection_start["error"]
+            .as_str()
+            .with_context(|| {
+                format!("synchronous header-injection failure had no error: {injection_start}")
+            })?
+            .to_string()
+    };
+    let normalized_error = injection_error.to_ascii_lowercase();
+    ensure!(
+        normalized_error.contains("subject")
+            && (normalized_error.contains("newline")
+                || normalized_error.contains("line break")
+                || normalized_error.contains("cr/lf")
+                || normalized_error.contains("control character")),
+        "header-injection error was not actionable: {injection_error}"
+    );
+    smtp.ensure_no_message(Duration::from_millis(250))?;
+
+    assert_eq!(
+        first_driver.command("compose_set_subject", json!({"value": subject}))?["ok"],
+        true
+    );
+    let attached =
+        first_driver.command("compose_add_attachment", json!({"path": attachment_path}))?;
+    assert_eq!(attached["ok"], true, "attachment add failed: {attached}");
+    let saved = first_driver.command("save_draft", json!({}))?;
+    assert_eq!(saved["ok"], true, "indexed draft save failed: {saved}");
+    let saved_path = saved["report"]["maildir_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("indexed draft save reported no Maildir path: {saved}"))?;
+    let saved_message_id = saved["report"]["indexed_message_id"]
+        .as_str()
+        .with_context(|| format!("indexed draft save reported no Message-ID: {saved}"))?
+        .to_string();
+    ensure!(saved_path.is_file(), "saved draft file is missing");
+
+    assert_eq!(
+        first_driver.command("close_main_window", json!({}))?["ok"],
+        true
+    );
+    drop(first_driver);
+    let first_status = first_app.wait_for_exit(Duration::from_secs(8))?;
+    ensure!(
+        first_status.success(),
+        "first local-SMTP app process failed: {first_status}\n{}",
+        first_app.logs()
+    );
+
+    drop(first_app.display.take());
+    for path in [&first_app.socket_path, &first_app.log_path] {
+        if path.exists() {
+            fs::remove_file(path)
+                .with_context(|| format!("removing first-run artifact {}", path.display()))?;
+        }
+    }
+    let display_dir = work_dir.join("gui-display");
+    if display_dir.exists() {
+        fs::remove_dir_all(&display_dir)
+            .with_context(|| format!("removing first-run display {}", display_dir.display()))?;
+    }
+
+    let restart_token = format!("notm-local-smtp-second-{run_id}");
+    let mut restarted_app =
+        FixtureApp::spawn_with_config(work_dir.clone(), &restart_token, &config_path)?;
+    let mut driver = restarted_app.connect(&restart_token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let draft_search = driver.command("run_search", json!({"query": "tag:draft"}))?;
+    assert_eq!(
+        draft_search["ok"], true,
+        "draft search failed: {draft_search}"
+    );
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let draft_deadline = Instant::now() + STARTUP_TIMEOUT;
+    let reopened = loop {
+        let state = driver.command("app_state", json!({}))?;
+        if state["state"]["active_draft"]["path"] == saved_path.display().to_string() {
+            break state;
+        }
+        ensure!(
+            Instant::now() < draft_deadline,
+            "restart never reopened the indexed draft: {state}\n{}",
+            restarted_app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+    assert_eq!(
+        reopened["state"]["active_draft"]["message_id"], saved_message_id,
+        "restart changed the draft Message-ID: {reopened}"
+    );
+    assert_eq!(
+        reopened["state"]["compose_fields"]["subject"], subject,
+        "restart lost the saved subject: {reopened}"
+    );
+    let reopened_from = notm_mail::address::parse_one_checked(
+        reopened["state"]["compose_fields"]["from"]
+            .as_str()
+            .context("reopened draft From is not text")?,
+    )?;
+    assert_eq!(reopened_from.email, "sender@example.test");
+    assert_eq!(reopened_from.name.as_deref(), Some("Jörg Sender"));
+    for (field, expected) in [
+        ("to", to_addresses.iter().cloned().collect::<BTreeSet<_>>()),
+        (
+            "cc",
+            ["zoe@example.test", "customer+tag@example.test"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        ),
+        (
+            "bcc",
+            ["hidden@example.test", "hidden+archive@example.test"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        ),
+    ] {
+        let value = reopened["state"]["compose_fields"][field]
+            .as_str()
+            .with_context(|| format!("reopened draft {field} is not text: {reopened}"))?;
+        let actual = notm_mail::address::parse_address_list_checked(value)?
+            .into_iter()
+            .map(|address| address.email)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected, "restart changed saved {field} semantics");
+    }
+    assert_eq!(
+        reopened["state"]["compose_fields"]["body"]
+            .as_str()
+            .map(|value| value.replace("\r\n", "\n")),
+        Some(body.clone()),
+        "restart lost the saved body: {reopened}"
+    );
+    ensure!(
+        reopened["state"]["compose_fields"]["attachments"]
+            .as_array()
+            .is_some_and(|attachments| attachments.len() == 1),
+        "restart lost the saved attachment: {reopened}"
+    );
+
+    let compose_start = driver.command("compose_send", json!({}))?;
+    assert_eq!(
+        compose_start["pending_confirmation"], true,
+        "saved draft Send did not request confirmation: {compose_start}"
+    );
+    accept_send_confirmation(&mut driver)?;
+    let compose_send = driver.wait_for_send(STARTUP_TIMEOUT)?;
+    assert_eq!(
+        compose_send["state"]["last_send_report"]["accepted"], true,
+        "saved Unicode message was not accepted: {compose_send}"
+    );
+    let mut compose_messages = smtp.wait_for_messages(1, STARTUP_TIMEOUT)?;
+    let compose_capture = compose_messages.pop().expect("one composed message");
+
+    select_first_thread(&mut driver, "id:html-message@fixture.test")?;
+    let reply = driver.command("reply_selected", json!({}))?;
+    assert_eq!(reply["ok"], true, "HTML reply did not open: {reply}");
+    assert_eq!(
+        reply["pending"], true,
+        "HTML reply preparation was not asynchronous: {reply}"
+    );
+    let reply_preparation = wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        reply_preparation["outcome"], "prepared",
+        "HTML reply did not finish preparing: {reply_preparation}"
+    );
+    for (command, value) in [
+        ("compose_set_cc", "Reply Team <reply+cc@example.test>"),
+        (
+            "compose_set_bcc",
+            "Reply Archive <reply-hidden@example.test>",
+        ),
+        (
+            "compose_set_body",
+            "Réponse Unicode café ☕ with both text and HTML alternatives.",
+        ),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(response["ok"], true, "{command} failed: {response}");
+    }
+    let reply_start = driver.command("compose_send", json!({}))?;
+    assert_eq!(
+        reply_start["pending"], true,
+        "reply did not start: {reply_start}"
+    );
+    let reply_send = driver.wait_for_send(STARTUP_TIMEOUT)?;
+    assert_eq!(
+        reply_send["state"]["last_send_report"]["accepted"], true,
+        "reply was not accepted: {reply_send}"
+    );
+    let mut reply_messages = smtp.wait_for_messages(1, STARTUP_TIMEOUT)?;
+    let reply_capture = reply_messages.pop().expect("one reply message");
+
+    select_first_thread(&mut driver, "id:attachment-message@fixture.test")?;
+    let forward = driver.command("forward_as_attachment_selected", json!({}))?;
+    assert_eq!(
+        forward["ok"], true,
+        "forward-as-attachment did not open: {forward}"
+    );
+    assert_eq!(
+        forward["pending"], true,
+        "forward-as-attachment preparation was not asynchronous: {forward}"
+    );
+    let forward_preparation = wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        forward_preparation["outcome"], "prepared",
+        "forward-as-attachment did not finish preparing: {forward_preparation}"
+    );
+    let forward_cache = wait_for_composer_attachment_cache_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        forward_cache["composer_cache"]["outcome"], "applied",
+        "forward-as-attachment cache was not applied: {forward_cache}"
+    );
+    for (command, value) in [
+        (
+            "compose_set_to",
+            "Forward Recipient <forward+tag@example.test>",
+        ),
+        (
+            "compose_set_bcc",
+            "Forward Archive <forward-hidden@example.test>",
+        ),
+        (
+            "compose_set_body",
+            "Forward body with Unicode Grüße and an attached original message.",
+        ),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(response["ok"], true, "{command} failed: {response}");
+    }
+    let forward_start = driver.command("compose_send", json!({}))?;
+    assert_eq!(
+        forward_start["pending"], true,
+        "forward did not start: {forward_start}"
+    );
+    let forward_send = driver.wait_for_send(STARTUP_TIMEOUT)?;
+    assert_eq!(
+        forward_send["state"]["last_send_report"]["accepted"], true,
+        "forward was not accepted: {forward_send}"
+    );
+    let mut forward_messages = smtp.wait_for_messages(1, STARTUP_TIMEOUT)?;
+    let forward_capture = forward_messages.pop().expect("one forwarded message");
+    smtp.ensure_no_message(Duration::from_millis(250))?;
+
+    assert_eq!(driver.command("close_main_window", json!({}))?["ok"], true);
+    drop(driver);
+    let restarted_status = restarted_app.wait_for_exit(Duration::from_secs(8))?;
+    ensure!(
+        restarted_status.success(),
+        "restarted local-SMTP app process failed: {restarted_status}\n{}",
+        restarted_app.logs()
+    );
+
+    let compose_parsed = parse_captured_smtp_wire(
+        &work_dir,
+        "composed",
+        &compose_capture,
+        "sender@example.test",
+    )?;
+    assert_eq!(compose_parsed["subject"], subject);
+    assert_eq!(compose_parsed["from"][0]["name"], "Jörg Sender");
+    assert_eq!(
+        parsed_addresses(&compose_parsed, "to")?,
+        to_addresses.into_iter().collect()
+    );
+    assert_eq!(
+        parsed_addresses(&compose_parsed, "cc")?,
+        ["zoe@example.test", "customer+tag@example.test"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
+    let mut compose_envelope = parsed_addresses(&compose_parsed, "to")?;
+    compose_envelope.extend(parsed_addresses(&compose_parsed, "cc")?);
+    compose_envelope.extend([
+        "hidden@example.test".to_string(),
+        "hidden+archive@example.test".to_string(),
+    ]);
+    assert_eq!(
+        compose_capture
+            .rcpt_to
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        compose_envelope,
+        "SMTP envelope did not preserve To/Cc/Bcc semantics"
+    );
+    let compose_parts = json_array_at(&compose_parsed, &["parts"])?;
+    let attachment = compose_parts
+        .iter()
+        .find(|part| part["filename"] == attachment_name)
+        .with_context(|| format!("independent parser found no attachment: {compose_parsed}"))?;
+    assert_eq!(attachment["size"], attachment_bytes.len());
+    assert_eq!(
+        attachment["sha256"],
+        "6ba2c82fe27d84e01d50bdb16550eda371f429957df9f8bb2414758419cc7ee6"
+    );
+    ensure!(
+        compose_parts.iter().any(|part| {
+            part["content_type"] == "text/plain"
+                && part["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(&long_body_line))
+        }),
+        "independent parser did not recover the long Unicode body: {compose_parsed}"
+    );
+
+    let reply_parsed =
+        parse_captured_smtp_wire(&work_dir, "reply", &reply_capture, "sender@example.test")?;
+    assert_eq!(reply_parsed["subject"], "Re: HTML message");
+    assert_eq!(reply_parsed["in_reply_to"], "<html-message@fixture.test>");
+    ensure!(
+        reply_parsed["references"]
+            .as_str()
+            .is_some_and(|references| references.contains("<html-message@fixture.test>")),
+        "reply lost References threading: {reply_parsed}"
+    );
+    assert_eq!(
+        reply_capture
+            .rcpt_to
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        [
+            "html@example.test",
+            "reply+cc@example.test",
+            "reply-hidden@example.test",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    );
+    let reply_parts = json_array_at(&reply_parsed, &["parts"])?;
+    for content_type in ["text/plain", "text/html"] {
+        ensure!(
+            reply_parts.iter().any(|part| {
+                part["content_type"] == content_type
+                    && part["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("Réponse Unicode"))
+            }),
+            "reply did not round-trip its {content_type} alternative: {reply_parsed}"
+        );
+    }
+
+    let forward_parsed = parse_captured_smtp_wire(
+        &work_dir,
+        "forward",
+        &forward_capture,
+        "sender@example.test",
+    )?;
+    assert_eq!(forward_parsed["subject"], "Fwd: Attachment message");
+    assert_eq!(
+        forward_capture
+            .rcpt_to
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        ["forward+tag@example.test", "forward-hidden@example.test"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
+    let forwarded_part = json_array_at(&forward_parsed, &["parts"])?
+        .iter()
+        .find(|part| part["content_type"] == "message/rfc822")
+        .with_context(|| {
+            format!("independent parser found no attached message: {forward_parsed}")
+        })?;
+    assert_eq!(
+        forwarded_part["nested_message_id"],
+        "<attachment-message@fixture.test>"
+    );
+    assert_eq!(forwarded_part["nested_subject"], "Attachment message");
+    assert_eq!(
+        forwarded_part["filename"], "forwarded-attachment-message.eml",
+        "forwarded message filename was not exact: {forwarded_part}"
+    );
+    ensure!(
+        !forwarded_part["content_transfer_encoding"]
+            .as_str()
+            .is_some_and(|encoding| encoding.eq_ignore_ascii_case("base64")),
+        "message/rfc822 was incorrectly base64 encoded: {forwarded_part}"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn clean_xdg_duplicate_draft_headers_preserve_recipients_and_reject_authors() -> anyhow::Result<()>
+{
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP clean_xdg_duplicate_draft_headers_preserve_recipients_and_reject_authors: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running duplicate draft-header UI E2E with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-duplicate-draft-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let token = format!("notm-duplicate-draft-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+
+    // Fixture mode permits confirmation-dialog automation, but its disposable
+    // database is created in the child process. Discover that private database
+    // and add the malformed interoperability fixtures only after launch.
+    let startup_state = driver.command("app_state", json!({}))?;
+    let database_path = startup_state["state"]["database_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("fixture app reported no database path: {startup_state}"))?;
+    let config_path = database_path
+        .parent()
+        .context("fixture database has no parent directory")?
+        .join("notmuch-config");
+    let draft_maildir = database_path.join("Drafts");
+    for child in ["cur", "new", "tmp"] {
+        fs::create_dir_all(draft_maildir.join(child))?;
+    }
+
+    let invalid_path = draft_maildir.join("cur/duplicate-from.eml:2,D");
+    fs::write(
+        &invalid_path,
+        concat!(
+            "From: First Author <first@example.test>\r\n",
+            "From: Second Author <second@example.test>\r\n",
+            "To: recipient@example.test\r\n",
+            "Subject: Duplicate From draft\r\n",
+            "Date: Wed, 26 Aug 2026 03:00:00 +0000\r\n",
+            "Message-ID: <duplicate-from-draft@example.test>\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "Malformed author draft.\r\n",
+        ),
+    )?;
+    let valid_path = draft_maildir.join("cur/duplicate-recipients.eml:2,D");
+    fs::write(
+        &valid_path,
+        concat!(
+            "From: Fixture User <fixture@example.test>\r\n",
+            "To: First Recipient <first@example.test>\r\n",
+            "To: Second Recipient <second@example.test>\r\n",
+            "Cc: First Carbon <cc-one@example.test>\r\n",
+            "Cc: Second Carbon <cc-two@example.test>\r\n",
+            "Bcc: First Hidden <hidden-one@example.test>\r\n",
+            "Bcc: Second Hidden <hidden-two@example.test>\r\n",
+            "Subject: Duplicate recipient draft\r\n",
+            "Date: Wed, 26 Aug 2026 03:01:00 +0000\r\n",
+            "Message-ID: <duplicate-recipient-draft@example.test>\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "Duplicate recipient draft body.\r\n",
+        ),
+    )?;
+    {
+        let db = notm_notmuch::Database::open(
+            &notm_notmuch::OpenConfig {
+                database_path: Some(database_path),
+                config_path: Some(config_path),
+                profile: None,
+            },
+            notm_notmuch::DatabaseMode::ReadWrite,
+        )?;
+        db.index_fixture_file(&invalid_path, &["draft"])?;
+        db.index_fixture_file(&valid_path, &["draft"])?;
+    }
+
+    let invalid_search = driver.command(
+        "run_search",
+        json!({"query": "id:duplicate-from-draft@example.test"}),
+    )?;
+    assert_eq!(
+        invalid_search["ok"], true,
+        "invalid draft search failed: {invalid_search}"
+    );
+    let invalid_result = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    ensure!(
+        json_array_at(&invalid_result, &["state", "thread_list_items"])?
+            .iter()
+            .any(|thread| thread["subject"] == "Duplicate From draft"),
+        "duplicate-From draft was not indexed: {invalid_result}"
+    );
+    assert_eq!(
+        driver.command("select_thread_by_index", json!({"index": 0}))?["ok"],
+        true
+    );
+    let invalid_deadline = Instant::now() + STARTUP_TIMEOUT;
+    let invalid_state = loop {
+        let state = driver.command("app_state", json!({}))?;
+        if state["state"]["last_error"].as_str().is_some() {
+            break state;
+        }
+        ensure!(
+            Instant::now() < invalid_deadline,
+            "duplicate From draft did not report an error: {state}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+    let invalid_error = invalid_state["state"]["last_error"]
+        .as_str()
+        .context("duplicate From draft error is not text")?;
+    ensure!(
+        invalid_error.contains("From")
+            && (invalid_error.contains("multiple") || invalid_error.contains("exactly one")),
+        "duplicate From error was not actionable: {invalid_error}"
+    );
+    ensure!(
+        invalid_state["state"]["active_draft"].is_null(),
+        "malformed duplicate-From draft became editable: {invalid_state}"
+    );
+
+    let valid_search = driver.command(
+        "run_search",
+        json!({"query": "id:duplicate-recipient-draft@example.test"}),
+    )?;
+    assert_eq!(
+        valid_search["ok"], true,
+        "valid draft search failed: {valid_search}"
+    );
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    assert_eq!(
+        driver.command("select_thread_by_index", json!({"index": 0}))?["ok"],
+        true
+    );
+    let valid_deadline = Instant::now() + STARTUP_TIMEOUT;
+    let opened = loop {
+        let state = driver.command("app_state", json!({}))?;
+        if state["state"]["active_draft"]["path"] == valid_path.display().to_string() {
+            break state;
+        }
+        ensure!(
+            Instant::now() < valid_deadline,
+            "duplicate-recipient draft did not open: {state}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+    for (field, expected) in [
+        (
+            "to",
+            ["first@example.test", "second@example.test"].as_slice(),
+        ),
+        (
+            "cc",
+            ["cc-one@example.test", "cc-two@example.test"].as_slice(),
+        ),
+        (
+            "bcc",
+            ["hidden-one@example.test", "hidden-two@example.test"].as_slice(),
+        ),
+    ] {
+        let value = opened["state"]["compose_fields"][field]
+            .as_str()
+            .with_context(|| format!("opened {field} field is not text: {opened}"))?;
+        let actual = notm_mail::address::parse_address_list_checked(value)?
+            .into_iter()
+            .map(|address| address.email)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual,
+            expected.iter().map(|value| value.to_string()).collect(),
+            "opening duplicate {field} fields changed recipients"
+        );
+    }
+
+    assert_eq!(
+        driver.command(
+            "compose_set_body",
+            json!({"value": "Duplicate recipients survive reopen and replacement save."}),
+        )?["ok"],
+        true
+    );
+    let save = driver.command("save_draft", json!({}))?;
+    assert_eq!(
+        save["pending_confirmation"], true,
+        "replacement save did not confirm: {save}"
+    );
+    let confirmation_id = pending_confirmation_id(&mut driver, "save_draft_replacement")?;
+    let accepted = driver.command(
+        "respond_confirmation",
+        json!({"response": "accept", "id": confirmation_id}),
+    )?;
+    assert_eq!(accepted["ok"], true, "replacement save failed: {accepted}");
+    let replacement_path = accepted["active_draft"]["path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("replacement save reported no active path: {accepted}"))?;
+    ensure!(
+        replacement_path
+            .extension()
+            .and_then(|value| value.to_str())
+            == Some("json"),
+        "fixture replacement was not saved to the isolated named-draft store: {}",
+        replacement_path.display()
+    );
+    ensure!(
+        !valid_path.exists(),
+        "replaced duplicate-header source remained on disk: {}",
+        valid_path.display()
+    );
+    let replacement: Value = serde_json::from_slice(&fs::read(&replacement_path)?)?;
+    for (field, value, expected) in [
+        (
+            "to",
+            replacement["to"].as_str().unwrap_or_default(),
+            ["first@example.test", "second@example.test"].as_slice(),
+        ),
+        (
+            "cc",
+            replacement["cc"].as_str().unwrap_or_default(),
+            ["cc-one@example.test", "cc-two@example.test"].as_slice(),
+        ),
+        (
+            "bcc",
+            replacement["bcc"].as_str().unwrap_or_default(),
+            ["hidden-one@example.test", "hidden-two@example.test"].as_slice(),
+        ),
+    ] {
+        let actual = notm_mail::address::parse_address_list_checked(value)?
+            .into_iter()
+            .map(|address| address.email)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual,
+            expected.iter().map(|value| value.to_string()).collect(),
+            "replacement save changed {field} recipient semantics"
+        );
+    }
+    assert_eq!(
+        replacement["body"],
+        "Duplicate recipients survive reopen and replacement save."
+    );
+
+    assert_eq!(driver.command("close_main_window", json!({}))?["ok"], true);
+    drop(driver);
+    let status = app.wait_for_exit(Duration::from_secs(8))?;
+    ensure!(
+        status.success(),
+        "duplicate draft-header app failed: {status}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn parse_captured_smtp_wire(
+    work_dir: &Path,
+    label: &str,
+    captured: &CapturedSmtpMessage,
+    expected_sender: &str,
+) -> anyhow::Result<Value> {
+    assert_smtp_wire_conformance(label, &captured.data)?;
+    assert_eq!(
+        captured.mail_from, expected_sender,
+        "{label} SMTP envelope sender changed"
+    );
+    let path = work_dir.join(format!("captured-{label}.eml"));
+    fs::write(&path, &captured.data)?;
+    let parsed = parse_wire_with_python(&path)?;
+    ensure!(
+        parsed["defects"]
+            .as_array()
+            .is_some_and(|defects| defects.is_empty()),
+        "independent parser reported top-level defects in {label}: {parsed}"
+    );
+    for part in json_array_at(&parsed, &["parts"])? {
+        ensure!(
+            part["defects"]
+                .as_array()
+                .is_some_and(|defects| defects.is_empty()),
+            "independent parser reported a MIME defect in {label}: {part}"
+        );
+    }
+    ensure!(
+        parsed["bcc"].as_array().is_some_and(|bcc| bcc.is_empty()),
+        "Bcc leaked into captured {label} wire bytes: {parsed}"
+    );
+    ensure!(
+        parsed["message_id"]
+            .as_str()
+            .is_some_and(|message_id| message_id.starts_with('<') && message_id.ends_with('>')),
+        "{label} has no standards-shaped Message-ID: {parsed}"
+    );
+    ensure!(
+        parsed["date"].as_str().is_some_and(|date| !date.is_empty()),
+        "{label} has no Date header: {parsed}"
+    );
+    Ok(parsed)
+}
+
+#[cfg(unix)]
+fn assert_smtp_wire_conformance(label: &str, wire: &[u8]) -> anyhow::Result<()> {
+    ensure!(wire.ends_with(b"\r\n"), "{label} wire does not end in CRLF");
+    for (index, byte) in wire.iter().copied().enumerate() {
+        if byte == b'\n' {
+            ensure!(
+                index > 0 && wire[index - 1] == b'\r',
+                "{label} wire contains a bare LF at byte {index}"
+            );
+        } else if byte == b'\r' {
+            ensure!(
+                wire.get(index + 1) == Some(&b'\n'),
+                "{label} wire contains a bare CR at byte {index}"
+            );
+        }
+    }
+    for line in wire.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        ensure!(
+            line.len() <= 998,
+            "{label} wire line is {} octets (RFC 5322 maximum is 998)",
+            line.len()
+        );
+    }
+    let separator = b"\r\n\r\n";
+    let header_end = wire
+        .windows(separator.len())
+        .position(|window| window == separator)
+        .with_context(|| format!("{label} wire has no header/body separator"))?;
+    let header = &wire[..header_end];
+    for line in header.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        ensure!(
+            line.len() <= 78,
+            "{label} header line is {} octets (safe fold target is 78): {}",
+            line.len(),
+            String::from_utf8_lossy(line)
+        );
+        ensure!(
+            !line
+                .split(|byte| *byte == b':')
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case(b"bcc")),
+            "{label} leaked a Bcc field"
+        );
+    }
+    let lower = String::from_utf8_lossy(header).to_ascii_lowercase();
+    ensure!(
+        lower.contains("=?utf-8?"),
+        "{label} did not RFC 2047-encode its Unicode headers:\n{}",
+        String::from_utf8_lossy(header)
+    );
+    ensure!(
+        header.windows(3).any(|window| window == b"\r\n ")
+            || header.windows(3).any(|window| window == b"\r\n\t"),
+        "{label} did not contain a folded header"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn parsed_addresses(parsed: &Value, field: &str) -> anyhow::Result<BTreeSet<String>> {
+    json_array_at(parsed, &[field])?
+        .iter()
+        .map(|mailbox| {
+            mailbox["address"]
+                .as_str()
+                .map(str::to_string)
+                .with_context(|| format!("parsed {field} mailbox has no address: {mailbox}"))
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_send_timeout_validation_preserves_last_valid_value_across_restart() -> anyhow::Result<()>
+{
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_send_timeout_validation_preserves_last_valid_value_across_restart: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running restart-backed send-timeout Settings UI smoke with {display}");
+
+    let root = tempfile::tempdir()?;
+    let config_path = root.path().join("notm.toml");
+    fs::write(&config_path, "[send]\ntimeout_seconds = 73\n")?;
+    let original_config = fs::read(&config_path)?;
+
+    let first_token = format!("notm-settings-timeout-first-{}", unique_run_id()?);
+    let mut first_app = FixtureApp::spawn_fixture_with_config(
+        root.path().join("first-launch"),
+        &first_token,
+        &config_path,
+    )?;
+    let mut first_driver = first_app.connect(&first_token)?;
+    first_driver.wait_for_search(STARTUP_TIMEOUT)?;
+    assert_eq!(
+        first_driver.command("open_settings", json!({}))?["ok"],
+        true
+    );
+    let initial = first_driver.command("settings_test_state", json!({}))?;
+    assert_eq!(initial["configured_send_timeout_seconds"], 73, "{initial}");
+    assert_eq!(initial["dialog"]["send_timeout_seconds"], "73", "{initial}");
+    let settings_output_path = initial["app_config_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("Settings state has no output config path: {initial}"))?;
+    let original_settings_output = fs::read(&settings_output_path).ok();
+    let timeout_above_maximum = (notm_mail::MAX_SEND_TIMEOUT_SECONDS + 1).to_string();
+
+    for (timeout, response) in [
+        ("0", "apply"),
+        ("-0", "save"),
+        ("-1", "save"),
+        ("not-a-number", "save"),
+        (&timeout_above_maximum, "save"),
+        ("9223372036854775807", "save"),
+        ("340282366920938463463374607431768211455", "save"),
+    ] {
+        let rejected = first_driver.command(
+            "respond_settings",
+            json!({
+                "response": response,
+                "send_timeout_seconds": timeout,
+            }),
+        )?;
+        assert_eq!(
+            rejected["ok"], false,
+            "invalid send timeout {timeout:?} unexpectedly succeeded: {rejected}"
+        );
+        ensure!(
+            rejected["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("send.timeout_seconds")),
+            "timeout validation error was not actionable: {rejected}"
+        );
+        assert_eq!(
+            rejected["state"]["dialog"]["visible"], true,
+            "invalid timeout closed the Settings dialog: {rejected}"
+        );
+        assert_eq!(
+            rejected["state"]["dialog"]["send_timeout_seconds"], timeout,
+            "Settings did not retain the rejected text for correction: {rejected}"
+        );
+        assert_eq!(
+            rejected["state"]["configured_send_timeout_seconds"], 73,
+            "invalid timeout changed the running launch setting: {rejected}"
+        );
+        assert_eq!(
+            fs::read(&config_path)?,
+            original_config,
+            "invalid timeout partially changed {}",
+            config_path.display()
+        );
+        assert_eq!(
+            fs::read(&settings_output_path).ok(),
+            original_settings_output,
+            "invalid timeout partially changed Settings output {}",
+            settings_output_path.display()
+        );
+    }
+
+    let maximum_timeout = notm_mail::MAX_SEND_TIMEOUT_SECONDS.to_string();
+    let saved = first_driver.command(
+        "respond_settings",
+        json!({
+            "response": "save",
+            "send_timeout_seconds": maximum_timeout,
+        }),
+    )?;
+    assert_eq!(saved["ok"], true, "maximum timeout did not save: {saved}");
+    assert_eq!(
+        saved["state"]["dialog"],
+        Value::Null,
+        "successful timeout Save did not close Settings: {saved}"
+    );
+    assert_eq!(
+        saved["state"]["configured_send_timeout_seconds"], 73,
+        "send timeout unexpectedly changed without the documented relaunch: {saved}"
+    );
+    let saved_config = fs::read_to_string(&settings_output_path)?;
+    let saved_toml: toml::Value = toml::from_str(&saved_config)?;
+    assert_eq!(
+        saved_toml["send"]["timeout_seconds"].as_integer(),
+        Some(i64::try_from(notm_mail::MAX_SEND_TIMEOUT_SECONDS)?),
+        "Settings did not persist the maximum valid timeout: {saved_config}"
+    );
+    assert_eq!(
+        fs::read(&config_path)?,
+        original_config,
+        "fixture Settings escaped its isolated output path"
+    );
+    assert_eq!(
+        first_driver.command("close_main_window", json!({}))?["ok"],
+        true
+    );
+    drop(first_driver);
+    let first_status = first_app.wait_for_exit(Duration::from_secs(8))?;
+    ensure!(
+        first_status.success(),
+        "first Settings process failed: {first_status}"
+    );
+    drop(first_app);
+
+    // Fixture mode deliberately writes to a child-owned disposable config,
+    // never to the supplied source. Copy those exact persisted bytes into the
+    // next process's isolated input path to exercise a real reload.
+    fs::write(&config_path, &saved_config)?;
+
+    let second_token = format!("notm-settings-timeout-second-{}", unique_run_id()?);
+    let mut second_app = FixtureApp::spawn_fixture_with_config(
+        root.path().join("second-launch"),
+        &second_token,
+        &config_path,
+    )?;
+    let mut second_driver = second_app.connect(&second_token)?;
+    second_driver.wait_for_search(STARTUP_TIMEOUT)?;
+    assert_eq!(
+        second_driver.command("open_settings", json!({}))?["ok"],
+        true
+    );
+    let restarted = second_driver.command("settings_test_state", json!({}))?;
+    assert_eq!(
+        restarted["configured_send_timeout_seconds"],
+        notm_mail::MAX_SEND_TIMEOUT_SECONDS,
+        "restart did not load the last valid timeout: {restarted}"
+    );
+    assert_eq!(
+        restarted["dialog"]["send_timeout_seconds"],
+        notm_mail::MAX_SEND_TIMEOUT_SECONDS.to_string(),
+        "restart did not restore the last valid timeout in Settings: {restarted}"
+    );
+    assert_eq!(
+        fs::read_to_string(&config_path)?,
+        saved_config,
+        "restart changed the saved maximum timeout configuration"
+    );
+
+    let closed_dialog = second_driver.command("respond_settings", json!({"response": "close"}))?;
+    assert_eq!(closed_dialog["ok"], true, "{closed_dialog}");
+    assert_eq!(
+        second_driver.command("close_main_window", json!({}))?["ok"],
+        true
+    );
+    drop(second_driver);
+    let second_status = second_app.wait_for_exit(Duration::from_secs(8))?;
+    ensure!(
+        second_status.success(),
+        "restarted Settings process failed: {second_status}"
+    );
 
     Ok(())
 }

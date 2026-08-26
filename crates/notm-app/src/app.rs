@@ -4,6 +4,7 @@ use anyhow::Context;
 use chrono::Utc;
 use notm_mail::{
     ComposedMessage, ExternalCommandTransport, FakeSendTransport, SendTransport, parse_mailto_uri,
+    send_timeout_duration,
 };
 use notm_notmuch::{Database, DatabaseMode, OpenConfig, QueryOptions, SortOrder};
 use notm_ui::{LaunchOptions, SavedSearch, model::ThemePreference};
@@ -255,7 +256,7 @@ fn external_transport(cfg: &config::AppConfig) -> anyhow::Result<ExternalCommand
         mode: config::transport_mode(&cfg.send.mode),
         working_dir: cfg.send.working_dir.clone(),
         env: cfg.send.env.clone(),
-        timeout: Duration::from_secs(cfg.send.timeout_seconds),
+        timeout: send_timeout_duration(cfg.send.timeout_seconds)?,
     })
 }
 

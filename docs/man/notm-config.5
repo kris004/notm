@@ -273,7 +273,10 @@ Optional working directory for the send command.
 Environment variables for the send command.
 .TP
 .B timeout_seconds
-Send timeout.  Defaults to 120.
+Send timeout in whole seconds.  Defaults to 120.  The valid range is 1 through
+946080000 (30 fixed 365-day years), which keeps the timeout representable as a
+monotonic timer deadline.  Zero, negative, nonnumeric, and larger values are
+rejected rather than replaced with a default or stored after integer wrapping.
 .TP
 .B save_sent
 Save accepted sent mail to a local Maildir.  Defaults to false.
