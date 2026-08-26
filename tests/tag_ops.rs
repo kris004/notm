@@ -1,5 +1,5 @@
 use notm_notmuch::{MessageSummary, QueryOptions, SortOrder, TagMutation};
-use std::{collections::BTreeMap, path::Path};
+use std::collections::BTreeMap;
 
 #[test]
 fn applies_and_undoes_tag_operations_without_cli() -> anyhow::Result<()> {
@@ -152,7 +152,7 @@ fn applies_tags_to_thread_range_without_expanding_ids() -> anyhow::Result<()> {
     let expected_messages = selected
         .iter()
         .map(|thread| {
-            db.thread_messages(&thread.thread_id)
+            db.thread_messages_bounded(&thread.thread_id, 4_096)
                 .map(|messages| messages.len())
         })
         .sum::<notm_notmuch::Result<usize>>()?;
@@ -204,16 +204,15 @@ fn removes_indexed_message_file_from_database() -> anyhow::Result<()> {
     };
     let db = fixture.open_readwrite()?;
     let messages = db.search_messages("subject:\"Draft like message\"", &options)?;
-    let filename = messages
-        .first()
-        .and_then(|message| message.filenames.first())
-        .expect("fixture draft filename")
-        .clone();
+    let filename = db
+        .open_message_file(messages.first().expect("fixture draft message"))?
+        .path()
+        .to_path_buf();
 
-    db.remove_message_file(Path::new(&filename))?;
+    db.remove_message_file(&filename)?;
     let count = db.count_messages("subject:\"Draft like message\"", &options)?;
 
     assert_eq!(count, 0);
-    assert!(Path::new(&filename).exists());
+    assert!(filename.exists());
     Ok(())
 }

@@ -13,7 +13,7 @@ fn sanitizes_html_and_detects_attachments() -> anyhow::Result<()> {
     let msg = db
         .search_messages("subject:\"Attachment message\"", &options)?
         .remove(0);
-    let parsed = notm_mail::mime::parse_file(&msg.filenames[0])?;
+    let parsed = notm_mail::mime::parse_reader(db.open_message_file(&msg)?)?;
     assert!(!parsed.attachments.is_empty());
     Ok(())
 }
