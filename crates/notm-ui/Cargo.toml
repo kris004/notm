@@ -9,6 +9,7 @@ publish = false
 anyhow.workspace = true
 chrono.workspace = true
 gtk4 = { version = "0.11", features = ["v4_12"] }
+mailparse.workspace = true
 notm-mail = { path = "../notm-mail" }
 notm-notmuch = { path = "../notm-notmuch" }
 parking_lot.workspace = true

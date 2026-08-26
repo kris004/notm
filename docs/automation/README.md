@@ -225,21 +225,23 @@ exits normally.
 After `open_settings`, the fixture-only `settings_test_state` reports the real
 dialog ID and visible controls, the requested theme and live resolved
 `theme_bg_color`/luminance plus raw GTK properties, the configured preview
-limit, and the actual rendered preview label's line limit, visibility, and
-text. `respond_settings` drives that same GTK dialog's response signal. It
-accepts optional `id`, `theme`, `thread_preview_lines`, and
-`show_thread_preview` arguments plus `response` set to `apply`, `save`, or
+limit, the send-timeout entry and configured launch value, and the actual
+rendered preview label's line limit, visibility, and text. `respond_settings`
+drives that same GTK dialog's response signal. It accepts optional `id`,
+`theme`, `thread_preview_lines`, `show_thread_preview`, and
+`send_timeout_seconds` arguments plus `response` set to `apply`, `save`, or
 `close`, for example:
 
 ```json
-{"token":"dev-token","command":"respond_settings","args":{"response":"apply","theme":"dark","thread_preview_lines":3,"show_thread_preview":true}}
+{"token":"dev-token","command":"respond_settings","args":{"response":"apply","theme":"dark","thread_preview_lines":3,"show_thread_preview":true,"send_timeout_seconds":120}}
 ```
 
 This is a fixture-only UI-test seam, not an alternate settings API. Invalid
-theme or preview values leave the dialog open and do not update runtime state or
-the config file. `apply` changes the running window without writing; `save`
-writes and then applies. The older `save_settings` command persists only its
-basic direct-test fields and does not exercise the dialog.
+theme, preview, or send-timeout values leave the dialog open and do not update
+runtime state or the config file. `apply` changes the running window without
+writing; `save` writes and then applies. Send changes require relaunch. The
+older `save_settings` command persists only its basic direct-test fields and
+does not exercise the dialog.
 
 `run_manual_sync` returns with `pending: true` after the configured commands
 have started in the background. Poll `app_state.state.sync_in_progress` until

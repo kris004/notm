@@ -14,7 +14,7 @@ use gtk::prelude::*;
 use gtk4 as gtk;
 use notm_mail::{
     ComposedMessage, ReplyKind,
-    address::{format_address, parse_address_list_checked, parse_one_checked},
+    address::{MailAddress, format_address, parse_address_list_checked, parse_one_checked},
     build_reply,
     compose::{AttachmentInput, Identity},
     forward::{build_attachment_forward, build_inline_forward},
@@ -322,8 +322,17 @@ pub(crate) fn prepare_draft_fields_from_message_reader(
     reader: impl Read,
 ) -> anyhow::Result<(ComposeFields, Vec<AttachmentInput>)> {
     let raw = read_message_bytes(reader)?;
+    let wire = mailparse::parse_mail(&raw)?;
     let parsed = parse_rfc5322(&raw)?;
     let attachment_inputs = attachments::attachment_inputs_from_bytes(&raw)?;
+    // Parse each raw address header structurally before decoding RFC 2047.
+    // A decoded display name such as `Doe, Zoë` needs its comma re-quoted;
+    // reparsing the already-decoded flat string would mistake it for a list
+    // delimiter and could change the recipient set on the next send.
+    let from = canonical_draft_address_header(&wire, "From", true)?;
+    let to = canonical_draft_address_header(&wire, "To", false)?;
+    let cc = canonical_draft_address_header(&wire, "Cc", false)?;
+    let bcc = canonical_draft_address_header(&wire, "Bcc", false)?;
     let body = if parsed.text_body.trim().is_empty() {
         parsed.safe_body
     } else {
@@ -331,10 +340,10 @@ pub(crate) fn prepare_draft_fields_from_message_reader(
     };
     Ok((
         ComposeFields {
-            from: parsed.from,
-            to: parsed.to,
-            cc: parsed.cc,
-            bcc: header_value(&parsed.headers, "Bcc"),
+            from,
+            to,
+            cc,
+            bcc,
             subject: parsed.subject,
             body,
             attachments: Vec::new(),
@@ -345,6 +354,67 @@ pub(crate) fn prepare_draft_fields_from_message_reader(
         },
         attachment_inputs,
     ))
+}
+
+fn canonical_draft_address_header(
+    message: &mailparse::ParsedMail<'_>,
+    label: &str,
+    require_one: bool,
+) -> anyhow::Result<String> {
+    let headers = message
+        .headers
+        .iter()
+        .filter(|header| header.get_key_ref().eq_ignore_ascii_case(label))
+        .collect::<Vec<_>>();
+    if headers.is_empty() {
+        anyhow::ensure!(!require_one, "saved draft is missing its {label} header");
+        return Ok(String::new());
+    }
+    if require_one {
+        anyhow::ensure!(
+            headers.len() == 1,
+            "saved draft contains multiple {label} headers"
+        );
+    }
+    let mut formatted = Vec::new();
+    for header in headers {
+        if header.get_value().trim().is_empty() {
+            continue;
+        }
+        let addresses = mailparse::addrparse_header(header)
+            .map_err(|err| anyhow::anyhow!("invalid {label} addresses in saved draft: {err}"))?;
+        for address in addresses.iter() {
+            anyhow::ensure!(
+                !require_one || matches!(address, mailparse::MailAddr::Single(_)),
+                "saved draft {label} header must contain exactly one mailbox"
+            );
+            let singles = match address {
+                mailparse::MailAddr::Single(single) => std::slice::from_ref(single),
+                mailparse::MailAddr::Group(group) => group.addrs.as_slice(),
+            };
+            for single in singles {
+                let candidate = MailAddress {
+                    name: single
+                        .display_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(ToOwned::to_owned),
+                    email: single.addr.trim().to_string(),
+                };
+                let candidate = format_address(&candidate);
+                let validated = parse_one_checked(&candidate).map_err(|err| {
+                    anyhow::anyhow!("invalid {label} mailbox in saved draft: {err}")
+                })?;
+                formatted.push(format_address(&validated));
+            }
+        }
+    }
+    anyhow::ensure!(
+        !require_one || formatted.len() == 1,
+        "saved draft {label} header must contain exactly one mailbox"
+    );
+    Ok(formatted.join(", "))
 }
 
 pub(crate) fn composed_reply_from_reader(
@@ -386,14 +456,6 @@ fn draft_fields_from_message_file(path: impl AsRef<Path>) -> anyhow::Result<Comp
         atomic_write_durable,
     )?;
     Ok(fields)
-}
-
-fn header_value(headers: &std::collections::BTreeMap<String, String>, name: &str) -> String {
-    headers
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.clone())
-        .unwrap_or_default()
 }
 
 fn nonempty_string(value: String) -> Option<String> {
@@ -2280,7 +2342,8 @@ mod tests {
             ..ComposeFields::default()
         };
         let message = composed_message_from_fields(&fields).expect("message");
-        let rendered = message.to_rfc5322();
+        let rendered = String::from_utf8(message.to_rfc5322().expect("render message"))
+            .expect("test message is UTF-8");
         assert_eq!(
             message.in_reply_to.as_deref(),
             Some("<original@example.test>")
@@ -2370,6 +2433,99 @@ mod tests {
                 "<parent@example.test>".to_string()
             ]
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn draft_address_round_trip_requotes_decoded_unicode_display_name_commas() {
+        let path = std::env::temp_dir().join(format!("notm-draft-{}.eml", Uuid::new_v4()));
+        let mut message = ComposedMessage::new(
+            r#""Doe, Zoë" <zoe@example.test>"#.to_string(),
+            vec![
+                r#""Smith, 世界" <world@example.test>"#.to_string(),
+                "other@example.test".to_string(),
+            ],
+            "Draft address round trip".to_string(),
+            "Draft body.".to_string(),
+        );
+        message.bcc = vec![r#""Hidden, Café" <hidden@example.test>"#.to_string()];
+        let raw = message
+            .to_rfc5322()
+            .expect("serialize Unicode address draft");
+        assert!(
+            raw.windows(b"=?UTF-8?B?".len())
+                .any(|window| window == b"=?UTF-8?B?"),
+            "regression fixture must exercise encoded display names"
+        );
+        std::fs::write(&path, raw).expect("write Unicode address draft");
+
+        let fields = draft_fields_from_message_file(&path).expect("load draft fields");
+
+        assert_eq!(fields.from, r#""Doe, Zoë" <zoe@example.test>"#);
+        assert_eq!(
+            fields.to,
+            r#""Smith, 世界" <world@example.test>, other@example.test"#
+        );
+        assert_eq!(fields.cc, "");
+        assert_eq!(fields.bcc, r#""Hidden, Café" <hidden@example.test>"#);
+        let composed = composed_message_from_fields(&fields).expect("recompose reopened draft");
+        assert_eq!(composed.to.len(), 2);
+        assert_eq!(composed.bcc.len(), 1);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn draft_address_loading_combines_duplicate_destination_headers_in_wire_order() {
+        let path = std::env::temp_dir().join(format!("notm-draft-{}.eml", Uuid::new_v4()));
+        let raw = concat!(
+            "From: sender@example.test\r\n",
+            "To: first@example.test\r\n",
+            "To: =?UTF-8?B?RG9lLCBab8Or?= <zoe@example.test>\r\n",
+            "Cc: copy-one@example.test\r\n",
+            "Cc: copy-two@example.test\r\n",
+            "Bcc:\r\n",
+            "Bcc: hidden@example.test\r\n",
+            "Subject: Duplicate destinations\r\n",
+            "Message-ID: <draft@example.test>\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "Draft body.\r\n",
+        );
+        std::fs::write(&path, raw).expect("write duplicate-header draft");
+
+        let fields = draft_fields_from_message_file(&path).expect("load draft fields");
+
+        assert_eq!(
+            fields.to,
+            r#"first@example.test, "Doe, Zoë" <zoe@example.test>"#
+        );
+        assert_eq!(fields.cc, "copy-one@example.test, copy-two@example.test");
+        assert_eq!(fields.bcc, "hidden@example.test");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn draft_address_loading_rejects_duplicate_from_headers() {
+        let path = std::env::temp_dir().join(format!("notm-draft-{}.eml", Uuid::new_v4()));
+        let raw = concat!(
+            "From: first@example.test\r\n",
+            "From: second@example.test\r\n",
+            "To: recipient@example.test\r\n",
+            "Subject: Duplicate From\r\n",
+            "Message-ID: <draft@example.test>\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "Draft body.\r\n",
+        );
+        std::fs::write(&path, raw).expect("write duplicate-From draft");
+
+        let error = draft_fields_from_message_file(&path)
+            .expect_err("duplicate From headers must be rejected");
+
+        assert!(error.to_string().contains("multiple From headers"));
         let _ = std::fs::remove_file(path);
     }
 

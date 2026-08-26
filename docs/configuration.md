@@ -146,8 +146,12 @@ index_sent_after_send = false
 `transport = "external"` is currently required. `mode` accepts `auto`,
 `stdin_rfc5322`, `file_arg`, or `command_template`; `auto` currently behaves as
 `stdin_rfc5322`. For `command_template`, at least one argument must contain
-`{file}`. See [Sending mail](send-transport.md) for mode behavior, Bcc handling,
-timeouts, and failure reporting.
+`{file}`. `timeout_seconds` must be a whole number from 1 through
+9223372036854775807. Config loading and the Settings dialog reject zero,
+negative, nonnumeric, or larger values instead of substituting a default or
+wrapping the stored value; a rejected Settings save leaves the previous config
+unchanged. See [Sending mail](send-transport.md) for mode behavior, Bcc
+handling, timeouts, and failure reporting.
 
 When `save_sent` is enabled and `sent_maildir` is omitted, the default is
 `Sent` under Notmuch's effective `database.mail_root` (falling back to the

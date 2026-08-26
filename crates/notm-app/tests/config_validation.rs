@@ -1,5 +1,6 @@
 use std::{ffi::CString, fs, path::Path, process::Command};
 
+use notm_mail::MAX_SEND_TIMEOUT_SECONDS;
 use serde_json::Value;
 
 struct PrivateConfig {
@@ -70,6 +71,42 @@ fn print_config_rejects_invalid_values_with_dotted_keys() -> anyhow::Result<()> 
         config.replace(contents)?;
         let output = config.command().arg("print-config").output()?;
         assert_rejected(&output, &config.path, key);
+    }
+    Ok(())
+}
+
+#[test]
+fn print_config_enforces_the_persistable_send_timeout_range() -> anyhow::Result<()> {
+    let config = PrivateConfig::create(&format!(
+        "[send]\ntimeout_seconds = {MAX_SEND_TIMEOUT_SECONDS}\n"
+    ))?;
+    let accepted = config
+        .command()
+        .args(["print-config", "--show-secrets"])
+        .output()?;
+    let printed = assert_printed_config(&accepted)?;
+    assert_eq!(
+        printed["send"]["timeout_seconds"].as_u64(),
+        Some(MAX_SEND_TIMEOUT_SECONDS)
+    );
+
+    for timeout in [
+        "0".to_string(),
+        "-0".to_string(),
+        "-1".to_string(),
+        "\"not-a-number\"".to_string(),
+        (MAX_SEND_TIMEOUT_SECONDS + 1).to_string(),
+        u128::MAX.to_string(),
+    ] {
+        let contents = format!("[send]\ntimeout_seconds = {timeout}\n");
+        config.replace(&contents)?;
+        let rejected = config.command().arg("print-config").output()?;
+        assert_rejected(&rejected, &config.path, "timeout_seconds");
+        assert_eq!(
+            fs::read(&config.path)?,
+            contents.as_bytes(),
+            "rejected configuration was modified for {timeout}"
+        );
     }
     Ok(())
 }
