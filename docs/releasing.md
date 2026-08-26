@@ -13,10 +13,23 @@ records and must not be retagged, moved, or replaced.
 
 A real release updates these version surfaces together:
 
-- the workspace version in `Cargo.toml` and its `Cargo.lock` reflection;
-- `CHANGELOG.md`; and
-- the release entry in
-  `packaging/io.github.kris004.notm.metainfo.xml`.
+- the workspace version in `Cargo.toml` and every local-package reflection in
+  `Cargo.lock`;
+- the latest released heading, date, and link in `CHANGELOG.md`;
+- the versioned `.TH` headers in all four files under `docs/man/`;
+- the latest release version and date in
+  `packaging/io.github.kris004.notm.metainfo.xml`; and
+- the stable application ID, binary, desktop launch command, icon, and mailto
+  declarations shared by Cargo, the Makefile, the desktop entry, and AppStream.
+
+`Version=1.0` in the desktop entry is the Desktop Entry specification version,
+not the notm release version. Do not change it during a release bump. The
+authoritative consistency check and its deterministic negative tests are:
+
+```sh
+packaging/verify-release-metadata.py .
+python3 -B tests/release_metadata_smoke.py
+```
 
 The exact release commit must be on protected `main` with these successful check
 names:
@@ -42,8 +55,24 @@ It must produce one `release-assets` workflow artifact containing exactly:
 - `SHA256SUMS`
 
 The binary is a dynamically linked x86-64 GNU/Linux build produced on Ubuntu
-24.04. The source archive extracts to `notm-VERSION/` and must equal `git
-archive` of the direct tag target.
+24.04. In the production Git-checkout path, the source archive extracts to
+`notm-VERSION/` and must equal `git archive` of the direct tag target. Git
+records that target in the tar PAX header, and `.git_archival.txt` carries the
+same commit into the extracted tree through `export-subst`. When the builder is
+itself run from that extracted tree without `.git`, it instead creates a
+deterministic tar from the archive contents and preserves the embedded commit
+in the PAX header. The standalone verifier validates either path, the complete
+artifact set, checksums, binary version, build information, and release
+metadata without needing a `.git` directory:
+
+```sh
+packaging/verify-linux-release.sh \
+  dist VERSION x86_64-unknown-linux-gnu FULL_SOURCE_COMMIT
+```
+
+`tests/source_archive_smoke.sh` additionally compiles and tests a clean
+extraction with `--locked`, runs its fixture and packaging suites, and proves
+the archive-side release smoke works without repository metadata.
 
 ## Signing values
 
@@ -51,8 +80,70 @@ The repository uses the configured hardware-backed OpenPGP key with fingerprint
 `BE592562E6131A53F4BADE4A046928E9A919BAF9`. For the next legitimate version,
 the corresponding minimal public key is pinned in
 `docs/release-signing-key.asc`. The release workflow verifies the tag against
-that key as well as GitHub's tag-object verification. Record the exact
-protected-main commit and run:
+that key as well as GitHub's tag-object verification.
+
+The pinned primary currently expires at **2026-11-13 22:55:31 UTC**. CI and the
+release workflow warn when 90 days or less remain and fail when 30 days or less
+remain, when the key is expired, or when the pinned certificate has no expiry.
+The read-only check is:
+
+```sh
+packaging/check-release-key-expiry.sh \
+  docs/release-signing-key.asc \
+  BE592562E6131A53F4BADE4A046928E9A919BAF9
+```
+
+### Hardware-key expiry handoff
+
+Complete an extension before the 30-day failure boundary on the trusted system
+that has access to the certification-capable primary key and the hardware
+token. Choose an explicitly approved ISO expiry date more than 90 days away,
+then run:
+
+```sh
+fingerprint=BE592562E6131A53F4BADE4A046928E9A919BAF9
+authentication_subkey=A707625241E8F3FCA82FF7E237AE3AC9F486FBC3
+encryption_subkey=9556DD524A4983D7E67F223098B779AB58AD4357
+new_expiry=YYYY-MM-DD
+
+gpg --list-secret-keys --with-subkey-fingerprint "$fingerprint"
+gpg --quick-set-expire \
+  "$fingerprint" \
+  "$new_expiry"
+gpg --quick-set-expire \
+  "$fingerprint" \
+  "$new_expiry" \
+  "$authentication_subkey" \
+  "$encryption_subkey"
+
+updated_key=$(mktemp)
+trap 'rm -f "$updated_key"' EXIT
+gpg --batch --armor --export-options export-minimal \
+  --export "$fingerprint" >"$updated_key"
+packaging/check-release-key-expiry.sh "$updated_key" "$fingerprint"
+gpg --batch --show-keys --with-subkey-fingerprints "$updated_key"
+install -m 0644 "$updated_key" docs/release-signing-key.asc
+```
+
+The first expiry command updates the primary key; the second updates the named
+authentication and encryption subkeys. Supplying subkey fingerprints does not
+also update the primary key. The expiry update and export require no new key or
+fingerprint, but GnuPG may request the hardware-key PIN and touch. If the
+certification-capable primary key is unavailable, stop; do not generate a
+replacement or weaken the policy as a workaround. Re-run the complete delivery
+gate, publish the refreshed public certificate through the GitHub account's
+**SSH and GPG keys** settings, and confirm GitHub reports the same fingerprint
+and new expiry before signing a tag. If GitHub requires deleting and re-adding
+the existing public key, treat that account change as a separate human-approved
+handoff and verify historical signature records before and after it.
+
+If extension is intentionally replaced by rotation, use a separately reviewed
+change to update the pinned public certificate, workflow fingerprint, Git
+signing configuration, GitHub account key, tests, and these instructions
+together. Rotation never authorizes moving or recreating an existing tag.
+
+After the expiry gate is healthy, record the exact protected-main commit and
+run:
 
 ```sh
 repo=kris004/notm
@@ -65,8 +156,9 @@ test -z "$(git tag --list "$tag")"
 git tag -s -u "$signing_key" "$tag" "$target" -m "notm ${tag#v}"
 ```
 
-The YubiKey touch requested by `git tag -s` is the only human-presence step.
-Before pushing, verify the exact local object:
+For an ordinary release after the expiry policy is healthy, the YubiKey touch
+requested by `git tag -s` is the only human-presence step. Before pushing,
+verify the exact local object:
 
 ```sh
 git verify-tag --raw "$tag"
@@ -78,9 +170,10 @@ git push origin "refs/tags/${tag}"
 The tag push runs `.github/workflows/release-linux.yml`. It rejects an annotated
 tag unless GitHub reports a direct commit target with a valid signature, the
 target is reachable from the default branch, and both required checks succeeded.
-It then tests, builds, and packages once; attests the exact uploaded workflow
-artifact; and gives those same files to a release creation command with explicit
-`--repo "$GITHUB_REPOSITORY"` context.
+It tests and builds the production binary, packages it once, independently
+rebuilds and tests the extracted source archive, attests the exact uploaded
+workflow artifact, and gives those same files to a release creation command
+with explicit `--repo "$GITHUB_REPOSITORY"` context.
 
 After publication, verify the repository-specific artifact set:
 

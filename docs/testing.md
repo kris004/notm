@@ -2,22 +2,29 @@
 
 Fixture tests create a disposable Maildir and Notmuch database through
 `libnotmuch`. Normal tests and fixture behavior should not shell out to the
-`notmuch` CLI. Desktop UI smoke tests start an isolated headless display when
-Sway is available and otherwise skip with a clear reason; interactive GTK flows
-can be driven through the local developer test harness described in
-[automation/README.md](automation/README.md).
+`notmuch` CLI. During an ordinary `cargo test --locked` run, desktop UI smoke
+tests start an isolated headless display when Sway is available and may
+otherwise skip with a clear reason. The complete delivery gate below supplies
+required Weston and Xvfb displays; `NOTM_REQUIRE_GTK_DISPLAY=1` makes an
+unavailable display fail, so a skipped required-display test never counts as a
+gate pass.
+Interactive GTK flows can be driven through the local developer test harness
+described in [automation/README.md](automation/README.md).
 
 ## Routine checks
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets --all-features
-cargo run -p notm-app -- fixture-smoke
-./tests/packaging_install_smoke.sh
-./tests/release_bundle_smoke.sh
-./tests/release_tag_smoke.sh
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-targets --all-features
+make smoke
+make check-packaging
 ```
+
+`make smoke` is fixture-only. `make check-packaging` runs the lock-policy and
+mutation regressions, release metadata and signing-key policy tests, staged
+install checks, deterministic release-bundle build and verification, and
+disposable signed-tag verification.
 
 To exercise `probe-send` without depending on a contributor's mail setup, use a
 disposable helper configuration:
@@ -27,14 +34,65 @@ probe_config=$(mktemp)
 trap 'rm -f "$probe_config"' EXIT
 cat >"$probe_config" <<'EOF'
 [send]
+enabled = true
+transport = "external"
 command = "true"
 mode = "stdin_rfc5322"
 EOF
-cargo run -p notm-app -- --config "$probe_config" probe-send
+cargo run --locked -p notm-app -- --config "$probe_config" probe-send
 ```
 
 The probe resolves the command and checks its working directory; it does not
 submit a message.
+
+## Complete hermetic delivery gate
+
+The delivery gate is intentionally explicit. It requires Cargo and the native
+build dependencies plus `actionlint`, ShellCheck, mandoc,
+`desktop-file-validate`, `appstreamcli`, GnuPG, Weston, Xvfb, Sway, `wtype`,
+`dbus-run-session`, and Python 3. A missing tool, skipped display test, or
+unavailable command is a failure, not a pass.
+
+Run the routine checks and the disposable send probe above, then:
+
+```sh
+./tests/source_archive_smoke.sh
+
+tests/run_with_headless_weston.sh \
+  dbus-run-session -- \
+  cargo test --locked -p notm-app --test desktop_ui_smoke -- \
+    --nocapture --test-threads=1
+
+env -u DISPLAY -u WAYLAND_DISPLAY -u SWAYSOCK \
+  GDK_BACKEND=x11 \
+  NOTM_GUI_TEST_DISPLAY=provided \
+  NOTM_REQUIRE_GTK_DISPLAY=1 \
+  dbus-run-session -- \
+  xvfb-run -a \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
+    fixture_html_link_hints_label_visible_links_and_cancel -- \
+    --exact --nocapture --test-threads=1
+
+cargo build --locked -p notm-app
+python3 -B tests/ui_text_focus_smoke.py --binary target/debug/notm
+
+actionlint
+shellcheck packaging/*.sh tests/*.sh
+mandoc -Tlint \
+  docs/man/notm.1 \
+  docs/man/notm-config.5 \
+  docs/man/notm-test-harness.7 \
+  docs/man/notm-automation.7
+desktop-file-validate packaging/io.github.kris004.notm.desktop
+appstreamcli validate --strict --pedantic --no-net \
+  packaging/io.github.kris004.notm.metainfo.xml
+```
+
+`tests/source_archive_smoke.sh` creates the exact source-archive form, confirms
+that it has no `.git`, verifies embedded commit and version provenance, and
+runs a clean locked release build, workspace test, fixture smoke, and packaging
+suite from the extraction. The packaging suite includes the deliberate
+Cargo.lock-mutation negative test and the standalone release-bundle verifier.
 
 ## Live smoke commands
 
@@ -42,8 +100,8 @@ Live smoke commands use the user's configured Notmuch database and/or send
 transport. Run them only when that is intentional.
 
 ```sh
-cargo run -p notm-app -- live-readonly-smoke
-cargo run -p notm-app -- live-self-send
+make smoke-live-readonly
+make smoke-live-send
 ```
 
 `live-readonly-smoke` opens the configured Notmuch database read-only and runs
@@ -58,7 +116,7 @@ ordering, selected `NOTMUCH_*` environment propagation, nonzero-exit handling,
 bounded diagnostics, and timeout cleanup:
 
 ```sh
-cargo test -p notm-ui main_window::tests::sync_ --lib -- --nocapture
+cargo test --locked -p notm-ui main_window::tests::sync_ --lib -- --nocapture
 ```
 
 Four required-display smokes exercise the real GTK startup/manual actions,
@@ -72,7 +130,7 @@ for test in \
   closing_main_window_waits_for_manual_sync
 do
   NOTM_REQUIRE_GTK_DISPLAY=1 \
-    cargo test -p notm-app --test desktop_ui_smoke "$test" -- \
+    cargo test --locked -p notm-app --test desktop_ui_smoke "$test" -- \
       --exact --nocapture --test-threads=1
 done
 ```
@@ -101,7 +159,7 @@ Use fixture data first when validating UI behavior. Start the app with the local
 developer test harness:
 
 ```sh
-cargo run -p notm-app -- launch --fixture \
+cargo run --locked -p notm-app -- launch --fixture \
   --test-harness \
   --test-harness-socket /tmp/notm.sock \
   --test-harness-token dev-token
@@ -145,11 +203,11 @@ mode turns a missing display into a failure instead of a skip:
 
 ```sh
 NOTM_REQUIRE_GTK_DISPLAY=1 \
-  cargo test -p notm-app --test desktop_ui_smoke \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
   fixture_settings_preview_limits_apply_without_partial_persistence \
   -- --exact --nocapture --test-threads=1
 NOTM_REQUIRE_GTK_DISPLAY=1 \
-  cargo test -p notm-app --test desktop_ui_smoke \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
   fixture_theme_modes_follow_both_simulated_system_preferences \
   -- --exact --nocapture --test-threads=1
 ```
@@ -170,7 +228,7 @@ fixture-only except for the narrowly gated saved-draft Send flow documented in
 
 ```sh
 NOTM_REQUIRE_GTK_DISPLAY=1 \
-  cargo test -p notm-app --test desktop_ui_smoke \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
   fixture_draft_confirmations_preserve_rejected_state \
   -- --exact --nocapture --test-threads=1
 ```
@@ -181,7 +239,7 @@ and clean navigation away from the saved composer:
 
 ```sh
 NOTM_REQUIRE_GTK_DISPLAY=1 \
-  cargo test -p notm-app --test desktop_ui_smoke \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
   indexed_maildir_draft_refresh_stays_clean_during_message_navigation \
   -- --exact --nocapture --test-threads=1
 ```
@@ -192,7 +250,7 @@ without an unsaved-composer prompt:
 
 ```sh
 NOTM_REQUIRE_GTK_DISPLAY=1 \
-  cargo test -p notm-app --test desktop_ui_smoke \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
   indexed_maildir_saved_draft_restart_does_not_prompt_as_unsaved \
   -- --exact --nocapture --test-threads=1
 ```
@@ -203,7 +261,7 @@ the now-missing body:
 
 ```sh
 NOTM_REQUIRE_GTK_DISPLAY=1 \
-  cargo test -p notm-app --test desktop_ui_smoke \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
   fixture_indexed_draft_delete_removes_row_without_missing_body \
   -- --exact --nocapture --test-threads=1
 ```
@@ -215,7 +273,7 @@ exact undo restoration:
 
 ```sh
 NOTM_REQUIRE_GTK_DISPLAY=1 \
-  cargo test -p notm-app --test desktop_ui_smoke \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
   fixture_current_message_navigation_and_tagging_are_explicit \
   -- --exact --nocapture --test-threads=1
 ```
@@ -225,7 +283,7 @@ links receive distinct labels and that cancelling clears the mode:
 
 ```sh
 NOTM_REQUIRE_GTK_DISPLAY=1 \
-  cargo test -p notm-app --test desktop_ui_smoke \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
   fixture_html_link_hints_label_visible_links_and_cancel \
   -- --exact --nocapture --test-threads=1
 ```
@@ -240,7 +298,7 @@ for test in \
   fixture_existing_instance_mailto_request_confirms_dirty_replacement
 do
   NOTM_REQUIRE_GTK_DISPLAY=1 \
-    cargo test -p notm-app --test desktop_ui_smoke "$test" -- \
+    cargo test --locked -p notm-app --test desktop_ui_smoke "$test" -- \
       --exact --nocapture --test-threads=1
 done
 ```
@@ -251,7 +309,7 @@ directions, and proves the selected message does not change:
 
 ```sh
 NOTM_REQUIRE_GTK_DISPLAY=1 \
-  cargo test -p notm-app --test desktop_ui_smoke \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
   fixture_ctrl_e_y_scroll_message_list_without_changing_selection \
   -- --exact --nocapture --test-threads=1
 ```
@@ -263,7 +321,7 @@ selected message:
 
 ```sh
 NOTM_REQUIRE_GTK_DISPLAY=1 \
-  cargo test -p notm-app --test desktop_ui_smoke \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
   fixture_message_and_sender_views_persist_with_message_precedence \
   -- --exact --nocapture --test-threads=1
 ```
@@ -284,7 +342,7 @@ without allowing them to mutate the selected message. It requires
 `dbus-run-session`, `sway`, `swaymsg`, and `wtype`:
 
 ```sh
-cargo build -p notm-app
+cargo build --locked -p notm-app
 python3 -B tests/ui_text_focus_smoke.py --binary target/debug/notm
 ```
 

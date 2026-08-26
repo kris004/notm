@@ -26,6 +26,7 @@ trap cleanup EXIT HUP INT TERM
 
 cd "$PROJECT_ROOT"
 
+./packaging/verify-release-metadata.py .
 desktop-file-validate packaging/io.github.kris004.notm.desktop
 # Keep packaging validation deterministic and independent of remote assets.
 appstreamcli validate --strict --pedantic --no-net \

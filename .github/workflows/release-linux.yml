@@ -36,6 +36,14 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Record committed Cargo.lock
+        id: cargo-lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'sha256=%s\n' "$(sha256sum Cargo.lock | cut -d ' ' -f 1)" \
+            >>"$GITHUB_OUTPUT"
+
       - name: Validate release source and authorization
         id: release
         env:
@@ -44,9 +52,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          packaging/check-release-key-expiry.sh \
+            docs/release-signing-key.asc \
+            "$RELEASE_SIGNING_FINGERPRINT"
           package_version="$(
-            cargo metadata --no-deps --format-version 1 |
-              jq -r '.packages[] | select(.name == "notm-app") | .version'
+            packaging/verify-release-metadata.py --print-version .
           )"
           [[ "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
           source_commit="$(git rev-parse HEAD)"
@@ -143,6 +153,7 @@ jobs:
             dbus-daemon \
             desktop-file-utils \
             file \
+            gnupg \
             libclang-dev \
             libgtk-4-dev \
             libgtksourceview-5-dev \
@@ -163,8 +174,8 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          cargo test --workspace --all-targets --all-features
-          cargo run -p notm-app -- fixture-smoke
+          cargo test --locked --workspace --all-targets --all-features
+          cargo run --locked -p notm-app -- fixture-smoke
           make check-packaging
 
       - name: Build release binary
@@ -220,7 +231,11 @@ jobs:
 
           rm dist/BUILD-INFO.txt dist/ldd.txt
           test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 3
-          (cd dist && sha256sum --check SHA256SUMS)
+          packaging/verify-linux-release.sh \
+            dist \
+            "$VERSION" \
+            x86_64-unknown-linux-gnu \
+            "$SOURCE_COMMIT"
 
           mkdir -p verify/binary verify/source verify/tag
           tar -xzf \
@@ -236,6 +251,17 @@ jobs:
           verify/binary/notm-v"${VERSION}"-x86_64-unknown-linux-gnu/bin/notm \
             --version
 
+          (
+            cd "verify/source/notm-${VERSION}"
+            test ! -e .git
+            CARGO_TARGET_DIR="${RUNNER_TEMP}/notm-source-archive-target"
+            export CARGO_TARGET_DIR
+            cargo build --release --locked -p notm-app
+            cargo test --locked --workspace --all-targets --all-features
+            cargo run --locked -p notm-app -- fixture-smoke
+            make check-packaging
+          )
+
       - name: Upload release assets
         id: upload
         # v7.0.1
@@ -248,6 +274,15 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
+
+      - name: Verify Cargo.lock is unchanged
+        if: always()
+        env:
+          EXPECTED_SHA256: ${{ steps.cargo-lock.outputs.sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          packaging/verify-cargo-lock.sh Cargo.lock "$EXPECTED_SHA256"
 
   attest:
     name: Attest release assets
