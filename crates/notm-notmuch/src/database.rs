@@ -1,4 +1,15 @@
-use std::{collections::BTreeSet, ffi::CString, os::raw::c_char, path::Path, ptr::NonNull};
+use std::{
+    collections::BTreeSet,
+    ffi::{CStr, CString},
+    fs::File,
+    io::{Read, Seek},
+    os::raw::c_char,
+    path::{Path, PathBuf},
+    ptr::NonNull,
+};
+
+#[cfg(unix)]
+use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +55,64 @@ pub struct Revision {
     pub revision: u64,
     pub uuid: String,
 }
+
+/// A currently indexed message file opened for reading.
+///
+/// Keeping the handle and its path together lets callers parse the already-open
+/// file without checking a path and reopening it after a Maildir move.
+#[derive(Debug)]
+pub struct ResolvedMessageFile {
+    path: PathBuf,
+    file: File,
+}
+
+impl ResolvedMessageFile {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+
+    pub fn file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
+
+    pub fn into_parts(self) -> (PathBuf, File) {
+        (self.path, self.file)
+    }
+}
+
+impl Read for ResolvedMessageFile {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buffer)
+    }
+}
+
+impl Seek for ResolvedMessageFile {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(position)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadMessagePage {
+    pub thread_id: String,
+    pub messages: Vec<MessageSummary>,
+    pub total: u32,
+    pub offset: usize,
+    pub limit: usize,
+    pub revision: Revision,
+}
+
+impl ThreadMessagePage {
+    pub fn has_more(&self) -> bool {
+        self.offset.saturating_add(self.messages.len()) < self.total as usize
+    }
+}
+
+const COMPLETE_THREAD_PAGE_SIZE: usize = 256;
 
 pub struct Database {
     ptr: NonNull<ffi::notmuch_database_t>,
@@ -229,15 +298,151 @@ impl Database {
         self.search_messages_with_query(q.as_ptr(), options)
     }
 
-    pub fn thread_messages(&self, thread_id: &str) -> Result<Vec<MessageSummary>> {
+    /// Collect a complete thread without ever exceeding the caller's bound.
+    ///
+    /// The total is checked from the first bounded page before the result
+    /// vector is sized. Threads above `maximum` return an explicit error rather
+    /// than an oldest-only prefix that could be mistaken for the full thread.
+    /// Callers that do not need to retain the complete thread should consume
+    /// [`Self::thread_messages_page`] directly instead.
+    pub fn thread_messages_bounded(
+        &self,
+        thread_id: &str,
+        maximum: usize,
+    ) -> Result<Vec<MessageSummary>> {
+        let mut messages = Vec::new();
+        let mut message_ids = BTreeSet::new();
+        let mut expected_total = None;
+        let mut expected_revision = None;
+        let mut offset = 0usize;
+
+        loop {
+            let page_limit = COMPLETE_THREAD_PAGE_SIZE.min(maximum.saturating_sub(offset));
+            let page = self.thread_messages_page(thread_id, offset, page_limit)?;
+            let total = page.total as usize;
+            if let Some(expected) = expected_total {
+                check_thread_page_snapshot(
+                    thread_id,
+                    expected_revision
+                        .as_ref()
+                        .expect("thread total and revision are initialized together"),
+                    expected,
+                    messages.len(),
+                    &page,
+                )?;
+            } else {
+                expected_total = Some(total);
+                expected_revision = Some(page.revision.clone());
+                if total > maximum {
+                    return Err(Error::ThreadMessageLimitExceeded {
+                        thread_id: thread_id.to_string(),
+                        total,
+                        limit: maximum,
+                    });
+                }
+                messages.reserve(total);
+            }
+
+            let page_len = page.messages.len();
+            for message in page.messages {
+                if !message_ids.insert(message.message_id.clone()) {
+                    return Err(Error::InconsistentThreadMessages {
+                        thread_id: thread_id.to_string(),
+                        expected: total,
+                        loaded: messages.len(),
+                    });
+                }
+                messages.push(message);
+            }
+            offset = offset.saturating_add(page_len);
+
+            if offset >= total {
+                break;
+            }
+            if page_len == 0 {
+                return Err(Error::InconsistentThreadMessages {
+                    thread_id: thread_id.to_string(),
+                    expected: total,
+                    loaded: messages.len(),
+                });
+            }
+        }
+
+        let expected = expected_total.unwrap_or_default();
+        if messages.len() != expected {
+            return Err(Error::InconsistentThreadMessages {
+                thread_id: thread_id.to_string(),
+                expected,
+                loaded: messages.len(),
+            });
+        }
+        Ok(messages)
+    }
+
+    /// Return one oldest-first page from a thread, together with its full count.
+    ///
+    /// Consumers paging over multiple calls must require the returned
+    /// [`ThreadMessagePage::revision`] to remain identical. The bounded
+    /// collector above performs that validation automatically.
+    pub fn thread_messages_page(
+        &self,
+        thread_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<ThreadMessagePage> {
         let query = format!("thread:{thread_id}");
         let options = QueryOptions {
             sort: SortOrder::OldestFirst,
-            limit: 1000,
-            offset: 0,
+            limit,
+            offset,
             excluded_tags: Vec::new(),
         };
-        self.search_messages(&query, &options)
+        let revision_before = self.revision();
+        let total = self.count_messages(&query, &options)?;
+        let messages = if limit == 0 || offset >= total as usize {
+            Vec::new()
+        } else {
+            self.search_messages(&query, &options)?
+        };
+        let revision_after = self.revision();
+        let expected_page_len = (total as usize).saturating_sub(offset).min(limit);
+        if revision_before != revision_after || messages.len() != expected_page_len {
+            return Err(Error::InconsistentThreadMessages {
+                thread_id: thread_id.to_string(),
+                expected: total as usize,
+                loaded: offset.saturating_add(messages.len()),
+            });
+        }
+        Ok(ThreadMessagePage {
+            thread_id: thread_id.to_string(),
+            messages,
+            total,
+            offset,
+            limit,
+            revision: revision_before,
+        })
+    }
+
+    /// Resolve and open a message using the database's current filename list.
+    ///
+    /// Notmuch may associate several paths with one Message-ID, and a summary's
+    /// filenames can become stale after Maildir flag synchronization. This looks
+    /// the message up again, orders and de-duplicates its current filenames, and
+    /// tries every candidate until one can be opened as a regular file.
+    pub fn open_message_file(&self, message: &MessageSummary) -> Result<ResolvedMessageFile> {
+        let message_id = CString::new(message.message_id.as_str())?;
+        let mut current = std::ptr::null_mut();
+        let status = unsafe {
+            ffi::notmuch_database_find_message(self.ptr.as_ptr(), message_id.as_ptr(), &mut current)
+        };
+        check(status, self.status_string())?;
+        if current.is_null() {
+            return Err(Error::MessageNotFound(message.message_id.clone()));
+        }
+        let filenames =
+            unsafe { collect_filename_paths(ffi::notmuch_message_get_filenames(current)) };
+        unsafe { ffi::notmuch_message_destroy(current) };
+        open_message_candidates(&message.message_id, filenames)
     }
 
     pub fn index_file_with_tags(&self, path: &Path, tags: &[&str]) -> Result<String> {
@@ -502,6 +707,23 @@ impl Database {
     }
 }
 
+fn check_thread_page_snapshot(
+    thread_id: &str,
+    expected_revision: &Revision,
+    expected_total: usize,
+    loaded: usize,
+    page: &ThreadMessagePage,
+) -> Result<()> {
+    if page.revision != *expected_revision || page.total as usize != expected_total {
+        return Err(Error::InconsistentThreadMessages {
+            thread_id: thread_id.to_string(),
+            expected: expected_total,
+            loaded,
+        });
+    }
+    Ok(())
+}
+
 impl Drop for Database {
     fn drop(&mut self) {
         let _ = unsafe { ffi::notmuch_database_destroy(self.ptr.as_ptr()) };
@@ -672,6 +894,80 @@ unsafe fn collect_filenames(files: *mut ffi::notmuch_filenames_t) -> Vec<String>
     out
 }
 
+unsafe fn collect_filename_paths(files: *mut ffi::notmuch_filenames_t) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    while unsafe { ffi::notmuch_filenames_valid(files) } != 0 {
+        out.push(unsafe { cstr_to_path_buf(ffi::notmuch_filenames_get(files)) });
+        unsafe { ffi::notmuch_filenames_move_to_next(files) };
+    }
+    if !files.is_null() {
+        unsafe { ffi::notmuch_filenames_destroy(files) };
+    }
+    out
+}
+
+/// Convert a filename returned by libnotmuch without losing non-UTF-8 Unix bytes.
+///
+/// # Safety
+///
+/// `ptr` must be either null or point to a valid NUL-terminated string for the
+/// duration of this call.
+unsafe fn cstr_to_path_buf(ptr: *const c_char) -> PathBuf {
+    if ptr.is_null() {
+        return PathBuf::new();
+    }
+    let bytes = unsafe { CStr::from_ptr(ptr) }.to_bytes().to_vec();
+    #[cfg(unix)]
+    {
+        PathBuf::from(OsString::from_vec(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+fn open_message_candidates(
+    message_id: &str,
+    mut candidates: Vec<PathBuf>,
+) -> Result<ResolvedMessageFile> {
+    candidates.sort();
+    candidates.dedup();
+
+    let mut failures = Vec::new();
+    for path in &candidates {
+        match File::open(path) {
+            Ok(file) => match file.metadata() {
+                Ok(metadata) if metadata.is_file() => {
+                    return Ok(ResolvedMessageFile {
+                        path: path.clone(),
+                        file,
+                    });
+                }
+                Ok(_) => failures.push(format!("{}: not a regular file", path.display())),
+                Err(error) => failures.push(format!("{}: {error}", path.display())),
+            },
+            Err(error) => failures.push(format!("{}: {error}", path.display())),
+        }
+    }
+
+    const DISPLAYED_FAILURES: usize = 8;
+    let omitted = failures.len().saturating_sub(DISPLAYED_FAILURES);
+    failures.truncate(DISPLAYED_FAILURES);
+    let mut detail = if failures.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", failures.join("; "))
+    };
+    if omitted > 0 {
+        detail.push_str(&format!("; {omitted} more candidate(s) failed"));
+    }
+    Err(Error::MessageFileUnavailable {
+        message_id: message_id.to_string(),
+        detail,
+    })
+}
+
 fn mutate_message(
     message: *mut ffi::notmuch_message_t,
     mutation: &TagMutation,
@@ -759,6 +1055,47 @@ fn effective_tag_change(
 mod tests {
     use super::*;
 
+    fn create_test_database() -> (tempfile::TempDir, Database, PathBuf) {
+        let temp = tempfile::tempdir().expect("temporary Notmuch test root");
+        let root = temp.path().join("mail");
+        let maildir = root.join("account/cur");
+        std::fs::create_dir_all(&maildir).expect("create test Maildir cur");
+        std::fs::create_dir_all(root.join("account/new")).expect("create test Maildir new");
+        std::fs::create_dir_all(root.join("account/tmp")).expect("create test Maildir tmp");
+        let config_path = temp.path().join("notmuch-config");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[database]\npath={}\n\n[user]\nname=Fixture User\nprimary_email=fixture@example.test\n\n[new]\ntags=\nignore=\n\n[search]\nexclude_tags=\n\n[maildir]\nsynchronize_flags=true\n",
+                root.display()
+            ),
+        )
+        .expect("write Notmuch test config");
+        let database = Database::create(&OpenConfig {
+            database_path: Some(root),
+            config_path: Some(config_path),
+            profile: None,
+        })
+        .expect("create Notmuch test database");
+        (temp, database, maildir)
+    }
+
+    fn summary_by_id(database: &Database, message_id: &str) -> MessageSummary {
+        database
+            .search_messages(
+                &format!("id:{message_id}"),
+                &QueryOptions {
+                    limit: 1,
+                    offset: 0,
+                    sort: SortOrder::MessageId,
+                    excluded_tags: Vec::new(),
+                },
+            )
+            .expect("query test message")
+            .pop()
+            .expect("indexed test message")
+    }
+
     #[test]
     fn effective_tag_change_records_only_net_per_message_delta() {
         let mutation = TagMutation {
@@ -799,5 +1136,178 @@ mod tests {
             .expect("remove then add leaves an absent tag added");
         assert_eq!(change.added, ["inbox"]);
         assert!(change.removed.is_empty());
+    }
+
+    #[test]
+    fn message_file_resolution_refreshes_and_tries_every_current_filename() {
+        let (_temp, database, maildir) = create_test_database();
+        let first = maildir.join("a-missing:2,");
+        let duplicate = maildir.join("z-duplicate:2,");
+        let raw = b"From: sender@example.test\r\nTo: fixture@example.test\r\nSubject: resolver\r\nMessage-ID: <resolver@example.test>\r\n\r\nresolver body\r\n";
+        std::fs::write(&first, raw).expect("write resolver message");
+        database
+            .index_file_with_tags(&first, &[])
+            .expect("index first resolver filename");
+        std::fs::hard_link(&first, &duplicate).expect("create hard-linked duplicate");
+        database
+            .index_file_with_tags(&duplicate, &[])
+            .expect("index hard-linked duplicate");
+        let stale_summary = summary_by_id(&database, "resolver@example.test");
+        assert!(
+            stale_summary
+                .filenames
+                .iter()
+                .any(|path| Path::new(path) == first)
+        );
+        assert!(
+            stale_summary
+                .filenames
+                .iter()
+                .any(|path| Path::new(path) == duplicate)
+        );
+
+        std::fs::remove_file(&first).expect("remove lexically first copy");
+        let mut resolved = database
+            .open_message_file(&stale_summary)
+            .expect("fall back to later current filename");
+        assert_eq!(resolved.path(), duplicate);
+        let mut resolved_raw = Vec::new();
+        resolved
+            .read_to_end(&mut resolved_raw)
+            .expect("read already-open resolver file");
+        assert_eq!(resolved_raw, raw);
+
+        let moved = maildir.join("m-moved:2,S");
+        std::fs::rename(&duplicate, &moved).expect("move duplicate within Maildir");
+        database
+            .remove_message_file(&duplicate)
+            .expect("remove old moved filename from index");
+        database
+            .index_file_with_tags(&moved, &[])
+            .expect("index moved filename");
+        let preferred = maildir.join("b-preferred:2,S");
+        std::fs::hard_link(&moved, &preferred).expect("create second current hard link");
+        database
+            .index_file_with_tags(&preferred, &[])
+            .expect("index second current hard link");
+
+        let resolved = database
+            .open_message_file(&stale_summary)
+            .expect("refresh stale summary filenames after move");
+        assert_eq!(
+            resolved.path(),
+            preferred,
+            "current readable candidates should be chosen in deterministic path order"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_filename_conversion_preserves_non_utf8_unix_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let raw = CString::new(vec![b'm', b'a', b'i', b'l', b'-', 0xff]).expect("test C string");
+        let path = unsafe { cstr_to_path_buf(raw.as_ptr()) };
+
+        assert_eq!(path.as_os_str().as_bytes(), b"mail-\xff");
+    }
+
+    #[test]
+    fn complete_thread_messages_pages_past_one_thousand_without_truncation() {
+        let (_temp, database, maildir) = create_test_database();
+        const MESSAGE_COUNT: usize = 4_097;
+        for index in 0..MESSAGE_COUNT {
+            let date = chrono::DateTime::from_timestamp(1_700_000_000 + index as i64, 0)
+                .expect("valid bulk message timestamp")
+                .to_rfc2822();
+            let reply_headers = if index == 0 {
+                String::new()
+            } else {
+                "In-Reply-To: <bulk-0000@example.test>\r\nReferences: <bulk-0000@example.test>\r\n"
+                    .to_string()
+            };
+            let raw = format!(
+                "From: sender@example.test\r\nTo: fixture@example.test\r\nSubject: Bulk thread\r\nDate: {date}\r\nMessage-ID: <bulk-{index:04}@example.test>\r\n{reply_headers}\r\nbody {index}\r\n"
+            );
+            let path = maildir.join(format!("bulk-{index:04}:2,"));
+            std::fs::write(&path, raw).expect("write bulk message");
+            database
+                .index_file_with_tags(&path, &[])
+                .expect("index bulk message");
+        }
+
+        let root = summary_by_id(&database, "bulk-0000@example.test");
+        let first_page = database
+            .thread_messages_page(&root.thread_id, 0, 257)
+            .expect("load first explicit thread page");
+        assert_eq!(first_page.total as usize, MESSAGE_COUNT);
+        assert_eq!(first_page.messages.len(), 257);
+        assert!(first_page.has_more());
+        let final_page = database
+            .thread_messages_page(&root.thread_id, 4_000, 257)
+            .expect("load final explicit thread page");
+        assert_eq!(final_page.messages.len(), 97);
+        assert!(!final_page.has_more());
+
+        let too_small = database
+            .thread_messages_bounded(&root.thread_id, 4_096)
+            .expect_err("reject a thread above the caller's explicit bound");
+        assert!(matches!(
+            &too_small,
+            Error::ThreadMessageLimitExceeded {
+                total: MESSAGE_COUNT,
+                limit: 4_096,
+                ..
+            }
+        ));
+        assert!(
+            too_small
+                .to_string()
+                .contains("no partial thread was loaded")
+        );
+
+        let messages = database
+            .thread_messages_bounded(&root.thread_id, MESSAGE_COUNT)
+            .expect("load complete internally paged thread at the exact bound");
+        assert_eq!(messages.len(), MESSAGE_COUNT);
+        let ids = messages
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), MESSAGE_COUNT);
+        assert!(ids.contains("bulk-4096@example.test"));
+        assert_eq!(
+            messages.last().map(|message| message.message_id.as_str()),
+            Some("bulk-4096@example.test"),
+            "the complete oldest-first result must end with the actual newest message"
+        );
+    }
+
+    #[test]
+    fn bounded_thread_collection_rejects_revision_change_with_unchanged_total() {
+        let expected_revision = Revision {
+            revision: 7,
+            uuid: "database".to_string(),
+        };
+        let page = ThreadMessagePage {
+            thread_id: "thread".to_string(),
+            messages: Vec::new(),
+            total: 512,
+            offset: 256,
+            limit: 256,
+            revision: Revision {
+                revision: 8,
+                uuid: "database".to_string(),
+            },
+        };
+
+        assert!(matches!(
+            check_thread_page_snapshot("thread", &expected_revision, 512, 256, &page),
+            Err(Error::InconsistentThreadMessages {
+                expected: 512,
+                loaded: 256,
+                ..
+            })
+        ));
     }
 }

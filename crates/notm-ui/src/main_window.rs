@@ -19,7 +19,8 @@ use notm_mail::{
     address::{dedupe_addresses, format_address, parse_address_list},
     compose::{AttachmentInput, Identity},
     html_sanitize::sanitize_html,
-    mime::parse_file,
+    message_io::{BoundedText, read_header_text, read_raw_text},
+    mime::parse_reader,
     parse_mailto_uri,
 };
 use notm_notmuch::{
@@ -37,7 +38,7 @@ use crate::{
     automation::{self, AutomationConfig, AutomationRequest},
     model::{
         ActiveDraft, ActivePane, ComposeFields, ContentLayout, InputMode, LayoutPreference,
-        MessageViewPreference, ThemePreference, UiState,
+        MAX_LOADED_THREAD_MESSAGES, MessageViewPreference, ThemePreference, UiState,
     },
     screenshot, theme,
     widgets::attachments::{
@@ -65,8 +66,8 @@ use crate::{
         StandaloneMessageController, StandaloneMessageHasHtml, StandaloneOpenOptions,
         StandalonePolicyProvider, StandalonePolicySnapshot, StandalonePreferredView,
         StandaloneRememberView, StandaloneResponseAction, StandaloneResponseHandler,
-        StandaloneResponseRequest, StandaloneSenderView, StandaloneTextRenderer,
-        StandaloneToggleSenderView,
+        StandaloneResponseRequest, StandaloneSenderView, StandaloneSourceReader,
+        StandaloneTextRenderer, StandaloneToggleSenderView,
     },
     widgets::thread_list::{
         self, AppendSearchOutcome, LoadMoreDecision, LocatePagePlan, ReplaceSearchOutcome,
@@ -1304,7 +1305,12 @@ fn build_ui(
     message_actions.append(&copy_menu_button);
     right.append(&message_actions);
 
-    let attachments = AttachmentController::new(&window, attachment_open_dir, options.fixture_mode);
+    let attachments = AttachmentController::new(
+        &window,
+        attachment_open_dir,
+        options.fixture_mode,
+        open_config(&options),
+    );
     right.append(&attachments.title_widget());
     right.append(&attachments.scrolled_widget());
 
@@ -8318,7 +8324,7 @@ fn show_preferred_selected_message_view(
         state
             .selected_message
             .as_ref()
-            .map(|message| message_view_preference(&state, message))
+            .map(|message| message_view_preference(options, &state, message))
     };
     match preference.map(MessageViewKind::from_preference) {
         Some(MessageViewKind::Html) => show_visual_html_selected_message(options, widgets, state),
@@ -8335,7 +8341,7 @@ fn show_selected_message_text_view(
     widgets: &Widgets,
     state: &SharedState,
 ) {
-    match render_selected_message_text(widgets, state) {
+    match render_selected_message_text(options, widgets, state) {
         Ok(rendered) => {
             set_active_message_view(widgets, MessageViewKind::Text);
             show_text_message_view(options, widgets, state);
@@ -8361,63 +8367,67 @@ fn show_selected_message_text_view(
     update_debug(widgets, state);
 }
 
-fn render_selected_message_text(widgets: &Widgets, state: &SharedState) -> anyhow::Result<String> {
+fn render_selected_message_text(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) -> anyhow::Result<String> {
     let message = state
         .borrow()
         .selected_message
         .clone()
         .ok_or_else(|| anyhow::anyhow!("no selected message"))?;
-    render_message_text(&message, widgets.quote_collapse.get())
+    render_message_text(options, &message, widgets.quote_collapse.get())
 }
 
 fn render_message_text(
+    options: &LaunchOptions,
     message: &notm_notmuch::MessageSummary,
     collapse_quotes: bool,
 ) -> anyhow::Result<String> {
     let mut rendered = String::new();
-    if let Some(path) = message.filenames.first() {
-        match parse_file(path) {
-            Ok(parsed) => {
-                rendered.push_str(&render_body_with_quote_collapse(
-                    &parsed.safe_body,
-                    collapse_quotes,
-                ));
-                if !parsed.decode_warnings.is_empty() {
-                    if !rendered.is_empty() {
-                        rendered.push_str("\n\n");
-                    }
-                    rendered.push_str("MIME decode warnings:\n");
-                    for warning in &parsed.decode_warnings {
-                        rendered.push_str(&format!("- {warning}\n"));
-                    }
+    let source = open_message_file(options, message)?;
+    match parse_reader(source) {
+        Ok(parsed) => {
+            rendered.push_str(&render_body_with_quote_collapse(
+                &parsed.safe_body,
+                collapse_quotes,
+            ));
+            if !parsed.decode_warnings.is_empty() {
+                if !rendered.is_empty() {
+                    rendered.push_str("\n\n");
                 }
-                if !parsed.attachments.is_empty() {
-                    rendered.push_str("\n\nAttachments:\n");
-                    for att in &parsed.attachments {
-                        let filename = att.filename.as_deref().unwrap_or("unnamed");
-                        match &att.decode_error {
-                            Some(error) => rendered.push_str(&format!(
-                                "- {filename} ({}, decode failed: {error})\n",
-                                att.content_type
-                            )),
-                            None if att.decode_warnings.is_empty() => rendered.push_str(&format!(
-                                "- {filename} ({}, {} bytes)\n",
-                                att.content_type, att.size
-                            )),
-                            None => rendered.push_str(&format!(
-                                "- {filename} ({}, {} bytes; decoded with warning)\n",
-                                att.content_type, att.size
-                            )),
-                        }
-                    }
-                }
-                rendered.push_str("\n\nMIME tree:\n");
-                for node in parsed.mime_tree {
-                    rendered.push_str(&format!("  {node}\n"));
+                rendered.push_str("MIME decode warnings:\n");
+                for warning in &parsed.decode_warnings {
+                    rendered.push_str(&format!("- {warning}\n"));
                 }
             }
-            Err(err) => rendered.push_str(&format!("Could not parse body: {err}\n")),
+            if !parsed.attachments.is_empty() {
+                rendered.push_str("\n\nAttachments:\n");
+                for att in &parsed.attachments {
+                    let filename = att.filename.as_deref().unwrap_or("unnamed");
+                    match &att.decode_error {
+                        Some(error) => rendered.push_str(&format!(
+                            "- {filename} ({}, decode failed: {error})\n",
+                            att.content_type
+                        )),
+                        None if att.decode_warnings.is_empty() => rendered.push_str(&format!(
+                            "- {filename} ({}, {} bytes)\n",
+                            att.content_type, att.size
+                        )),
+                        None => rendered.push_str(&format!(
+                            "- {filename} ({}, {} bytes; decoded with warning)\n",
+                            att.content_type, att.size
+                        )),
+                    }
+                }
+            }
+            rendered.push_str("\n\nMIME tree:\n");
+            for node in parsed.mime_tree {
+                rendered.push_str(&format!("  {node}\n"));
+            }
         }
+        Err(err) => rendered.push_str(&format!("Could not parse body: {err}\n")),
     }
     Ok(rendered)
 }
@@ -8605,7 +8615,7 @@ fn choose_selected_message_view(
         widgets.status_label.set_text("No selected message");
         return false;
     };
-    if view == MessageViewKind::Html && !message_has_html(&message) {
+    if view == MessageViewKind::Html && !message_has_html(options, &message) {
         widgets.status_label.set_text("No visual HTML part");
         return false;
     }
@@ -8732,7 +8742,7 @@ fn update_message_tag_controls(widgets: &Widgets, state: &SharedState) {
 
 fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     let html_visible = html_view_is_visible(widgets);
-    let has_html = selected_message_has_html(state);
+    let has_html = selected_message_has_html(options, state);
     let (has_message, selected_thread, message_count, background_activity, send_in_progress) = {
         let state = state.borrow();
         (
@@ -8884,7 +8894,7 @@ fn start_link_hint_mode(options: &LaunchOptions, widgets: &Widgets, state: &Shar
             .set_text("Link hints are unavailable while composing");
         return true;
     }
-    if !selected_message_has_html(state) {
+    if !selected_message_has_html(options, state) {
         widgets
             .status_label
             .set_text("The selected message has no Visual HTML links");
@@ -8917,17 +8927,17 @@ fn webkit_view_images_allowed(view: &webkit6::WebView) -> bool {
         .unwrap_or(false)
 }
 
-fn selected_message_has_html(state: &SharedState) -> bool {
+fn selected_message_has_html(options: &LaunchOptions, state: &SharedState) -> bool {
     state
         .borrow()
         .selected_message
         .as_ref()
-        .is_some_and(message_has_html)
+        .is_some_and(|message| message_has_html(options, message))
 }
 
-fn message_has_html(message: &notm_notmuch::MessageSummary) -> bool {
-    message_filename(message)
-        .and_then(parse_file)
+fn message_has_html(options: &LaunchOptions, message: &notm_notmuch::MessageSummary) -> bool {
+    open_message_file(options, message)
+        .and_then(parse_reader)
         .ok()
         .and_then(|parsed| parsed.html_body)
         .is_some_and(|html| !html.trim().is_empty())
@@ -8935,18 +8945,20 @@ fn message_has_html(message: &notm_notmuch::MessageSummary) -> bool {
 
 fn show_raw_source(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     let scroll = current_message_scroll_fraction(widgets);
-    let result = (|| -> anyhow::Result<String> {
-        let filename = selected_message_filename(state)?;
-        Ok(std::fs::read_to_string(filename)?)
+    let result = (|| -> anyhow::Result<BoundedText> {
+        let message = selected_message(state)?;
+        Ok(read_raw_text(open_message_file(options, &message)?)?)
     })();
     match result {
         Ok(raw) => {
             set_active_message_view(widgets, MessageViewKind::Raw);
             show_text_message_view(options, widgets, state);
             widgets.message_view.set_monospace(true);
-            widgets.message_view.buffer().set_text(&raw);
+            widgets.message_view.buffer().set_text(&raw.text);
             restore_message_scroll_fraction(widgets, scroll);
-            widgets.status_label.set_text("Raw message source shown");
+            widgets
+                .status_label
+                .set_text(&bounded_source_status("Raw message source shown", &raw));
             let mut state = state.borrow_mut();
             state.last_operation = Some("showed raw source".to_string());
             state.last_error = None;
@@ -8963,19 +8975,21 @@ fn show_raw_source(options: &LaunchOptions, widgets: &Widgets, state: &SharedSta
 
 fn show_full_headers(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     let scroll = current_message_scroll_fraction(widgets);
-    let result = (|| -> anyhow::Result<String> {
-        let filename = selected_message_filename(state)?;
-        let raw = std::fs::read_to_string(filename)?;
-        Ok(header_block(&raw))
+    let result = (|| -> anyhow::Result<BoundedText> {
+        let message = selected_message(state)?;
+        Ok(read_header_text(open_message_file(options, &message)?)?)
     })();
     match result {
         Ok(headers) => {
             set_active_message_view(widgets, MessageViewKind::Headers);
             show_text_message_view(options, widgets, state);
             widgets.message_view.set_monospace(true);
-            widgets.message_view.buffer().set_text(&headers);
+            widgets.message_view.buffer().set_text(&headers.text);
             restore_message_scroll_fraction(widgets, scroll);
-            widgets.status_label.set_text("Full message headers shown");
+            widgets.status_label.set_text(&bounded_source_status(
+                "Full message headers shown",
+                &headers,
+            ));
             let mut state = state.borrow_mut();
             state.last_operation = Some("showed full headers".to_string());
             state.last_error = None;
@@ -8988,16 +9002,6 @@ fn show_full_headers(options: &LaunchOptions, widgets: &Widgets, state: &SharedS
         }
     }
     update_debug(widgets, state);
-}
-
-fn header_block(raw: &str) -> String {
-    if let Some((headers, _)) = raw.split_once("\r\n\r\n") {
-        headers.to_string()
-    } else if let Some((headers, _)) = raw.split_once("\n\n") {
-        headers.to_string()
-    } else {
-        raw.to_string()
-    }
 }
 
 fn toggle_quote_collapse(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -9046,21 +9050,35 @@ fn text_view_text(view: &gtk::TextView) -> String {
         .to_string()
 }
 
-fn selected_message_filename(state: &SharedState) -> anyhow::Result<String> {
+fn selected_message(state: &SharedState) -> anyhow::Result<notm_notmuch::MessageSummary> {
     state
         .borrow()
         .selected_message
-        .as_ref()
-        .and_then(|message| message.filenames.first().cloned())
-        .ok_or_else(|| anyhow::anyhow!("selected message has no file"))
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("no selected message"))
 }
 
-fn message_filename(message: &notm_notmuch::MessageSummary) -> anyhow::Result<String> {
-    message
-        .filenames
-        .first()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("message has no file"))
+fn open_message_file(
+    options: &LaunchOptions,
+    message: &notm_notmuch::MessageSummary,
+) -> anyhow::Result<notm_notmuch::ResolvedMessageFile> {
+    let database = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
+    Ok(database.open_message_file(message)?)
+}
+
+fn bounded_source_status(base: &str, source: &BoundedText) -> String {
+    let mut notes = Vec::new();
+    if source.truncated {
+        notes.push(format!("preview limited to {} bytes", source.bytes_read));
+    }
+    if source.lossy {
+        notes.push("invalid or binary bytes replaced".to_string());
+    }
+    if notes.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base} ({})", notes.join("; "))
+    }
 }
 
 fn selected_message_is_draft(options: &LaunchOptions, state: &SharedState) -> bool {
@@ -9095,13 +9113,11 @@ fn open_selected_draft_message(
         .selected_message
         .clone()
         .ok_or_else(|| anyhow::anyhow!("no selected draft message"))?;
-    let filename = message
-        .filenames
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("selected draft has no file"))?;
-    let (fields, attachment_inputs) = composer::prepare_draft_fields_from_message_file(filename)?;
+    let source = open_message_file(options, &message)?;
+    let path = source.path().to_path_buf();
+    let (fields, attachment_inputs) = composer::prepare_draft_fields_from_message_reader(source)?;
     let active_source = PreparedActiveDraft {
-        path: PathBuf::from(filename),
+        path,
         message_id: Some(message.message_id.clone()),
         indexed: true,
     };
@@ -9346,8 +9362,7 @@ fn render_visual_html_for_message(
         ImagePolicy::Config => message_allows_images(options, state, message),
         ImagePolicy::Once | ImagePolicy::TrustSender => true,
     };
-    let filename = message_filename(message)?;
-    let parsed = parse_file(filename)?;
+    let parsed = parse_reader(open_message_file(options, message)?)?;
     let decode_warning_count = parsed.decode_warnings.len();
     let html = parsed
         .html_body
@@ -9497,6 +9512,7 @@ fn resolve_message_view_preference(
 }
 
 fn message_view_preference(
+    options: &LaunchOptions,
     state: &UiState,
     message: &notm_notmuch::MessageSummary,
 ) -> MessageViewPreference {
@@ -9506,7 +9522,7 @@ fn message_view_preference(
         &state.sender_view_preferences,
         &message.message_id,
         message_sender_email(message).as_deref(),
-        message_has_html(message),
+        message_has_html(options, message),
     )
 }
 
@@ -9659,23 +9675,25 @@ fn html_view_state(
         .visible_child_name()
         .map(|name| name.to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    let (has_html, html_len, decode_warning_count, error) =
-        match selected_message_filename(state).and_then(parse_file) {
-            Ok(parsed) => (
-                parsed
-                    .html_body
-                    .as_ref()
-                    .is_some_and(|html| !html.trim().is_empty()),
-                parsed
-                    .html_body
-                    .as_ref()
-                    .map(|html| html.len())
-                    .unwrap_or(0),
-                parsed.decode_warnings.len(),
-                None,
-            ),
-            Err(err) => (false, 0, 0, Some(err.to_string())),
-        };
+    let parsed = selected_message(state)
+        .and_then(|message| open_message_file(options, &message))
+        .and_then(parse_reader);
+    let (has_html, html_len, decode_warning_count, error) = match parsed {
+        Ok(parsed) => (
+            parsed
+                .html_body
+                .as_ref()
+                .is_some_and(|html| !html.trim().is_empty()),
+            parsed
+                .html_body
+                .as_ref()
+                .map(|html| html.len())
+                .unwrap_or(0),
+            parsed.decode_warnings.len(),
+            None,
+        ),
+        Err(err) => (false, 0, 0, Some(err.to_string())),
+    };
     let sender_email = selected_sender_email(state);
     let sender_trusted = sender_email
         .as_deref()
@@ -10666,7 +10684,7 @@ fn select_thread_by_index(
 
     let result = (|| -> anyhow::Result<()> {
         let db = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
-        let messages = db.thread_messages(&thread.thread_id)?;
+        let messages = db.thread_messages_bounded(&thread.thread_id, MAX_LOADED_THREAD_MESSAGES)?;
         {
             let mut state = state.borrow_mut();
             state.selected_thread = Some(thread.clone());
@@ -10776,7 +10794,8 @@ fn open_loaded_thread_at_message(
     for (index, thread) in threads.iter().enumerate() {
         let result = (|| -> anyhow::Result<Option<usize>> {
             let db = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
-            let messages = db.thread_messages(&thread.thread_id)?;
+            let messages =
+                db.thread_messages_bounded(&thread.thread_id, MAX_LOADED_THREAD_MESSAGES)?;
             let Some(message_index) = messages
                 .iter()
                 .position(|message| message.message_id == message_id)
@@ -10872,7 +10891,7 @@ fn open_thread_by_index(
     let destination = thread_open_destination(pane_is_visible(widgets, ActivePane::Message));
     let result = (|| -> anyhow::Result<(Vec<notm_notmuch::MessageSummary>, usize)> {
         let db = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
-        let messages = db.thread_messages(&thread.thread_id)?;
+        let messages = db.thread_messages_bounded(&thread.thread_id, MAX_LOADED_THREAD_MESSAGES)?;
         let selected_index = messages.len().saturating_sub(1);
         {
             let mut s = state.borrow_mut();
@@ -10990,8 +11009,13 @@ fn open_standalone_message_window(
             response_sensitive: !state.send_in_progress,
         }
     });
-    let message_has_html: StandaloneMessageHasHtml = Rc::new(message_has_html);
-    let render_text: StandaloneTextRenderer = Rc::new(render_message_text);
+    let html_probe_options = options.clone();
+    let message_has_html: StandaloneMessageHasHtml =
+        Rc::new(move |message| message_has_html(&html_probe_options, message));
+    let text_options = options.clone();
+    let render_text: StandaloneTextRenderer = Rc::new(move |message, collapse_quotes| {
+        render_message_text(&text_options, message, collapse_quotes)
+    });
     let render_options = options.clone();
     let render_state = state.clone();
     let render_html: StandaloneHtmlRenderer = Rc::new(move |message, policy| {
@@ -11013,6 +11037,16 @@ fn open_standalone_message_window(
             ),
         })
     });
+    let raw_options = options.clone();
+    let read_raw: StandaloneSourceReader =
+        Rc::new(move |message| Ok(read_raw_text(open_message_file(&raw_options, message)?)?));
+    let header_options = options.clone();
+    let read_headers: StandaloneSourceReader = Rc::new(move |message| {
+        Ok(read_header_text(open_message_file(
+            &header_options,
+            message,
+        )?)?)
+    });
     let initialize_html_view: StandaloneHtmlViewInitializer =
         Rc::new(move |view, status_label, allow_remote_images| {
             configure_html_webview(view, allow_remote_images);
@@ -11032,9 +11066,11 @@ fn open_standalone_message_window(
             }
         });
     let open_link: LinkHintOpener = Rc::new(open_html_link_externally);
+    let preferred_options = options.clone();
     let preferred_state = state.clone();
-    let preferred_view: StandalonePreferredView =
-        Rc::new(move |message| message_view_preference(&preferred_state.borrow(), message));
+    let preferred_view: StandalonePreferredView = Rc::new(move |message| {
+        message_view_preference(&preferred_options, &preferred_state.borrow(), message)
+    });
     let remember_options = options.clone();
     let remember_state = state.clone();
     let remember_view: StandaloneRememberView = Rc::new(move |message, preference| {
@@ -11081,6 +11117,8 @@ fn open_standalone_message_window(
         message_has_html,
         render_text,
         render_html,
+        read_raw,
+        read_headers,
         initialize_html_view,
         scroll_html,
         open_link,
@@ -11159,34 +11197,34 @@ fn composed_reply_for_message(
     message: &notm_notmuch::MessageSummary,
     kind: ReplyKind,
 ) -> anyhow::Result<ComposedMessage> {
-    let path = message_filename(message)?;
+    let source = open_message_file(options, message)?;
     let identity =
         identity(options).ok_or_else(|| anyhow::anyhow!("No identity configured for reply"))?;
     let mut own = options.other_email.clone();
     if let Some(email) = &options.primary_email {
         own.push(email.clone());
     }
-    composer::composed_reply_from_file(path, &identity, &own, kind)
+    composer::composed_reply_from_reader(source, &identity, &own, kind)
 }
 
 fn composed_inline_forward_for_message(
     options: &LaunchOptions,
     message: &notm_notmuch::MessageSummary,
 ) -> anyhow::Result<ComposedMessage> {
-    let path = message_filename(message)?;
+    let source = open_message_file(options, message)?;
     let identity =
         identity(options).ok_or_else(|| anyhow::anyhow!("No identity configured for forward"))?;
-    composer::composed_inline_forward_from_file(path, &identity)
+    composer::composed_inline_forward_from_reader(source, &identity)
 }
 
 fn composed_attachment_forward_for_message(
     options: &LaunchOptions,
     message: &notm_notmuch::MessageSummary,
 ) -> anyhow::Result<ComposedMessage> {
-    let path = message_filename(message)?;
+    let source = open_message_file(options, message)?;
     let identity =
         identity(options).ok_or_else(|| anyhow::anyhow!("No identity configured for forward"))?;
-    composer::composed_attachment_forward_from_file(path, &identity)
+    composer::composed_attachment_forward_from_reader(source, &identity)
 }
 
 fn push_undo_tag_action(undo_state: &UndoState, action: UndoTagAction) {
@@ -15179,7 +15217,7 @@ fn handle_automation_request(
             json!({"ok": true, "trusted_image_senders": state.borrow().trusted_image_senders})
         }
         "html_view_state" => html_view_state(options, widgets, state),
-        "view_preference_state" => view_preference_state_json(widgets, state),
+        "view_preference_state" => view_preference_state_json(options, widgets, state),
         "click_sender_view_preference" => {
             update_sender_view_preference_button(widgets, state);
             widgets.view_menu_button.popup();
@@ -15189,7 +15227,7 @@ fn handle_automation_request(
                 && selected_sender_email(state).is_some()
             {
                 widgets.sender_view_preference_button.emit_clicked();
-                let mut result = view_preference_state_json(widgets, state);
+                let mut result = view_preference_state_json(options, widgets, state);
                 result["sender_button_was_visible"] = json!(button_was_visible);
                 result
             } else {
@@ -15733,12 +15771,16 @@ fn link_hint_state_json(widgets: &Widgets) -> serde_json::Value {
     })
 }
 
-fn view_preference_state_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
+fn view_preference_state_json(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) -> serde_json::Value {
     let state_ref = state.borrow();
     let selected_message = state_ref.selected_message.clone();
     let resolved = selected_message
         .as_ref()
-        .map(|message| message_view_preference(&state_ref, message));
+        .map(|message| message_view_preference(options, &state_ref, message));
     let selected_sender = selected_message.as_ref().and_then(message_sender_email);
     json!({
         "ok": true,

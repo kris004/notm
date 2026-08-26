@@ -13,14 +13,13 @@ use chrono::Utc;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use notm_notmuch::{
-    Database, DatabaseMode, MessageSummary, OpenConfig, QueryOptions, Revision, SortOrder,
-    ThreadSummary,
+    Database, DatabaseMode, OpenConfig, QueryOptions, Revision, SortOrder, ThreadSummary,
 };
 use serde_json::json;
 
 use crate::{
     cache::{BoundedLruCache, SEARCH_PAGE_CACHE_CAPACITY, THREAD_DETAIL_CACHE_CAPACITY},
-    model::ThreadUiDetails,
+    model::{MAX_LOADED_THREAD_MESSAGES, ThreadUiDetails},
 };
 
 use super::search_bar::{self, SearchWorkerRequest};
@@ -1081,20 +1080,13 @@ fn thread_row_widget(index: usize, snapshot: &ThreadRowSnapshot) -> gtk::Box {
     let content = gtk::Box::new(gtk::Orientation::Vertical, 3);
     content.set_hexpand(true);
     content.set_halign(gtk::Align::Fill);
-    let title = gtk::Label::new(Some(&format!(
-        "{}{}{}{}{}{}",
-        if thread.has_unread { "● " } else { "" },
-        if thread.is_flagged { "★ " } else { "" },
-        if detail.has_attachment { "📎 " } else { "" },
-        if detail.has_encrypted { "🔒 " } else { "" },
-        if detail.has_signed { "✍ " } else { "" },
-        thread.subject
-    )));
+    let title = gtk::Label::new(Some(&thread_title_text(thread, detail)));
     title.set_widget_name(&format!("notm-thread-title-{index}"));
     title.set_xalign(0.0);
     title.set_hexpand(true);
     title.set_halign(gtk::Align::Fill);
     title.set_wrap(true);
+    title.set_tooltip_text(detail.load_warning.as_deref());
     let meta_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     meta_row.set_hexpand(true);
     meta_row.set_halign(gtk::Align::Fill);
@@ -1153,6 +1145,23 @@ fn thread_row_widget(index: usize, snapshot: &ThreadRowSnapshot) -> gtk::Box {
     row_content.append(&content);
     box_.append(&row_content);
     box_
+}
+
+fn thread_title_text(thread: &ThreadSummary, detail: &ThreadUiDetails) -> String {
+    format!(
+        "{}{}{}{}{}{}{}",
+        if thread.has_unread { "● " } else { "" },
+        if thread.is_flagged { "★ " } else { "" },
+        if detail.has_attachment { "📎 " } else { "" },
+        if detail.has_encrypted { "🔒 " } else { "" },
+        if detail.has_signed { "✍ " } else { "" },
+        if detail.load_warning.is_some() {
+            "⚠ "
+        } else {
+            ""
+        },
+        thread.subject
+    )
 }
 
 fn connect_thread_row_multi_select(row: &gtk::Box, thread_id: &str, handler: MultiSelectHandler) {
@@ -1371,10 +1380,11 @@ fn thread_details_for_threads(
             out.insert(thread.thread_id.clone(), detail);
             continue;
         }
-        let detail = db
-            .thread_messages(&thread.thread_id)
-            .map(|messages| compute_thread_detail(&messages))
-            .unwrap_or_default();
+        let detail = match db.thread_messages_bounded(&thread.thread_id, MAX_LOADED_THREAD_MESSAGES)
+        {
+            Ok(messages) => compute_thread_detail(db, &messages),
+            Err(error) => unavailable_thread_detail(&error),
+        };
         thread_detail_cache()
             .lock()
             .expect("thread detail cache lock")
@@ -1384,24 +1394,28 @@ fn thread_details_for_threads(
     out
 }
 
-fn compute_thread_detail(messages: &[MessageSummary]) -> ThreadUiDetails {
+fn unavailable_thread_detail(error: &impl std::fmt::Display) -> ThreadUiDetails {
+    ThreadUiDetails {
+        load_warning: Some(format!("Thread details unavailable: {error}")),
+        ..ThreadUiDetails::default()
+    }
+}
+
+fn compute_thread_detail(
+    db: &Database,
+    messages: &[notm_notmuch::MessageSummary],
+) -> ThreadUiDetails {
     let mut detail = ThreadUiDetails::default();
     for message in messages {
-        for filename in &message.filenames {
-            let Ok(bytes) = std::fs::read(filename) else {
-                continue;
-            };
-            let raw_lower = String::from_utf8_lossy(&bytes).to_lowercase();
-            detail.has_encrypted |= raw_lower.contains("multipart/encrypted")
-                || raw_lower.contains("application/pgp-encrypted");
-            detail.has_signed |= raw_lower.contains("multipart/signed")
-                || raw_lower.contains("application/pgp-signature")
-                || raw_lower.contains("application/pkcs7-signature");
-            if let Ok(parsed) = notm_mail::mime::parse_rfc5322(&bytes) {
-                detail.has_attachment |= !parsed.attachments.is_empty();
-                if detail.preview.is_empty() {
-                    detail.preview = body_preview(&parsed.safe_body);
-                }
+        let Ok(source) = db.open_message_file(message) else {
+            continue;
+        };
+        if let Ok(parsed) = notm_mail::mime::parse_reader(source) {
+            detail.has_encrypted |= parsed.classification.has_encrypted();
+            detail.has_signed |= parsed.classification.has_signed();
+            detail.has_attachment |= !parsed.attachments.is_empty();
+            if detail.preview.is_empty() {
+                detail.preview = body_preview(&parsed.safe_body);
             }
         }
     }
@@ -1631,6 +1645,21 @@ mod tests {
         let long = body_preview(&"x".repeat(THREAD_PREVIEW_CACHE_MAX_CHARS + 50));
         assert_eq!(long.chars().count(), THREAD_PREVIEW_CACHE_MAX_CHARS);
         assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn oversized_thread_detail_failure_is_visible_and_explicitly_non_partial() {
+        let error = notm_notmuch::Error::ThreadMessageLimitExceeded {
+            thread_id: "large-thread".to_string(),
+            total: MAX_LOADED_THREAD_MESSAGES + 1,
+            limit: MAX_LOADED_THREAD_MESSAGES,
+        };
+        let detail = unavailable_thread_detail(&error);
+        let warning = detail.load_warning.as_deref().expect("visible warning");
+
+        assert!(warning.contains(&(MAX_LOADED_THREAD_MESSAGES + 1).to_string()));
+        assert!(warning.contains("no partial thread was loaded"));
+        assert!(thread_title_text(&test_thread("large-thread"), &detail).contains("⚠ "));
     }
 
     #[test]

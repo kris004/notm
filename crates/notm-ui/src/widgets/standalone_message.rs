@@ -6,7 +6,7 @@ use std::{
 use chrono::Utc;
 use gtk::prelude::*;
 use gtk4 as gtk;
-use notm_mail::{ReplyKind, address::parse_address_list};
+use notm_mail::{ReplyKind, address::parse_address_list, message_io::BoundedText};
 use notm_notmuch::MessageSummary;
 use serde::Serialize;
 use webkit6::prelude::WebViewExt;
@@ -67,6 +67,7 @@ pub(crate) type StandaloneTextRenderer =
     Rc<dyn Fn(&MessageSummary, bool) -> anyhow::Result<String>>;
 pub(crate) type StandaloneHtmlRenderer =
     Rc<dyn Fn(&MessageSummary, StandaloneImagePolicy) -> anyhow::Result<StandaloneHtmlRender>>;
+pub(crate) type StandaloneSourceReader = Rc<dyn Fn(&MessageSummary) -> anyhow::Result<BoundedText>>;
 pub(crate) type StandaloneHtmlViewInitializer = Rc<dyn Fn(&webkit6::WebView, &gtk::Label, bool)>;
 pub(crate) type StandaloneHtmlScrollHandler =
     Rc<dyn Fn(&webkit6::WebView, &gtk::Label, StandaloneHtmlScroll)>;
@@ -86,6 +87,8 @@ pub(crate) struct StandaloneOpenOptions {
     pub(crate) message_has_html: StandaloneMessageHasHtml,
     pub(crate) render_text: StandaloneTextRenderer,
     pub(crate) render_html: StandaloneHtmlRenderer,
+    pub(crate) read_raw: StandaloneSourceReader,
+    pub(crate) read_headers: StandaloneSourceReader,
     pub(crate) initialize_html_view: StandaloneHtmlViewInitializer,
     pub(crate) scroll_html: StandaloneHtmlScrollHandler,
     pub(crate) open_link: LinkHintOpener,
@@ -356,6 +359,8 @@ impl StandaloneMessageController {
             message_has_html: options.message_has_html,
             render_text: options.render_text,
             render_html: options.render_html,
+            read_raw: options.read_raw,
+            read_headers: options.read_headers,
             scroll_html: options.scroll_html,
             respond: options.respond,
             preferred_view: options.preferred_view,
@@ -508,6 +513,8 @@ struct StandaloneMessageWindow {
     message_has_html: StandaloneMessageHasHtml,
     render_text: StandaloneTextRenderer,
     render_html: StandaloneHtmlRenderer,
+    read_raw: StandaloneSourceReader,
+    read_headers: StandaloneSourceReader,
     scroll_html: StandaloneHtmlScrollHandler,
     respond: StandaloneResponseHandler,
     preferred_view: StandalonePreferredView,
@@ -1347,18 +1354,16 @@ fn show_html_message(standalone: &StandaloneMessageWindow, message: &MessageSumm
 }
 
 fn show_headers(standalone: &StandaloneMessageWindow, message: &MessageSummary) -> bool {
-    let result = (|| -> anyhow::Result<String> {
-        let filename = message_filename(message)?;
-        Ok(header_block(&std::fs::read_to_string(filename)?))
-    })();
+    let result = (standalone.read_headers)(message);
     match result {
         Ok(headers) => {
             set_active_message_view(standalone, MessageViewKind::Headers);
             standalone.text_view.set_monospace(true);
-            standalone.text_view.buffer().set_text(&headers);
-            standalone
-                .status_label
-                .set_text("Full message headers shown");
+            standalone.text_view.buffer().set_text(&headers.text);
+            standalone.status_label.set_text(&bounded_source_status(
+                "Full message headers shown",
+                &headers,
+            ));
             true
         }
         Err(err) => {
@@ -1371,16 +1376,15 @@ fn show_headers(standalone: &StandaloneMessageWindow, message: &MessageSummary) 
 }
 
 fn show_raw(standalone: &StandaloneMessageWindow, message: &MessageSummary) -> bool {
-    let result = (|| -> anyhow::Result<String> {
-        let filename = message_filename(message)?;
-        Ok(std::fs::read_to_string(filename)?)
-    })();
+    let result = (standalone.read_raw)(message);
     match result {
         Ok(raw) => {
             set_active_message_view(standalone, MessageViewKind::Raw);
             standalone.text_view.set_monospace(true);
-            standalone.text_view.buffer().set_text(&raw);
-            standalone.status_label.set_text("Raw message source shown");
+            standalone.text_view.buffer().set_text(&raw.text);
+            standalone
+                .status_label
+                .set_text(&bounded_source_status("Raw message source shown", &raw));
             true
         }
         Err(err) => {
@@ -1848,21 +1852,18 @@ fn truncate_status_text(value: &str, max_chars: usize) -> String {
     out
 }
 
-fn message_filename(message: &MessageSummary) -> anyhow::Result<String> {
-    message
-        .filenames
-        .first()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("message has no file"))
-}
-
-fn header_block(raw: &str) -> String {
-    if let Some((headers, _)) = raw.split_once("\r\n\r\n") {
-        headers.to_string()
-    } else if let Some((headers, _)) = raw.split_once("\n\n") {
-        headers.to_string()
+fn bounded_source_status(base: &str, source: &BoundedText) -> String {
+    let mut notes = Vec::new();
+    if source.truncated {
+        notes.push(format!("preview limited to {} bytes", source.bytes_read));
+    }
+    if source.lossy {
+        notes.push("invalid or binary bytes replaced".to_string());
+    }
+    if notes.is_empty() {
+        base.to_string()
     } else {
-        raw.to_string()
+        format!("{base} ({})", notes.join("; "))
     }
 }
 

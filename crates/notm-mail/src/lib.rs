@@ -5,6 +5,7 @@ pub mod external_command;
 pub mod forward;
 pub mod html_sanitize;
 pub mod mailto;
+pub mod message_io;
 pub mod mime;
 pub mod reply;
 pub mod rfc5322;

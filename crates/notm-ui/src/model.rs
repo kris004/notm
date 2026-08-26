@@ -13,6 +13,15 @@ use serde::{Deserialize, Serialize};
 /// the setting does not require a different thread-detail cache entry.
 pub const MAX_THREAD_PREVIEW_LINES: usize = 20;
 
+/// Maximum number of message summaries retained for interactive thread
+/// navigation.
+///
+/// Thread navigation keeps its summaries in GTK state, so requiring an
+/// explicit ceiling prevents an unexpectedly large thread from growing that
+/// synchronous state without bound. Threads over this limit are rejected with
+/// their exact count instead of displaying a partial prefix.
+pub const MAX_LOADED_THREAD_MESSAGES: usize = 4_096;
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemePreference {
@@ -226,6 +235,8 @@ pub struct ThreadUiDetails {
     pub has_encrypted: bool,
     pub has_signed: bool,
     pub preview: String,
+    #[serde(default)]
+    pub load_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
