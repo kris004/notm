@@ -71,10 +71,11 @@ use crate::{
     },
     widgets::thread_list::{
         self, AppendSearchOutcome, LoadMoreDecision, LocatePagePlan, ReplaceSearchOutcome,
-        SearchErrorOutcome, SearchPageCoordinator, SearchPageRequest, SearchPageResponse,
-        SearchRuntimeSnapshot, ThreadDisplayToggle, ThreadListController, ThreadListDisplay,
-        ThreadModelSnapshot, ThreadModelUpdate, ThreadPagingSnapshot, ThreadRowSnapshot,
-        ThreadSearchStateSnapshot, ThreadSearchStateUpdate, format_count, format_thread_list_date,
+        SearchCachePolicy, SearchErrorOutcome, SearchPageCoordinator, SearchPageRequest,
+        SearchPageResponse, SearchRuntimeSnapshot, ThreadDisplayToggle, ThreadListController,
+        ThreadListDisplay, ThreadModelSnapshot, ThreadModelUpdate, ThreadPagingSnapshot,
+        ThreadRowSnapshot, ThreadSearchStateSnapshot, ThreadSearchStateUpdate,
+        canonical_excluded_tags, format_count, format_thread_list_date,
         thread_window_status as thread_window_status_from_parts,
     },
 };
@@ -600,8 +601,80 @@ struct ThreadRangeSelectionResponse {
     generation: u64,
     anchor_index: usize,
     cursor_index: usize,
-    revision: notm_notmuch::Revision,
+    fingerprint: VisualSearchFingerprint,
     result: anyhow::Result<BTreeMap<String, notm_notmuch::ThreadSummary>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VisualSearchFingerprint {
+    query: String,
+    revision: notm_notmuch::Revision,
+    total_count: u32,
+    excluded_tags: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct VisualPageSelectionSnapshot {
+    fingerprint: VisualSearchFingerprint,
+    request_generation: u64,
+    anchor: Option<usize>,
+    cursor: Option<usize>,
+    selected_threads: BTreeSet<String>,
+    selected_thread_snapshots: BTreeMap<String, notm_notmuch::ThreadSummary>,
+}
+
+fn visual_page_selection_is_current(
+    snapshot: &VisualPageSelectionSnapshot,
+    state: &UiState,
+) -> bool {
+    state.visual_select_mode
+        && state.visual_selection_request_generation == snapshot.request_generation
+        && state.visual_select_anchor == snapshot.anchor
+        && state.visual_select_cursor == snapshot.cursor
+}
+
+fn visual_page_response_is_stale(
+    snapshot: Option<&VisualPageSelectionSnapshot>,
+    state: &UiState,
+) -> bool {
+    snapshot.is_some_and(|snapshot| !visual_page_selection_is_current(snapshot, state))
+}
+
+fn validate_visual_search_fingerprint(
+    expected: &VisualSearchFingerprint,
+    observed: &VisualSearchFingerprint,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        observed.query == expected.query,
+        "visual search query changed from `{}` to `{}`",
+        expected.query,
+        observed.query
+    );
+    anyhow::ensure!(
+        observed.revision.uuid == expected.revision.uuid,
+        "visual search database UUID changed from `{}` to `{}`",
+        expected.revision.uuid,
+        observed.revision.uuid
+    );
+    anyhow::ensure!(
+        observed.revision.revision == expected.revision.revision,
+        "visual search revision changed from {} to {}",
+        expected.revision.revision,
+        observed.revision.revision
+    );
+    anyhow::ensure!(
+        observed.total_count == expected.total_count,
+        "visual search thread count changed from {} to {}",
+        expected.total_count,
+        observed.total_count
+    );
+    anyhow::ensure!(
+        observed.excluded_tags == expected.excluded_tags,
+        "visual search excluded-tag policy changed from {:?} to {:?}",
+        expected.excluded_tags,
+        observed.excluded_tags
+    );
+    Ok(())
 }
 
 impl SearchActivityState for UiState {
@@ -5196,18 +5269,26 @@ fn load_thread_page_containing_index(
         return;
     }
     let visual_snapshot = {
+        let excluded_tags =
+            canonical_excluded_tags(settings::excluded_tags(&options.runtime_settings));
         let state = state.borrow();
         if state.visual_select_mode {
-            state.database_revision.clone().map(|revision| {
-                (
-                    state.current_query.clone(),
-                    revision,
-                    state.visual_select_anchor,
-                    state.visual_select_cursor,
-                    state.visual_selected_threads.clone(),
-                    state.visual_selected_thread_snapshots.clone(),
-                )
-            })
+            state
+                .database_revision
+                .clone()
+                .map(|revision| VisualPageSelectionSnapshot {
+                    fingerprint: VisualSearchFingerprint {
+                        query: state.current_query.clone(),
+                        revision,
+                        total_count: state.thread_total_count,
+                        excluded_tags,
+                    },
+                    request_generation: state.visual_selection_request_generation,
+                    anchor: state.visual_select_anchor,
+                    cursor: state.visual_select_cursor,
+                    selected_threads: state.visual_selected_threads.clone(),
+                    selected_thread_snapshots: state.visual_selected_thread_snapshots.clone(),
+                })
         } else {
             None
         }
@@ -5229,6 +5310,11 @@ fn load_thread_page_containing_index(
         offset: plan.offset,
         select_first: false,
         delay: Duration::ZERO,
+        cache_policy: if visual_snapshot.is_some() {
+            SearchCachePolicy::Bypass
+        } else {
+            SearchCachePolicy::Use
+        },
     };
     let coordinator = search_page_coordinator(options);
     let opts = options.clone();
@@ -5238,40 +5324,45 @@ fn load_thread_page_containing_index(
         if !accept_search_page_response(&w, &st, &response) {
             return;
         }
+        if visual_page_response_is_stale(visual_snapshot.as_ref(), &st.borrow()) {
+            update_thread_result_label(&w, &st);
+            update_debug(&w, &st);
+            return;
+        }
         match response.result {
             Ok(data) => {
-                if let Some((expected_query, expected_revision, ..)) = &visual_snapshot
-                    && (&data.query != expected_query || &data.revision != expected_revision)
-                {
-                    let error = format!(
-                        "Visual selection snapshot changed before page navigation (expected revision {}, got {}); reselect it",
-                        expected_revision.revision, data.revision.revision
-                    );
-                    st.borrow_mut().last_error = Some(error.clone());
-                    w.status_label.set_text(&error);
-                    update_thread_result_label(&w, &st);
-                    update_debug(&w, &st);
-                    return;
+                if let Some(snapshot) = &visual_snapshot {
+                    let observed_fingerprint = VisualSearchFingerprint {
+                        query: data.query.clone(),
+                        revision: data.revision.clone(),
+                        total_count: data.count,
+                        excluded_tags: data.excluded_tags.clone(),
+                    };
+                    if let Err(err) = validate_visual_search_fingerprint(
+                        &snapshot.fingerprint,
+                        &observed_fingerprint,
+                    ) {
+                        let error = format!(
+                            "Visual selection snapshot changed before page navigation; reselect it: {err}"
+                        );
+                        reject_visual_selection(&w, &st, error);
+                        update_thread_result_label(&w, &st);
+                        return;
+                    }
                 }
                 let outcome = thread_list::reduce_replace_search(data);
                 finish_replaced_search(&opts, &w, &st, outcome, false);
-                if let Some((
-                    _,
-                    _,
-                    anchor,
-                    cursor,
-                    selected_threads,
-                    selected_thread_snapshots,
-                )) = &visual_snapshot
-                {
+                if let Some(snapshot) = &visual_snapshot {
                     let mut state = st.borrow_mut();
                     state.visual_select_mode = true;
-                    state.visual_select_anchor = *anchor;
-                    state.visual_select_cursor = *cursor;
-                    state.visual_selected_threads.clone_from(selected_threads);
+                    state.visual_select_anchor = snapshot.anchor;
+                    state.visual_select_cursor = snapshot.cursor;
+                    state
+                        .visual_selected_threads
+                        .clone_from(&snapshot.selected_threads);
                     state
                         .visual_selected_thread_snapshots
-                        .clone_from(selected_thread_snapshots);
+                        .clone_from(&snapshot.selected_thread_snapshots);
                 }
                 let local_index = plan
                     .target_index
@@ -5280,8 +5371,23 @@ fn load_thread_page_containing_index(
                 update_thread_result_label(&w, &st);
             }
             Err(err) => {
-                let has_threads = !st.borrow().thread_list_items.is_empty();
-                finish_search_error(&w, &st, thread_list::reduce_search_error(err, has_threads));
+                if visual_snapshot.is_some() {
+                    reject_visual_selection(
+                        &w,
+                        &st,
+                        format!(
+                            "Visual selection page could not be validated; reselect it: {err}"
+                        ),
+                    );
+                    update_thread_result_label(&w, &st);
+                } else {
+                    let has_threads = !st.borrow().thread_list_items.is_empty();
+                    finish_search_error(
+                        &w,
+                        &st,
+                        thread_list::reduce_search_error(err, has_threads),
+                    );
+                }
             }
         }
     });
@@ -10459,6 +10565,7 @@ fn start_full_search(
             offset: 0,
             select_first: request.select_first,
             delay: request.delay,
+            cache_policy: SearchCachePolicy::Use,
         },
         "search cancelled",
         move |response| {
@@ -10598,6 +10705,7 @@ fn load_more_threads(
         offset,
         select_first: false,
         delay: Duration::ZERO,
+        cache_policy: SearchCachePolicy::Use,
     };
     let coordinator = search_page_coordinator(options);
     let opts = options.clone();
@@ -10845,12 +10953,7 @@ fn enter_visual_select_mode(widgets: &Widgets, state: &SharedState) {
 fn clear_visual_selection(widgets: &Widgets, state: &SharedState) {
     {
         let mut state = state.borrow_mut();
-        state.visual_select_mode = false;
-        state.visual_select_anchor = None;
-        state.visual_select_cursor = None;
-        state.visual_selected_threads.clear();
-        state.visual_selected_thread_snapshots.clear();
-        state.visual_selection_pending_range = None;
+        clear_visual_selection_targets(&mut state);
         state.input_mode = InputMode::Normal;
         state.active_pane = ActivePane::Threads;
     }
@@ -10858,6 +10961,30 @@ fn clear_visual_selection(widgets: &Widgets, state: &SharedState) {
     update_button_binding_labels(widgets, state);
     update_active_pane_visuals(widgets, state);
     widgets.status_label.set_text("Normal mode");
+}
+
+fn clear_visual_selection_targets(state: &mut UiState) {
+    state.visual_selection_request_generation =
+        state.visual_selection_request_generation.saturating_add(1);
+    state.visual_select_mode = false;
+    state.visual_select_anchor = None;
+    state.visual_select_cursor = None;
+    state.visual_selected_threads.clear();
+    state.visual_selected_thread_snapshots.clear();
+    state.visual_selection_pending_range = None;
+}
+
+fn reject_visual_selection(widgets: &Widgets, state: &SharedState, error: String) {
+    {
+        let mut state = state.borrow_mut();
+        clear_visual_selection_targets(&mut state);
+        state.last_error = Some(error.clone());
+    }
+    update_visual_selection_rows(widgets, state);
+    update_button_binding_labels(widgets, state);
+    update_active_pane_visuals(widgets, state);
+    widgets.status_label.set_text(&error);
+    update_debug(widgets, state);
 }
 
 fn toggle_multi_selected_thread(widgets: &Widgets, state: &SharedState) {
@@ -10995,6 +11122,9 @@ fn maybe_load_visual_selection_range(
     let Some(anchor_index) = visual_selection_anchor_index(widgets, state) else {
         return;
     };
+    let runtime = settings::snapshot(&options.runtime_settings);
+    let page_size = runtime.page_size.max(1);
+    let excluded_tags = canonical_excluded_tags(runtime.excluded_tags);
     let snapshot = {
         let state = state.borrow();
         state.database_revision.clone().map(|revision| {
@@ -11004,10 +11134,14 @@ fn maybe_load_visual_selection_range(
                 state.thread_list_items.len(),
                 state.search_generation,
                 revision,
+                state.thread_total_count,
+                excluded_tags,
             )
         })
     };
-    let Some((query, window_offset, loaded_len, generation, revision)) = snapshot else {
+    let Some((query, window_offset, loaded_len, generation, revision, total_count, excluded_tags)) =
+        snapshot
+    else {
         let mut state = state.borrow_mut();
         state.visual_selection_request_generation =
             state.visual_selection_request_generation.saturating_add(1);
@@ -11042,49 +11176,68 @@ fn maybe_load_visual_selection_range(
     ));
 
     let open = open_config(options);
-    let runtime = settings::snapshot(&options.runtime_settings);
-    let page_size = runtime.page_size.max(1);
-    let excluded_tags = runtime.excluded_tags;
     let (tx, rx) = mpsc::channel::<ThreadRangeSelectionResponse>();
-    let expected_revision = revision.clone();
-    let request_revision = revision.clone();
+    let fingerprint = VisualSearchFingerprint {
+        query,
+        revision,
+        total_count,
+        excluded_tags,
+    };
+    let request_fingerprint = fingerprint.clone();
     thread::spawn(move || {
-        let result = collect_thread_ids_for_range(
-            &open,
-            &query,
-            start,
-            end,
-            page_size,
-            excluded_tags,
-            &expected_revision,
-        );
+        let result = collect_thread_ids_for_range(&open, &fingerprint, start, end, page_size);
         let _ = tx.send(ThreadRangeSelectionResponse {
             request_generation,
             generation,
             anchor_index,
             cursor_index,
-            revision,
+            fingerprint,
             result,
         });
     });
 
     let w = widgets.clone();
     let st = state.clone();
+    let runtime_settings = options.runtime_settings.clone();
     gtk::glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
         Ok(response) => {
             let current_cursor =
                 selected_thread_index(&w).map(|index| st.borrow().thread_window_offset + index);
-            let response_is_current = response.request_generation
+            let request_is_current = response.request_generation
                 == st.borrow().visual_selection_request_generation
                 && response.generation == w.search_bar.current_generation()
                 && response.generation == st.borrow().search_generation
-                && st.borrow().database_revision.as_ref() == Some(&response.revision)
                 && st.borrow().visual_select_mode
                 && st.borrow().visual_select_anchor == Some(response.anchor_index)
                 && current_cursor == Some(response.cursor_index);
-            if response_is_current {
-                match response.result {
-                    Ok(snapshots) => {
+            if request_is_current {
+                let current_fingerprint = {
+                    let excluded_tags =
+                        canonical_excluded_tags(settings::excluded_tags(&runtime_settings));
+                    let state = st.borrow();
+                    state
+                        .database_revision
+                        .clone()
+                        .map(|revision| VisualSearchFingerprint {
+                            query: state.current_query.clone(),
+                            revision,
+                            total_count: state.thread_total_count,
+                            excluded_tags,
+                        })
+                };
+                let fingerprint_result = current_fingerprint
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("visual search revision is unavailable"))
+                    .and_then(|current| {
+                        validate_visual_search_fingerprint(&response.fingerprint, current)
+                    });
+                match (fingerprint_result, response.result) {
+                    (Err(err), _) => reject_visual_selection(
+                        &w,
+                        &st,
+                        format!("Visual selection changed; reselect it: {err}"),
+                    ),
+                    (Ok(()), Ok(snapshots)) => {
                         let count = snapshots.len();
                         {
                             let mut state = st.borrow_mut();
@@ -11099,19 +11252,11 @@ fn maybe_load_visual_selection_range(
                             format_count(count)
                         ));
                     }
-                    Err(err) => {
-                        {
-                            let mut state = st.borrow_mut();
-                            state.visual_selected_threads.clear();
-                            state.visual_selected_thread_snapshots.clear();
-                            state.visual_selection_pending_range = None;
-                            state.last_error = Some(err.to_string());
-                        }
-                        update_visual_selection_rows(&w, &st);
-                        w.status_label
-                            .set_text(&format!("Visual selection changed; reselect it: {err}"));
-                        update_debug(&w, &st);
-                    }
+                    (Ok(()), Err(err)) => reject_visual_selection(
+                        &w,
+                        &st,
+                        format!("Visual selection changed; reselect it: {err}"),
+                    ),
                 }
             }
             gtk::glib::ControlFlow::Break
@@ -11124,20 +11269,33 @@ fn maybe_load_visual_selection_range(
                 == st.borrow().visual_selection_request_generation
                 && generation == w.search_bar.current_generation()
                 && generation == st.borrow().search_generation
-                && st.borrow().database_revision.as_ref() == Some(&request_revision)
                 && st.borrow().visual_select_mode
                 && st.borrow().visual_select_anchor == Some(anchor_index)
                 && current_cursor == Some(cursor_index);
             if request_is_current {
-                {
-                    let mut state = st.borrow_mut();
-                    state.visual_selected_threads.clear();
-                    state.visual_selected_thread_snapshots.clear();
-                    state.visual_selection_pending_range = None;
-                    state.last_error = Some("visual selection ID worker disconnected".to_string());
-                }
-                update_visual_selection_rows(&w, &st);
-                update_debug(&w, &st);
+                let excluded_tags =
+                    canonical_excluded_tags(settings::excluded_tags(&runtime_settings));
+                let current_fingerprint =
+                    st.borrow()
+                        .database_revision
+                        .clone()
+                        .map(|revision| VisualSearchFingerprint {
+                            query: st.borrow().current_query.clone(),
+                            revision,
+                            total_count: st.borrow().thread_total_count,
+                            excluded_tags,
+                        });
+                let error = current_fingerprint
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("visual search revision is unavailable"))
+                    .and_then(|current| {
+                        validate_visual_search_fingerprint(&request_fingerprint, current)
+                    })
+                    .map_or_else(
+                        |error| format!("Visual selection changed; reselect it: {error}"),
+                        |()| "visual selection ID worker disconnected".to_string(),
+                    );
+                reject_visual_selection(&w, &st, error);
             }
             gtk::glib::ControlFlow::Break
         }
@@ -11146,21 +11304,45 @@ fn maybe_load_visual_selection_range(
 
 fn collect_thread_ids_for_range(
     open_config: &OpenConfig,
-    query: &str,
+    expected_fingerprint: &VisualSearchFingerprint,
     start: usize,
     end: usize,
     page_size: usize,
-    excluded_tags: Vec<String>,
-    expected_revision: &notm_notmuch::Revision,
 ) -> anyhow::Result<BTreeMap<String, notm_notmuch::ThreadSummary>> {
+    collect_thread_ids_for_range_with_page_hook(
+        open_config,
+        expected_fingerprint,
+        start,
+        end,
+        page_size,
+        |_| Ok(()),
+    )
+}
+
+fn collect_thread_ids_for_range_with_page_hook<F>(
+    open_config: &OpenConfig,
+    expected_fingerprint: &VisualSearchFingerprint,
+    start: usize,
+    end: usize,
+    page_size: usize,
+    mut after_page: F,
+) -> anyhow::Result<BTreeMap<String, notm_notmuch::ThreadSummary>>
+where
+    F: FnMut(usize) -> anyhow::Result<()>,
+{
     let db = Database::open(open_config, DatabaseMode::ReadOnly)?;
-    let opened_revision = db.revision();
-    anyhow::ensure!(
-        &opened_revision == expected_revision,
-        "Notmuch revision changed from {} to {}",
-        expected_revision.revision,
-        opened_revision.revision
-    );
+    let query = &expected_fingerprint.query;
+    let paging_revision = db.revision();
+    validate_visual_search_fingerprint(
+        expected_fingerprint,
+        &VisualSearchFingerprint {
+            query: query.clone(),
+            revision: paging_revision,
+            total_count: expected_fingerprint.total_count,
+            excluded_tags: expected_fingerprint.excluded_tags.clone(),
+        },
+    )?;
+    validate_database_visual_search_fingerprint(open_config, expected_fingerprint)?;
     let mut offset = (start / page_size.max(1)) * page_size.max(1);
     let mut snapshots = BTreeMap::new();
     while offset <= end {
@@ -11168,9 +11350,11 @@ fn collect_thread_ids_for_range(
             limit: page_size.max(1),
             offset,
             sort: SortOrder::NewestFirst,
-            excluded_tags: excluded_tags.clone(),
+            excluded_tags: expected_fingerprint.excluded_tags.clone(),
         };
         let threads = db.search_threads(query, &options)?;
+        after_page(offset)?;
+        validate_database_visual_search_fingerprint(open_config, expected_fingerprint)?;
         if threads.is_empty() {
             break;
         }
@@ -11186,6 +11370,7 @@ fn collect_thread_ids_for_range(
         }
         offset = next_offset;
     }
+    validate_database_visual_search_fingerprint(open_config, expected_fingerprint)?;
     let expected_count = end.saturating_sub(start).saturating_add(1);
     anyhow::ensure!(
         snapshots.len() == expected_count,
@@ -11193,6 +11378,40 @@ fn collect_thread_ids_for_range(
         snapshots.len()
     );
     Ok(snapshots)
+}
+
+fn validate_database_visual_search_fingerprint(
+    open_config: &OpenConfig,
+    expected: &VisualSearchFingerprint,
+) -> anyhow::Result<()> {
+    let db = Database::open(open_config, DatabaseMode::ReadOnly)?;
+    let revision_before_count = db.revision();
+    let count_options = QueryOptions {
+        limit: 1,
+        offset: 0,
+        sort: SortOrder::NewestFirst,
+        excluded_tags: expected.excluded_tags.clone(),
+    };
+    let total_count = db.count_threads(&expected.query, &count_options)?;
+    let revision_after_count = db.revision();
+    validate_visual_search_fingerprint(
+        expected,
+        &VisualSearchFingerprint {
+            query: expected.query.clone(),
+            revision: revision_before_count,
+            total_count,
+            excluded_tags: expected.excluded_tags.clone(),
+        },
+    )?;
+    validate_visual_search_fingerprint(
+        expected,
+        &VisualSearchFingerprint {
+            query: expected.query.clone(),
+            revision: revision_after_count,
+            total_count,
+            excluded_tags: expected.excluded_tags.clone(),
+        },
+    )
 }
 
 fn update_visual_selection_rows(widgets: &Widgets, state: &SharedState) {
@@ -18986,6 +19205,239 @@ fn apply_pane_visibility_values(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn visual_search_fingerprint(
+        revision: u64,
+        uuid: &str,
+        total_count: u32,
+    ) -> VisualSearchFingerprint {
+        VisualSearchFingerprint {
+            query: "tag:inbox".to_string(),
+            revision: notm_notmuch::Revision {
+                revision,
+                uuid: uuid.to_string(),
+            },
+            total_count,
+            excluded_tags: vec!["spam".to_string(), "trash".to_string()],
+        }
+    }
+
+    fn visual_page_snapshot_for_state(state: &UiState) -> VisualPageSelectionSnapshot {
+        VisualPageSelectionSnapshot {
+            fingerprint: visual_search_fingerprint(7, "database-uuid", 12),
+            request_generation: state.visual_selection_request_generation,
+            anchor: state.visual_select_anchor,
+            cursor: state.visual_select_cursor,
+            selected_threads: state.visual_selected_threads.clone(),
+            selected_thread_snapshots: state.visual_selected_thread_snapshots.clone(),
+        }
+    }
+
+    fn replace_with_newer_visual_targets(state: &mut UiState) {
+        clear_visual_selection_targets(state);
+        state.visual_select_mode = true;
+        state.visual_select_anchor = Some(20);
+        state.visual_select_cursor = Some(22);
+        state.visual_selected_threads = BTreeSet::from(["new-thread".to_string()]);
+    }
+
+    #[test]
+    fn visual_range_accepts_an_identical_search_fingerprint() {
+        let fingerprint = visual_search_fingerprint(7, "database-uuid", 12);
+
+        validate_visual_search_fingerprint(&fingerprint, &fingerprint)
+            .expect("identical visual search fingerprint");
+    }
+
+    #[test]
+    fn visual_range_rejects_uuid_or_numeric_revision_drift() {
+        let expected = visual_search_fingerprint(7, "database-uuid", 12);
+
+        for observed in [
+            visual_search_fingerprint(7, "replacement-database-uuid", 12),
+            visual_search_fingerprint(8, "database-uuid", 12),
+        ] {
+            assert!(
+                validate_visual_search_fingerprint(&expected, &observed).is_err(),
+                "revision drift was accepted: {observed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn visual_range_rejects_a_shifted_page_after_total_count_shrinks() {
+        let expected = visual_search_fingerprint(7, "database-uuid", 12);
+        let after_delete = visual_search_fingerprint(7, "database-uuid", 11);
+
+        let error = validate_visual_search_fingerprint(&expected, &after_delete)
+            .expect_err("an unchanged revision must not hide a shifted range after deletion");
+        assert!(error.to_string().contains("thread count changed"));
+    }
+
+    #[test]
+    fn visual_range_rejects_same_count_excluded_tag_policy_drift() {
+        let expected = visual_search_fingerprint(7, "database-uuid", 12);
+        let mut observed = expected.clone();
+        observed.excluded_tags = vec!["deleted".to_string(), "trash".to_string()];
+
+        let error = validate_visual_search_fingerprint(&expected, &observed)
+            .expect_err("same-count exclusion policy drift must invalidate visual targets");
+        assert!(error.to_string().contains("excluded-tag policy changed"));
+    }
+
+    #[test]
+    fn rejecting_visual_selection_clears_every_retained_target() {
+        let mut state = UiState {
+            visual_select_mode: true,
+            visual_select_anchor: Some(2),
+            visual_select_cursor: Some(7),
+            visual_selected_threads: BTreeSet::from(["thread-a".to_string()]),
+            visual_selected_thread_snapshots: BTreeMap::from([(
+                "thread-a".to_string(),
+                notm_notmuch::ThreadSummary {
+                    thread_id: "thread-a".to_string(),
+                    subject: String::new(),
+                    authors: String::new(),
+                    oldest_date: 0,
+                    newest_date: 0,
+                    matched_messages: 1,
+                    total_messages: 1,
+                    tags: Vec::new(),
+                    has_unread: false,
+                    is_flagged: false,
+                },
+            )]),
+            visual_selection_pending_range: Some((2, 7)),
+            ..UiState::default()
+        };
+
+        clear_visual_selection_targets(&mut state);
+
+        assert!(!state.visual_select_mode);
+        assert_eq!(state.visual_select_anchor, None);
+        assert_eq!(state.visual_select_cursor, None);
+        assert!(state.visual_selected_threads.is_empty());
+        assert!(state.visual_selected_thread_snapshots.is_empty());
+        assert_eq!(state.visual_selection_pending_range, None);
+    }
+
+    #[test]
+    fn stale_successful_visual_page_response_cannot_restore_old_targets() {
+        let mut state = UiState {
+            visual_select_mode: true,
+            visual_select_anchor: Some(2),
+            visual_select_cursor: Some(7),
+            visual_selected_threads: BTreeSet::from(["old-thread".to_string()]),
+            ..UiState::default()
+        };
+        let old_snapshot = visual_page_snapshot_for_state(&state);
+        replace_with_newer_visual_targets(&mut state);
+
+        assert!(visual_page_response_is_stale(Some(&old_snapshot), &state));
+        assert_eq!(
+            state.visual_selected_threads,
+            BTreeSet::from(["new-thread".to_string()]),
+            "discarding a stale success must preserve the newer visual targets"
+        );
+    }
+
+    #[test]
+    fn stale_failed_visual_page_response_cannot_clear_new_targets() {
+        let mut state = UiState {
+            visual_select_mode: true,
+            visual_select_anchor: Some(2),
+            visual_select_cursor: Some(7),
+            visual_selected_threads: BTreeSet::from(["old-thread".to_string()]),
+            ..UiState::default()
+        };
+        let old_snapshot = visual_page_snapshot_for_state(&state);
+        replace_with_newer_visual_targets(&mut state);
+
+        assert!(visual_page_response_is_stale(Some(&old_snapshot), &state));
+        assert_eq!(state.visual_select_anchor, Some(20));
+        assert_eq!(state.visual_select_cursor, Some(22));
+        assert_eq!(
+            state.visual_selected_threads,
+            BTreeSet::from(["new-thread".to_string()]),
+            "discarding a stale error must not clear the newer visual targets"
+        );
+    }
+
+    #[test]
+    fn visual_range_rejects_deletion_between_freshly_validated_pages() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("mail");
+        let maildir = root.join("cur");
+        std::fs::create_dir_all(&maildir)?;
+        let config_path = temp.path().join("notmuch-config");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[database]\npath={}\n\n[user]\nname=Fixture User\nprimary_email=fixture@example.test\n",
+                root.display()
+            ),
+        )?;
+        let open_config = OpenConfig {
+            database_path: Some(root),
+            config_path: Some(config_path),
+            profile: None,
+        };
+        let db = Database::create(&open_config)?;
+        let mut paths = Vec::new();
+        for index in 0..3 {
+            let path = maildir.join(format!("message-{index}:2,"));
+            std::fs::write(
+                &path,
+                format!(
+                    "From: Fixture User <fixture@example.test>\nTo: recipient@example.test\nSubject: Visual range {index}\nMessage-ID: <visual-range-{index}@fixture.test>\nDate: Tue, 19 Aug 2026 12:0{index}:00 -0600\n\nBody {index}.\n"
+                ),
+            )?;
+            db.index_file_with_tags(&path, &["inbox"])?;
+            paths.push(path);
+        }
+        let count_options = QueryOptions {
+            limit: 1,
+            offset: 0,
+            sort: SortOrder::NewestFirst,
+            excluded_tags: vec!["spam".to_string(), "trash".to_string()],
+        };
+        let fingerprint = VisualSearchFingerprint {
+            query: "tag:inbox".to_string(),
+            revision: db.revision(),
+            total_count: db.count_threads("tag:inbox", &count_options)?,
+            excluded_tags: count_options.excluded_tags,
+        };
+        drop(db);
+
+        let removed_path = paths.remove(0);
+        let mut removed = false;
+        let error = collect_thread_ids_for_range_with_page_hook(
+            &open_config,
+            &fingerprint,
+            0,
+            2,
+            1,
+            |_| {
+                if !removed {
+                    let db = Database::open(&open_config, DatabaseMode::ReadWrite)?;
+                    db.remove_message_file(&removed_path)?;
+                    drop(db);
+                    std::fs::remove_file(&removed_path)?;
+                    removed = true;
+                }
+                Ok(())
+            },
+        )
+        .expect_err("a deletion between range pages must invalidate the immutable snapshot");
+
+        assert!(removed, "the deterministic between-page hook did not run");
+        let error = error.to_string();
+        assert!(
+            error.contains("revision changed") || error.contains("thread count changed"),
+            "unexpected snapshot rejection: {error}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn tag_targets_remain_snapshot_ids_after_visible_rows_reorder() {
