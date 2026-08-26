@@ -262,6 +262,73 @@ fn successful_multi_file_maildir_sync_reports_current_filenames() -> anyhow::Res
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn non_utf8_maildir_sync_reconciles_exact_raw_paths() -> anyhow::Result<()> {
+    use std::{
+        ffi::OsString,
+        os::unix::ffi::{OsStrExt, OsStringExt},
+    };
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let options = query_options(SortOrder::NewestFirst);
+    let db = fixture.open_readwrite()?;
+    let original_path = fixture
+        .maildir
+        .join("cur")
+        .join(OsString::from_vec(b"non-utf8-\xff:2,".to_vec()));
+    fs::write(
+        &original_path,
+        b"From: raw-path@example.test\r\nTo: fixture@example.test\r\nSubject: Non-UTF-8 Maildir path\r\nMessage-ID: <non-utf8-path@fixture.test>\r\n\r\nbody\r\n",
+    )?;
+    let message_id = db.index_file_with_tags(&original_path, &["inbox", "unread"])?;
+
+    let report = db.apply_tags_to_messages(
+        &[MessageTagMutation {
+            message_id: message_id.clone(),
+            add: Vec::new(),
+            remove: vec!["unread".into()],
+        }],
+        true,
+    )?;
+    assert_complete(&report);
+    assert_eq!(report.changed_messages, 1);
+    let expected_path = fixture
+        .maildir
+        .join("cur")
+        .join(OsString::from_vec(b"non-utf8-\xff:2,S".to_vec()));
+    assert!(!original_path.exists());
+    assert!(expected_path.is_file());
+    assert_eq!(
+        report.changes[0].filenames,
+        [expected_path.to_string_lossy().into_owned()]
+    );
+    assert_eq!(
+        report.changes[0].filename_changes,
+        [notm_notmuch::MaildirFilenameChange {
+            previous_filename: original_path.to_string_lossy().into_owned(),
+            current_filename: expected_path.to_string_lossy().into_owned(),
+        }]
+    );
+    let current = only_message(&db, &format!("id:{message_id}"), &options)?;
+    let resolved = db.open_message_file(&current)?;
+    assert_eq!(
+        resolved.path().as_os_str().as_bytes(),
+        expected_path.as_os_str().as_bytes()
+    );
+    db.close()?;
+
+    let reopened = fixture.open_readonly()?;
+    let persisted = only_message(&reopened, &format!("id:{message_id}"), &options)?;
+    let resolved = reopened.open_message_file(&persisted)?;
+    assert_eq!(
+        resolved.path().as_os_str().as_bytes(),
+        expected_path.as_os_str().as_bytes()
+    );
+    reopened.close()?;
+    Ok(())
+}
+
 #[test]
 fn partial_maildir_rename_failure_is_reported_per_file() -> anyhow::Result<()> {
     let fixture = notm_test_support::FixtureDatabase::create()?;

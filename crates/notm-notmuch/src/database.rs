@@ -9,7 +9,10 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+use std::{
+    ffi::OsString,
+    os::unix::ffi::{OsStrExt, OsStringExt},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -915,15 +918,10 @@ unsafe fn collect_tags(tags: *mut ffi::notmuch_tags_t) -> Vec<String> {
 }
 
 unsafe fn collect_filenames(files: *mut ffi::notmuch_filenames_t) -> Vec<String> {
-    let mut out = Vec::new();
-    while unsafe { ffi::notmuch_filenames_valid(files) } != 0 {
-        out.push(unsafe { cstr_to_string(ffi::notmuch_filenames_get(files)) });
-        unsafe { ffi::notmuch_filenames_move_to_next(files) };
-    }
-    if !files.is_null() {
-        unsafe { ffi::notmuch_filenames_destroy(files) };
-    }
-    out
+    unsafe { collect_filename_paths(files) }
+        .iter()
+        .map(|path| report_filename(path))
+        .collect()
 }
 
 unsafe fn collect_filename_paths(files: *mut ffi::notmuch_filenames_t) -> Vec<PathBuf> {
@@ -1008,9 +1006,10 @@ fn mutate_message(
     let message_id = unsafe { cstr_to_string(ffi::notmuch_message_get_message_id(message)) };
     let mut before_tags = unsafe { collect_tags(ffi::notmuch_message_get_tags(message)) };
     before_tags.sort();
-    let mut before_filenames =
-        unsafe { collect_filenames(ffi::notmuch_message_get_filenames(message)) };
-    before_filenames.sort();
+    let mut before_filename_paths =
+        unsafe { collect_filename_paths(ffi::notmuch_message_get_filenames(message)) };
+    before_filename_paths.sort();
+    let before_filenames = report_filenames(&before_filename_paths);
     let effective = match effective_tag_mutation(&before_tags, mutation) {
         Some(effective) => effective,
         None if mutation.sync_maildir_flags => TagMutation {
@@ -1118,20 +1117,22 @@ fn mutate_message(
     let tag_operations_succeeded = failures
         .iter()
         .all(|failure| failure.stage == TagFailureStage::MaildirFlagSync);
-    let mut current_filenames =
-        unsafe { collect_filenames(ffi::notmuch_message_get_filenames(message)) };
-    current_filenames.sort();
-    let mut filename_changes = before_filenames
+    let mut current_filename_paths =
+        unsafe { collect_filename_paths(ffi::notmuch_message_get_filenames(message)) };
+    current_filename_paths.sort();
+    let mut filename_changes = before_filename_paths
         .iter()
-        .cloned()
-        .map(|filename| MaildirFilenameChange {
-            previous_filename: filename.clone(),
-            current_filename: filename,
+        .map(|filename| {
+            let filename = report_filename(filename);
+            MaildirFilenameChange {
+                previous_filename: filename.clone(),
+                current_filename: filename,
+            }
         })
         .collect::<Vec<_>>();
 
     if effective.sync_maildir_flags && thaw_succeeded && tag_operations_succeeded {
-        let expectations = before_filenames
+        let expectations = before_filename_paths
             .iter()
             .map(|filename| {
                 (
@@ -1145,13 +1146,14 @@ fn mutate_message(
             detail.to_string(),
         )
         .err();
-        let mut database_filenames =
-            unsafe { collect_filenames(ffi::notmuch_message_get_filenames(message)) };
-        database_filenames.sort();
+        let mut database_filename_paths =
+            unsafe { collect_filename_paths(ffi::notmuch_message_get_filenames(message)) };
+        database_filename_paths.sort();
         let (authoritative, reconciled_changes, file_failures) =
-            reconcile_maildir_filenames(&expectations, &database_filenames);
-        current_filenames = authoritative;
+            reconcile_maildir_filenames(&expectations, &database_filename_paths);
+        current_filename_paths = authoritative;
         filename_changes = reconciled_changes;
+        let current_filenames = report_filenames(&current_filename_paths);
         if let Some(err) = sync_error {
             failures.push(message_failure(
                 &message_id,
@@ -1170,6 +1172,8 @@ fn mutate_message(
             ));
         }
     }
+
+    let current_filenames = report_filenames(&current_filename_paths);
 
     let change = applied_tag_change(
         &message_id,
@@ -1258,20 +1262,48 @@ fn applied_tag_change(
     })
 }
 
-fn expected_maildir_filename(filename: &str, tags: &[String]) -> String {
-    let Some(last_slash) = filename.rfind('/') else {
-        return filename.to_string();
+// Public message/report models retain their String filename contract. Keep this
+// lossy conversion at that boundary; filesystem reconciliation must use Path.
+fn report_filename(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn report_filenames(paths: &[PathBuf]) -> Vec<String> {
+    paths.iter().map(|path| report_filename(path)).collect()
+}
+
+fn expected_maildir_filename(filename: &Path, tags: &[String]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        let expected = expected_maildir_filename_bytes(filename.as_os_str().as_bytes(), tags);
+        PathBuf::from(OsString::from_vec(expected))
+    }
+    #[cfg(not(unix))]
+    {
+        let filename = filename.to_string_lossy();
+        let expected = expected_maildir_filename_bytes(filename.as_bytes(), tags);
+        PathBuf::from(String::from_utf8_lossy(&expected).into_owned())
+    }
+}
+
+fn expected_maildir_filename_bytes(filename: &[u8], tags: &[String]) -> Vec<u8> {
+    let Some(last_slash) = filename.iter().rposition(|byte| *byte == b'/') else {
+        return filename.to_vec();
     };
     let directory_start = filename[..last_slash]
-        .rfind('/')
+        .iter()
+        .rposition(|byte| *byte == b'/')
         .map_or(0, |slash| slash + 1);
     let directory = &filename[directory_start..last_slash];
-    if directory != "cur" && directory != "new" {
-        return filename.to_string();
+    if directory != b"cur" && directory != b"new" {
+        return filename.to_vec();
     }
 
-    let maildir_info = filename.rfind(":2,").filter(|info| *info > last_slash);
-    let flag_bytes = maildir_info.map_or(&[][..], |info| &filename.as_bytes()[info + 3..]);
+    let maildir_info = filename
+        .windows(3)
+        .rposition(|window| window == b":2,")
+        .filter(|info| *info > last_slash);
+    let flag_bytes = maildir_info.map_or(&[][..], |info| &filename[info + 3..]);
     let mut flags = BTreeSet::new();
     let mut previous = None;
     for flag in flag_bytes {
@@ -1279,7 +1311,7 @@ fn expected_maildir_filename(filename: &str, tags: &[String]) -> String {
             || previous.is_some_and(|previous| *flag < previous)
             || !flags.insert(*flag)
         {
-            return filename.to_string();
+            return filename.to_vec();
         }
         previous = Some(*flag);
     }
@@ -1301,23 +1333,25 @@ fn expected_maildir_filename(filename: &str, tags: &[String]) -> String {
         }
     }
 
-    if directory == "new" && maildir_info.is_none() && !flags_changed {
-        return filename.to_string();
+    if directory == b"new" && maildir_info.is_none() && !flags_changed {
+        return filename.to_vec();
     }
-    let prefix = maildir_info.map_or(filename, |info| &filename[..info]);
-    let flags = flags.into_iter().map(char::from).collect::<String>();
-    let mut expected = format!("{prefix}:2,{flags}");
-    if directory == "new" {
-        expected.replace_range(directory_start..last_slash, "cur");
+    let prefix_end = maildir_info.unwrap_or(filename.len());
+    let mut expected = Vec::with_capacity(prefix_end.saturating_add(3 + flags.len()));
+    expected.extend_from_slice(&filename[..prefix_end]);
+    expected.extend_from_slice(b":2,");
+    expected.extend(flags);
+    if directory == b"new" {
+        expected.splice(directory_start..last_slash, b"cur".iter().copied());
     }
     expected
 }
 
 fn reconcile_maildir_filenames(
-    expectations: &[(String, String)],
-    database_filenames: &[String],
+    expectations: &[(PathBuf, PathBuf)],
+    database_filenames: &[PathBuf],
 ) -> (
-    Vec<String>,
+    Vec<PathBuf>,
     Vec<MaildirFilenameChange>,
     Vec<MaildirFlagSyncFailure>,
 ) {
@@ -1330,13 +1364,13 @@ fn reconcile_maildir_filenames(
         let current = [expected, previous]
             .into_iter()
             .find(|candidate| {
-                !claimed.contains(*candidate)
-                    && database_filenames.contains(*candidate)
+                !claimed.contains(candidate.as_path())
+                    && database_filenames.contains(candidate.as_path())
                     && path_is_message_file(candidate)
             })
             .or_else(|| {
                 [expected, previous].into_iter().find(|candidate| {
-                    !claimed.contains(*candidate) && path_is_message_file(candidate)
+                    !claimed.contains(candidate.as_path()) && path_is_message_file(candidate)
                 })
             })
             .cloned();
@@ -1344,17 +1378,17 @@ fn reconcile_maildir_filenames(
             claimed.insert(current.clone());
             authoritative.insert(current.clone());
             filename_changes.push(MaildirFilenameChange {
-                previous_filename: previous.clone(),
-                current_filename: current.clone(),
+                previous_filename: report_filename(previous),
+                current_filename: report_filename(current),
             });
         }
         let database_and_file_match =
-            database_filenames.contains(expected) && path_is_message_file(expected);
-        if current.as_deref() != Some(expected.as_str()) || !database_and_file_match {
+            database_filenames.contains(expected.as_path()) && path_is_message_file(expected);
+        if current.as_deref() != Some(expected.as_path()) || !database_and_file_match {
             failures.push(MaildirFlagSyncFailure {
-                previous_filename: previous.clone(),
-                expected_filename: expected.clone(),
-                current_filename: current,
+                previous_filename: report_filename(previous),
+                expected_filename: report_filename(expected),
+                current_filename: current.as_deref().map(report_filename),
             });
         }
     }
@@ -1375,7 +1409,7 @@ fn reconcile_maildir_filenames(
     )
 }
 
-fn path_is_message_file(path: &str) -> bool {
+fn path_is_message_file(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
@@ -1459,23 +1493,23 @@ mod tests {
     #[test]
     fn expected_maildir_filename_handles_new_cur_and_preserved_flags() {
         assert_eq!(
-            expected_maildir_filename("/mail/new/example", &["unread".to_string()]),
-            "/mail/new/example"
+            expected_maildir_filename(Path::new("/mail/new/example"), &["unread".to_string()]),
+            Path::new("/mail/new/example")
         );
         assert_eq!(
-            expected_maildir_filename("/mail/new/example", &[]),
-            "/mail/cur/example:2,S"
+            expected_maildir_filename(Path::new("/mail/new/example"), &[]),
+            Path::new("/mail/cur/example:2,S")
         );
         assert_eq!(
             expected_maildir_filename(
-                "/mail/cur/example:2,RSZ",
+                Path::new("/mail/cur/example:2,RSZ"),
                 &["draft".to_string(), "unread".to_string()]
             ),
-            "/mail/cur/example:2,DZ"
+            Path::new("/mail/cur/example:2,DZ")
         );
         assert_eq!(
-            expected_maildir_filename("/mail/cur/example:2,SS", &[]),
-            "/mail/cur/example:2,SS",
+            expected_maildir_filename(Path::new("/mail/cur/example:2,SS"), &[]),
+            Path::new("/mail/cur/example:2,SS"),
             "invalid duplicate flags must not be rewritten"
         );
     }
