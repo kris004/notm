@@ -10654,13 +10654,10 @@ fn finish_replaced_search(
         });
     {
         let mut state = state.borrow_mut();
-        if let Some((_, thread)) = &restored_thread {
-            state.selected_thread = Some(thread.clone());
-        } else {
-            state.selected_thread = None;
-            state.selected_message = None;
-            state.messages.clear();
-        }
+        reconcile_selected_message_state_after_search(
+            &mut state,
+            restored_thread.as_ref().map(|(_, thread)| thread),
+        );
         state.visual_select_mode = false;
         state.visual_select_anchor = None;
         state.visual_select_cursor = None;
@@ -12610,9 +12607,12 @@ fn finish_tag_worker(
     let mut refresh_required = completion_context.interrupted_search
         || concurrent_search
         || matches!(ui_action, PendingTagUiAction::Undo { .. });
+    let discard_retained_message_state;
     match response.result {
         Ok(result) => {
             thread_list::invalidate_search_caches();
+            discard_retained_message_state =
+                tag_report_requires_fresh_message_state(&result.report);
             let operation_complete = result.is_complete();
             let retained_paths_resolved = apply_completed_tag_report(
                 options,
@@ -12626,7 +12626,7 @@ fn finish_tag_worker(
             let complete = operation_complete && retained_paths_resolved;
             state.borrow_mut().tag_paths_uncertain =
                 !retained_paths_resolved || tag_report_has_uncertain_retained_state(&result.report);
-            refresh_required |= !complete;
+            refresh_required |= discard_retained_message_state || !complete;
             if complete {
                 let mut state = state.borrow_mut();
                 state.tag_warning = None;
@@ -12651,6 +12651,7 @@ fn finish_tag_worker(
         }
         Err(error) => {
             thread_list::invalidate_search_caches();
+            discard_retained_message_state = true;
             refresh_required = true;
             if let PendingTagUiAction::Undo { actions } = ui_action {
                 restore_undo_tag_actions(undo_state, actions);
@@ -12674,7 +12675,8 @@ fn finish_tag_worker(
     update_debug(widgets, state);
 
     if refresh_required {
-        let selected_thread_id = selected_thread_id_for_tag_refresh(&state.borrow());
+        let selected_thread_id =
+            selected_thread_id_for_tag_refresh(&state.borrow(), discard_retained_message_state);
         widgets
             .tag_refresh_selected_thread_id
             .replace(selected_thread_id);
@@ -12695,14 +12697,30 @@ fn finish_tag_worker(
     close_main_window_after_background_activity(widgets, state);
 }
 
-fn selected_thread_id_for_tag_refresh(state: &UiState) -> Option<String> {
-    if state.tag_paths_uncertain {
+fn selected_thread_id_for_tag_refresh(
+    state: &UiState,
+    discard_retained_message_state: bool,
+) -> Option<String> {
+    if state.tag_paths_uncertain || discard_retained_message_state {
         None
     } else {
         state
             .selected_thread
             .as_ref()
             .map(|thread| thread.thread_id.clone())
+    }
+}
+
+fn reconcile_selected_message_state_after_search(
+    state: &mut UiState,
+    restored_thread: Option<&notm_notmuch::ThreadSummary>,
+) {
+    if let Some(thread) = restored_thread {
+        state.selected_thread = Some(thread.clone());
+    } else {
+        state.selected_thread = None;
+        state.selected_message = None;
+        state.messages.clear();
     }
 }
 
@@ -12869,6 +12887,16 @@ fn tag_report_has_uncertain_retained_state(report: &notm_notmuch::TagBatchReport
             }
             notm_notmuch::TagFailureStage::Lookup => false,
         })
+}
+
+fn tag_report_requires_fresh_message_state(report: &notm_notmuch::TagBatchReport) -> bool {
+    // A lookup failure means a message disappeared between the immutable target snapshot and the
+    // writable operation. The failed lookup does not itself make paths uncertain, but without an
+    // authoritative message-to-thread result it is safest to discard all retained detail state.
+    report
+        .failures
+        .iter()
+        .any(|failure| failure.stage == notm_notmuch::TagFailureStage::Lookup)
 }
 
 fn apply_local_tag_mutation(
@@ -19251,13 +19279,137 @@ mod tests {
         };
 
         assert_eq!(
-            selected_thread_id_for_tag_refresh(&state).as_deref(),
+            selected_thread_id_for_tag_refresh(&state, false).as_deref(),
             Some("selected-thread")
         );
 
         state.tag_paths_uncertain = tag_report_has_uncertain_retained_state(&report);
 
-        assert_eq!(selected_thread_id_for_tag_refresh(&state), None);
+        assert_eq!(selected_thread_id_for_tag_refresh(&state, false), None);
+    }
+
+    #[test]
+    fn lookup_failure_reconciliation_discards_ghost_message_before_unblocking() {
+        let selected_thread = notm_notmuch::ThreadSummary {
+            thread_id: "selected-thread".to_string(),
+            subject: "Selected thread".to_string(),
+            authors: String::new(),
+            oldest_date: 0,
+            newest_date: 0,
+            matched_messages: 1,
+            total_messages: 1,
+            tags: vec!["inbox".to_string()],
+            has_unread: false,
+            is_flagged: false,
+        };
+        let ghost_message = notm_notmuch::MessageSummary {
+            message_id: "removed@example.test".to_string(),
+            thread_id: selected_thread.thread_id.clone(),
+            date: 0,
+            from: String::new(),
+            to: String::new(),
+            cc: String::new(),
+            subject: "Removed message".to_string(),
+            tags: vec!["inbox".to_string()],
+            filenames: vec!["/mail/cur/removed:2,S".to_string()],
+        };
+        let report = notm_notmuch::TagBatchReport {
+            requested_messages: 1,
+            failures: vec![notm_notmuch::MessageTagFailure {
+                message_id: ghost_message.message_id.clone(),
+                stage: notm_notmuch::TagFailureStage::Lookup,
+                detail: "message disappeared before lookup".to_string(),
+                current_filenames: Vec::new(),
+                file_failures: Vec::new(),
+            }],
+            ..notm_notmuch::TagBatchReport::default()
+        };
+        let warning = tag_batch_failure_summary(&report, &[]);
+        let retained_draft_path = PathBuf::from("/mail/cur/unrelated-draft:2,D");
+        let mut active_draft = Some(ActiveDraft {
+            path: retained_draft_path.clone(),
+            message_id: Some("unrelated-draft@example.test".to_string()),
+            indexed: true,
+            saved_fields: ComposeFields::default(),
+        });
+        let mut state = UiState {
+            selected_thread: Some(selected_thread),
+            selected_message: Some(ghost_message.clone()),
+            messages: vec![ghost_message],
+            tag_warning: Some(warning.clone()),
+            ..UiState::default()
+        };
+
+        assert!(!tag_report_has_uncertain_retained_state(&report));
+        assert!(!state.tag_paths_uncertain);
+        assert!(tag_report_requires_fresh_message_state(&report));
+        assert_eq!(selected_thread_id_for_tag_refresh(&state, true), None);
+        assert!(tag_path_actions_blocked(&state));
+        assert!(!report.is_complete());
+        assert_eq!(report.changed_messages, 0);
+        assert!(report.changes.is_empty());
+        assert!(report.path_states.is_empty());
+        assert!(inverse_tag_mutations(&report.changes).is_empty());
+        assert!(apply_active_draft_authoritative_paths(
+            &mut active_draft,
+            &report.changes,
+            &report.path_states,
+        ));
+        assert_eq!(
+            active_draft.expect("unrelated active draft").path,
+            retained_draft_path
+        );
+
+        reconcile_selected_message_state_after_search(&mut state, None);
+        assert_eq!(state.selected_thread, None);
+        assert_eq!(state.selected_message, None);
+        assert!(state.messages.is_empty());
+        assert_eq!(
+            reduce_tag_warning_after_search(&mut state, true),
+            TagWarningRefreshOutcome::Reconciled(warning)
+        );
+        assert_eq!(state.tag_warning, None);
+        assert!(!state.tag_paths_uncertain);
+        assert!(!tag_path_actions_blocked(&state));
+        assert_eq!(state.selected_thread, None);
+        assert_eq!(state.selected_message, None);
+        assert!(state.messages.is_empty());
+    }
+
+    #[test]
+    fn unrelated_lookup_failure_conservatively_suppresses_thread_restore() {
+        let state = UiState {
+            selected_thread: Some(notm_notmuch::ThreadSummary {
+                thread_id: "still-present-thread".to_string(),
+                subject: "Still present".to_string(),
+                authors: String::new(),
+                oldest_date: 0,
+                newest_date: 0,
+                matched_messages: 1,
+                total_messages: 1,
+                tags: vec!["inbox".to_string()],
+                has_unread: false,
+                is_flagged: false,
+            }),
+            ..UiState::default()
+        };
+        let report = notm_notmuch::TagBatchReport {
+            failures: vec![notm_notmuch::MessageTagFailure {
+                message_id: "different-thread-message@example.test".to_string(),
+                stage: notm_notmuch::TagFailureStage::Lookup,
+                detail: "not found".to_string(),
+                current_filenames: Vec::new(),
+                file_failures: Vec::new(),
+            }],
+            ..notm_notmuch::TagBatchReport::default()
+        };
+
+        assert!(tag_report_requires_fresh_message_state(&report));
+        assert_eq!(selected_thread_id_for_tag_refresh(&state, true), None);
+        assert_eq!(
+            selected_thread_id_for_tag_refresh(&state, false).as_deref(),
+            Some("still-present-thread")
+        );
     }
 
     #[test]
