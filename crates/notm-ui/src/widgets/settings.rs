@@ -1875,6 +1875,15 @@ fn persist_private_settings_toml(path: &Path, value: &toml::Value) -> anyhow::Re
 }
 
 fn atomic_write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    atomic_write_private_with_rename(path, bytes, |source, destination| {
+        std::fs::rename(source, destination)
+    })
+}
+
+fn atomic_write_private_with_rename<F>(path: &Path, bytes: &[u8], rename: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
     let configured_parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
@@ -1898,7 +1907,7 @@ fn atomic_write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         temporary.write_all(bytes)?;
         temporary.sync_all()?;
         drop(temporary);
-        std::fs::rename(&temporary_path, path)?;
+        rename(&temporary_path, path)?;
         Ok(())
     })();
     if write_result.is_err() {
@@ -2165,30 +2174,29 @@ mod tests {
         assert!(error.to_string().contains("must contain a TOML table"));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn failed_atomic_settings_write_preserves_original_policy_and_cleans_temporary_file() {
+    fn failed_atomic_settings_rename_preserves_original_policy_and_cleans_temporary_file() {
         let directory = tempfile::tempdir().expect("temporary settings directory");
-        let config_directory = directory.path().join("notm");
-        std::fs::create_dir(&config_directory).expect("create config directory");
-        let path = config_directory.join("config.toml");
+        let path = directory.path().join("config.toml");
         let original = b"[ui]\nremote_images = false\n";
         std::fs::write(&path, original).expect("seed remote-image policy");
-        std::fs::set_permissions(&config_directory, std::fs::Permissions::from_mode(0o500))
-            .expect("make config directory unwritable");
 
-        let result = persist_ui_value(Some(&path), "remote_images", toml::Value::Boolean(true));
+        let result =
+            atomic_write_private_with_rename(&path, b"[ui]\nremote_images = true\n", |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "simulated atomic rename failure",
+                ))
+            });
 
-        std::fs::set_permissions(&config_directory, std::fs::Permissions::from_mode(0o700))
-            .expect("restore config directory permissions");
-        let error = result.expect_err("unwritable config directory must reject policy save");
+        let error = result.expect_err("failed rename must reject policy save");
         assert!(error.to_string().contains("writing app config"), "{error}");
         assert_eq!(
             std::fs::read(&path).expect("read preserved config"),
             original,
             "failed persistence must not broaden the stored remote-image policy"
         );
-        let entries = std::fs::read_dir(&config_directory)
+        let entries = std::fs::read_dir(directory.path())
             .expect("list config directory")
             .collect::<Result<Vec<_>, _>>()
             .expect("read config entries");
