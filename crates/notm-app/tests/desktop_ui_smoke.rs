@@ -2893,6 +2893,7 @@ fn fixture_send_waits_for_draft_flush_and_aborts_on_flush_failure() -> anyhow::R
         );
     }
 
+    let before_send_write_count = draft_write_count(&draft_autosave_status(&mut driver)?)?;
     let started = driver.command("compose_send", json!({}))?;
     assert_eq!(started["ok"], true, "fixture send did not start: {started}");
     assert_eq!(
@@ -2910,18 +2911,33 @@ fn fixture_send_waits_for_draft_flush_and_aborts_on_flush_failure() -> anyhow::R
         0,
         "fixture transport ran before the delayed draft flush completed"
     );
+    let sent_generation = started["state"]["compose_generation"]
+        .as_u64()
+        .with_context(|| format!("send start had no composer generation: {started}"))?;
     let finalizing_deadline = Instant::now() + Duration::from_secs(3);
-    let finalizing = loop {
-        let state = driver.command("app_state", json!({}))?;
-        if regular_file_count(&capture_dir)? == 1 && state["state"]["send_in_progress"] == true {
-            break state;
+    let (finalizing, finalizing_autosave) = loop {
+        let state = driver.command("draft_list_state", json!({}))?;
+        let autosave = draft_autosave_status(&mut driver)?;
+        if state["status_text"] == "Finalizing accepted send…"
+            && state["compose_fields"]["subject"] == "Send waits for recovery flush"
+            && autosave["busy"] == true
+            && autosave["pending_generation"] == sent_generation
+            && draft_write_count(&autosave)? >= before_send_write_count.saturating_add(2)
+        {
+            break (state, autosave);
         }
         ensure!(
             Instant::now() < finalizing_deadline,
-            "send did not reach delayed accepted-send finalization: {state}"
+            "send did not reach the active accepted-send recovery clear: state={state}, autosave={autosave}"
         );
         thread::sleep(STARTUP_POLL_INTERVAL);
     };
+    assert_eq!(
+        regular_file_count(&capture_dir)?,
+        1,
+        "accepted-send recovery clear started before the fixture transport completed"
+    );
+    let mut last_edit = Value::Null;
     for (command, value) in [
         ("compose_set_subject", "Newer subject during final clear"),
         ("compose_set_body", "newer body during final clear"),
@@ -2931,13 +2947,29 @@ fn fixture_send_waits_for_draft_flush_and_aborts_on_flush_failure() -> anyhow::R
             edited["ok"], true,
             "{command} was blocked during accepted-send finalization: {edited}"
         );
+        last_edit = edited;
     }
+    assert_eq!(
+        last_edit["compose_fields"]["subject"], "Newer subject during final clear",
+        "accepted-send finalization did not retain the live subject edit: {last_edit}"
+    );
+    assert_eq!(
+        last_edit["compose_fields"]["body"], "newer body during final clear",
+        "accepted-send finalization did not retain the live body edit: {last_edit}"
+    );
+    let edited_state = driver.command("app_state", json!({}))?;
+    ensure!(
+        edited_state["state"]["compose_generation"]
+            .as_u64()
+            .is_some_and(|generation| generation > sent_generation),
+        "composer edits did not supersede accepted-send generation {sent_generation}: {edited_state}"
+    );
     thread::sleep(Duration::from_millis(150));
     let finalizing_health = driver.command("health", json!({}))?;
     ensure!(
         finalizing_health["gtk_heartbeat"].as_u64().unwrap_or(0)
             > during_flush["gtk_heartbeat"].as_u64().unwrap_or(0),
-        "GTK heartbeat stopped before/during accepted-send finalization: before={during_flush}, finalizing={finalizing}, after={finalizing_health}"
+        "GTK heartbeat stopped before/during accepted-send finalization: before={during_flush}, finalizing={finalizing}, autosave={finalizing_autosave}, after={finalizing_health}"
     );
     let sent = driver.wait_for_send(Duration::from_secs(4))?;
     assert_eq!(
@@ -8699,7 +8731,7 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
             "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = {}\nexcluded_tags = []\nsync_maildir_flags_after_tag_change = true\n\
              \n[identity]\nname = \"Fixture User\"\nprimary_email = \"fixture@example.test\"\n\
              \n[drafts]\nsave_maildir = false\nindex_after_save = false\n\
-             \n[automation]\nallow_live_tag_test = true\n",
+             \n[automation]\nallow_live_tag_test = true\nallow_live_send_test = true\n",
             toml_path(&fixture.root),
             toml_path(&fixture.config_path),
             toml::Value::String(initial_query.to_string()),
@@ -8854,11 +8886,33 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
 
     let race_tag = format!("notm/tag-race-{run_id}");
     let rejected_tag = format!("notm/rejected-race-{run_id}");
+    let loader_before_race = driver.command("thread_load_status", json!({}))?;
+    let cancelled_before_race = loader_before_race["cancelled"].as_u64().unwrap_or(0);
     let refresh = driver.command("run_search", json!({"query": "*", "test_delay_ms": 1_200}))?;
     assert_eq!(
         refresh["scheduled"], true,
         "delayed refresh was not scheduled: {refresh}"
     );
+    let delayed = driver.command("set_fixture_thread_delay", json!({"milliseconds": 1_200}))?;
+    assert_eq!(
+        delayed["ok"], true,
+        "could not delay preparation during the tag race: {delayed}"
+    );
+    let delayed_preparation =
+        driver.command("select_thread_by_index", json!({"index": other_index}))?;
+    assert_eq!(
+        delayed_preparation["ok"], true,
+        "could not schedule the overlapping thread preparation: {delayed_preparation}"
+    );
+    let delayed_status = driver.command("thread_load_status", json!({}))?;
+    assert_eq!(
+        delayed_status["busy"], true,
+        "overlapping thread preparation was not active: {delayed_status}"
+    );
+    let delayed_generation = delayed_status["generation"]
+        .as_u64()
+        .with_context(|| format!("overlapping preparation had no generation: {delayed_status}"))?;
+    driver.command("set_fixture_thread_delay", json!({"milliseconds": 0}))?;
     let tagged = driver.command(
         "tag_selected",
         json!({
@@ -8870,6 +8924,23 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
     assert_eq!(
         tagged["pending"], true,
         "tag mutation did not remain asynchronous: {tagged}"
+    );
+    let cancelled_preparation = driver.command("thread_load_status", json!({}))?;
+    assert_eq!(
+        cancelled_preparation["busy"], false,
+        "tag mutation left the stale preparation active: delayed_generation={delayed_generation}, status={cancelled_preparation}"
+    );
+    ensure!(
+        cancelled_preparation["cancelled"]
+            .as_u64()
+            .is_some_and(|cancelled| cancelled > cancelled_before_race),
+        "tag mutation did not cancel overlapping generation {delayed_generation}: before={loader_before_race}, after={cancelled_preparation}"
+    );
+    let retained_after_cancel = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        retained_after_cancel["state"]["selected_thread"]["thread_id"],
+        attachment_before_duplicate.thread_id,
+        "tag cancellation let delayed preparation replace the retained attachment thread: {retained_after_cancel}"
     );
     assert_eq!(
         driver.command("health", json!({}))?["ok"],
@@ -8993,6 +9064,56 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
         "the newly front-positioned thread was tagged instead of an immutable target"
     );
 
+    // Recreate the attachment message's pre-rename paths as readable, unindexed
+    // poison files. Cached-path-first reads must still use the raw authoritative
+    // path mappings from the tag report rather than accepting these stale files.
+    const STALE_PATH_SENTINEL: &str = "STALE-PATH-SENTINEL";
+    let stale_attachment_paths = old_filenames
+        .get(attachment_message_id)
+        .context("attachment message had no pre-rename paths")?
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let poison_message = format!(
+        "From: poison@example.test\r\nTo: fixture@example.test\r\nSubject: Poison stale attachment source\r\nDate: Thu, 18 Jun 2037 20:01:00 -0600\r\nMessage-ID: <{attachment_message_id}>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=stale-path-boundary\r\n\r\n--stale-path-boundary\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{STALE_PATH_SENTINEL} body\r\n--stale-path-boundary\r\nContent-Type: text/plain; name=note.txt\r\nContent-Disposition: attachment; filename=note.txt\r\n\r\n{STALE_PATH_SENTINEL} attachment\r\n--stale-path-boundary--\r\n"
+    );
+    for path in &stale_attachment_paths {
+        fs::write(path, poison_message.as_bytes())
+            .with_context(|| format!("creating readable stale path {}", path.display()))?;
+    }
+
+    let retained_attachments = driver.command("attachment_list_items", json!({}))?;
+    ensure!(
+        json_array_at(&retained_attachments, &["attachments"])?
+            .iter()
+            .any(|attachment| attachment["filename"] == "note.txt"),
+        "tag reconciliation lost the retained attachment payload: {retained_attachments}"
+    );
+    let retained_downloads = work_dir.join("retained-authoritative-downloads");
+    fs::create_dir_all(&retained_downloads)?;
+    let retained_save = driver.command(
+        "save_selected_attachment",
+        json!({"index": 0, "dir": retained_downloads}),
+    )?;
+    assert_eq!(
+        retained_save["pending"], true,
+        "retained attachment save did not start: {retained_save}"
+    );
+    let retained_save_status = wait_for_attachment_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let retained_saved_path = retained_save_status["last_completion"]["path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| {
+            format!("retained attachment save returned no path: {retained_save_status}")
+        })?;
+    let retained_saved = fs::read(&retained_saved_path)?;
+    ensure!(
+        String::from_utf8_lossy(&retained_saved).contains("attached text")
+            && !String::from_utf8_lossy(&retained_saved).contains(STALE_PATH_SENTINEL),
+        "retained attachment payload read a stale pre-rename source: {}",
+        String::from_utf8_lossy(&retained_saved)
+    );
+
     let verify_ui_thread = |driver: &mut UiDriver, thread_id: &str| -> anyhow::Result<Value> {
         select_first_thread(driver, &format!("thread:{thread_id}"))?;
         wait_for_thread_load_idle(driver, LARGE_THREAD_COMMAND_TIMEOUT)?;
@@ -9099,6 +9220,14 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
         raw["ok"], true,
         "raw view could not open the renamed message: {raw}"
     );
+    let raw_text = driver.command("message_view_text", json!({}))?;
+    ensure!(
+        raw_text["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Subject: Attachment message")
+                && !text.contains(STALE_PATH_SENTINEL)),
+        "main raw view exposed the readable stale path: {raw_text}"
+    );
     let listed = driver.command("attachment_list_items", json!({}))?;
     ensure!(
         json_array_at(&listed, &["attachments"])?
@@ -9168,6 +9297,12 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
         main_reply["state"]["compose_fields"]["in_reply_to"],
         "<attachment-message@fixture.test>"
     );
+    ensure!(
+        main_reply["state"]["compose_fields"]["body"]
+            .as_str()
+            .is_some_and(|body| !body.contains(STALE_PATH_SENTINEL)),
+        "main reply quoted the readable stale path: {main_reply}"
+    );
     for command in [
         "compose_set_to",
         "compose_set_cc",
@@ -9207,6 +9342,12 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
         standalone_reply["state"]["compose_fields"]["in_reply_to"],
         "<attachment-message@fixture.test>"
     );
+    ensure!(
+        standalone_reply["state"]["compose_fields"]["body"]
+            .as_str()
+            .is_some_and(|body| !body.contains(STALE_PATH_SENTINEL)),
+        "standalone reply quoted the readable stale path: {standalone_reply}"
+    );
     for command in [
         "compose_set_to",
         "compose_set_cc",
@@ -9227,6 +9368,58 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
     );
     assert_eq!(clear_standalone_reply["pending_confirmation"], false);
 
+    // Keep the pre-mutation standalone window alive through the fresh main
+    // reloads above, then exercise its independently retained lazy source.
+    // The resulting dirty forward is closed through the real modal main-window
+    // workflow below; that workflow intentionally preserves recovery state.
+    let retained_standalone_forward = driver.command(
+        "standalone_respond",
+        json!({"window_index": 0, "action": "forward_attachment"}),
+    )?;
+    assert_eq!(
+        retained_standalone_forward["pending"], true,
+        "retained standalone forward did not prepare asynchronously: {retained_standalone_forward}"
+    );
+    let retained_standalone_preparation =
+        wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        retained_standalone_preparation["outcome"], "prepared",
+        "retained standalone forward did not finish preparing: {retained_standalone_preparation}"
+    );
+    let retained_standalone_cache =
+        wait_for_composer_attachment_cache_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        retained_standalone_cache["composer_cache"]["outcome"], "applied",
+        "retained standalone source was not cached: {retained_standalone_cache}"
+    );
+    let retained_forward_state = driver.command("app_state", json!({}))?;
+    let retained_forward_paths = json_array_at(
+        &retained_forward_state,
+        &["state", "compose_fields", "attachments"],
+    )?;
+    ensure!(
+        retained_forward_paths.len() == 1,
+        "retained standalone forward did not cache exactly one source: {retained_forward_state}"
+    );
+    let retained_forward_path = retained_forward_paths[0]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| {
+            format!("retained standalone forward path was not a string: {retained_forward_state}")
+        })?;
+    let retained_forward_bytes = fs::read(&retained_forward_path)?;
+    ensure!(
+        String::from_utf8_lossy(&retained_forward_bytes).contains("Subject: Attachment message")
+            && !String::from_utf8_lossy(&retained_forward_bytes).contains(STALE_PATH_SENTINEL),
+        "retained standalone forward cached a stale pre-rename source: {}",
+        String::from_utf8_lossy(&retained_forward_bytes)
+    );
+
+    for path in &stale_attachment_paths {
+        fs::remove_file(path)
+            .with_context(|| format!("removing readable stale path {}", path.display()))?;
+    }
+
     let standalone_closed = driver.command("close_standalone_message_windows", json!({}))?;
     assert_eq!(
         standalone_closed["closed"], 1,
@@ -9234,6 +9427,21 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
     );
     let closed = driver.command("close_main_window", json!({}))?;
     assert_eq!(closed["ok"], true, "first app close failed: {closed}");
+    let close_id = pending_confirmation_id(&mut driver, "close_main_window")?;
+    let accepted_close = driver.command(
+        "respond_confirmation",
+        json!({"response": "accept", "id": close_id}),
+    )?;
+    assert_eq!(
+        accepted_close["ok"], true,
+        "could not close the retained standalone forward at main-window Close: {accepted_close}"
+    );
+    let recovery_path = accepted_close["recovery_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| {
+            format!("main-window Close returned no recovery path: {accepted_close}")
+        })?;
     drop(driver);
     let status = app.wait_for_exit(Duration::from_secs(5))?;
     ensure!(
@@ -9241,6 +9449,21 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
         "first app did not exit normally: {status}\n{}",
         app.logs()
     );
+
+    // The restart phase verifies tag/path persistence, not draft recovery.
+    // Remove only this disposable process's expected recovery file so it does
+    // not raise a modal while the restarted harness switches between threads.
+    ensure!(
+        recovery_path.is_file(),
+        "main-window Close did not preserve the expected isolated recovery file: {}",
+        recovery_path.display()
+    );
+    fs::remove_file(&recovery_path).with_context(|| {
+        format!(
+            "removing isolated retained-forward recovery {}",
+            recovery_path.display()
+        )
+    })?;
 
     // Preserve the clean XDG state and Notmuch database while replacing only the
     // first process's private display and harness artifacts.

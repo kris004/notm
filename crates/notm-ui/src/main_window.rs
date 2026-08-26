@@ -60,8 +60,8 @@ use crate::{
     },
     screenshot, theme,
     thread_loader::{
-        PreparedMessage, PreparedThread, TargetMessageNotFound, ThreadLoadCoordinator,
-        ThreadLoadRequest, ThreadLoadResponse,
+        AuthoritativePathMap, PreparedMessage, PreparedThread, TargetMessageNotFound,
+        ThreadLoadCoordinator, ThreadLoadRequest, ThreadLoadResponse,
     },
     widgets::attachments::{
         self, AttachmentController, AttachmentEvent, AttachmentEventHandler, AttachmentOpenStore,
@@ -13418,6 +13418,16 @@ fn open_standalone_message_window(
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("standalone message content is still loading"))?;
     let prepared_retained_bytes = prepared_thread.retained_bytes();
+    let message_sources = prepared_thread
+        .message_contents
+        .iter()
+        .filter_map(|(message_id, prepared)| {
+            prepared
+                .source()
+                .ok()
+                .map(|source| (message_id.clone(), source.clone()))
+        })
+        .collect();
     let policy_options = options.clone();
     let policy_state = state.clone();
     let policy_quote_collapse = widgets.quote_collapse.clone();
@@ -13551,6 +13561,7 @@ fn open_standalone_message_window(
         messages,
         selected_index,
         prepared_retained_bytes,
+        message_sources,
         policy,
         message_has_html,
         render_text,
@@ -14581,7 +14592,7 @@ fn finish_tag_worker(
                 let mut operation_errors = result.operation_errors;
                 if !retained_paths_resolved {
                     operation_errors.push(
-                        "an active draft retained a filename absent from the authoritative message paths"
+                        "retained message, attachment, standalone, or draft state contains a filename absent from the authoritative message paths"
                             .to_string(),
                     );
                 }
@@ -14961,12 +14972,27 @@ fn apply_authoritative_tag_changes(
     widgets
         .standalone_messages
         .apply_authoritative_tag_changes(changes);
-    widgets
+    let path_map = AuthoritativePathMap::new(path_states);
+    let prepared_sources_resolved = {
+        let prepared_threads = widgets.prepared_threads.borrow();
+        let mut resolved = true;
+        for prepared in prepared_threads.values() {
+            resolved &= prepared.apply_authoritative_path_states(&path_map);
+        }
+        resolved
+    };
+    let attachment_sources_resolved = widgets
         .attachments
-        .apply_authoritative_messages(&state.borrow().messages);
+        .apply_authoritative_path_states(&path_map);
+    let standalone_sources_resolved = widgets
+        .standalone_messages
+        .apply_authoritative_path_states(&path_map);
     refresh_thread_model_rows(widgets, state, &row_updates.0);
     update_visual_selection_rows(widgets, state);
     row_updates.1
+        && prepared_sources_resolved
+        && attachment_sources_resolved
+        && standalone_sources_resolved
 }
 
 fn apply_active_draft_authoritative_paths(
@@ -19840,6 +19866,7 @@ fn ensure_automation_request_allowed(
         | "click_message_tag_action"
         | ADD_CUSTOM_TAG_FROM_ENTRY_COMMAND
         | REMOVE_CUSTOM_TAG_FROM_ENTRY_COMMAND
+        | "set_fixture_thread_delay"
         | "tag_selected"
         | "add_tag_selected"
         | "remove_tag_selected"
@@ -19851,7 +19878,6 @@ fn ensure_automation_request_allowed(
         | "set_fixture_attachment_delay"
         | "set_fixture_draft_delay"
         | "refresh_named_drafts"
-        | "set_fixture_thread_delay"
         | "set_fixture_composer_preparation_delay"
         | "fail_next_draft_write"
         | "draft_list_state"
@@ -23252,12 +23278,23 @@ mod tests {
                 .contains("allow_live_tag_test=true")
         );
 
+        let thread_delay_error =
+            ensure_automation_request_allowed(&options, "set_fixture_thread_delay", &json!({}))
+                .expect_err("live thread preparation delay should require the tag-test gate");
+        assert!(
+            thread_delay_error
+                .to_string()
+                .contains("allow_live_tag_test=true")
+        );
+
         options.allow_live_send_test = true;
         options.allow_live_tag_test = true;
         ensure_automation_request_allowed(&options, "compose_send", &json!({}))
             .expect("explicit send gate");
         ensure_automation_request_allowed(&options, "archive_selected", &json!({}))
             .expect("explicit tag gate");
+        ensure_automation_request_allowed(&options, "set_fixture_thread_delay", &json!({}))
+            .expect("explicit tag gate should allow the disposable preparation race seam");
         ensure_automation_request_allowed(&options, "run_command", &json!({"command": ":archive"}))
             .expect("explicit tag gate should cover nested command");
     }

@@ -23,7 +23,10 @@ use notm_mail::compose::AttachmentInput;
 use notm_mail::mime::extract_attachments_detailed;
 use uuid::Uuid;
 
-use crate::{thread_loader::MessageSource, widgets::composer};
+use crate::{
+    thread_loader::{AuthoritativePathMap, MessageSource},
+    widgets::composer,
+};
 
 #[cfg(test)]
 use std::sync::Condvar;
@@ -151,6 +154,17 @@ impl From<Arc<[u8]>> for AttachmentIoSource {
 impl AttachmentIoSource {
     pub(crate) fn mime_part(source: MessageSource, part_index: usize) -> Self {
         Self::MimePart { source, part_index }
+    }
+
+    pub(crate) fn apply_authoritative_path_states(
+        &self,
+        message_id: &str,
+        path_map: &AuthoritativePathMap<'_>,
+    ) -> bool {
+        match self {
+            Self::Shared(_) => true,
+            Self::MimePart { source, .. } => path_map.apply_to_source(message_id, source),
+        }
     }
 }
 
@@ -1388,6 +1402,24 @@ mod tests {
                     .is_some_and(|name| name.starts_with(".notm-attachment-"))
             })
             .collect()
+    }
+
+    #[test]
+    fn lazy_mime_part_source_shares_authoritative_path_remaps() {
+        let source = MessageSource::new("/mail/cur/message:2,S".into(), 128);
+        let attachment = AttachmentIoSource::mime_part(source.clone(), 3);
+        let path_states = [notm_notmuch::MessagePathState {
+            message_id: "message@example.test".to_string(),
+            paths: vec!["/mail/cur/message:2,".into()],
+            path_changes: vec![notm_notmuch::MaildirPathChange {
+                previous_path: "/mail/cur/message:2,S".into(),
+                current_path: "/mail/cur/message:2,".into(),
+            }],
+        }];
+
+        let path_map = AuthoritativePathMap::new(&path_states);
+        assert!(attachment.apply_authoritative_path_states("message@example.test", &path_map,));
+        assert_eq!(source.path(), Path::new("/mail/cur/message:2,"));
     }
 
     #[test]

@@ -29,7 +29,7 @@ use crate::{
         AttachmentIoResponse, AttachmentIoSource, AttachmentIoToken, MAX_FIXTURE_DELAY,
     },
     model::ComposeFields,
-    thread_loader::PreparedAttachment,
+    thread_loader::{AuthoritativePathMap, PreparedAttachment},
 };
 
 const ATTACHMENT_ROWS_PER_UPDATE: usize = 24;
@@ -292,10 +292,28 @@ impl AttachmentController {
         self.list.set_sensitive(sensitive);
     }
 
-    /// Prepared attachment metadata and MIME-part ordering do not change when
-    /// tags change. Lazy payload sources resolve stale cached paths by
-    /// Message-ID when read, so no retained summary needs replacement here.
-    pub(crate) fn apply_authoritative_messages(&self, _messages: &[notm_notmuch::MessageSummary]) {}
+    /// Applies byte-preserving Maildir renames to every retained lazy payload.
+    ///
+    /// The payload map keeps clones of the prepared message sources, so this
+    /// also updates requests already cloned from the selected row. Resolver
+    /// fallback remains available for missing paths, but a still-readable old
+    /// Maildir file must never win over an authoritative path change.
+    pub(crate) fn apply_authoritative_path_states(
+        &self,
+        path_map: &AuthoritativePathMap<'_>,
+    ) -> bool {
+        let mut resolved = true;
+        for ((message_id, _), source) in self.payloads.borrow().iter() {
+            resolved &= source.apply_authoritative_path_states(message_id, path_map);
+        }
+        if let Some(pending) = self.pending_save.borrow().as_ref() {
+            resolved &= pending
+                .payload
+                .source
+                .apply_authoritative_path_states(&pending.payload.message_id, path_map);
+        }
+        resolved
+    }
 
     pub(crate) fn refresh_prepared(
         &self,

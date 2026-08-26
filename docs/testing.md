@@ -227,9 +227,11 @@ must remain responsive while work is outstanding. A disposable non-fixture
 tag-race harness may use the same delay only when
 `automation.allow_live_tag_test = true`; other non-fixture runs reject it.
 
-Thread/message preparation, message-derived reply/forward/draft preparation,
-and draft persistence expose the same kind of fixture-only latency seam through
-`set_fixture_thread_delay`, `set_fixture_composer_preparation_delay`, and
+Thread/message preparation exposes the same latency seam through
+`set_fixture_thread_delay`; it is fixture-only except in a disposable
+non-fixture tag-race harness with `automation.allow_live_tag_test = true`.
+Message-derived reply/forward/draft preparation and draft persistence expose
+fixture-only seams through `set_fixture_composer_preparation_delay` and
 `set_fixture_draft_delay`; attachment writes and composer attachment caching use
 `set_fixture_attachment_delay`. `fail_next_draft_write` and
 `fail_next_attachment_write` inject one draft or attachment write failure,

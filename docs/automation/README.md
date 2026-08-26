@@ -55,13 +55,16 @@ path, tag, send, or sync action. A reported partial result with known paths
 instead remains blocked only through its automatic reconciliation search.
 
 Thread/message and message-derived composer preparation plus recovery-draft
-persistence have equivalent fixture-only controls. `set_fixture_thread_delay`,
+persistence have equivalent latency controls. `set_fixture_thread_delay`,
 `set_fixture_composer_preparation_delay`, `set_fixture_draft_delay`, and
 `set_fixture_attachment_delay` inject at most 5000 milliseconds of worker-side
-I/O delay. `fail_next_draft_write` and `fail_next_attachment_write` inject one
-recovery-draft or attachment write failure, respectively. These latency and
-failure-injection controls are fixture-only; the status commands remain
-read-only and available in any test-harness run.
+I/O delay. `set_fixture_thread_delay` is also available to a disposable
+non-fixture tag-race harness when `automation.allow_live_tag_test = true`, so a
+real Maildir rename can overlap cancellable preparation; the other latency and
+failure-injection controls remain fixture-only. `fail_next_draft_write` and
+`fail_next_attachment_write` inject one recovery-draft or attachment write
+failure, respectively. Status commands remain read-only and available in any
+test-harness run.
 `thread_load_status`, `composer_preparation_status`, `draft_autosave_status`,
 `draft_io_status`, `recovery_load_status`, and `attachment_io_status` report
 the current generation, activity, and last completion/error. The attachment

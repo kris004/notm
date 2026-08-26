@@ -54,13 +54,17 @@ threads remain explicit partial results for the other exact targets. Their
 batch reports retain partial failures and authoritative current Maildir
 filenames. Search generations that overlap a write are discarded and
 reconciled before another tag mutation is accepted; retained message, draft,
-and standalone window models receive filename mappings without reparsing MIME
-on the GTK callback. Attachment models keep lazy message sources and resolve a
-stale cached path by Message-ID when the payload is requested. Explicit partial
-reports keep path actions disabled until the reconciliation search completes.
-An unreported result, close/commit failure, or unresolved retained filename
-keeps those actions disabled until restart rather than allowing a stale path to
-escape.
+attachment, and standalone window models receive byte-preserving path mappings
+without reparsing MIME on the GTK callback. Cloned lazy message sources share a
+thread-safe current path, so a Maildir rename updates raw, attachment,
+reply/forward, indexed-draft, and standalone actions together. Payload reads
+remain cached-path-first, but only after that cache has been remapped to the
+authoritative path; Message-ID lookup is the fallback for a missing cached
+file, not a substitute for remapping a still-readable old file. Explicit
+partial reports keep path actions disabled until the reconciliation search
+completes. An unreported result, close/commit failure, or unresolved retained
+message, attachment, standalone, or draft filename keeps those actions
+disabled until restart rather than allowing a stale path to escape.
 Durable undo-history writes are serialized on a separate worker.
 
 ## Implementation notes

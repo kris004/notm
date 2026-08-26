@@ -9,6 +9,8 @@ use chrono::Utc;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use notm_mail::{ReplyKind, address::parse_address_list};
+#[cfg(test)]
+use notm_notmuch::MessagePathState;
 use notm_notmuch::{AppliedTagChange, MessageSummary};
 use serde::Serialize;
 use webkit6::prelude::WebViewExt;
@@ -17,6 +19,7 @@ use super::link_hints::{LinkHintController, LinkHintOpener, LinkHintSnapshot};
 use crate::{
     html_view_lifecycle::{HtmlViewLifecycle, HtmlViewLifecycleSnapshot},
     model::MessageViewPreference,
+    thread_loader::{AuthoritativePathMap, MessageSource},
 };
 
 const MESSAGE_HEADER_VALUE_LINES: i32 = 1;
@@ -82,6 +85,7 @@ pub(crate) struct StandaloneOpenOptions {
     pub(crate) messages: Vec<MessageSummary>,
     pub(crate) selected_index: usize,
     pub(crate) prepared_retained_bytes: usize,
+    pub(crate) message_sources: BTreeMap<String, MessageSource>,
     pub(crate) policy: StandalonePolicyProvider,
     pub(crate) message_has_html: StandaloneMessageHasHtml,
     pub(crate) render_text: StandaloneTextRenderer,
@@ -388,6 +392,7 @@ impl StandaloneMessageController {
             toggle_sender_view: options.toggle_sender_view,
             path_actions_sensitive: Cell::new(policy.response_sensitive),
             message_html_by_id: RefCell::new(BTreeMap::new()),
+            message_sources: options.message_sources,
             state: RefCell::new(StandaloneMessageState {
                 messages: options.messages,
                 selected_index,
@@ -493,6 +498,23 @@ impl StandaloneMessageController {
             }
         }
         updated_messages
+    }
+
+    /// Remaps sources captured by standalone render and response closures.
+    /// Standalone windows can outlive the main prepared-thread cache, so
+    /// updating their String-only summaries does not make retained file paths
+    /// authoritative by itself.
+    pub(crate) fn apply_authoritative_path_states(
+        &self,
+        path_map: &AuthoritativePathMap<'_>,
+    ) -> bool {
+        let windows = self.windows.borrow().clone();
+        let mut resolved = true;
+        for standalone in windows {
+            resolved &=
+                apply_authoritative_path_states_to_sources(&standalone.message_sources, path_map);
+        }
+        resolved
     }
 
     pub(crate) fn close_all(&self) -> usize {
@@ -623,6 +645,17 @@ fn apply_authoritative_changes_to_messages(
         .collect()
 }
 
+fn apply_authoritative_path_states_to_sources(
+    sources: &BTreeMap<String, MessageSource>,
+    path_map: &AuthoritativePathMap<'_>,
+) -> bool {
+    let mut resolved = true;
+    for (message_id, source) in sources {
+        resolved &= path_map.apply_to_source(message_id, source);
+    }
+    resolved
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MessageViewKind {
     Text,
@@ -714,6 +747,7 @@ struct StandaloneMessageWindow {
     toggle_sender_view: StandaloneToggleSenderView,
     path_actions_sensitive: Cell<bool>,
     message_html_by_id: RefCell<BTreeMap<String, bool>>,
+    message_sources: BTreeMap<String, MessageSource>,
     state: RefCell<StandaloneMessageState>,
 }
 
@@ -2285,6 +2319,41 @@ mod tests {
         );
         assert_eq!(messages[0].tags, ["inbox"]);
         assert_eq!(messages[0].filenames, ["final:2,"]);
+    }
+
+    #[test]
+    fn standalone_sources_remap_all_matches_and_report_any_unresolved_path() {
+        let unresolved = MessageSource::new("/mail/cur/unresolved:2,S".into(), 1);
+        let mapped = MessageSource::new("/mail/cur/mapped:2,S".into(), 1);
+        let sources = BTreeMap::from([
+            ("a-unresolved@example.test".to_string(), unresolved.clone()),
+            ("z-mapped@example.test".to_string(), mapped.clone()),
+        ]);
+        let path_states = vec![
+            MessagePathState {
+                message_id: "a-unresolved@example.test".to_string(),
+                paths: vec!["/mail/cur/other:2,".into()],
+                path_changes: Vec::new(),
+            },
+            MessagePathState {
+                message_id: "z-mapped@example.test".to_string(),
+                paths: vec!["/mail/cur/mapped:2,".into()],
+                path_changes: vec![notm_notmuch::MaildirPathChange {
+                    previous_path: "/mail/cur/mapped:2,S".into(),
+                    current_path: "/mail/cur/mapped:2,".into(),
+                }],
+            },
+        ];
+
+        let path_map = AuthoritativePathMap::new(&path_states);
+        assert!(!apply_authoritative_path_states_to_sources(
+            &sources, &path_map,
+        ));
+        assert_eq!(
+            unresolved.path(),
+            std::path::Path::new("/mail/cur/unresolved:2,S")
+        );
+        assert_eq!(mapped.path(), std::path::Path::new("/mail/cur/mapped:2,"));
     }
 
     #[test]

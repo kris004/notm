@@ -108,6 +108,7 @@ other non-fixture runs reject it.
 .BR select_thread_by_index ,
 .BR select_relative_thread ,
 .BR select_thread_edge ,
+.BR set_fixture_thread_delay ,
 .BR open_selected_thread ,
 .BR select_message_by_index ,
 .BR select_relative_message ,
@@ -204,7 +205,13 @@ requests to verify that GTK remains responsive.
 .B thread_load_status
 reports prepared message and attachment counts, estimated retained bytes, and
 active/peak payload-preparation workers.  The peak is bounded to one and stale
-queued generations are coalesced.  Fixture tests may set
+queued generations are coalesced.
+.B set_fixture_thread_delay
+adds at most 5000 milliseconds of worker-side delay.  It is fixture-only except
+in a disposable non-fixture tag-race harness with
+.B automation.allow_live_tag_test=true
+so a real Maildir rename can overlap cancellable preparation.  Fixture tests
+may set
 .B NOTM_FIXTURE_TEST_LARGE_ATTACHMENT_BYTES
 to enlarge the first attachment-heavy payload, capped at 8 MiB; ordinary
 fixture runs are unchanged.

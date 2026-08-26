@@ -16,7 +16,7 @@ use std::{
 use anyhow::Context as _;
 use mailparse::{MailHeaderMap as _, parse_content_disposition, parse_content_type, parse_headers};
 use notm_mail::{ParsedMessage, html_sanitize::sanitize_html, mime::parse_rfc5322};
-use notm_notmuch::{Database, DatabaseMode, MessageSummary, OpenConfig};
+use notm_notmuch::{Database, DatabaseMode, MessagePathState, MessageSummary, OpenConfig};
 
 use crate::model::MAX_LOADED_THREAD_MESSAGES;
 
@@ -49,11 +49,43 @@ struct PreparationLimits {
     header_bytes: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct MessageSource {
-    path: Arc<PathBuf>,
+    path: Arc<Mutex<CurrentMessagePath>>,
     source_bytes: usize,
     resolver: Option<Arc<MessageSourceResolver>>,
+}
+
+#[derive(Debug)]
+struct CurrentMessagePath {
+    path: PathBuf,
+    generation: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct AuthoritativePathMap<'a> {
+    states_by_message_id: BTreeMap<&'a str, Vec<&'a MessagePathState>>,
+}
+
+impl<'a> AuthoritativePathMap<'a> {
+    pub(crate) fn new(path_states: &'a [MessagePathState]) -> Self {
+        let mut states_by_message_id = BTreeMap::<_, Vec<_>>::new();
+        for state in path_states {
+            states_by_message_id
+                .entry(state.message_id.as_str())
+                .or_default()
+                .push(state);
+        }
+        Self {
+            states_by_message_id,
+        }
+    }
+
+    pub(crate) fn apply_to_source(&self, message_id: &str, source: &MessageSource) -> bool {
+        self.states_by_message_id
+            .get(message_id)
+            .is_none_or(|states| source.apply_matching_path_states(states))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +97,10 @@ struct MessageSourceResolver {
 impl MessageSource {
     pub(crate) fn new(path: PathBuf, source_bytes: usize) -> Self {
         Self {
-            path: Arc::new(path),
+            path: Arc::new(Mutex::new(CurrentMessagePath {
+                path,
+                generation: 0,
+            })),
             source_bytes,
             resolver: None,
         }
@@ -79,8 +114,8 @@ impl MessageSource {
         self
     }
 
-    pub(crate) fn path(&self) -> &Path {
-        self.path.as_path()
+    pub(crate) fn path(&self) -> PathBuf {
+        self.path_snapshot().0
     }
 
     pub(crate) const fn source_bytes(&self) -> usize {
@@ -96,32 +131,122 @@ impl MessageSource {
         &self,
         max_bytes: usize,
     ) -> anyhow::Result<(PathBuf, Vec<u8>)> {
-        match read_bounded(self.path(), max_bytes) {
-            Ok(bytes) => Ok((self.path().to_path_buf(), bytes)),
-            Err(cached_error) => {
-                let Some(resolver) = self.resolver.as_deref() else {
-                    return Err(cached_error);
-                };
-                let database = Database::open(&resolver.config, DatabaseMode::ReadOnly)?;
-                let source = database
-                    .open_message_id_file(&resolver.message_id)
-                    .map_err(anyhow::Error::from)?;
-                let (path, file) = source.into_parts();
-                let bytes = read_reader_bounded(file, max_bytes).with_context(|| {
-                    format!(
-                        "cached message path {} was unavailable ({cached_error}); resolving current file for {}",
-                        self.path().display(),
-                        resolver.message_id
-                    )
-                })?;
-                Ok((path, bytes))
+        // Do not hold the path mutex across filesystem or Notmuch I/O. If an
+        // authoritative tag result remaps the shared source while a read is in
+        // progress, discard that stale completion and retry the newer path.
+        for _ in 0..8 {
+            let (cached_path, generation) = self.path_snapshot();
+            match read_bounded(&cached_path, max_bytes) {
+                Ok(bytes) if self.path_generation() == generation => {
+                    return Ok((cached_path, bytes));
+                }
+                Ok(_) => continue,
+                Err(_) if self.path_generation() != generation => continue,
+                Err(cached_error) => {
+                    let Some(resolver) = self.resolver.as_deref() else {
+                        return Err(cached_error);
+                    };
+                    let resolved = (|| -> anyhow::Result<(PathBuf, Vec<u8>)> {
+                        let database = Database::open(&resolver.config, DatabaseMode::ReadOnly)?;
+                        let source = database
+                            .open_message_id_file(&resolver.message_id)
+                            .map_err(anyhow::Error::from)?;
+                        let (resolved_path, file) = source.into_parts();
+                        let bytes = read_reader_bounded(file, max_bytes).with_context(|| {
+                            format!(
+                                "cached message path {} was unavailable ({cached_error}); resolving current file for {}",
+                                cached_path.display(),
+                                resolver.message_id
+                            )
+                        })?;
+                        Ok((resolved_path, bytes))
+                    })();
+                    if self.path_generation() != generation {
+                        continue;
+                    }
+                    let (resolved_path, bytes) = resolved?;
+                    if !self.replace_path_if_generation(generation, resolved_path.clone()) {
+                        continue;
+                    }
+                    return Ok((resolved_path, bytes));
+                }
             }
         }
+        anyhow::bail!("message source path changed repeatedly while it was being read")
+    }
+
+    /// Applies byte-preserving Maildir path changes for one message.
+    ///
+    /// Clones share the same path cell, so updating a retained prepared
+    /// message also updates lazy attachment and composer-preparation sources.
+    /// A matching final state that does not contain the retained path is
+    /// unresolved; callers must keep path-based actions blocked until a fresh
+    /// model replaces that retained state.
+    #[cfg(test)]
+    pub(crate) fn apply_authoritative_path_states(
+        &self,
+        message_id: &str,
+        path_states: &[MessagePathState],
+    ) -> bool {
+        AuthoritativePathMap::new(path_states).apply_to_source(message_id, self)
+    }
+
+    fn apply_matching_path_states(&self, path_states: &[&MessagePathState]) -> bool {
+        let mut current = self
+            .path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let original_path = current.path.clone();
+        for state in path_states {
+            if let Some(change) = state
+                .path_changes
+                .iter()
+                .find(|change| change.previous_path.as_path() == current.path.as_path())
+            {
+                current.path.clone_from(&change.current_path);
+            }
+        }
+        if current.path != original_path {
+            current.generation = current.generation.saturating_add(1);
+        }
+        path_states
+            .last()
+            .is_none_or(|state| state.paths.contains(&current.path))
+    }
+
+    fn path_snapshot(&self) -> (PathBuf, u64) {
+        let current = self
+            .path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (current.path.clone(), current.generation)
+    }
+
+    fn path_generation(&self) -> u64 {
+        self.path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .generation
+    }
+
+    fn replace_path_if_generation(&self, expected_generation: u64, path: PathBuf) -> bool {
+        let mut current = self
+            .path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current.generation != expected_generation {
+            return false;
+        }
+        if current.path != path {
+            current.path = path;
+            current.generation = current.generation.saturating_add(1);
+        }
+        true
     }
 
     fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
-            .saturating_add(self.path.as_os_str().len())
+            .saturating_add(self.path().as_os_str().len())
             .saturating_add(
                 self.resolver
                     .as_deref()
@@ -130,6 +255,16 @@ impl MessageSource {
             )
     }
 }
+
+impl PartialEq for MessageSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.source_bytes == other.source_bytes
+            && self.resolver == other.resolver
+            && (Arc::ptr_eq(&self.path, &other.path) || self.path() == other.path())
+    }
+}
+
+impl Eq for MessageSource {}
 
 fn message_source_resolver_bytes(resolver: &MessageSourceResolver) -> usize {
     resolver
@@ -365,6 +500,22 @@ pub(crate) struct PreparedThread {
 impl PreparedThread {
     pub(crate) const fn retained_bytes(&self) -> usize {
         self.retained_bytes
+    }
+
+    pub(crate) fn apply_authoritative_path_states(
+        &self,
+        path_map: &AuthoritativePathMap<'_>,
+    ) -> bool {
+        let mut resolved = true;
+        for (message_id, message) in &self.message_contents {
+            if let Some(source) = &message.source {
+                resolved &= path_map.apply_to_source(message_id, source);
+            }
+        }
+        for attachment in &self.attachments {
+            resolved &= path_map.apply_to_source(&attachment.message_id, &attachment.source);
+        }
+        resolved
     }
 }
 
@@ -2214,6 +2365,85 @@ BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nEND:VCALENDAR\r\n\
     }
 
     #[test]
+    fn authoritative_path_state_remaps_all_source_clones_before_cached_read() {
+        let temp = tempfile::tempdir().expect("temporary source root");
+        let readable_old_path = temp.path().join("message:2,S");
+        let current_path = temp.path().join("message:2,");
+        std::fs::write(&readable_old_path, b"poison from readable old path")
+            .expect("write old source poison");
+        std::fs::write(&current_path, b"authoritative current source")
+            .expect("write current source");
+        let source = MessageSource::new(readable_old_path.clone(), 28);
+        let lazy_attachment_source = source.clone();
+        let path_states = [notm_notmuch::MessagePathState {
+            message_id: "mapped-source@fixture.test".to_string(),
+            paths: vec![current_path.clone()],
+            path_changes: vec![notm_notmuch::MaildirPathChange {
+                previous_path: readable_old_path,
+                current_path: current_path.clone(),
+            }],
+        }];
+
+        assert!(
+            source.apply_authoritative_path_states("mapped-source@fixture.test", &path_states,)
+        );
+        assert_eq!(source.path(), current_path);
+        assert_eq!(lazy_attachment_source.path(), current_path);
+        assert_eq!(
+            lazy_attachment_source
+                .read_bounded(DEFAULT_PREPARATION_LIMITS.source_bytes)
+                .expect("read remapped source"),
+            b"authoritative current source"
+        );
+    }
+
+    #[test]
+    fn authoritative_path_state_rejects_an_unmapped_retained_source() {
+        let temp = tempfile::tempdir().expect("temporary source root");
+        let retained_path = temp.path().join("retained:2,S");
+        let unrelated_current_path = temp.path().join("different-copy:2,");
+        std::fs::write(&retained_path, b"still readable but not authoritative")
+            .expect("write retained source");
+        std::fs::write(&unrelated_current_path, b"different current copy")
+            .expect("write unrelated current source");
+        let source = MessageSource::new(retained_path.clone(), 36);
+        let path_states = [notm_notmuch::MessagePathState {
+            message_id: "unresolved-source@fixture.test".to_string(),
+            paths: vec![unrelated_current_path],
+            path_changes: Vec::new(),
+        }];
+
+        assert!(
+            !source
+                .apply_authoritative_path_states("unresolved-source@fixture.test", &path_states,)
+        );
+        assert_eq!(source.path(), retained_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authoritative_source_remap_preserves_non_utf8_maildir_paths() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let old_path = PathBuf::from(OsString::from_vec(b"/mail/cur/message-\xff:2,S".to_vec()));
+        let current_path = PathBuf::from(OsString::from_vec(b"/mail/cur/message-\xff:2,".to_vec()));
+        let source = MessageSource::new(old_path.clone(), 1);
+        let path_states = [notm_notmuch::MessagePathState {
+            message_id: "non-utf8-source@fixture.test".to_string(),
+            paths: vec![current_path.clone()],
+            path_changes: vec![notm_notmuch::MaildirPathChange {
+                previous_path: old_path,
+                current_path: current_path.clone(),
+            }],
+        }];
+
+        assert!(
+            source.apply_authoritative_path_states("non-utf8-source@fixture.test", &path_states,)
+        );
+        assert_eq!(source.path(), current_path);
+    }
+
+    #[test]
     fn message_source_resolves_current_notmuch_file_when_cached_path_is_stale() {
         let temp = tempfile::tempdir().expect("temporary Notmuch root");
         let (config, maildir) = notmuch_fixture_config(&temp);
@@ -2230,6 +2460,7 @@ Subject: Resolved source\r\n\r\ncurrent database source\r\n";
         let stale_path = maildir.join("stale-resolved:2,");
         let source = MessageSource::new(stale_path, 0)
             .with_resolver(&config, "resolved-source@fixture.test");
+        let source_clone = source.clone();
 
         let (resolved_path, bytes) = source
             .read_bounded_with_path(DEFAULT_PREPARATION_LIMITS.source_bytes)
@@ -2237,6 +2468,8 @@ Subject: Resolved source\r\n\r\ncurrent database source\r\n";
 
         assert_eq!(resolved_path, current_path);
         assert_eq!(bytes, current);
+        assert_eq!(source.path(), current_path);
+        assert_eq!(source_clone.path(), current_path);
     }
 
     #[test]
