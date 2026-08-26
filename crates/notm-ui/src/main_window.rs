@@ -10493,50 +10493,73 @@ fn start_full_search(
     );
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TagWarningRefreshOutcome {
+    NoWarning,
+    PersistentUncertainty(String),
+    Reconciled(String),
+    RefreshFailed(String),
+}
+
+fn reduce_tag_warning_after_search(
+    state: &mut UiState,
+    refreshed: bool,
+) -> TagWarningRefreshOutcome {
+    let Some(warning) = state.tag_warning.clone() else {
+        return TagWarningRefreshOutcome::NoWarning;
+    };
+    if refreshed && state.tag_paths_uncertain {
+        let combined = format!(
+            "Tag effects remain uncertain ({warning}); the thread list was refreshed, but retained message tags, message filenames, or draft filenames cannot be verified safely. Restart notm before using message, draft, tag, send, or sync actions"
+        );
+        state.last_error = Some(combined.clone());
+        state.last_operation = Some(combined.clone());
+        TagWarningRefreshOutcome::PersistentUncertainty(combined)
+    } else if refreshed {
+        state.tag_warning = None;
+        state.last_error = Some(warning.clone());
+        TagWarningRefreshOutcome::Reconciled(warning)
+    } else {
+        let search_error = state.search_error.clone().unwrap_or_else(|| {
+            "the reconciliation search did not complete successfully".to_string()
+        });
+        let combined = format!(
+            "Tag effects remain uncertain ({warning}); reconciliation failed: {search_error}"
+        );
+        state.last_error = Some(combined.clone());
+        TagWarningRefreshOutcome::RefreshFailed(combined)
+    }
+}
+
 fn restore_tag_warning_after_search(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
     refreshed: bool,
 ) {
-    let warning = state.borrow().tag_warning.clone();
-    if let Some(warning) = warning {
-        if refreshed && state.borrow().tag_paths_uncertain {
-            let combined = format!(
-                "Tag effects remain uncertain ({warning}); the thread list was refreshed, but retained message and draft filenames cannot be verified safely. Restart notm before using message, draft, tag, send, or sync actions"
-            );
-            let mut state_ref = state.borrow_mut();
-            state_ref.last_error = Some(combined.clone());
-            state_ref.last_operation = Some(combined.clone());
-            drop(state_ref);
-            widgets.status_label.set_text(&combined);
+    let outcome = reduce_tag_warning_after_search(&mut state.borrow_mut(), refreshed);
+    match outcome {
+        TagWarningRefreshOutcome::NoWarning => return,
+        TagWarningRefreshOutcome::PersistentUncertainty(message) => {
+            widgets.status_label.set_text(&message);
             update_background_activity_controls(options, widgets, state);
             close_main_window_after_background_activity(widgets, state);
-        } else if refreshed {
-            let mut state_ref = state.borrow_mut();
-            state_ref.tag_warning = None;
-            state_ref.last_error = Some(warning.clone());
-            drop(state_ref);
+        }
+        TagWarningRefreshOutcome::Reconciled(warning) => {
             widgets.status_label.set_text(&format!(
                 "Search state refreshed after the tag operation warning: {warning}"
             ));
             update_background_activity_controls(options, widgets, state);
             close_main_window_after_background_activity(widgets, state);
-        } else {
-            let search_error = state.borrow().search_error.clone().unwrap_or_else(|| {
-                "the reconciliation search did not complete successfully".to_string()
-            });
-            let combined = format!(
-                "Tag effects remain uncertain ({warning}); reconciliation failed: {search_error}"
-            );
-            state.borrow_mut().last_error = Some(combined.clone());
-            widgets.status_label.set_text(&combined);
+        }
+        TagWarningRefreshOutcome::RefreshFailed(message) => {
+            widgets.status_label.set_text(&message);
             if widgets.close_when_idle.replace(false) {
                 widgets.window.present();
             }
         }
-        update_debug(widgets, state);
     }
+    update_debug(widgets, state);
 }
 
 fn record_full_search_outcome(state: &SharedState, generation: u64) {
@@ -12147,7 +12170,7 @@ fn ensure_user_operation_allowed(
         anyhow::bail!(message);
     }
     if operation != UserOperation::ComposeEdit && state.borrow().tag_paths_uncertain {
-        let message = "message, draft, tag, send, and sync operations are unavailable after an uncertain tag result; restart notm before reusing retained paths";
+        let message = "message, draft, tag, send, and sync operations are unavailable after an uncertain tag result; restart notm before reusing retained message or path state";
         widgets.status_label.set_text(message);
         state.borrow_mut().last_operation = Some(message.to_string());
         update_debug(widgets, state);
@@ -12602,7 +12625,7 @@ fn finish_tag_worker(
             );
             let complete = operation_complete && retained_paths_resolved;
             state.borrow_mut().tag_paths_uncertain =
-                !retained_paths_resolved || tag_report_has_uncertain_retained_paths(&result.report);
+                !retained_paths_resolved || tag_report_has_uncertain_retained_state(&result.report);
             refresh_required |= !complete;
             if complete {
                 let mut state = state.borrow_mut();
@@ -12651,17 +12674,7 @@ fn finish_tag_worker(
     update_debug(widgets, state);
 
     if refresh_required {
-        let selected_thread_id = {
-            let state = state.borrow();
-            if state.tag_paths_uncertain {
-                None
-            } else {
-                state
-                    .selected_thread
-                    .as_ref()
-                    .map(|thread| thread.thread_id.clone())
-            }
-        };
+        let selected_thread_id = selected_thread_id_for_tag_refresh(&state.borrow());
         widgets
             .tag_refresh_selected_thread_id
             .replace(selected_thread_id);
@@ -12680,6 +12693,17 @@ fn finish_tag_worker(
         widgets.tag_refresh_selected_thread_id.borrow_mut().take();
     }
     close_main_window_after_background_activity(widgets, state);
+}
+
+fn selected_thread_id_for_tag_refresh(state: &UiState) -> Option<String> {
+    if state.tag_paths_uncertain {
+        None
+    } else {
+        state
+            .selected_thread
+            .as_ref()
+            .map(|thread| thread.thread_id.clone())
+    }
 }
 
 fn apply_completed_tag_report(
@@ -12831,13 +12855,19 @@ fn tag_batch_failure_summary(
     }
 }
 
-fn tag_report_has_uncertain_retained_paths(report: &notm_notmuch::TagBatchReport) -> bool {
+fn tag_report_has_uncertain_retained_state(report: &notm_notmuch::TagBatchReport) -> bool {
     !report.finalization_errors.is_empty()
-        || report.failures.iter().any(|failure| {
-            failure.stage == notm_notmuch::TagFailureStage::MaildirFlagSync
-                && failure.file_failures.iter().any(|file| {
+        || report.failures.iter().any(|failure| match failure.stage {
+            notm_notmuch::TagFailureStage::Freeze
+            | notm_notmuch::TagFailureStage::RemoveTag
+            | notm_notmuch::TagFailureStage::AddTag
+            | notm_notmuch::TagFailureStage::Thaw => true,
+            notm_notmuch::TagFailureStage::MaildirFlagSync => {
+                failure.file_failures.iter().any(|file| {
                     file.current_filename.as_deref() != Some(file.previous_filename.as_str())
                 })
+            }
+            notm_notmuch::TagFailureStage::Lookup => false,
         })
 }
 
@@ -19120,7 +19150,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_path_uncertainty_distinguishes_known_partial_results() {
+    fn retained_state_uncertainty_distinguishes_mutation_and_known_partial_results() {
         let failure = |current_filename: Option<&str>| notm_notmuch::MessageTagFailure {
             message_id: "message@example.test".to_string(),
             stage: notm_notmuch::TagFailureStage::MaildirFlagSync,
@@ -19137,19 +19167,19 @@ mod tests {
             failures: vec![failure(Some("/mail/cur/message:2,S"))],
             ..notm_notmuch::TagBatchReport::default()
         };
-        assert!(!tag_report_has_uncertain_retained_paths(&known_unchanged));
+        assert!(!tag_report_has_uncertain_retained_state(&known_unchanged));
 
         let unresolved = notm_notmuch::TagBatchReport {
             failures: vec![failure(None)],
             ..notm_notmuch::TagBatchReport::default()
         };
-        assert!(tag_report_has_uncertain_retained_paths(&unresolved));
+        assert!(tag_report_has_uncertain_retained_state(&unresolved));
 
         let database_mismatch = notm_notmuch::TagBatchReport {
             failures: vec![failure(Some("/mail/cur/message:2,"))],
             ..notm_notmuch::TagBatchReport::default()
         };
-        assert!(tag_report_has_uncertain_retained_paths(&database_mismatch));
+        assert!(tag_report_has_uncertain_retained_state(&database_mismatch));
 
         let lookup_failure = notm_notmuch::TagBatchReport {
             failures: vec![notm_notmuch::MessageTagFailure {
@@ -19161,13 +19191,138 @@ mod tests {
             }],
             ..notm_notmuch::TagBatchReport::default()
         };
-        assert!(!tag_report_has_uncertain_retained_paths(&lookup_failure));
+        assert!(!tag_report_has_uncertain_retained_state(&lookup_failure));
+
+        for stage in [
+            notm_notmuch::TagFailureStage::Freeze,
+            notm_notmuch::TagFailureStage::RemoveTag,
+            notm_notmuch::TagFailureStage::AddTag,
+            notm_notmuch::TagFailureStage::Thaw,
+        ] {
+            let mutation_failure = notm_notmuch::TagBatchReport {
+                failures: vec![notm_notmuch::MessageTagFailure {
+                    message_id: "message@example.test".to_string(),
+                    stage,
+                    detail: "mutation state could not be committed safely".to_string(),
+                    current_filenames: Vec::new(),
+                    file_failures: Vec::new(),
+                }],
+                ..notm_notmuch::TagBatchReport::default()
+            };
+            assert!(
+                tag_report_has_uncertain_retained_state(&mutation_failure),
+                "{stage:?} must keep retained state uncertain"
+            );
+        }
 
         let close_failure = notm_notmuch::TagBatchReport {
             finalization_errors: vec!["database close/commit failed".to_string()],
             ..notm_notmuch::TagBatchReport::default()
         };
-        assert!(tag_report_has_uncertain_retained_paths(&close_failure));
+        assert!(tag_report_has_uncertain_retained_state(&close_failure));
+    }
+
+    #[test]
+    fn uncertain_retained_state_suppresses_selected_thread_restore() {
+        let report = notm_notmuch::TagBatchReport {
+            failures: vec![notm_notmuch::MessageTagFailure {
+                message_id: "message@example.test".to_string(),
+                stage: notm_notmuch::TagFailureStage::Thaw,
+                detail: "thaw failed".to_string(),
+                current_filenames: Vec::new(),
+                file_failures: Vec::new(),
+            }],
+            ..notm_notmuch::TagBatchReport::default()
+        };
+        let mut state = UiState {
+            selected_thread: Some(notm_notmuch::ThreadSummary {
+                thread_id: "selected-thread".to_string(),
+                subject: "Selected thread".to_string(),
+                authors: String::new(),
+                oldest_date: 0,
+                newest_date: 0,
+                matched_messages: 1,
+                total_messages: 1,
+                tags: vec!["inbox".to_string()],
+                has_unread: false,
+                is_flagged: false,
+            }),
+            ..UiState::default()
+        };
+
+        assert_eq!(
+            selected_thread_id_for_tag_refresh(&state).as_deref(),
+            Some("selected-thread")
+        );
+
+        state.tag_paths_uncertain = tag_report_has_uncertain_retained_state(&report);
+
+        assert_eq!(selected_thread_id_for_tag_refresh(&state), None);
+    }
+
+    #[test]
+    fn uncertain_retained_state_warning_persists_after_successful_refresh() {
+        let warning = "message at thaw: thaw failed";
+        let mut state = UiState {
+            tag_warning: Some(warning.to_string()),
+            tag_paths_uncertain: true,
+            ..UiState::default()
+        };
+
+        let outcome = reduce_tag_warning_after_search(&mut state, true);
+
+        assert!(matches!(
+            outcome,
+            TagWarningRefreshOutcome::PersistentUncertainty(ref message)
+                if message.contains("retained message tags")
+        ));
+        assert_eq!(state.tag_warning.as_deref(), Some(warning));
+        assert!(
+            state
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("Restart notm"))
+        );
+
+        state.tag_paths_uncertain = false;
+        assert_eq!(
+            reduce_tag_warning_after_search(&mut state, true),
+            TagWarningRefreshOutcome::Reconciled(warning.to_string())
+        );
+        assert_eq!(state.tag_warning, None);
+    }
+
+    #[test]
+    fn mutation_failure_without_applied_changes_creates_no_undo_or_path_remap() {
+        let report = notm_notmuch::TagBatchReport {
+            requested_messages: 1,
+            failures: vec![notm_notmuch::MessageTagFailure {
+                message_id: "draft@example.test".to_string(),
+                stage: notm_notmuch::TagFailureStage::Thaw,
+                detail: "thaw failed".to_string(),
+                current_filenames: vec!["/mail/cur/draft:2,D".to_string()],
+                file_failures: Vec::new(),
+            }],
+            ..notm_notmuch::TagBatchReport::default()
+        };
+        let original_path = PathBuf::from("/mail/cur/draft:2,D");
+        let mut active_draft = Some(ActiveDraft {
+            path: original_path.clone(),
+            message_id: Some("draft@example.test".to_string()),
+            indexed: true,
+            saved_fields: ComposeFields::default(),
+        });
+
+        assert!(report.changes.is_empty());
+        assert!(report.path_states.is_empty());
+        assert!(inverse_tag_mutations(&report.changes).is_empty());
+        assert!(apply_active_draft_authoritative_paths(
+            &mut active_draft,
+            &report.changes,
+            &report.path_states,
+        ));
+        assert_eq!(active_draft.expect("active draft").path, original_path);
+        assert!(tag_report_has_uncertain_retained_state(&report));
     }
 
     #[test]

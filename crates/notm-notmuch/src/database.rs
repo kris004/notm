@@ -1172,28 +1172,14 @@ fn mutate_message(
         }
     }
 
-    let current_filenames = report_filenames(&current_filename_paths);
-    let filename_changes = report_filename_changes(&path_changes);
-
-    let change = applied_tag_change(
-        &message_id,
+    finalize_message_mutation(
+        message_id,
         &before_tags,
         after_tags,
-        current_filenames.clone(),
-        filename_changes,
-    );
-    for failure in &mut failures {
-        failure.current_filenames = current_filenames.clone();
-    }
-    let applied = change.map(|change| AppliedMessageMutation {
-        change,
-        path_state: MessagePathState {
-            message_id,
-            paths: current_filename_paths,
-            path_changes,
-        },
-    });
-    MessageMutationOutcome { applied, failures }
+        current_filename_paths,
+        path_changes,
+        failures,
+    )
 }
 
 #[derive(Default)]
@@ -1205,6 +1191,48 @@ struct MessageMutationOutcome {
 struct AppliedMessageMutation {
     change: AppliedTagChange,
     path_state: MessagePathState,
+}
+
+fn finalize_message_mutation(
+    message_id: String,
+    before_tags: &[String],
+    after_tags: Vec<String>,
+    current_filename_paths: Vec<PathBuf>,
+    path_changes: Vec<MaildirPathChange>,
+    mut failures: Vec<MessageTagFailure>,
+) -> MessageMutationOutcome {
+    let current_filenames = report_filenames(&current_filename_paths);
+    for failure in &mut failures {
+        failure.current_filenames = current_filenames.clone();
+    }
+
+    if failures
+        .iter()
+        .any(|failure| failure.stage == TagFailureStage::Thaw)
+    {
+        return MessageMutationOutcome {
+            applied: None,
+            failures,
+        };
+    }
+
+    let filename_changes = report_filename_changes(&path_changes);
+    let applied = applied_tag_change(
+        &message_id,
+        before_tags,
+        after_tags,
+        current_filenames,
+        filename_changes,
+    )
+    .map(|change| AppliedMessageMutation {
+        change,
+        path_state: MessagePathState {
+            message_id,
+            paths: current_filename_paths,
+            path_changes,
+        },
+    });
+    MessageMutationOutcome { applied, failures }
 }
 
 fn message_failure(
@@ -1507,6 +1535,76 @@ mod tests {
             .expect("remove then add leaves an absent tag added");
         assert_eq!(effective.add, ["inbox"]);
         assert!(effective.remove.is_empty());
+    }
+
+    #[test]
+    fn thaw_failure_finalization_suppresses_uncommitted_applied_state() {
+        let message_id = "thaw-failure@example.test";
+        let path = PathBuf::from("/mail/cur/thaw-failure:2,S");
+        let outcome = finalize_message_mutation(
+            message_id.to_string(),
+            &["inbox".to_string()],
+            vec!["inbox".to_string(), "staged".to_string()],
+            vec![path.clone()],
+            vec![MaildirPathChange {
+                previous_path: path.clone(),
+                current_path: path.clone(),
+            }],
+            vec![MessageTagFailure {
+                message_id: message_id.to_string(),
+                stage: TagFailureStage::Thaw,
+                detail: "forced thaw failure".to_string(),
+                current_filenames: Vec::new(),
+                file_failures: Vec::new(),
+            }],
+        );
+
+        assert!(
+            outcome.applied.is_none(),
+            "staged tags and their path state are not authoritative after thaw fails"
+        );
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].stage, TagFailureStage::Thaw);
+        assert_eq!(outcome.failures[0].detail, "forced thaw failure");
+        assert_eq!(
+            outcome.failures[0].current_filenames,
+            [path.to_string_lossy().into_owned()]
+        );
+    }
+
+    #[test]
+    fn successful_finalization_retains_applied_change_and_path_state() {
+        let message_id = "thaw-success@example.test";
+        let path = PathBuf::from("/mail/cur/thaw-success:2,S");
+        let outcome = finalize_message_mutation(
+            message_id.to_string(),
+            &["inbox".to_string()],
+            vec!["inbox".to_string(), "stored".to_string()],
+            vec![path.clone()],
+            vec![MaildirPathChange {
+                previous_path: path.clone(),
+                current_path: path.clone(),
+            }],
+            Vec::new(),
+        );
+
+        assert!(outcome.failures.is_empty());
+        let applied = outcome.applied.expect("successful applied mutation");
+        assert_eq!(applied.change.message_id, message_id);
+        assert_eq!(applied.change.added, ["stored"]);
+        assert_eq!(applied.change.tags, ["inbox", "stored"]);
+        assert_eq!(applied.path_state.message_id, message_id);
+        assert_eq!(
+            applied.path_state.paths.as_slice(),
+            std::slice::from_ref(&path)
+        );
+        assert_eq!(
+            applied.path_state.path_changes,
+            [MaildirPathChange {
+                previous_path: path.clone(),
+                current_path: path,
+            }]
+        );
     }
 
     #[test]
