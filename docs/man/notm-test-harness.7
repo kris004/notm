@@ -58,15 +58,31 @@ is false before inspecting final rows.
 .B select_saved_search
 and
 .B load_more_threads
-use the same background-search state. Fixture harness requests may pass
+use the same background-search state. Tag commands return
+.B pending
+after scheduling; poll
+.B tag_status
+until
+.B in_progress
+is false before inspecting tag or filename results. If
+.B paths_uncertain
+is true, restart notm before issuing any retained-message, draft, tag, send, or
+sync action. Fixture harness requests may pass
 .B test_delay_ms
-(maximum 5000) to validate responsiveness while worker-side search work is
-outstanding; non-fixture runs reject that test-only argument.
+(maximum 5000) to
+.B run_search
+or
+.B tag_selected
+to validate responsiveness while worker-side work is outstanding. A disposable
+non-fixture tag-race harness may use the delay only with
+.B automation.allow_live_tag_test=true ;
+other non-fixture runs reject it.
 .SH TEST COMMAND GROUPS
 .SS Health and state
 .BR health ,
 .BR app_state ,
 .BR search_status ,
+.BR tag_status ,
 .BR get_logs ,
 .BR screenshot .
 .SS Search and navigation
@@ -166,6 +182,10 @@ It targets the selected message ID only and ignores thread multi-selection.
 .BR cancel_link_hints ,
 .BR toggle_quote_collapse ,
 .BR message_view_text ,
+.BR standalone_message_windows ,
+.BR close_standalone_message_windows ,
+.BR standalone_select_message ,
+.BR standalone_respond ,
 .BR attachment_list_items ,
 .BR save_selected_attachment ,
 .BR save_attachment ,

@@ -31,6 +31,7 @@ const THREAD_STATUS_PREFIX: &str = "status";
 #[derive(Debug, Clone)]
 pub(crate) struct SearchData {
     pub(crate) query: String,
+    pub(crate) excluded_tags: Vec<String>,
     pub(crate) threads: Vec<ThreadSummary>,
     pub(crate) details: BTreeMap<String, ThreadUiDetails>,
     pub(crate) count: u32,
@@ -40,6 +41,12 @@ pub(crate) struct SearchData {
     pub(crate) database_path: String,
     pub(crate) revision: Revision,
     pub(crate) cached: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchCachePolicy {
+    Use,
+    Bypass,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +70,7 @@ pub(crate) struct SearchPageRequest {
     pub(crate) offset: usize,
     pub(crate) select_first: bool,
     pub(crate) delay: Duration,
+    pub(crate) cache_policy: SearchCachePolicy,
 }
 
 pub(crate) struct SearchPageResponse {
@@ -89,6 +97,7 @@ impl SearchPageCoordinator {
     {
         let select_first = request.select_first;
         let offset = request.offset;
+        let cache_policy = request.cache_policy;
         let open_config = self.open_config.clone();
         let runtime = self.runtime.clone();
         search_bar::launch_worker(
@@ -107,6 +116,7 @@ impl SearchPageCoordinator {
                     offset,
                     runtime.page_size,
                     runtime.excluded_tags,
+                    cache_policy,
                 )
             },
             move |generation, result| {
@@ -549,6 +559,10 @@ impl ThreadListController {
         self.load_more_button.set_sensitive(sensitive);
     }
 
+    pub(crate) fn set_selection_sensitive(&self, sensitive: bool) {
+        self.list.set_sensitive(sensitive);
+    }
+
     pub(crate) fn connect_activate<F>(&self, callback: F)
     where
         F: Fn(usize) + 'static,
@@ -884,8 +898,10 @@ pub(crate) fn execute_search_page(
     offset: usize,
     limit: usize,
     excluded_tags: Vec<String>,
+    cache_policy: SearchCachePolicy,
 ) -> anyhow::Result<SearchData> {
     let limit = limit.max(1);
+    let excluded_tags = canonical_excluded_tags(excluded_tags);
     // Capture the epoch before opening the database. A mutation that commits
     // afterward bumps the epoch, so this worker cannot publish its older
     // snapshot under the post-mutation cache generation.
@@ -902,13 +918,15 @@ pub(crate) fn execute_search_page(
         excluded_tags.clone(),
         cache_epoch,
     );
-    let cached = {
-        let mut cache = search_cache().lock().expect("search cache lock");
-        cache.get(&key).cloned()
-    };
-    if let Some(mut cached) = cached {
-        cached.cached = true;
-        return Ok(cached);
+    if cache_policy == SearchCachePolicy::Use {
+        let cached = {
+            let mut cache = search_cache().lock().expect("search cache lock");
+            cache.get(&key).cloned()
+        };
+        if let Some(mut cached) = cached {
+            cached.cached = true;
+            return Ok(cached);
+        }
     }
 
     let tags = db.all_tags();
@@ -916,15 +934,26 @@ pub(crate) fn execute_search_page(
         limit,
         offset,
         sort: SortOrder::NewestFirst,
-        excluded_tags,
+        excluded_tags: excluded_tags.clone(),
     };
     let threads = db.search_threads(query, &options)?;
-    let count = db
-        .count_threads(query, &options)
-        .unwrap_or(threads.len() as u32);
+    let count = match cache_policy {
+        SearchCachePolicy::Use => db
+            .count_threads(query, &options)
+            .unwrap_or(threads.len() as u32),
+        SearchCachePolicy::Bypass => db.count_threads(query, &options)?,
+    };
+    let completed_revision = db.revision();
+    if cache_policy == SearchCachePolicy::Bypass {
+        anyhow::ensure!(
+            completed_revision == revision,
+            "database revision changed while loading an authoritative search page"
+        );
+    }
     let details = thread_details_for_threads(&db, &db_path, &revision, &threads, cache_epoch);
     let data = SearchData {
         query: query.to_string(),
+        excluded_tags,
         threads,
         details,
         count,
@@ -935,11 +964,19 @@ pub(crate) fn execute_search_page(
         revision,
         cached: false,
     };
-    search_cache()
-        .lock()
-        .expect("search cache lock")
-        .insert(key, data.clone());
+    if cache_policy == SearchCachePolicy::Use {
+        search_cache()
+            .lock()
+            .expect("search cache lock")
+            .insert(key, data.clone());
+    }
     Ok(data)
+}
+
+pub(crate) fn canonical_excluded_tags(mut excluded_tags: Vec<String>) -> Vec<String> {
+    excluded_tags.sort_unstable();
+    excluded_tags.dedup();
+    excluded_tags
 }
 
 pub(crate) fn format_count(value: usize) -> String {
@@ -1456,7 +1493,7 @@ fn search_cache_key(
         query: query.to_string(),
         offset,
         limit,
-        excluded_tags,
+        excluded_tags: canonical_excluded_tags(excluded_tags),
     }
 }
 
@@ -1505,6 +1542,7 @@ mod tests {
     fn test_search_data(query: &str, offset: usize, ids: &[&str], count: u32) -> SearchData {
         SearchData {
             query: query.to_string(),
+            excluded_tags: vec!["spam".to_string(), "trash".to_string()],
             threads: ids.iter().map(|id| test_thread(id)).collect(),
             details: ids
                 .iter()
@@ -1781,19 +1819,20 @@ mod tests {
                     0,
                 ),
             ),
-            (
-                "excluded tag order",
-                search_cache_key(
-                    "tag:inbox",
-                    "/mail/a",
-                    &base_revision,
-                    25,
-                    25,
-                    vec!["c".to_string(), "a,b".to_string()],
-                    0,
-                ),
-            ),
         ];
+        let reordered_and_duplicated = search_cache_key(
+            "tag:inbox",
+            "/mail/a",
+            &base_revision,
+            25,
+            25,
+            vec!["c".to_string(), "a,b".to_string(), "c".to_string()],
+            0,
+        );
+        assert_eq!(
+            base, reordered_and_duplicated,
+            "semantically identical excluded tags must share a canonical cache key"
+        );
         let mut cache = BoundedLruCache::new(variants.len() + 1);
         cache.insert(base.clone(), "base");
         for (dimension, key) in &variants {
@@ -1917,7 +1956,14 @@ mod tests {
         db.index_file_with_tags(&retained_path, &["inbox"])?;
         drop(db);
 
-        let first = execute_search_page(&open_config, "tag:draft", 0, 100, Vec::new())?;
+        let first = execute_search_page(
+            &open_config,
+            "tag:draft",
+            0,
+            100,
+            Vec::new(),
+            SearchCachePolicy::Use,
+        )?;
         assert_eq!(first.threads.len(), 1);
         assert!(!first.cached);
 
@@ -1927,13 +1973,114 @@ mod tests {
         fs::remove_file(&path)?;
         invalidate_search_caches();
 
-        let second = execute_search_page(&open_config, "tag:draft", 0, 100, Vec::new())?;
+        let second = execute_search_page(
+            &open_config,
+            "tag:draft",
+            0,
+            100,
+            Vec::new(),
+            SearchCachePolicy::Use,
+        )?;
         assert!(
             second.threads.is_empty(),
             "removed draft was returned after cache invalidation; result revision={:?}, cached={}",
             second.revision,
             second.cached
         );
+        Ok(())
+    }
+
+    #[test]
+    fn authoritative_search_bypasses_matching_revision_stale_cache_after_deletion()
+    -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("mail");
+        let maildir = root.join("cur");
+        fs::create_dir_all(&maildir)?;
+        let config_path = temp.path().join("notmuch-config");
+        fs::write(
+            &config_path,
+            format!(
+                "[database]\npath={}\n\n[user]\nname=Fixture User\nprimary_email=fixture@example.test\n",
+                root.display()
+            ),
+        )?;
+        let open_config = OpenConfig {
+            database_path: Some(root),
+            config_path: Some(config_path),
+            profile: None,
+        };
+        let db = Database::create(&open_config)?;
+        let removed_path = maildir.join("removed:2,");
+        let retained_path = maildir.join("retained:2,");
+        for (path, message_id, subject) in [
+            (&removed_path, "removed@fixture.test", "Removed"),
+            (&retained_path, "retained@fixture.test", "Retained"),
+        ] {
+            fs::write(
+                path,
+                format!(
+                    "From: Fixture User <fixture@example.test>\nTo: recipient@example.test\nSubject: {subject}\nMessage-ID: <{message_id}>\nDate: Tue, 19 Aug 2026 12:00:00 -0600\n\nBody.\n"
+                ),
+            )?;
+            db.index_file_with_tags(path, &["inbox"])?;
+        }
+        drop(db);
+
+        let mut stale = execute_search_page(
+            &open_config,
+            "tag:inbox",
+            0,
+            100,
+            Vec::new(),
+            SearchCachePolicy::Use,
+        )?;
+        assert_eq!(stale.count, 2);
+        assert_eq!(stale.threads.len(), 2);
+
+        let db = Database::open(&open_config, DatabaseMode::ReadWrite)?;
+        db.remove_message_file(&removed_path)?;
+        drop(db);
+        fs::remove_file(&removed_path)?;
+        let db = Database::open(&open_config, DatabaseMode::ReadOnly)?;
+        let current_revision = db.revision();
+        let database_path = db.path();
+        drop(db);
+
+        stale.revision = current_revision.clone();
+        stale.database_path.clone_from(&database_path);
+        stale.cached = false;
+        let key = search_cache_key(
+            "tag:inbox",
+            &database_path,
+            &current_revision,
+            0,
+            100,
+            Vec::new(),
+            CACHE_EPOCH.load(Ordering::Acquire),
+        );
+        let mut cache = search_cache().lock().expect("search cache lock");
+        cache.insert(key.clone(), stale);
+        assert_eq!(
+            cache.get(&key).map(|entry| entry.count),
+            Some(2),
+            "the matching-revision stale entry was not installed"
+        );
+
+        let authoritative = execute_search_page(
+            &open_config,
+            "tag:inbox",
+            0,
+            100,
+            Vec::new(),
+            SearchCachePolicy::Bypass,
+        )?;
+        drop(cache);
+        assert!(!authoritative.cached);
+        assert_eq!(authoritative.excluded_tags, Vec::<String>::new());
+        assert_eq!(authoritative.count, 1);
+        assert_eq!(authoritative.threads.len(), 1);
+        assert_eq!(authoritative.threads[0].subject, "Retained");
         Ok(())
     }
 
