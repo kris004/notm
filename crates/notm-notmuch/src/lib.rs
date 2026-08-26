@@ -17,9 +17,9 @@ pub use database::{
 };
 pub use error::{Error, Result};
 pub use message::{
-    AppliedTagChange, MaildirFilenameChange, MaildirFlagSyncFailure, MessageSummary,
-    MessageTagFailure, MessageTagMutation, TagBatchReport, TagFailureStage, TagMutation,
-    TagOperationReport, ThreadTagReport,
+    AppliedTagChange, MaildirFilenameChange, MaildirFlagSyncFailure, MaildirPathChange,
+    MessagePathState, MessageSummary, MessageTagFailure, MessageTagMutation, TagBatchReport,
+    TagFailureStage, TagMutation, TagOperationReport, ThreadTagReport,
 };
 pub use query::{QueryOptions, SortOrder};
 pub use thread::ThreadSummary;

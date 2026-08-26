@@ -12557,6 +12557,7 @@ fn merge_tag_batch_report(
         .changed_messages
         .saturating_add(report.changed_messages);
     combined.changes.extend(report.changes);
+    combined.path_states.extend(report.path_states);
     combined.failures.extend(report.failures);
     combined
         .finalization_errors
@@ -12771,7 +12772,7 @@ fn apply_completed_tag_report(
             }
         }
     }
-    apply_authoritative_tag_changes(widgets, state, &report.changes)
+    apply_authoritative_tag_changes(widgets, state, &report.changes, &report.path_states)
 }
 
 fn inverse_tag_mutations(changes: &[notm_notmuch::AppliedTagChange]) -> Vec<MessageTagMutation> {
@@ -12890,8 +12891,9 @@ fn apply_authoritative_tag_changes(
     widgets: &Widgets,
     state: &SharedState,
     changes: &[notm_notmuch::AppliedTagChange],
+    path_states: &[notm_notmuch::MessagePathState],
 ) -> bool {
-    if changes.is_empty() {
+    if changes.is_empty() && path_states.is_empty() {
         return true;
     }
     let row_updates = {
@@ -12920,7 +12922,7 @@ fn apply_authoritative_tag_changes(
         }
 
         let active_draft_paths_resolved =
-            apply_active_draft_filename_changes(&mut state.active_draft, changes);
+            apply_active_draft_authoritative_paths(&mut state.active_draft, changes, path_states);
 
         let mut updated_thread_indices = Vec::new();
         for thread_id in affected_thread_ids {
@@ -12961,6 +12963,45 @@ fn apply_authoritative_tag_changes(
     refresh_thread_model_rows(widgets, state, &row_updates.0);
     update_visual_selection_rows(widgets, state);
     row_updates.1
+}
+
+fn apply_active_draft_authoritative_paths(
+    active_draft: &mut Option<ActiveDraft>,
+    changes: &[notm_notmuch::AppliedTagChange],
+    path_states: &[notm_notmuch::MessagePathState],
+) -> bool {
+    if path_states.is_empty() {
+        apply_active_draft_filename_changes(active_draft, changes)
+    } else {
+        apply_active_draft_path_states(active_draft, path_states)
+    }
+}
+
+fn apply_active_draft_path_states(
+    active_draft: &mut Option<ActiveDraft>,
+    path_states: &[notm_notmuch::MessagePathState],
+) -> bool {
+    let Some(active_draft) = active_draft else {
+        return true;
+    };
+    let Some(message_id) = active_draft.message_id.as_deref() else {
+        return true;
+    };
+    let mut last_matching_state = None;
+    for path_state in path_states {
+        if path_state.message_id != message_id {
+            continue;
+        }
+        if let Some(path_change) = path_state
+            .path_changes
+            .iter()
+            .find(|path_change| active_draft.path == path_change.previous_path)
+        {
+            active_draft.path.clone_from(&path_change.current_path);
+        }
+        last_matching_state = Some(path_state);
+    }
+    last_matching_state.is_none_or(|path_state| path_state.paths.contains(&active_draft.path))
 }
 
 fn apply_active_draft_filename_changes(
@@ -18942,14 +18983,90 @@ mod tests {
             },
         ];
 
-        assert!(apply_active_draft_filename_changes(
+        assert!(apply_active_draft_authoritative_paths(
             &mut active_draft,
-            &changes
+            &changes,
+            &[],
         ));
 
         assert_eq!(
             active_draft.expect("active draft").path,
             PathBuf::from("/mail/cur/draft:2,D")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_path_states_remap_non_utf8_active_draft_without_uncertainty() {
+        use std::{
+            ffi::OsString,
+            os::unix::ffi::{OsStrExt, OsStringExt},
+        };
+
+        let raw_path = |bytes: &[u8]| PathBuf::from(OsString::from_vec(bytes.to_vec()));
+        let original_path = raw_path(b"/mail/new/draft-\xff");
+        let intermediate_path = raw_path(b"/mail/cur/draft-\xff:2,DF");
+        let final_path = raw_path(b"/mail/cur/draft-\xff:2,D");
+        let mut active_draft = Some(ActiveDraft {
+            path: original_path.clone(),
+            message_id: Some("draft@example.test".to_string()),
+            indexed: true,
+            saved_fields: ComposeFields::default(),
+        });
+        let lossy_changes = vec![
+            notm_notmuch::AppliedTagChange {
+                message_id: "draft@example.test".to_string(),
+                added: vec!["flagged".to_string()],
+                removed: Vec::new(),
+                tags: vec!["draft".to_string(), "flagged".to_string()],
+                filenames: vec![intermediate_path.to_string_lossy().into_owned()],
+                filename_changes: vec![notm_notmuch::MaildirFilenameChange {
+                    previous_filename: original_path.to_string_lossy().into_owned(),
+                    current_filename: intermediate_path.to_string_lossy().into_owned(),
+                }],
+            },
+            notm_notmuch::AppliedTagChange {
+                message_id: "draft@example.test".to_string(),
+                added: Vec::new(),
+                removed: vec!["flagged".to_string()],
+                tags: vec!["draft".to_string()],
+                filenames: vec![final_path.to_string_lossy().into_owned()],
+                filename_changes: vec![notm_notmuch::MaildirFilenameChange {
+                    previous_filename: intermediate_path.to_string_lossy().into_owned(),
+                    current_filename: final_path.to_string_lossy().into_owned(),
+                }],
+            },
+        ];
+        let path_states = vec![
+            notm_notmuch::MessagePathState {
+                message_id: "draft@example.test".to_string(),
+                paths: vec![intermediate_path.clone()],
+                path_changes: vec![notm_notmuch::MaildirPathChange {
+                    previous_path: original_path,
+                    current_path: intermediate_path.clone(),
+                }],
+            },
+            notm_notmuch::MessagePathState {
+                message_id: "draft@example.test".to_string(),
+                paths: vec![final_path.clone()],
+                path_changes: vec![notm_notmuch::MaildirPathChange {
+                    previous_path: intermediate_path,
+                    current_path: final_path.clone(),
+                }],
+            },
+        ];
+
+        assert!(apply_active_draft_authoritative_paths(
+            &mut active_draft,
+            &lossy_changes,
+            &path_states,
+        ));
+
+        let active_draft = active_draft.expect("active draft");
+        assert_eq!(active_draft.path, final_path);
+        assert_eq!(
+            active_draft.path.as_os_str().as_bytes(),
+            b"/mail/cur/draft-\xff:2,D"
         );
     }
 
@@ -18970,9 +19087,10 @@ mod tests {
             filename_changes: Vec::new(),
         }];
 
-        assert!(!apply_active_draft_filename_changes(
+        assert!(!apply_active_draft_authoritative_paths(
             &mut active_draft,
-            &changes
+            &changes,
+            &[],
         ));
     }
 

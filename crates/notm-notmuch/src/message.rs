@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -93,6 +93,19 @@ pub struct MaildirFilenameChange {
     pub current_filename: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaildirPathChange {
+    pub previous_path: PathBuf,
+    pub current_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessagePathState {
+    pub message_id: String,
+    pub paths: Vec<PathBuf>,
+    pub path_changes: Vec<MaildirPathChange>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessageTagFailure {
     pub message_id: String,
@@ -110,6 +123,11 @@ pub struct TagBatchReport {
     pub changed_messages: usize,
     #[serde(default)]
     pub changes: Vec<AppliedTagChange>,
+    /// Byte-preserving runtime companion to `changes`, in the same order.
+    ///
+    /// Serialized reports retain their existing String-only JSON contract.
+    #[serde(skip)]
+    pub path_states: Vec<MessagePathState>,
     #[serde(default)]
     pub failures: Vec<MessageTagFailure>,
     /// Errors ending the atomic section or durably closing the database.

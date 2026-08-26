@@ -247,6 +247,27 @@ fn successful_multi_file_maildir_sync_reports_current_filenames() -> anyhow::Res
         .into_iter()
         .collect()
     );
+    let path_state = &report.path_states[0];
+    assert_eq!(path_state.message_id, original.message_id);
+    assert_eq!(
+        path_state.paths.iter().cloned().collect::<BTreeSet<_>>(),
+        [expected_original.clone(), expected_duplicate.clone()]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        path_state
+            .path_changes
+            .iter()
+            .map(|mapping| (mapping.previous_path.clone(), mapping.current_path.clone()))
+            .collect::<BTreeSet<_>>(),
+        [
+            (original_path.clone(), expected_original.clone()),
+            (duplicate_path.clone(), expected_duplicate.clone()),
+        ]
+        .into_iter()
+        .collect()
+    );
     assert!(!change.tags.iter().any(|tag| tag == "unread"));
     assert!(expected_original.is_file());
     assert!(expected_duplicate.is_file());
@@ -281,35 +302,102 @@ fn non_utf8_maildir_sync_reconciles_exact_raw_paths() -> anyhow::Result<()> {
         &original_path,
         b"From: raw-path@example.test\r\nTo: fixture@example.test\r\nSubject: Non-UTF-8 Maildir path\r\nMessage-ID: <non-utf8-path@fixture.test>\r\n\r\nbody\r\n",
     )?;
-    let message_id = db.index_file_with_tags(&original_path, &["inbox", "unread"])?;
+    let message_id = db.index_file_with_tags(&original_path, &["draft", "inbox", "unread"])?;
 
     let report = db.apply_tags_to_messages(
-        &[MessageTagMutation {
-            message_id: message_id.clone(),
-            add: Vec::new(),
-            remove: vec!["unread".into()],
-        }],
+        &[
+            MessageTagMutation {
+                message_id: message_id.clone(),
+                add: Vec::new(),
+                remove: vec!["unread".into()],
+            },
+            MessageTagMutation {
+                message_id: message_id.clone(),
+                add: vec!["flagged".into()],
+                remove: Vec::new(),
+            },
+        ],
         true,
     )?;
     assert_complete(&report);
-    assert_eq!(report.changed_messages, 1);
+    assert_eq!(report.requested_messages, 2);
+    assert_eq!(report.changed_messages, 2);
+    assert_eq!(report.path_states.len(), report.changes.len());
+    let intermediate_path = fixture
+        .maildir
+        .join("cur")
+        .join(OsString::from_vec(b"non-utf8-\xff:2,DS".to_vec()));
     let expected_path = fixture
         .maildir
         .join("cur")
-        .join(OsString::from_vec(b"non-utf8-\xff:2,S".to_vec()));
+        .join(OsString::from_vec(b"non-utf8-\xff:2,DFS".to_vec()));
     assert!(!original_path.exists());
+    assert!(!intermediate_path.exists());
     assert!(expected_path.is_file());
     assert_eq!(
-        report.changes[0].filenames,
+        report.changes[1].filenames,
         [expected_path.to_string_lossy().into_owned()]
     );
     assert_eq!(
         report.changes[0].filename_changes,
         [notm_notmuch::MaildirFilenameChange {
             previous_filename: original_path.to_string_lossy().into_owned(),
+            current_filename: intermediate_path.to_string_lossy().into_owned(),
+        }]
+    );
+    assert_eq!(
+        report.changes[1].filename_changes,
+        [notm_notmuch::MaildirFilenameChange {
+            previous_filename: intermediate_path.to_string_lossy().into_owned(),
             current_filename: expected_path.to_string_lossy().into_owned(),
         }]
     );
+    for (change, path_state) in report.changes.iter().zip(&report.path_states) {
+        assert_eq!(path_state.message_id, change.message_id);
+    }
+    assert_eq!(
+        report.path_states[0].paths[0].as_os_str().as_bytes(),
+        intermediate_path.as_os_str().as_bytes()
+    );
+    assert_eq!(
+        report.path_states[0].path_changes[0]
+            .previous_path
+            .as_os_str()
+            .as_bytes(),
+        original_path.as_os_str().as_bytes()
+    );
+    assert_eq!(
+        report.path_states[0].path_changes[0]
+            .current_path
+            .as_os_str()
+            .as_bytes(),
+        intermediate_path.as_os_str().as_bytes()
+    );
+    assert_eq!(
+        report.path_states[1].paths[0].as_os_str().as_bytes(),
+        expected_path.as_os_str().as_bytes()
+    );
+    assert_eq!(
+        report.path_states[1].path_changes[0]
+            .previous_path
+            .as_os_str()
+            .as_bytes(),
+        intermediate_path.as_os_str().as_bytes()
+    );
+    assert_eq!(
+        report.path_states[1].path_changes[0]
+            .current_path
+            .as_os_str()
+            .as_bytes(),
+        expected_path.as_os_str().as_bytes()
+    );
+    let serialized = serde_json::to_value(&report)?;
+    assert!(
+        serialized.get("path_states").is_none(),
+        "raw paths must not change the serialized report contract"
+    );
+    let deserialized: TagBatchReport = serde_json::from_value(serialized)?;
+    assert!(deserialized.path_states.is_empty());
     let current = only_message(&db, &format!("id:{message_id}"), &options)?;
     let resolved = db.open_message_file(&current)?;
     assert_eq!(
@@ -403,6 +491,31 @@ fn partial_maildir_rename_failure_is_reported_per_file() -> anyhow::Result<()> {
         .into_iter()
         .collect()
     );
+    assert_eq!(report.path_states.len(), 1);
+    assert_eq!(report.path_states[0].message_id, original.message_id);
+    assert_eq!(
+        report.path_states[0]
+            .paths
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        [successful_target.clone(), duplicate_path.clone()]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        report.path_states[0]
+            .path_changes
+            .iter()
+            .map(|mapping| (mapping.previous_path.clone(), mapping.current_path.clone()))
+            .collect::<BTreeSet<_>>(),
+        [
+            (original_path.clone(), successful_target.clone()),
+            (duplicate_path.clone(), duplicate_path.clone()),
+        ]
+        .into_iter()
+        .collect()
+    );
     assert!(successful_target.is_file());
     assert!(duplicate_path.is_file());
     assert!(blocked_target.is_dir());
@@ -418,6 +531,7 @@ fn partial_maildir_rename_failure_is_reported_per_file() -> anyhow::Result<()> {
     )?;
     assert_complete(&retry);
     assert_eq!(retry.changed_messages, 1);
+    assert_eq!(retry.path_states.len(), 1);
     assert!(retry.changes[0].added.is_empty());
     assert!(retry.changes[0].removed.is_empty());
     assert_eq!(
@@ -429,6 +543,19 @@ fn partial_maildir_rename_failure_is_reported_per_file() -> anyhow::Result<()> {
         [successful_target.clone(), blocked_target.clone()]
             .into_iter()
             .collect()
+    );
+    assert_eq!(
+        retry.path_states[0]
+            .path_changes
+            .iter()
+            .map(|mapping| (mapping.previous_path.clone(), mapping.current_path.clone()))
+            .collect::<BTreeSet<_>>(),
+        [
+            (successful_target.clone(), successful_target.clone()),
+            (duplicate_path.clone(), blocked_target.clone()),
+        ]
+        .into_iter()
+        .collect()
     );
     assert!(blocked_target.is_file());
     assert!(!duplicate_path.exists());

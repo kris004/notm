@@ -21,9 +21,9 @@ use crate::{
     error::{check, check_index},
     ffi,
     message::{
-        AppliedTagChange, MaildirFilenameChange, MaildirFlagSyncFailure, MessageSummary,
-        MessageTagFailure, MessageTagMutation, TagBatchReport, TagFailureStage, TagMutation,
-        TagOperationReport, ThreadTagReport,
+        AppliedTagChange, MaildirFilenameChange, MaildirFlagSyncFailure, MaildirPathChange,
+        MessagePathState, MessageSummary, MessageTagFailure, MessageTagMutation, TagBatchReport,
+        TagFailureStage, TagMutation, TagOperationReport, ThreadTagReport,
     },
     query::{QueryOptions, SortOrder},
     safe::{cstr_to_string, path_to_cstring, take_malloc_string},
@@ -652,8 +652,9 @@ impl Database {
             }
             let outcome = mutate_message(message, &prepared.mutation, &self.status_string());
             unsafe { ffi::notmuch_message_destroy(message) };
-            if let Some(change) = outcome.change {
-                report.changes.push(change);
+            if let Some(applied) = outcome.applied {
+                report.changes.push(applied.change);
+                report.path_states.push(applied.path_state);
             }
             report.failures.extend(outcome.failures);
         }
@@ -1024,7 +1025,7 @@ fn mutate_message(
         detail.to_string(),
     ) {
         return MessageMutationOutcome {
-            change: None,
+            applied: None,
             failures: vec![message_failure(
                 &message_id,
                 TagFailureStage::Freeze,
@@ -1120,14 +1121,12 @@ fn mutate_message(
     let mut current_filename_paths =
         unsafe { collect_filename_paths(ffi::notmuch_message_get_filenames(message)) };
     current_filename_paths.sort();
-    let mut filename_changes = before_filename_paths
+    let mut path_changes = before_filename_paths
         .iter()
-        .map(|filename| {
-            let filename = report_filename(filename);
-            MaildirFilenameChange {
-                previous_filename: filename.clone(),
-                current_filename: filename,
-            }
+        .cloned()
+        .map(|path| MaildirPathChange {
+            previous_path: path.clone(),
+            current_path: path,
         })
         .collect::<Vec<_>>();
 
@@ -1149,10 +1148,10 @@ fn mutate_message(
         let mut database_filename_paths =
             unsafe { collect_filename_paths(ffi::notmuch_message_get_filenames(message)) };
         database_filename_paths.sort();
-        let (authoritative, reconciled_changes, file_failures) =
+        let (authoritative, reconciled_path_changes, file_failures) =
             reconcile_maildir_filenames(&expectations, &database_filename_paths);
         current_filename_paths = authoritative;
-        filename_changes = reconciled_changes;
+        path_changes = reconciled_path_changes;
         let current_filenames = report_filenames(&current_filename_paths);
         if let Some(err) = sync_error {
             failures.push(message_failure(
@@ -1174,6 +1173,7 @@ fn mutate_message(
     }
 
     let current_filenames = report_filenames(&current_filename_paths);
+    let filename_changes = report_filename_changes(&path_changes);
 
     let change = applied_tag_change(
         &message_id,
@@ -1185,13 +1185,26 @@ fn mutate_message(
     for failure in &mut failures {
         failure.current_filenames = current_filenames.clone();
     }
-    MessageMutationOutcome { change, failures }
+    let applied = change.map(|change| AppliedMessageMutation {
+        change,
+        path_state: MessagePathState {
+            message_id,
+            paths: current_filename_paths,
+            path_changes,
+        },
+    });
+    MessageMutationOutcome { applied, failures }
 }
 
 #[derive(Default)]
 struct MessageMutationOutcome {
-    change: Option<AppliedTagChange>,
+    applied: Option<AppliedMessageMutation>,
     failures: Vec<MessageTagFailure>,
+}
+
+struct AppliedMessageMutation {
+    change: AppliedTagChange,
+    path_state: MessagePathState,
 }
 
 fn message_failure(
@@ -1270,6 +1283,16 @@ fn report_filename(path: &Path) -> String {
 
 fn report_filenames(paths: &[PathBuf]) -> Vec<String> {
     paths.iter().map(|path| report_filename(path)).collect()
+}
+
+fn report_filename_changes(changes: &[MaildirPathChange]) -> Vec<MaildirFilenameChange> {
+    changes
+        .iter()
+        .map(|change| MaildirFilenameChange {
+            previous_filename: report_filename(&change.previous_path),
+            current_filename: report_filename(&change.current_path),
+        })
+        .collect()
 }
 
 fn expected_maildir_filename(filename: &Path, tags: &[String]) -> PathBuf {
@@ -1352,13 +1375,13 @@ fn reconcile_maildir_filenames(
     database_filenames: &[PathBuf],
 ) -> (
     Vec<PathBuf>,
-    Vec<MaildirFilenameChange>,
+    Vec<MaildirPathChange>,
     Vec<MaildirFlagSyncFailure>,
 ) {
     let database_filenames = database_filenames.iter().cloned().collect::<BTreeSet<_>>();
     let mut authoritative = BTreeSet::new();
     let mut claimed = BTreeSet::new();
-    let mut filename_changes = Vec::new();
+    let mut path_changes = Vec::new();
     let mut failures = Vec::new();
     for (previous, expected) in expectations {
         let current = [expected, previous]
@@ -1377,9 +1400,9 @@ fn reconcile_maildir_filenames(
         if let Some(current) = &current {
             claimed.insert(current.clone());
             authoritative.insert(current.clone());
-            filename_changes.push(MaildirFilenameChange {
-                previous_filename: report_filename(previous),
-                current_filename: report_filename(current),
+            path_changes.push(MaildirPathChange {
+                previous_path: previous.clone(),
+                current_path: current.clone(),
             });
         }
         let database_and_file_match =
@@ -1402,11 +1425,7 @@ fn reconcile_maildir_filenames(
             authoritative.insert(filename);
         }
     }
-    (
-        authoritative.into_iter().collect(),
-        filename_changes,
-        failures,
-    )
+    (authoritative.into_iter().collect(), path_changes, failures)
 }
 
 fn path_is_message_file(path: &Path) -> bool {
