@@ -64,6 +64,47 @@ Body"#;
 }
 
 #[test]
+fn reply_strips_legacy_reference_phrases_while_preserving_message_ids() -> anyhow::Result<()> {
+    let raw = br#"From: Alice <alice@example.test>
+To: Me <me@example.test>
+Subject: Legacy phrase threading
+Message-ID: <current@example.test>
+References: =?UTF-8?B?5pel5pys6Kqe?= . Example <root@example.test> "=?UTF-8?Q?Caf=C3=A9?= <not-an-id>" <""@legacy.example> trailing phrase
+Content-Type: text/plain; charset=utf-8
+
+Body"#;
+    let parsed = parse_rfc5322(raw)?;
+    assert!(
+        parsed.references.contains("日本語") && parsed.references.contains("Café"),
+        "mailparse should expose decoded RFC 2047 phrase words: {:?}",
+        parsed.references
+    );
+    let identity = Identity {
+        name: Some("Me".into()),
+        email: "me@example.test".into(),
+    };
+
+    let reply = build_reply(
+        &parsed,
+        &identity,
+        &["me@example.test".into()],
+        ReplyKind::Sender,
+    );
+    let rendered = reply.to_rfc5322()?;
+    let reparsed = mailparse::parse_mail(&rendered)?;
+
+    assert_eq!(
+        reparsed.headers.get_first_value("References").as_deref(),
+        Some("<root@example.test> <\"\"@legacy.example> <current@example.test>")
+    );
+    assert_eq!(
+        reparsed.headers.get_first_value("In-Reply-To").as_deref(),
+        Some("<current@example.test>")
+    );
+    Ok(())
+}
+
+#[test]
 fn reply_all_preserves_quoted_names_and_flattens_recipient_groups() -> anyhow::Result<()> {
     let raw = br#"From: Sender <sender@example.test>
 To: Me <me@example.test>, "Doe, Jane" <jane@example.test>

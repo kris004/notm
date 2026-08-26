@@ -211,13 +211,13 @@ fn utf8_chunks(value: &str, max_bytes: usize) -> Vec<&str> {
 
 fn message_id_tokens(field: &str, values: &[String]) -> anyhow::Result<Vec<String>> {
     let mut tokens = Vec::new();
-    let allow_obsolete_internal_cfws = field != "Message-ID";
+    let allow_obsolete_threading_syntax = matches!(field, "In-Reply-To" | "References");
     for value in values {
         validate_header_text(field, value)?;
         tokens.extend(parse_message_id_sequence(
             field,
             value,
-            allow_obsolete_internal_cfws,
+            allow_obsolete_threading_syntax,
         )?);
     }
     Ok(tokens)
@@ -226,7 +226,7 @@ fn message_id_tokens(field: &str, values: &[String]) -> anyhow::Result<Vec<Strin
 fn parse_message_id_sequence(
     field: &str,
     value: &str,
-    allow_obsolete_internal_cfws: bool,
+    allow_obsolete_threading_syntax: bool,
 ) -> anyhow::Result<Vec<String>> {
     let bytes = value.as_bytes();
     let mut index = 0;
@@ -236,21 +236,117 @@ fn parse_message_id_sequence(
         if index == bytes.len() {
             break;
         }
-        ensure!(
-            bytes[index] == b'<',
-            "{field} contains text outside a message identifier near {:?}",
-            &value[index..]
-        );
+        if bytes[index] != b'<' {
+            ensure!(
+                allow_obsolete_threading_syntax,
+                "{field} contains text outside a message identifier near {:?}",
+                &value[index..]
+            );
+            // RFC 5322's obsolete In-Reply-To and References syntax is
+            // *(phrase / msg-id). Phrases are semantically ignored, but
+            // still need to be parsed deliberately so arbitrary punctuation
+            // cannot be mistaken for harmless legacy text.
+            index = parse_obsolete_threading_phrase(field, value, index)?;
+            continue;
+        }
         let end = find_message_id_end(field, value, index + 1)?;
         let id = &value[index..=end];
         ids.push(canonical_message_id_core(
             field,
             id,
-            allow_obsolete_internal_cfws,
+            allow_obsolete_threading_syntax,
         )?);
         index = end + 1;
     }
     Ok(ids)
+}
+
+fn parse_obsolete_threading_phrase(
+    field: &str,
+    value: &str,
+    mut index: usize,
+) -> anyhow::Result<usize> {
+    let bytes = value.as_bytes();
+    index = parse_obsolete_threading_word(field, value, index)?;
+    loop {
+        index = skip_message_id_cfws(field, value, index)?;
+        let Some(&byte) = bytes.get(index) else {
+            return Ok(index);
+        };
+        if byte == b'<' {
+            return Ok(index);
+        }
+        if byte == b'.' {
+            index += 1;
+            continue;
+        }
+        index = parse_obsolete_threading_word(field, value, index)?;
+    }
+}
+
+fn parse_obsolete_threading_word(field: &str, value: &str, index: usize) -> anyhow::Result<usize> {
+    let bytes = value.as_bytes();
+    if bytes.get(index) == Some(&b'"') {
+        return parse_obsolete_threading_quoted_word(value, index).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{field} contains an invalid or unterminated quoted phrase near {:?}",
+                &value[index..]
+            )
+        });
+    }
+    parse_obsolete_threading_atom(value, index).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{field} contains an invalid obsolete phrase token near {:?}",
+            &value[index..]
+        )
+    })
+}
+
+fn parse_obsolete_threading_atom(value: &str, index: usize) -> Option<usize> {
+    // Keep IDs on the ASCII atext parser. Unicode is accepted only here
+    // because mailparse exposes decoded RFC 2047 phrase words to callers.
+    let mut end = index;
+    for (offset, character) in value[index..].char_indices() {
+        if character.is_ascii() {
+            if !is_atext(character as u8) {
+                break;
+            }
+        } else if character.is_control() {
+            return None;
+        }
+        end = index + offset + character.len_utf8();
+    }
+    (end != index).then_some(end)
+}
+
+fn parse_obsolete_threading_quoted_word(value: &str, mut index: usize) -> Option<usize> {
+    index += 1;
+    while let Some(&byte) = value.as_bytes().get(index) {
+        match byte {
+            b'\\' => {
+                index += 1;
+                let &escaped = value.as_bytes().get(index)?;
+                if !matches!(escaped, b' ' | b'\t') && !escaped.is_ascii_graphic() {
+                    return None;
+                }
+                index += 1;
+            }
+            b'"' => return Some(index + 1),
+            b' ' | b'\t' | b'!' | b'#'..=b'[' | b']'..=b'~' => index += 1,
+            byte if byte.is_ascii() => return None,
+            _ => {
+                // mailparse decodes RFC 2047 encoded-words before returning
+                // header values, so an otherwise valid ignored phrase can be
+                // Unicode at this semantic boundary. IDs remain ASCII-only.
+                let character = value[index..].chars().next()?;
+                if character.is_control() {
+                    return None;
+                }
+                index += character.len_utf8();
+            }
+        }
+    }
+    None
 }
 
 fn skip_message_id_cfws(field: &str, value: &str, mut index: usize) -> anyhow::Result<usize> {
@@ -696,7 +792,6 @@ fn parse_id_left_word(value: &[u8], index: usize) -> Option<usize> {
 
 fn parse_quoted_id_word(value: &[u8], mut index: usize) -> Option<usize> {
     index += 1;
-    let content_start = index;
     let mut escaped = false;
     while let Some(&byte) = value.get(index) {
         if escaped {
@@ -707,7 +802,10 @@ fn parse_quoted_id_word(value: &[u8], mut index: usize) -> Option<usize> {
         } else {
             match byte {
                 b'\\' => escaped = true,
-                b'"' => return (index != content_start).then_some(index + 1),
+                // An empty quoted-string is valid in the obsolete local-part
+                // grammar. The strict Message-ID path still requires a
+                // dot-atom and therefore continues to reject quoted forms.
+                b'"' => return Some(index + 1),
                 b' ' | b'\t' | b'!' | b'#'..=b'[' | b']'..=b'~' => {}
                 _ => return None,
             }
@@ -1588,6 +1686,8 @@ mod tests {
             "<a@\"quoted\".example.test>",
             "<a@[ ]>",
             "<a@@example.test>",
+            "<x\"\"@example.test>",
+            "<\"\"x@example.test>",
         ] {
             for field in ["In-Reply-To", "References"] {
                 assert!(
@@ -1596,6 +1696,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn obsolete_threading_phrases_are_ignored_while_message_ids_are_preserved() {
+        let sequence = "Leading Café atom . initials \"日本語 <text>\" (before) \
+                        <first@example.test> between . words (middle) \
+                        <second@example.test> trailing . phrase (after)";
+        for field in ["In-Reply-To", "References"] {
+            assert_eq!(
+                message_id_tokens(field, &[sequence.to_string()])
+                    .unwrap_or_else(|error| panic!("{field} rejected obsolete phrases: {error:#}")),
+                ["<first@example.test>", "<second@example.test>"]
+            );
+        }
+    }
+
+    #[test]
+    fn obsolete_threading_phrases_are_validated_not_treated_as_free_text() {
+        for invalid in [
+            "leading, phrase <valid@example.test>",
+            "leading: phrase <valid@example.test>",
+            "leading @ phrase <valid@example.test>",
+            "\"unterminated <valid@example.test>",
+            "(unterminated <valid@example.test>",
+            "<valid@example.test> trailing,",
+            "<valid@example.test> \"unterminated",
+            ". leading <valid@example.test>",
+            "leading <missing-at>",
+        ] {
+            for field in ["In-Reply-To", "References"] {
+                assert!(
+                    message_id_tokens(field, &[invalid.to_string()]).is_err(),
+                    "{field} accepted malformed obsolete phrase {invalid:?}"
+                );
+            }
+        }
+
+        let phrase_only = "legacy . phrase \"with <quoted angles>\" (comment)";
+        assert_eq!(
+            message_id_tokens("References", &[phrase_only.to_string()])
+                .expect("valid phrase grammar can be parsed"),
+            Vec::<String>::new()
+        );
+        for field in ["In-Reply-To", "References"] {
+            let mut message = test_message();
+            if field == "In-Reply-To" {
+                message.in_reply_to = Some(phrase_only.to_string());
+            } else {
+                message.references = vec![phrase_only.to_string()];
+            }
+            let error = render_message(&message)
+                .expect_err("a threading field containing no msg-id must be rejected");
+            assert!(
+                error.to_string().contains(field),
+                "unexpected {field} error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_quoted_legacy_id_left_is_accepted_only_for_threading() {
+        for field in ["In-Reply-To", "References"] {
+            assert_eq!(
+                message_id_tokens(field, &["<\"\"@example.test>".to_string()]).unwrap_or_else(
+                    |error| panic!("{field} rejected empty quoted id-left: {error:#}")
+                ),
+                ["<\"\"@example.test>"]
+            );
+        }
+        assert!(
+            message_id_tokens("Message-ID", &["<\"\"@example.test>".to_string()]).is_err(),
+            "strict Message-ID accepted an obsolete quoted id-left"
+        );
+
+        let mut message = test_message();
+        message.in_reply_to = Some("legacy phrase <\"\"@example.test> tail".to_string());
+        message.references = vec!["root <root@example.test> <\"\"@example.test>".to_string()];
+        let raw = render(&message);
+        let parsed = mailparse::parse_mail(&raw).expect("parse rendered message");
+        assert_eq!(
+            parsed.headers.get_first_value("In-Reply-To").as_deref(),
+            Some("<\"\"@example.test>")
+        );
+        assert_eq!(
+            parsed.headers.get_first_value("References").as_deref(),
+            Some("<root@example.test> <\"\"@example.test>")
+        );
     }
 
     #[test]
