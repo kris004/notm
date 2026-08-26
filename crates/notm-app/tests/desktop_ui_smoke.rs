@@ -2898,6 +2898,110 @@ fn fixture_send_waits_for_draft_flush_and_aborts_on_flush_failure() -> anyhow::R
 
 #[cfg(unix)]
 #[test]
+fn fixture_named_draft_corruption_keeps_valid_rows_and_reports_warning() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_named_draft_corruption_keeps_valid_rows_and_reports_warning: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running named-draft corruption UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-draft-corruption-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let token = format!("notm-draft-corruption-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir.clone(), &token)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+
+    let initial = driver.command("draft_list_state", json!({}))?;
+    let drafts_dir = initial["drafts_dir"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("fixture exposed no named-draft directory: {initial}"))?;
+    fs::create_dir_all(&drafts_dir)?;
+    fs::write(
+        drafts_dir.join("valid.json"),
+        serde_json::to_vec_pretty(&json!({
+            "from": "",
+            "to": "recipient@example.test",
+            "cc": "",
+            "bcc": "",
+            "subject": "Valid draft survives corruption",
+            "body": "valid body",
+            "attachments": [],
+            "in_reply_to": null,
+            "references": [],
+            "text_reply_quote": null,
+            "html_reply_quote": null,
+        }))?,
+    )?;
+    fs::write(drafts_dir.join("malformed.json"), b"{truncated")?;
+    fs::create_dir(drafts_dir.join("unreadable.json"))?;
+
+    let requested = driver.command("refresh_named_drafts", json!({}))?;
+    assert_eq!(
+        requested["ok"], true,
+        "refresh was not scheduled: {requested}"
+    );
+    let generation = requested["generation"]
+        .as_u64()
+        .with_context(|| format!("refresh had no generation: {requested}"))?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let completed = loop {
+        let status = driver.command("draft_io_status", json!({}))?;
+        if status["list_busy"] == false
+            && status["list_completed_generation"].as_u64() == Some(generation)
+        {
+            break status;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "named-draft refresh did not complete: {status}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+    let warning = completed["last_error"]
+        .as_str()
+        .with_context(|| format!("rejected entries did not produce a warning: {completed}"))?;
+    ensure!(
+        warning.contains("Named draft refresh warning:")
+            && warning.contains("rejected 2")
+            && warning.contains("malformed.json")
+            && warning.contains("unreadable.json"),
+        "rejected-entry warning was not useful: {completed}"
+    );
+
+    let drafts = driver.command("list_drafts", json!({}))?;
+    let entries = json_array_at(&drafts, &["drafts"])?;
+    ensure!(
+        entries.len() == 1 && entries[0]["fields"]["subject"] == "Valid draft survives corruption",
+        "valid named draft was lost when neighbors were rejected: {drafts}"
+    );
+    let ui = driver.command("draft_list_state", json!({}))?;
+    let rows = json_array_at(&ui, &["list", "rows"])?;
+    ensure!(
+        rows.len() == 1
+            && rows[0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Valid draft survives corruption")),
+        "GTK draft rows were not replaced with the valid subset: {ui}"
+    );
+    assert_eq!(ui["last_error"], warning);
+    ensure!(
+        ui["status_text"]
+            .as_str()
+            .is_some_and(|status| status.contains("Named draft refresh warning:")),
+        "partial refresh warning was not visible in the status UI: {ui}"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn fixture_saved_drafts_are_visible_activatable_and_delete_safely() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 

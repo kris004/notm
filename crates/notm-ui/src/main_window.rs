@@ -8971,10 +8971,32 @@ fn schedule_named_draft_refresh(widgets: &Widgets, state: &SharedState, migrate_
             return gtk::glib::ControlFlow::Break;
         }
         match response.result {
-            Ok(NamedDraftLoadResult { drafts, migrated }) => {
+            Ok(NamedDraftLoadResult {
+                drafts,
+                migrated,
+                warning,
+            }) => {
                 w.composer.replace_named_drafts(drafts);
-                *w.named_draft_io_last_error.borrow_mut() = None;
-                if migrated > 0 {
+                if let Some(warning) = warning {
+                    let migration = if migrated > 0 {
+                        format!("Migrated {migrated} legacy named draft(s); ")
+                    } else {
+                        String::new()
+                    };
+                    let message = format!("{migration}Named draft refresh warning: {warning}");
+                    *w.named_draft_io_last_error.borrow_mut() = Some(message.clone());
+                    {
+                        let mut state = st.borrow_mut();
+                        state.last_error = Some(message.clone());
+                        state.last_operation =
+                            Some("named draft refresh completed with warnings".to_string());
+                    }
+                    w.status_label.set_text(&message);
+                    update_debug(&w, &st);
+                } else {
+                    *w.named_draft_io_last_error.borrow_mut() = None;
+                }
+                if migrated > 0 && w.named_draft_io_last_error.borrow().is_none() {
                     let message =
                         format!("Migrated {migrated} legacy named draft(s) to persistent state");
                     st.borrow_mut().last_operation = Some(message.clone());
@@ -16170,6 +16192,13 @@ fn handle_automation_request(
             "last_error": widgets.named_draft_io_last_error.borrow().clone(),
             "gtk_heartbeat": widgets.gtk_heartbeat.get(),
         }),
+        "refresh_named_drafts" => {
+            schedule_named_draft_refresh(widgets, state, false);
+            json!({
+                "ok": true,
+                "generation": widgets.named_draft_io_coordinator.borrow().active_generation(),
+            })
+        }
         "set_fixture_draft_delay" => {
             let milliseconds = req
                 .args
@@ -18101,6 +18130,7 @@ fn ensure_automation_request_allowed(
         | "respond_attachment_save"
         | "set_fixture_attachment_delay"
         | "set_fixture_draft_delay"
+        | "refresh_named_drafts"
         | "set_fixture_thread_delay"
         | "set_fixture_composer_preparation_delay"
         | "fail_next_draft_write"
