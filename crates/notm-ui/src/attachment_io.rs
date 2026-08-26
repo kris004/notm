@@ -1239,9 +1239,6 @@ fn extract_requested_part_with_limits(
 mod tests {
     use std::{ffi::OsStr, fs, sync::mpsc::TryRecvError, time::Instant};
 
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt as _;
-
     use super::*;
 
     fn bytes(value: &'static [u8]) -> Arc<[u8]> {
