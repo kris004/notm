@@ -5606,6 +5606,142 @@ fn fixture_attachment_io_stays_responsive_and_rejects_stale_ui_completion() -> a
 }
 
 #[test]
+fn fixture_closing_last_window_waits_for_atomic_attachment_save() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_closing_last_window_waits_for_atomic_attachment_save: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running atomic attachment lifetime UI smoke with {display}");
+
+    const LARGE_ATTACHMENT_BYTES: usize = 6 * 1024 * 1024;
+    const ATTACHMENT_FILENAME: &str = "fixture-0-00.txt";
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-attachment-lifetime-ui-{run_id}"));
+    let failed_downloads = work_dir.join("failed-downloads");
+    let completed_downloads = work_dir.join("completed-downloads");
+    fs::create_dir_all(&failed_downloads)?;
+    fs::create_dir_all(&completed_downloads)?;
+    let preserved_target = failed_downloads.join(ATTACHMENT_FILENAME);
+    fs::write(&preserved_target, b"preserve the prior destination")?;
+    let failed_tree_before = directory_tree_snapshot(&failed_downloads)?;
+
+    let token = format!("notm-attachment-lifetime-ui-{run_id}");
+    let mut app =
+        FixtureApp::spawn_with_large_attachment(work_dir, &token, LARGE_ATTACHMENT_BYTES)?;
+    let mut driver = app.connect(&token)?;
+    select_first_thread(&mut driver, "id:attachment-heavy-0@fixture.test")?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+
+    let listed = driver.command("attachment_list_items", json!({}))?;
+    let attachments = json_array_at(&listed, &["attachments"])?;
+    ensure!(
+        attachments.first().is_some_and(|attachment| {
+            attachment["filename"] == ATTACHMENT_FILENAME
+                && attachment["size"] == LARGE_ATTACHMENT_BYTES
+        }),
+        "large fixture attachment was not available first: {listed}"
+    );
+
+    let armed = driver.command("fail_next_attachment_write", json!({}))?;
+    assert_eq!(
+        armed["ok"], true,
+        "fixture attachment failure did not arm: {armed}"
+    );
+    let failed = driver.command(
+        "save_selected_attachment",
+        json!({"index": 0, "dir": failed_downloads}),
+    )?;
+    assert_eq!(
+        failed["pending"], true,
+        "injected attachment write did not start asynchronously: {failed}"
+    );
+    let failed_status = wait_for_attachment_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+    ensure!(
+        failed_status["last_completion"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("injected attachment write failure")),
+        "injected atomic attachment failure was not reported: {failed_status}"
+    );
+    assert_eq!(
+        fs::read(&preserved_target)?,
+        b"preserve the prior destination",
+        "failed atomic save replaced the prior destination"
+    );
+    assert_eq!(
+        directory_tree_snapshot(&failed_downloads)?,
+        failed_tree_before,
+        "failed atomic save left a numbered destination or temporary artifact"
+    );
+
+    let applied_delay = driver.command(
+        "set_fixture_attachment_delay",
+        json!({"milliseconds": 1200}),
+    )?;
+    assert_eq!(applied_delay["milliseconds"], 1200);
+    let completed_target = completed_downloads.join(ATTACHMENT_FILENAME);
+    let started = driver.command(
+        "save_selected_attachment",
+        json!({"index": 0, "dir": completed_downloads}),
+    )?;
+    assert_eq!(
+        started["pending"], true,
+        "delayed large attachment save did not start: {started}"
+    );
+    assert_eq!(
+        driver.command("attachment_io_status", json!({}))?["busy"],
+        true,
+        "attachment worker was not active before closing"
+    );
+    ensure!(
+        !completed_target.exists(),
+        "atomic destination became visible before the delayed worker completed"
+    );
+
+    let closed = driver.command("close_main_window", json!({}))?;
+    assert_eq!(closed["ok"], true, "main-window close failed: {closed}");
+    drop(driver);
+    thread::sleep(Duration::from_millis(250));
+    ensure!(
+        app.child.try_wait()?.is_none(),
+        "application exited while its attachment worker was still pending\n{}",
+        app.logs()
+    );
+    ensure!(
+        !completed_target.exists(),
+        "attachment destination was exposed before the delayed write completed"
+    );
+
+    let status = app.wait_for_exit(STARTUP_TIMEOUT)?;
+    ensure!(
+        status.success(),
+        "application failed while finishing attachment save after close: {status}\n{}",
+        app.logs()
+    );
+    let completed = fs::read(&completed_target)?;
+    ensure!(
+        completed.len() == LARGE_ATTACHMENT_BYTES && completed.iter().all(|byte| *byte == b'x'),
+        "attachment destination did not contain the exact complete fixture payload: bytes={}",
+        completed.len()
+    );
+    let completed_tree = directory_tree_snapshot(&completed_downloads)?;
+    ensure!(
+        completed_tree.len() == 2
+            && completed_tree
+                .get(Path::new("."))
+                .is_some_and(Option::is_none)
+            && completed_tree
+                .get(Path::new(ATTACHMENT_FILENAME))
+                .is_some_and(|entry| entry.as_deref() == Some(completed.as_slice())),
+        "successful atomic attachment save left an unexpected partial or temporary artifact: {completed_tree:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn fixture_attachment_save_chooser_and_private_open_are_deterministic() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(

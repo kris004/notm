@@ -17763,6 +17763,10 @@ fn handle_automation_request(
                 "milliseconds": u64::try_from(applied.as_millis()).unwrap_or(u64::MAX),
             })
         }
+        "fail_next_attachment_write" => match widgets.attachments.fail_next_fixture_write() {
+            Ok(()) => json!({"ok": true}),
+            Err(err) => json!({"ok": false, "error": err.to_string()}),
+        },
         "respond_attachment_save" => {
             let response = req
                 .args
@@ -18258,6 +18262,7 @@ fn ensure_automation_request_allowed(
         "run_manual_sync" => Some(AutomationOperation::ExternalSync),
         "attachment_test_state"
         | "respond_attachment_save"
+        | "fail_next_attachment_write"
         | "set_fixture_attachment_delay"
         | "set_fixture_draft_delay"
         | "refresh_named_drafts"
@@ -20763,6 +20768,8 @@ mod tests {
             &json!({}),
         )
         .expect_err("live harness must not inject attachment I/O latency");
+        ensure_automation_request_allowed(&live_options, "fail_next_attachment_write", &json!({}))
+            .expect_err("live harness must not inject attachment write failures");
 
         let fixture_options = LaunchOptions {
             fixture_mode: true,
@@ -20778,6 +20785,12 @@ mod tests {
             &json!({}),
         )
         .expect("fixture attachment delay");
+        ensure_automation_request_allowed(
+            &fixture_options,
+            "fail_next_attachment_write",
+            &json!({}),
+        )
+        .expect("fixture attachment write failure");
     }
 
     #[test]

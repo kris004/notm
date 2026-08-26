@@ -212,8 +212,9 @@ Thread/message preparation, message-derived reply/forward/draft preparation,
 and draft persistence expose the same kind of fixture-only latency seam through
 `set_fixture_thread_delay`, `set_fixture_composer_preparation_delay`, and
 `set_fixture_draft_delay`; attachment writes and composer attachment caching use
-`set_fixture_attachment_delay`. `fail_next_draft_write` injects one draft write
-failure. Poll `thread_load_status`, `composer_preparation_status`,
+`set_fixture_attachment_delay`. `fail_next_draft_write` and
+`fail_next_attachment_write` inject one draft or attachment write failure,
+respectively. Poll `thread_load_status`, `composer_preparation_status`,
 `draft_autosave_status`, `draft_io_status`, `recovery_load_status`, or
 `attachment_io_status` for
 completion. Compare the

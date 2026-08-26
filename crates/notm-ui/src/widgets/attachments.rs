@@ -144,6 +144,9 @@ struct AttachmentIoRuntime {
 
 #[derive(Clone)]
 struct AttachmentIoLauncher {
+    application: gtk::Application,
+    fixture_mode: bool,
+    fail_next_fixture_write: Rc<Cell<bool>>,
     coordinator: Rc<RefCell<AttachmentIoCoordinator>>,
     runtime: Rc<RefCell<AttachmentIoRuntime>>,
     fixture_delay: Rc<Cell<Duration>>,
@@ -244,6 +247,11 @@ impl AttachmentController {
             next_save_id: Rc::new(Cell::new(1)),
             render_generation: Rc::new(Cell::new(0)),
             io: AttachmentIoLauncher {
+                application: window
+                    .application()
+                    .expect("attachment controller window must belong to an application"),
+                fixture_mode,
+                fail_next_fixture_write: Rc::new(Cell::new(false)),
                 coordinator: Rc::new(RefCell::new(AttachmentIoCoordinator::default())),
                 runtime: Rc::new(RefCell::new(AttachmentIoRuntime::default())),
                 fixture_delay: Rc::new(Cell::new(Duration::ZERO)),
@@ -580,11 +588,21 @@ impl AttachmentController {
         self.io.fixture_delay.get()
     }
 
+    pub(crate) fn fail_next_fixture_write(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.io.fixture_mode,
+            "attachment write failure injection is available only in fixture mode"
+        );
+        self.io.fail_next_fixture_write.set(true);
+        Ok(())
+    }
+
     pub(crate) fn io_status_json(&self) -> serde_json::Value {
         attachment_io_status_json(
             &self.io.coordinator.borrow(),
             &self.io.runtime.borrow(),
             self.io.fixture_delay.get(),
+            self.io.fail_next_fixture_write.get(),
         )
     }
 
@@ -798,6 +816,9 @@ fn launch_attachment_worker(
     io: &AttachmentIoLauncher,
     event_handler: AttachmentEventHandler,
 ) {
+    let request = request.with_fixture_fail_before_publish(
+        io.fixture_mode && io.fail_next_fixture_write.replace(false),
+    );
     let token = request.token();
     let action = request.action();
     if io.coordinator.borrow().accepts(token)
@@ -810,10 +831,16 @@ fn launch_attachment_worker(
         let mut runtime = io.runtime.borrow_mut();
         runtime.in_flight = runtime.in_flight.saturating_add(1);
     }
+    // The last window may close while a delayed or large attachment is still
+    // being written. Keep the application running until the worker response
+    // has been observed so process teardown cannot interrupt the write.
+    let application_hold = io.application.hold();
     let receiver = attachment_io::spawn(request);
     let io = io.clone();
     let mut context = Some(context);
+    let mut application_hold = Some(application_hold);
     gtk::glib::timeout_add_local(ATTACHMENT_WORKER_POLL_INTERVAL, move || {
+        let _keep_application_alive = application_hold.as_ref();
         match receiver.try_recv() {
             Ok(response) => {
                 complete_attachment_worker(
@@ -825,6 +852,7 @@ fn launch_attachment_worker(
                     &io.opener,
                     &event_handler,
                 );
+                drop(application_hold.take());
                 gtk::glib::ControlFlow::Break
             }
             Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
@@ -836,6 +864,7 @@ fn launch_attachment_worker(
                     &io.runtime,
                     &event_handler,
                 );
+                drop(application_hold.take());
                 gtk::glib::ControlFlow::Break
             }
         }
@@ -984,6 +1013,7 @@ fn attachment_io_status_json(
     coordinator: &AttachmentIoCoordinator,
     runtime: &AttachmentIoRuntime,
     fixture_delay: Duration,
+    fail_next_fixture_write: bool,
 ) -> serde_json::Value {
     let active = runtime.active.as_ref().map(|active| {
         json!({
@@ -1017,6 +1047,7 @@ fn attachment_io_status_json(
         "stale_completion_count": runtime.stale_completion_count,
         "last_completion": last_completion,
         "fixture_delay_ms": u64::try_from(fixture_delay.as_millis()).unwrap_or(u64::MAX),
+        "fail_next_fixture_write": fail_next_fixture_write,
     })
 }
 

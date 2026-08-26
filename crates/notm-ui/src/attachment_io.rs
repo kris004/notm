@@ -1,6 +1,9 @@
 use std::{
     error::Error,
-    fmt, io,
+    ffi::{OsStr, OsString},
+    fmt,
+    fs::File,
+    io::{self, Write as _},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -15,10 +18,7 @@ use std::{
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 
 use anyhow::Context as _;
-use notm_mail::attachments::{
-    sanitize_attachment_filename, save_attachment_to_target_without_overwrite,
-    save_attachment_without_overwrite,
-};
+use notm_mail::attachments::sanitize_attachment_filename;
 use notm_mail::compose::AttachmentInput;
 use notm_mail::mime::extract_attachments_detailed;
 use uuid::Uuid;
@@ -130,6 +130,7 @@ pub(crate) struct AttachmentIoRequest {
     destination: AttachmentIoDestination,
     source: AttachmentIoSource,
     fixture_delay: Duration,
+    fixture_fail_before_publish: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +169,7 @@ impl AttachmentIoRequest {
             },
             source: source.into(),
             fixture_delay: Duration::ZERO,
+            fixture_fail_before_publish: false,
         }
     }
 
@@ -181,6 +183,7 @@ impl AttachmentIoRequest {
             destination: AttachmentIoDestination::Target { target },
             source: source.into(),
             fixture_delay: Duration::ZERO,
+            fixture_fail_before_publish: false,
         }
     }
 
@@ -198,11 +201,17 @@ impl AttachmentIoRequest {
             },
             source: source.into(),
             fixture_delay: Duration::ZERO,
+            fixture_fail_before_publish: false,
         }
     }
 
     pub(crate) fn with_fixture_delay(mut self, delay: Duration) -> Self {
         self.fixture_delay = delay.min(MAX_FIXTURE_DELAY);
+        self
+    }
+
+    pub(crate) fn with_fixture_fail_before_publish(mut self, fail: bool) -> Self {
+        self.fixture_fail_before_publish = fail;
         self
     }
 
@@ -1127,36 +1136,144 @@ fn execute(request: AttachmentIoRequest) -> Result<AttachmentIoCompleted, Attach
         thread::sleep(request.fixture_delay);
     }
     let action = request.action();
+    let fail_before_publish = request.fixture_fail_before_publish;
     let bytes = load_attachment_source(request.source)
         .map_err(|source| AttachmentIoError::LoadPayload { action, source })?;
-    let path =
-        match request.destination {
-            AttachmentIoDestination::Directory {
-                directory,
-                filename,
-            } => save_attachment_without_overwrite(&directory, &filename, &bytes).map_err(
-                |source| AttachmentIoError::SaveToDirectory {
-                    directory,
-                    filename,
-                    source,
-                },
-            )?,
-            AttachmentIoDestination::Target { target } => {
-                save_attachment_to_target_without_overwrite(&target, &bytes)
-                    .map_err(|source| AttachmentIoError::SaveToTarget { target, source })?
-            }
-            AttachmentIoDestination::OpenStore {
-                directory,
-                filename,
-            } => save_attachment_without_overwrite(&directory, &filename, &bytes).map_err(
-                |source| AttachmentIoError::PrepareOpen {
-                    directory,
-                    filename,
-                    source,
-                },
-            )?,
-        };
+    let path = match request.destination {
+        AttachmentIoDestination::Directory {
+            directory,
+            filename,
+        } => save_attachment_atomically_without_overwrite(
+            &directory,
+            &filename,
+            &bytes,
+            fail_before_publish,
+        )
+        .map_err(|source| AttachmentIoError::SaveToDirectory {
+            directory,
+            filename,
+            source,
+        })?,
+        AttachmentIoDestination::Target { target } => {
+            save_attachment_to_target_atomically_without_overwrite(
+                &target,
+                &bytes,
+                fail_before_publish,
+            )
+            .map_err(|source| AttachmentIoError::SaveToTarget { target, source })?
+        }
+        AttachmentIoDestination::OpenStore {
+            directory,
+            filename,
+        } => save_attachment_atomically_without_overwrite(
+            &directory,
+            &filename,
+            &bytes,
+            fail_before_publish,
+        )
+        .map_err(|source| AttachmentIoError::PrepareOpen {
+            directory,
+            filename,
+            source,
+        })?,
+    };
     Ok(AttachmentIoCompleted { action, path })
+}
+
+fn save_attachment_atomically_without_overwrite(
+    target_dir: &Path,
+    filename: &str,
+    bytes: &[u8],
+    fail_before_publish: bool,
+) -> io::Result<PathBuf> {
+    let filename = sanitize_attachment_filename(filename);
+    save_attachment_to_target_atomically_without_overwrite(
+        &target_dir.join(filename),
+        bytes,
+        fail_before_publish,
+    )
+}
+
+fn save_attachment_to_target_atomically_without_overwrite(
+    target: &Path,
+    bytes: &[u8],
+    fail_before_publish: bool,
+) -> io::Result<PathBuf> {
+    save_attachment_to_target_atomically_without_overwrite_with(
+        target,
+        |file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        },
+        fail_before_publish,
+    )
+}
+
+fn save_attachment_to_target_atomically_without_overwrite_with(
+    target: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+    fail_before_publish: bool,
+) -> io::Result<PathBuf> {
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let filename = target.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "attachment target must include a filename",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".notm-attachment-");
+    #[cfg(unix)]
+    builder.permissions(std::fs::Permissions::from_mode(0o666));
+    let mut temporary = builder.tempfile_in(parent)?;
+    write(temporary.as_file_mut())?;
+    if fail_before_publish {
+        return Err(io::Error::other(
+            "injected attachment write failure before atomic publish",
+        ));
+    }
+
+    let mut collision_index = 0_u64;
+    loop {
+        let candidate = numbered_attachment_filename(filename, collision_index);
+        let path = target.with_file_name(candidate);
+        match temporary.persist_noclobber(&path) {
+            Ok(_) => return Ok(path),
+            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+                temporary = error.file;
+                collision_index = collision_index.checked_add(1).ok_or_else(|| {
+                    io::Error::other("attachment filename collision counter overflowed")
+                })?;
+            }
+            Err(error) => return Err(error.error),
+        }
+    }
+}
+
+fn numbered_attachment_filename(filename: &OsStr, collision_index: u64) -> OsString {
+    if collision_index == 0 {
+        return filename.to_os_string();
+    }
+
+    let filename_path = Path::new(filename);
+    let extension = filename_path
+        .extension()
+        .filter(|extension| !extension.is_empty());
+    let stem = extension
+        .and_then(|_| filename_path.file_stem())
+        .unwrap_or(filename);
+    let mut numbered = OsString::from(stem);
+    numbered.push(format!(" ({collision_index})"));
+    if let Some(extension) = extension {
+        numbered.push(".");
+        numbered.push(extension);
+    }
+    numbered
 }
 
 fn load_attachment_source(source: AttachmentIoSource) -> anyhow::Result<Vec<u8>> {
@@ -1237,7 +1354,13 @@ fn extract_requested_part_with_limits(
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsStr, fs, sync::mpsc::TryRecvError, time::Instant};
+    use std::{
+        collections::BTreeSet,
+        ffi::OsStr,
+        fs,
+        sync::{Barrier, mpsc::TryRecvError},
+        time::Instant,
+    };
 
     use super::*;
 
@@ -1252,6 +1375,19 @@ mod tests {
                 path.is_file() || (path.is_dir() && tree_contains_file(&path))
             })
         })
+    }
+
+    fn attachment_temporary_paths(directory: &Path) -> Vec<PathBuf> {
+        fs::read_dir(directory)
+            .expect("read attachment destination directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with(".notm-attachment-"))
+            })
+            .collect()
     }
 
     #[test]
@@ -1389,6 +1525,119 @@ mod tests {
         assert_eq!(
             fs::read(target_result.path).expect("read target save"),
             b"target save"
+        );
+        assert!(
+            attachment_temporary_paths(directory.path()).is_empty(),
+            "successful atomic saves left temporary files behind"
+        );
+    }
+
+    #[test]
+    fn atomic_target_save_publishes_exact_complete_bytes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("large.bin");
+        let expected = (0..(2 * 1024 * 1024))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+
+        let saved =
+            save_attachment_to_target_atomically_without_overwrite(&target, &expected, false)
+                .expect("atomically save attachment");
+
+        assert_eq!(saved, target);
+        assert_eq!(fs::read(&saved).expect("read saved attachment"), expected);
+        assert!(
+            attachment_temporary_paths(directory.path()).is_empty(),
+            "successful atomic save left a temporary file behind"
+        );
+    }
+
+    #[test]
+    fn concurrent_atomic_saves_publish_distinct_complete_files() {
+        const SAVE_COUNT: usize = 12;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = Arc::new(directory.path().join("report.bin"));
+        let barrier = Arc::new(Barrier::new(SAVE_COUNT));
+        let handles = (0..SAVE_COUNT)
+            .map(|index| {
+                let target = Arc::clone(&target);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let expected = format!("attachment {index}").into_bytes();
+                    barrier.wait();
+                    let saved = save_attachment_to_target_atomically_without_overwrite(
+                        &target, &expected, false,
+                    )
+                    .expect("atomically save concurrent attachment");
+                    (saved, expected)
+                })
+            })
+            .collect::<Vec<_>>();
+        let saved = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("attachment save thread"))
+            .collect::<Vec<_>>();
+        let paths = saved
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(paths.len(), SAVE_COUNT);
+        for (path, expected) in saved {
+            assert_eq!(fs::read(path).expect("read attachment"), expected);
+        }
+        assert!(
+            attachment_temporary_paths(directory.path()).is_empty(),
+            "concurrent atomic saves left temporary files behind"
+        );
+    }
+
+    #[test]
+    fn injected_pre_publish_failure_preserves_destination_and_cleans_temporary_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("report.bin");
+        fs::write(&target, b"keep prior destination").expect("write prior destination");
+        let mut coordinator = AttachmentIoCoordinator::default();
+        let token = coordinator.begin();
+
+        let response = spawn(
+            AttachmentIoRequest::save_to_target(
+                token,
+                target.clone(),
+                bytes(b"fully written replacement bytes"),
+            )
+            .with_fixture_fail_before_publish(true),
+        )
+        .recv_timeout(Duration::from_secs(1))
+        .expect("receive injected write failure");
+
+        assert!(coordinator.finish(response.token));
+        let error = response.result.expect_err("write must fail before publish");
+        assert_eq!(error.action(), AttachmentIoAction::SaveToTarget);
+        assert!(error.to_string().contains("failure before atomic publish"));
+        assert_eq!(
+            fs::read(&target).expect("read prior destination"),
+            b"keep prior destination"
+        );
+        assert!(!directory.path().join("report (1).bin").exists());
+        assert!(
+            attachment_temporary_paths(directory.path()).is_empty(),
+            "failed atomic save left a temporary file behind"
+        );
+
+        let absent_target = directory.path().join("absent.bin");
+        let error = save_attachment_to_target_atomically_without_overwrite(
+            &absent_target,
+            b"fully written unpublished bytes",
+            true,
+        )
+        .expect_err("injected failure must not publish a new destination");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(!absent_target.exists());
+        assert!(
+            attachment_temporary_paths(directory.path()).is_empty(),
+            "failed new save left a temporary file behind"
         );
     }
 
