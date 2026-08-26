@@ -4184,6 +4184,11 @@ fn oversized_thread_rejection_restores_selection_before_tagging() -> anyhow::Res
         "tag action after oversized rejection failed: {tagged}"
     );
     assert_eq!(
+        tagged["pending"], true,
+        "tag action after oversized rejection was not scheduled asynchronously: {tagged}"
+    );
+    let tagged = wait_for_tag(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
         tagged["state"]["selected_thread"]["thread_id"], safe_thread_id,
         "post-rejection tag action no longer targeted the restored row: {tagged}"
     );
