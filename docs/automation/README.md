@@ -14,7 +14,7 @@ main loop and operate on the real app model/widgets.
 ## Launch with the test harness
 
 ```sh
-cargo run -p notm-app -- launch \
+cargo run --locked -p notm-app -- launch \
   --test-harness \
   --test-harness-socket /tmp/notm.sock \
   --test-harness-token dev-token
@@ -23,7 +23,7 @@ cargo run -p notm-app -- launch \
 Against disposable fixture data:
 
 ```sh
-cargo run -p notm-app -- launch \
+cargo run --locked -p notm-app -- launch \
   --fixture \
   --test-harness \
   --test-harness-socket /tmp/notm.sock \

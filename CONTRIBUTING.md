@@ -25,7 +25,7 @@ The native dependencies and basic build instructions are in the
 [README](README.md#requirements). A development build can be started with:
 
 ```sh
-cargo run -p notm-app -- launch
+cargo run --locked -p notm-app -- launch
 ```
 
 ## Test
@@ -33,19 +33,23 @@ cargo run -p notm-app -- launch
 Use disposable fixture data before a live mailbox. The routine checks are:
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets --all-features
-cargo run -p notm-app -- fixture-smoke
+make check
+make test
+make smoke
 ```
+
+These targets run formatting, denied-warning Clippy, the release-integrity
+policy checks, locked workspace tests, and the hermetic fixture smoke.
 
 Run `./tests/packaging_install_smoke.sh` when changing installation or packaging
 files. UI changes should also run the narrowest relevant non-skipping GTK smoke
 test on a real or virtual display. See [docs/testing.md](docs/testing.md) for the
 full commands and the difference between fixture and live tests.
 
-Do not run `live-readonly-smoke` or `live-self-send` against a real setup unless
-that access is intentional. `live-self-send` sends real mail.
+`make smoke` is fixture-only and does not use a configured mailbox or send
+transport. Do not run `make smoke-live-readonly` or `make smoke-live-send`
+against a real setup unless that access is intentional. The latter sends real
+mail.
 
 ## Pull requests
 

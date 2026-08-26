@@ -75,12 +75,13 @@ SOURCE_NAME="notm-${VERSION}"
 SOURCE_ARCHIVE="$OUTPUT_DIR/notm-v${VERSION}-src.tar.gz"
 CHECKSUM="$OUTPUT_DIR/SHA256SUMS"
 SOURCE_REF=${SOURCE_REF:-HEAD}
+METADATA_VERIFIER="$SOURCE_ROOT/packaging/verify-release-metadata.py"
 WORK_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/notm-release.XXXXXX")
 BUNDLE_TAR="$WORK_ROOT/$BUNDLE_NAME.tar"
 SOURCE_TAR="$WORK_ROOT/$SOURCE_NAME.tar"
 readonly \
   SOURCE_ROOT BINARY BUILD_INFO OUTPUT_DIR BUNDLE_NAME ARCHIVE \
-  SOURCE_NAME SOURCE_ARCHIVE SOURCE_REF CHECKSUM WORK_ROOT \
+  SOURCE_NAME SOURCE_ARCHIVE SOURCE_REF CHECKSUM METADATA_VERIFIER WORK_ROOT \
   BUNDLE_TAR SOURCE_TAR
 BUNDLE_ROOT="$WORK_ROOT/$BUNDLE_NAME"
 readonly BUNDLE_ROOT
@@ -90,11 +91,69 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-if ! git -C "$SOURCE_ROOT" rev-parse --verify "${SOURCE_REF}^{commit}" \
-  > /dev/null 2>&1; then
-  printf 'source ref does not resolve to a commit: %s\n' "$SOURCE_REF" >&2
+if [ ! -x "$METADATA_VERIFIER" ]; then
+  printf 'release metadata verifier is not executable: %s\n' \
+    "$METADATA_VERIFIER" >&2
   exit 2
 fi
+
+metadata_version=$(
+  "$METADATA_VERIFIER" --print-version "$SOURCE_ROOT"
+)
+if [ "$metadata_version" != "$VERSION" ]; then
+  printf 'release version does not match verified metadata: %s != %s\n' \
+    "$VERSION" "$metadata_version" >&2
+  exit 1
+fi
+
+git_root=$(git -C "$SOURCE_ROOT" rev-parse --show-toplevel 2>/dev/null || :)
+if [ "$git_root" = "$SOURCE_ROOT" ]; then
+  source_mode=git
+  if ! source_commit=$(
+    git -C "$SOURCE_ROOT" rev-parse --verify "${SOURCE_REF}^{commit}"
+  ); then
+    printf 'source ref does not resolve to a commit: %s\n' "$SOURCE_REF" >&2
+    exit 2
+  fi
+else
+  source_mode=archive
+  source_commit=$(
+    sed -n 's/^commit=\([0-9a-f]\{40\}\)$/\1/p' \
+      "$SOURCE_ROOT/.git_archival.txt"
+  )
+  if [ -z "$source_commit" ]; then
+    printf '%s\n' \
+      'archive source does not contain expanded commit provenance' >&2
+    exit 2
+  fi
+  "$METADATA_VERIFIER" \
+    --expected-version "$VERSION" \
+    --expected-source-commit "$source_commit" \
+    --require-archive-provenance \
+    "$SOURCE_ROOT" >/dev/null
+  if [ "$SOURCE_REF" != HEAD ] && [ "$SOURCE_REF" != "$source_commit" ]; then
+    printf 'archive source commit does not match SOURCE_REF: %s != %s\n' \
+      "$source_commit" "$SOURCE_REF" >&2
+    exit 1
+  fi
+  case "$OUTPUT_DIR" in
+    "$SOURCE_ROOT" | "$SOURCE_ROOT"/*)
+      printf '%s\n' \
+        'archive-source output directory must be outside the source tree' >&2
+      exit 2
+      ;;
+  esac
+  for input in "$BINARY" "$BUILD_INFO"; do
+    case "$input" in
+      "$SOURCE_ROOT"/*)
+        printf 'archive-source input must be outside the source tree: %s\n' \
+          "$input" >&2
+        exit 2
+        ;;
+    esac
+  done
+fi
+readonly source_mode source_commit metadata_version git_root
 
 for artifact in "$ARCHIVE" "$SOURCE_ARCHIVE" "$CHECKSUM"; do
   if [ -e "$artifact" ] || [ -L "$artifact" ]; then
@@ -191,11 +250,30 @@ fi
 )
 gzip -n -9 -c "$BUNDLE_TAR" > "$ARCHIVE"
 
-git -C "$SOURCE_ROOT" archive \
-  --format=tar \
-  --prefix="$SOURCE_NAME/" \
-  --output="$SOURCE_TAR" \
-  "$SOURCE_REF"
+if [ "$source_mode" = git ]; then
+  git -C "$SOURCE_ROOT" archive \
+    --format=tar \
+    --prefix="$SOURCE_NAME/" \
+    --output="$SOURCE_TAR" \
+    "$source_commit"
+else
+  (
+    cd -- "$SOURCE_ROOT"
+    LC_ALL=C tar \
+      --format=pax \
+      --sort=name \
+      --owner=0 \
+      --group=0 \
+      --numeric-owner \
+      --mtime="$archive_mtime" \
+      --pax-option="comment=$source_commit,delete=atime,delete=ctime" \
+      --exclude-vcs-ignores \
+      --transform="s|^\\./|$SOURCE_NAME/|" \
+      --transform="s|^\\.$|$SOURCE_NAME/|" \
+      -cf "$SOURCE_TAR" \
+      .
+  )
+fi
 gzip -n -9 -c "$SOURCE_TAR" > "$SOURCE_ARCHIVE"
 
 (
