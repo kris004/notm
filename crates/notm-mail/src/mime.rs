@@ -232,7 +232,10 @@ pub fn parse_rfc5322_with_limits(
         .collect::<BTreeMap<_, _>>();
     let mut state = ParseState::new(limits);
     let selection = walk_part(&parsed, 0, &mut Vec::new(), false, &mut state)?;
-    let text_body = selection.text.unwrap_or_default();
+    let text_body = selection
+        .text
+        .or(selection.text_fallback)
+        .unwrap_or_default();
     let html_body = selection.html;
     let safe_body = if !text_body.trim().is_empty() {
         text_body.clone()
@@ -305,11 +308,16 @@ pub fn parse_reader_with_limits(
 struct BodySelection {
     text: Option<String>,
     html: Option<String>,
+    text_fallback: Option<String>,
 }
 
 impl BodySelection {
     fn append(&mut self, other: Self) {
-        append_body(&mut self.text, other.text);
+        // Outside multipart/alternative, a readable text subtype is part of
+        // the message body even when it is not one of the two representations
+        // we render specially. Prefer an exact text/plain representation when
+        // both are available from a nested selection.
+        append_body(&mut self.text, other.text.or(other.text_fallback));
         append_body(&mut self.html, other.html);
     }
 
@@ -319,6 +327,9 @@ impl BodySelection {
         }
         if other.html.is_some() {
             self.html = other.html;
+        }
+        if other.text_fallback.is_some() {
+            self.text_fallback = other.text_fallback;
         }
     }
 }
@@ -402,8 +413,9 @@ fn walk_part(
 
     if !part.subparts.is_empty() {
         let mut selections = Vec::with_capacity(part.subparts.len());
-        let child_named_body_allowed = named_body_allowed || mimetype == "multipart/alternative";
         for (index, subpart) in part.subparts.iter().enumerate() {
+            let child_named_body_allowed =
+                named_body_allowed_for_child(part, &mimetype, named_body_allowed, index);
             path.push(index);
             let selection = walk_part(subpart, depth + 1, path, child_named_body_allowed, state)?;
             path.pop();
@@ -490,10 +502,17 @@ fn walk_part(
                 "text/plain" => BodySelection {
                     text: Some(body),
                     html: None,
+                    text_fallback: None,
                 },
                 "text/html" => BodySelection {
                     text: None,
                     html: Some(body),
+                    text_fallback: None,
+                },
+                _ if mimetype.starts_with("text/") => BodySelection {
+                    text: None,
+                    html: None,
+                    text_fallback: Some(body),
                 },
                 _ => BodySelection::default(),
             })
@@ -523,19 +542,7 @@ fn select_multipart_body(
             selected
         }
         "multipart/related" => {
-            let root_index =
-                part.ctype
-                    .params
-                    .get("start")
-                    .and_then(|start| {
-                        let start = normalize_content_id(start);
-                        part.subparts.iter().position(|subpart| {
-                            subpart.headers.get_first_value("Content-ID").is_some_and(
-                                |content_id| normalize_content_id(&content_id) == start,
-                            )
-                        })
-                    })
-                    .unwrap_or(0);
+            let root_index = related_root_index(part);
             selections.into_iter().nth(root_index).unwrap_or_default()
         }
         "multipart/signed" => selections.into_iter().next().unwrap_or_default(),
@@ -548,6 +555,50 @@ fn select_multipart_body(
             selected
         }
     }
+}
+
+fn named_body_allowed_for_child(
+    part: &mailparse::ParsedMail<'_>,
+    mimetype: &str,
+    named_body_allowed: bool,
+    child_index: usize,
+) -> bool {
+    if mimetype == "multipart/alternative" {
+        // Each direct child is an alternative representation and may carry a
+        // descriptive name without becoming an attachment.
+        return true;
+    }
+    if !named_body_allowed || mimetype == "multipart/encrypted" {
+        return false;
+    }
+
+    // Once an alternative representation enters another container, preserve
+    // the exemption only along that container's actual body/root path. Named
+    // siblings remain attachments instead of inheriting it indiscriminately.
+    let root_index = if mimetype == "multipart/related" {
+        related_root_index(part)
+    } else {
+        // multipart/signed carries its signed body first. multipart/mixed and
+        // other composite representations conventionally carry the body first.
+        0
+    };
+    child_index == root_index
+}
+
+fn related_root_index(part: &mailparse::ParsedMail<'_>) -> usize {
+    part.ctype
+        .params
+        .get("start")
+        .and_then(|start| {
+            let start = normalize_content_id(start);
+            part.subparts.iter().position(|subpart| {
+                subpart
+                    .headers
+                    .get_first_value("Content-ID")
+                    .is_some_and(|content_id| normalize_content_id(&content_id) == start)
+            })
+        })
+        .unwrap_or(0)
 }
 
 fn normalize_content_id(value: &str) -> &str {
@@ -581,7 +632,7 @@ fn part_is_attachment_like(
 ) -> bool {
     explicitly_attached
         || mimetype == "text/calendar"
-        || (!crypto_related && !matches!(mimetype, "text/plain" | "text/html"))
+        || (!crypto_related && !mimetype.starts_with("text/"))
 }
 
 fn fallback_attachment_filename(part: &mailparse::ParsedMail<'_>) -> String {
@@ -673,15 +724,16 @@ fn ensure_decode_may_fit(
         return Ok(());
     };
     let upper_bound = match encoding {
-        TransferEncoding::Identity | TransferEncoding::QuotedPrintable => raw.len(),
-        TransferEncoding::Base64 => {
+        TransferEncoding::Identity => raw.len(),
+        TransferEncoding::QuotedPrintable => quoted_printable_decoded_len(raw).unwrap_or(raw.len()),
+        TransferEncoding::Base64 => base64_decoded_len(raw).unwrap_or_else(|| {
             raw.iter()
                 .filter(|byte| !byte.is_ascii_whitespace())
                 .count()
                 .saturating_add(3)
                 / 4
                 * 3
-        }
+        }),
     };
     if upper_bound > limit {
         return Err(MimeLimitError::DecodedPart {
@@ -691,6 +743,102 @@ fn ensure_decode_may_fit(
         .into());
     }
     Ok(())
+}
+
+// Return the exact decoded length for syntactically valid quoted-printable
+// without allocating. Invalid input is handled by the normal decoder; callers
+// use the encoded length as a conservative bound in that case.
+fn quoted_printable_decoded_len(raw: &[u8]) -> Option<usize> {
+    let mut decoded_len = 0usize;
+    let mut line_start = 0usize;
+    let mut previous_line_was_hard = false;
+    loop {
+        let newline = raw[line_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| line_start + offset);
+        let line_end = newline.unwrap_or(raw.len());
+        let mut line = &raw[line_start..line_end];
+        while line
+            .last()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r'))
+        {
+            line = &line[..line.len() - 1];
+        }
+        if previous_line_was_hard {
+            decoded_len = decoded_len.checked_add(2)?;
+        }
+
+        let soft_break = line.last() == Some(&b'=');
+        let content_end = line.len().saturating_sub(usize::from(soft_break));
+        let mut index = 0usize;
+        while index < content_end {
+            let byte = line[index];
+            if !matches!(byte, b'\t' | b'\r' | b' '..=b'~') {
+                return None;
+            }
+            if byte == b'=' {
+                let upper = *line.get(index + 1)?;
+                let lower = *line.get(index + 2)?;
+                if !upper.is_ascii_hexdigit() || !lower.is_ascii_hexdigit() {
+                    return None;
+                }
+                decoded_len = decoded_len.checked_add(1)?;
+                index += 3;
+            } else {
+                decoded_len = decoded_len.checked_add(1)?;
+                index += 1;
+            }
+        }
+
+        previous_line_was_hard = !soft_break;
+        let Some(newline) = newline else {
+            break;
+        };
+        line_start = newline + 1;
+        if line_start == raw.len() {
+            if previous_line_was_hard {
+                decoded_len = decoded_len.checked_add(2)?;
+            }
+            break;
+        }
+    }
+    Some(decoded_len)
+}
+
+// Match mailparse's MIME base64 decoder: ASCII whitespace is ignored and
+// padding is required. This validates enough of the grammar to make the length
+// exact while keeping the preflight allocation-free.
+fn base64_decoded_len(raw: &[u8]) -> Option<usize> {
+    let mut encoded_len = 0usize;
+    let mut padding = 0usize;
+    let mut saw_padding = false;
+    for byte in raw
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+    {
+        encoded_len = encoded_len.checked_add(1)?;
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' if !saw_padding => {}
+            b'=' => {
+                saw_padding = true;
+                padding = padding.checked_add(1)?;
+            }
+            _ => return None,
+        }
+    }
+    if !encoded_len.is_multiple_of(4) || padding > 2 {
+        return None;
+    }
+    let data_len = encoded_len.checked_sub(padding)?;
+    if (padding == 1 && data_len % 4 != 3) || (padding == 2 && data_len % 4 != 2) {
+        return None;
+    }
+    encoded_len
+        .checked_div(4)?
+        .checked_mul(3)?
+        .checked_sub(padding)
 }
 
 fn encoded_body_bytes<'a>(part: &'a mailparse::ParsedMail<'a>) -> &'a [u8] {
@@ -786,16 +934,32 @@ fn find_subslice(haystack: &[u8], start: usize, needle: &[u8]) -> Option<usize> 
 }
 
 // Match mailparse's multipart delimiter recognition: the delimiter must be at
-// the beginning of the searched body or immediately follow LF.
+// the beginning of the searched body or immediately follow LF, and the rest of
+// the delimiter line may contain only the closing marker and transport
+// whitespace.
 fn find_line_prefix(haystack: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
     let mut search_from = start;
     while let Some(index) = find_subslice(haystack, search_from, needle) {
-        if index == start || haystack[index - 1] == b'\n' {
+        if (index == start || haystack[index - 1] == b'\n')
+            && valid_boundary_line_suffix(haystack, index + needle.len())
+        {
             return Some(index);
         }
         search_from = index + 1;
     }
     None
+}
+
+fn valid_boundary_line_suffix(haystack: &[u8], mut index: usize) -> bool {
+    if haystack.get(index..index.saturating_add(2)) == Some(b"--") {
+        index += 2;
+    }
+    while matches!(haystack.get(index), Some(b' ' | b'\t')) {
+        index += 1;
+    }
+    index == haystack.len()
+        || haystack.get(index) == Some(&b'\n')
+        || (haystack.get(index) == Some(&b'\r') && haystack.get(index + 1) == Some(&b'\n'))
 }
 
 fn part_description(mimetype: &str, filename: Option<&str>, is_attachment: bool) -> String {
@@ -1076,8 +1240,9 @@ fn collect_attachment_data(
 ) -> anyhow::Result<()> {
     let mimetype = part.ctype.mimetype.to_ascii_lowercase();
     if !part.subparts.is_empty() {
-        let child_named_body_allowed = named_body_allowed || mimetype == "multipart/alternative";
-        for subpart in &part.subparts {
+        for (index, subpart) in part.subparts.iter().enumerate() {
+            let child_named_body_allowed =
+                named_body_allowed_for_child(part, &mimetype, named_body_allowed, index);
             collect_attachment_data(
                 subpart,
                 limits,
@@ -1426,6 +1591,97 @@ mod tests {
     }
 
     #[test]
+    fn named_attachments_in_nested_alternative_containers_stay_attachments() {
+        let raw = b"MIME-Version: 1.0\r\n\
+                    Content-Type: multipart/alternative; boundary=alt\r\n\r\n\
+                    --alt\r\nContent-Type: text/plain\r\n\r\nPlain body\r\n\
+                    --alt\r\nContent-Type: multipart/mixed; boundary=mixed\r\n\r\n\
+                    --mixed\r\nContent-Type: text/html\r\n\r\n<p>HTML body</p>\r\n\
+                    --mixed\r\nContent-Type: text/plain; name=notes.txt\r\n\r\nAttached notes\r\n\
+                    --mixed\r\nContent-Type: text/html; name=extra.html\r\n\r\n<p>Attached HTML</p>\r\n\
+                    --mixed--\r\n\
+                    --alt--\r\n";
+
+        let parsed = parse_rfc5322(raw).expect("parse nested alternative container");
+
+        assert_eq!(parsed.text_body, "Plain body");
+        assert_eq!(parsed.html_body.as_deref(), Some("<p>HTML body</p>"));
+        assert_eq!(parsed.attachments.len(), 2);
+        assert_eq!(parsed.attachments[0].filename.as_deref(), Some("notes.txt"));
+        assert_eq!(
+            parsed.attachments[1].filename.as_deref(),
+            Some("extra.html")
+        );
+
+        let extracted = extract_attachments(raw).expect("extract nested named attachments");
+        assert_eq!(extracted.len(), 2);
+        assert_eq!(extracted[0].filename, "notes.txt");
+        assert_eq!(extracted[0].bytes, b"Attached notes");
+        assert_eq!(extracted[1].filename, "extra.html");
+        assert_eq!(extracted[1].bytes, b"<p>Attached HTML</p>");
+    }
+
+    #[test]
+    fn named_related_root_inside_alternative_remains_the_body() {
+        let raw = b"MIME-Version: 1.0\r\n\
+                    Content-Type: multipart/alternative; boundary=alt\r\n\r\n\
+                    --alt\r\nContent-Type: text/plain\r\n\r\nPlain body\r\n\
+                    --alt\r\n\
+                    Content-Type: multipart/related; boundary=related; start=\"<body>\"\r\n\r\n\
+                    --related\r\n\
+                    Content-Type: image/png; name=pixel.png\r\n\
+                    Content-ID: <pixel>\r\n\r\npng bytes\r\n\
+                    --related\r\n\
+                    Content-Type: text/html; charset=utf-8; name=body.html\r\n\
+                    Content-Disposition: inline; filename=body.html\r\n\
+                    Content-ID: <body>\r\n\r\n<p>Named related body</p>\r\n\
+                    --related--\r\n\
+                    --alt--\r\n";
+
+        let parsed = parse_rfc5322(raw).expect("parse named related alternative");
+
+        assert_eq!(parsed.text_body, "Plain body");
+        assert_eq!(
+            parsed.html_body.as_deref(),
+            Some("<p>Named related body</p>")
+        );
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].filename.as_deref(), Some("pixel.png"));
+
+        let extracted = extract_attachments(raw).expect("extract related sibling attachment");
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].filename, "pixel.png");
+        assert_eq!(extracted[0].bytes, b"png bytes");
+    }
+
+    #[test]
+    fn filename_less_text_subtypes_are_readable_fallbacks() {
+        for media_type in ["text/markdown", "text/enriched", "text/x-diff"] {
+            let raw = format!("Content-Type: {media_type}; charset=utf-8\r\n\r\nReadable fallback");
+            let parsed = parse_rfc5322(raw.as_bytes()).expect("parse textual fallback");
+
+            assert_eq!(parsed.text_body, "Readable fallback", "{media_type}");
+            assert_eq!(parsed.safe_body, "Readable fallback", "{media_type}");
+            assert!(parsed.attachments.is_empty(), "{media_type}");
+            assert!(
+                extract_attachments(raw.as_bytes())
+                    .expect("extract textual fallback")
+                    .is_empty(),
+                "{media_type}"
+            );
+        }
+
+        let alternative = b"MIME-Version: 1.0\r\n\
+                            Content-Type: multipart/alternative; boundary=alt\r\n\r\n\
+                            --alt\r\nContent-Type: text/markdown\r\n\r\nMarkdown fallback\r\n\
+                            --alt\r\nContent-Type: text/plain\r\n\r\nPreferred plain\r\n\
+                            --alt--\r\n";
+        let parsed = parse_rfc5322(alternative).expect("parse fallback alternative");
+        assert_eq!(parsed.text_body, "Preferred plain");
+        assert_eq!(parsed.safe_body, "Preferred plain");
+    }
+
+    #[test]
     fn genuinely_attached_text_parts_stay_attachments() {
         let mixed = b"MIME-Version: 1.0\r\n\
                       Content-Type: multipart/mixed; boundary=mixed\r\n\r\n\
@@ -1684,6 +1940,47 @@ mod tests {
     }
 
     #[test]
+    fn multipart_preflight_ignores_boundary_token_prefix_lines() {
+        let limits = MimeLimits {
+            // The root plus the one real child exactly fill this limit. A
+            // token-prefix line misclassified as a delimiter would exceed it.
+            max_parts: 2,
+            ..MimeLimits::default()
+        };
+        let raw = b"MIME-Version: 1.0\r\n\
+                    Content-Type: multipart/mixed; boundary=boundary\r\n\r\n\
+                    --boundary\r\nContent-Type: text/plain\r\n\r\n\
+                    first line\r\n--boundarySuffix\r\nlast line\r\n\
+                    --boundary--\r\n";
+
+        let parsed = parse_rfc5322_with_limits(raw, limits)
+            .expect("boundary token prefix is ordinary body text");
+
+        assert!(parsed.safe_body.contains("first line"));
+
+        for valid_line in [
+            b"--boundary".as_slice(),
+            b"--boundary\r\n",
+            b"--boundary \t\r\n",
+            b"--boundary--\r\n",
+            b"--boundary-- \t\r\n",
+        ] {
+            assert_eq!(
+                find_line_prefix(valid_line, 0, b"--boundary"),
+                Some(0),
+                "{valid_line:?}"
+            );
+        }
+        for invalid_line in [b"--boundarySuffix".as_slice(), b"--boundary--Suffix"] {
+            assert_eq!(
+                find_line_prefix(invalid_line, 0, b"--boundary"),
+                None,
+                "{invalid_line:?}"
+            );
+        }
+    }
+
+    #[test]
     fn decoded_part_and_aggregate_sizes_are_bounded() {
         let part_limits = MimeLimits {
             max_decoded_part_bytes: 4,
@@ -1715,6 +2012,41 @@ mod tests {
             aggregate_error.downcast_ref::<MimeLimitError>(),
             Some(&MimeLimitError::TotalDecoded { limit: 5 })
         );
+    }
+
+    #[test]
+    fn encoded_parts_are_limited_by_exact_decoded_size() {
+        let limits = MimeLimits {
+            max_decoded_part_bytes: 2,
+            ..MimeLimits::default()
+        };
+        for (encoding, payload) in [("quoted-printable", "=41=42"), ("base64", "QUI=")] {
+            let raw = format!(
+                "Content-Type: text/plain; charset=utf-8\r\n\
+                 Content-Transfer-Encoding: {encoding}\r\n\r\n{payload}"
+            );
+            let parsed = parse_rfc5322_with_limits(raw.as_bytes(), limits)
+                .expect("decoded bytes fit the exact limit");
+            assert_eq!(parsed.safe_body, "AB", "{encoding}");
+            let attachments =
+                extract_attachments_with_limits(&attachment_message(encoding, payload), limits)
+                    .expect("encoded attachment fits the exact decoded limit");
+            assert_eq!(attachments[0].bytes, b"AB", "{encoding}");
+
+            let too_small = MimeLimits {
+                max_decoded_part_bytes: 1,
+                ..MimeLimits::default()
+            };
+            let error = parse_rfc5322_with_limits(raw.as_bytes(), too_small)
+                .expect_err("decoded bytes exceed the smaller limit");
+            assert!(
+                matches!(
+                    error.downcast_ref::<MimeLimitError>(),
+                    Some(MimeLimitError::DecodedPart { limit: 1, .. })
+                ),
+                "{encoding}: {error:#}"
+            );
+        }
     }
 
     #[test]

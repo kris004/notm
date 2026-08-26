@@ -10807,6 +10807,7 @@ fn select_thread_by_index(
             }
         }
         Err(err) => {
+            apply_message_selection_snapshot(options, widgets, state, rejection_restore);
             state.borrow_mut().last_error = Some(err.to_string());
             widgets
                 .status_label
@@ -10934,6 +10935,7 @@ fn open_loaded_thread_at_message(
             }
             Ok(None) => {}
             Err(err) => {
+                apply_message_selection_snapshot(options, widgets, state, rejection_restore);
                 state.borrow_mut().last_error = Some(err.to_string());
                 widgets
                     .status_label
@@ -11035,6 +11037,7 @@ fn open_thread_by_index(
             }
         }
         Err(err) => {
+            apply_message_selection_snapshot(options, widgets, state, rejection_restore);
             state.borrow_mut().last_error = Some(err.to_string());
             widgets
                 .status_label

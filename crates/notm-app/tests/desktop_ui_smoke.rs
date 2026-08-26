@@ -4027,6 +4027,191 @@ fn standalone_remote_images_are_revoked_when_settings_disable_them() -> anyhow::
 
 #[cfg(unix)]
 #[test]
+fn oversized_thread_rejection_restores_selection_before_tagging() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP oversized_thread_rejection_restores_selection_before_tagging: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running oversized-thread selection rollback smoke with {display}");
+
+    const OVERSIZED_MESSAGE_COUNT: usize = notm_ui::model::MAX_LOADED_THREAD_MESSAGES + 1;
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-oversized-select-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+
+    let query_tag = format!("oversized-select-{run_id}");
+    let mutation_tag = format!("after-rejected-selection-{run_id}");
+    let safe_message_id = format!("oversized-safe-{run_id}@fixture.test");
+    let oversized_root_id = format!("oversized-root-{run_id}@fixture.test");
+    let oversized_subject = "Oversized selection rejection";
+    {
+        let db = fixture.open_readwrite()?;
+        let safe_path = fixture
+            .maildir
+            .join("cur")
+            .join(format!("oversized-safe-{run_id}:2,S"));
+        fs::write(
+            &safe_path,
+            format!(
+                "From: Safe Sender <safe@example.test>\r\n\
+                 To: Fixture User <fixture@example.test>\r\n\
+                 Subject: Safe selection target\r\n\
+                 Date: Tue, 25 Aug 2030 13:00:00 -0600\r\n\
+                 Message-ID: <{safe_message_id}>\r\n\
+                 MIME-Version: 1.0\r\n\
+                 Content-Type: text/plain; charset=utf-8\r\n\r\n\
+                 Safe selection body.\r\n"
+            ),
+        )?;
+        db.index_file_with_tags(&safe_path, &["inbox", &query_tag])?;
+
+        for index in 0..OVERSIZED_MESSAGE_COUNT {
+            let message_id = if index == 0 {
+                oversized_root_id.clone()
+            } else {
+                format!("oversized-reply-{index}-{run_id}@fixture.test")
+            };
+            let reply_headers = if index == 0 {
+                String::new()
+            } else {
+                format!(
+                    "In-Reply-To: <{oversized_root_id}>\r\n\
+                     References: <{oversized_root_id}>\r\n"
+                )
+            };
+            let path = fixture
+                .maildir
+                .join("cur")
+                .join(format!("oversized-{run_id}-{index:04}:2,S"));
+            fs::write(
+                &path,
+                format!(
+                    "From: Oversized Sender <oversized@example.test>\r\n\
+                     To: Fixture User <fixture@example.test>\r\n\
+                     Subject: {}{oversized_subject}\r\n\
+                     Date: Tue, 25 Aug 2026 12:00:00 -0600\r\n\
+                     Message-ID: <{message_id}>\r\n\
+                     {reply_headers}\
+                     MIME-Version: 1.0\r\n\
+                     Content-Type: text/plain; charset=utf-8\r\n\r\n\
+                     Oversized message {index}.\r\n",
+                    if index == 0 { "" } else { "Re: " },
+                ),
+            )?;
+            db.index_file_with_tags(&path, &["inbox", &query_tag])?;
+        }
+    }
+
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = {}\nexcluded_tags = []\n\
+             \n[identity]\nname = \"Fixture User\"\nprimary_email = \"fixture@example.test\"\n\
+             \n[send]\nenabled = false\n\
+             \n[sync]\nenabled = false\n\
+             \n[automation]\nallow_live_tag_test = true\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+            toml::Value::String(format!("tag:{query_tag}")),
+        ),
+    )?;
+
+    let token = format!("notm-oversized-select-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect_with_command_timeout(&token, LARGE_THREAD_COMMAND_TIMEOUT)?;
+    let search = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let rows = json_array_at(&search, &["state", "thread_list_items"])?;
+    ensure!(
+        rows.len() == 2,
+        "expected safe and oversized threads: {search}"
+    );
+    let safe_index = rows
+        .iter()
+        .position(|thread| thread["subject"] == "Safe selection target")
+        .with_context(|| format!("safe thread was not present: {search}"))?;
+    let safe_thread_id = rows[safe_index]["thread_id"]
+        .as_str()
+        .with_context(|| format!("safe thread had no ID: {search}"))?
+        .to_string();
+    let oversized_index = rows
+        .iter()
+        .position(|thread| thread["subject"] == oversized_subject)
+        .with_context(|| format!("oversized thread was not present: {search}"))?;
+
+    let selected = driver.command("select_thread_by_index", json!({"index": safe_index}))?;
+    assert_eq!(
+        selected["selected_thread"]["thread_id"], safe_thread_id,
+        "safe thread was not selected before rejection: {selected}"
+    );
+
+    let rejected = driver.command("select_thread_by_index", json!({"index": oversized_index}))?;
+    assert_eq!(
+        rejected["selected_thread_index"], safe_index,
+        "rejected oversized row remained selected: {rejected}"
+    );
+    assert_eq!(
+        rejected["selected_thread"]["thread_id"], safe_thread_id,
+        "rejected oversized selection changed the state target: {rejected}"
+    );
+    let selection = driver.command("thread_selection_view_state", json!({}))?;
+    assert_eq!(
+        selection["selected_local"], safe_index,
+        "GTK selection did not roll back with state: {selection}"
+    );
+    let rejected_state = driver.command("app_state", json!({}))?;
+    ensure!(
+        rejected_state["state"]["last_error"]
+            .as_str()
+            .is_some_and(|error| {
+                error.contains(&format!("contains {OVERSIZED_MESSAGE_COUNT} message(s)"))
+                    && error.contains(&format!(
+                        "safety limit of {}",
+                        notm_ui::model::MAX_LOADED_THREAD_MESSAGES
+                    ))
+                    && error.contains("no partial thread was loaded")
+            }),
+        "oversized rejection was not surfaced: {rejected_state}"
+    );
+
+    let tagged = driver.command("tag_selected", json!({"add": [&mutation_tag]}))?;
+    assert_eq!(
+        tagged["ok"], true,
+        "tag action after oversized rejection failed: {tagged}"
+    );
+    assert_eq!(
+        tagged["state"]["selected_thread"]["thread_id"], safe_thread_id,
+        "post-rejection tag action no longer targeted the restored row: {tagged}"
+    );
+
+    let db = fixture.open_readonly()?;
+    let query_options = notm_notmuch::QueryOptions {
+        excluded_tags: Vec::new(),
+        ..notm_notmuch::QueryOptions::default()
+    };
+    assert_eq!(
+        db.count_messages(&format!("tag:{mutation_tag}"), &query_options)?,
+        1,
+        "post-rejection tag leaked onto the oversized thread"
+    );
+    assert_eq!(
+        db.count_messages(
+            &format!("id:{safe_message_id} and tag:{mutation_tag}"),
+            &query_options,
+        )?,
+        1,
+        "restored safe thread did not receive the tag"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn isolated_message_io_mime_survives_missing_copy_limits_and_restart() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
