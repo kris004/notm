@@ -1,0 +1,3 @@
+# Expanded by `git archive`; the checkout placeholders are intentional.
+commit=$Format:%H$
+commit-date=$Format:%cI$

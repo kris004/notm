@@ -108,7 +108,7 @@ under `~/.local`. Make sure `~/.local/bin` is in `PATH`.
 To build without installing:
 
 ```sh
-cargo build --release -p notm-app
+cargo build --release --locked -p notm-app
 ./target/release/notm launch
 ```
 

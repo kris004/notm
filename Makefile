@@ -15,12 +15,14 @@ DESKTOP_FILE := $(DESKTOP_ID).desktop
 ICON_FILE := $(DESKTOP_ID).svg
 METAINFO_FILE := $(DESKTOP_ID).metainfo.xml
 
-.PHONY: all build install install-user install-man uninstall uninstall-user uninstall-man check check-packaging test smoke clean
+.PHONY: all build install install-user install-man uninstall uninstall-user \
+	uninstall-man check check-policy check-packaging test smoke \
+	check-source-archive smoke-live-readonly smoke-live-send clean
 
 all: build
 
 build:
-	$(CARGO) build --release -p notm-app
+	$(CARGO) build --release --locked -p notm-app
 
 install: build install-man
 	$(INSTALL) -Dm755 "$(BINARY)" "$(DESTDIR)$(BINDIR)/notm"
@@ -67,20 +69,42 @@ uninstall-user:
 	$(MAKE) PREFIX="$(HOME)/.local" uninstall
 
 check:
-	$(CARGO) fmt --all --check
-	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
+	$(CARGO) fmt --all -- --check
+	$(CARGO) clippy --locked --workspace --all-targets --all-features -- -D warnings
+	$(MAKE) check-policy
 
-check-packaging:
+check-policy:
+	./tests/cargo_lock_policy_smoke.py
+	./tests/cargo_lock_guard_smoke.sh
+	./tests/make_smoke_policy.sh
+	./packaging/verify-release-metadata.py .
+	./tests/release_metadata_smoke.py
+	./tests/release_key_expiry_smoke.sh
+	./packaging/check-release-key-expiry.sh \
+		docs/release-signing-key.asc \
+		BE592562E6131A53F4BADE4A046928E9A919BAF9
+
+check-packaging: check-policy
 	./tests/packaging_install_smoke.sh
 	./tests/release_bundle_smoke.sh
 	./tests/release_tag_smoke.sh
 
-test:
-	$(CARGO) test --workspace --all-targets --all-features
+check-source-archive:
+	./tests/source_archive_smoke.sh
 
+test:
+	$(CARGO) test --locked --workspace --all-targets --all-features
+
+# Keep the default smoke hermetic. Live mailbox and transport checks have
+# deliberately explicit targets below.
 smoke:
-	$(CARGO) run -p notm-app -- fixture-smoke
-	$(CARGO) run -p notm-app -- live-readonly-smoke
+	$(CARGO) run --locked -p notm-app -- fixture-smoke
+
+smoke-live-readonly:
+	$(CARGO) run --locked -p notm-app -- live-readonly-smoke
+
+smoke-live-send:
+	$(CARGO) run --locked -p notm-app -- live-self-send
 
 clean:
 	$(CARGO) clean

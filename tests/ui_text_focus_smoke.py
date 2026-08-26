@@ -1579,7 +1579,7 @@ def run_outer(args: argparse.Namespace) -> int:
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise SmokeFailure(
             f"notm test binary is missing or not executable: {binary}; "
-            "build it with `cargo build -p notm-app` or pass --binary"
+            "build it with `cargo build --locked -p notm-app` or pass --binary"
         )
     args.binary = binary
 
