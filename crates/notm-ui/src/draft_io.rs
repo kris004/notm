@@ -159,14 +159,23 @@ pub(crate) struct WorkerResponse<T> {
 pub(crate) struct DraftIoCoordinator {
     next_generation: u64,
     active_generation: Option<u64>,
+    active_migration: bool,
     completed_generation: Option<u64>,
 }
 
 impl DraftIoCoordinator {
-    pub(crate) fn begin(&mut self) -> u64 {
+    pub(crate) fn begin(&mut self, migrate_legacy: bool) -> Option<u64> {
+        // A legacy migration is the only named-draft load that mutates the
+        // store. Its worker is deliberately not cancellable once started, so
+        // a newer refresh must not replace the generation that gates draft
+        // saves, deletes, and accepted-send cleanup for its full lifetime.
+        if self.active_migration {
+            return None;
+        }
         self.next_generation = self.next_generation.saturating_add(1);
         self.active_generation = Some(self.next_generation);
-        self.next_generation
+        self.active_migration = migrate_legacy;
+        Some(self.next_generation)
     }
 
     pub(crate) fn accepts(&self, generation: u64) -> bool {
@@ -178,12 +187,14 @@ impl DraftIoCoordinator {
             return false;
         }
         self.active_generation = None;
+        self.active_migration = false;
         self.completed_generation = Some(generation);
         true
     }
 
     pub(crate) fn cancel(&mut self) {
         self.active_generation = None;
+        self.active_migration = false;
     }
 
     pub(crate) fn active_generation(&self) -> Option<u64> {
@@ -192,6 +203,10 @@ impl DraftIoCoordinator {
 
     pub(crate) fn completed_generation(&self) -> Option<u64> {
         self.completed_generation
+    }
+
+    pub(crate) fn migration_in_progress(&self) -> bool {
+        self.active_generation.is_some() && self.active_migration
     }
 }
 
@@ -1069,13 +1084,32 @@ mod tests {
     #[test]
     fn coordinator_rejects_stale_completion() {
         let mut coordinator = DraftIoCoordinator::default();
-        let old = coordinator.begin();
-        let current = coordinator.begin();
+        let old = coordinator.begin(false).expect("first refresh");
+        let current = coordinator.begin(false).expect("replacement refresh");
         assert!(!coordinator.accepts(old));
         assert!(coordinator.accepts(current));
         assert!(!coordinator.finish(old));
         assert!(coordinator.finish(current));
         assert_eq!(coordinator.completed_generation(), Some(current));
+    }
+
+    #[test]
+    fn coordinator_keeps_migration_exclusive_until_exact_completion() {
+        let mut coordinator = DraftIoCoordinator::default();
+        let migration = coordinator.begin(true).expect("start migration");
+        assert!(coordinator.migration_in_progress());
+        assert_eq!(coordinator.begin(false), None);
+        assert_eq!(coordinator.begin(true), None);
+        assert_eq!(coordinator.active_generation(), Some(migration));
+
+        assert!(!coordinator.finish(migration.saturating_add(1)));
+        assert!(coordinator.migration_in_progress());
+        assert_eq!(coordinator.active_generation(), Some(migration));
+
+        assert!(coordinator.finish(migration));
+        assert!(!coordinator.migration_in_progress());
+        let refresh = coordinator.begin(false).expect("refresh after migration");
+        assert!(refresh > migration);
     }
 
     #[test]

@@ -1828,7 +1828,7 @@ fn build_ui(
         );
     }
 
-    schedule_named_draft_refresh(&widgets, &state, true);
+    schedule_named_draft_refresh(&widgets, &state, true, None);
     window.present();
     {
         let w = widgets.clone();
@@ -7167,7 +7167,12 @@ fn report_draft_persistence_error(
 }
 
 fn update_draft_action_buttons(widgets: &Widgets, state: &SharedState) {
-    let (active_draft, background_activity, attachment_cache_pending) = {
+    let (
+        active_draft,
+        background_activity,
+        attachment_cache_pending,
+        named_draft_migration_pending,
+    ) = {
         let state = state.borrow();
         (
             state.active_draft.clone(),
@@ -7175,6 +7180,10 @@ fn update_draft_action_buttons(widgets: &Widgets, state: &SharedState) {
                 || state.send_in_progress
                 || widgets.draft_save_active.get().is_some(),
             widgets.composer_attachment_cache_active.get().is_some(),
+            widgets
+                .named_draft_io_coordinator
+                .borrow()
+                .migration_in_progress(),
         )
     };
     if let Some(active_draft) = active_draft {
@@ -7204,24 +7213,23 @@ fn update_draft_action_buttons(widgets: &Widgets, state: &SharedState) {
             .delete_local_draft_button()
             .set_visible(false);
     }
-    widgets
-        .composer
-        .save_draft_button()
-        .set_sensitive(!background_activity && !attachment_cache_pending);
+    widgets.composer.save_draft_button().set_sensitive(
+        !background_activity && !attachment_cache_pending && !named_draft_migration_pending,
+    );
     widgets
         .composer
         .clear_draft_button()
         .set_sensitive(!background_activity);
-    widgets
-        .composer
-        .delete_local_draft_button()
-        .set_sensitive(!background_activity && !attachment_cache_pending);
+    widgets.composer.delete_local_draft_button().set_sensitive(
+        !background_activity && !attachment_cache_pending && !named_draft_migration_pending,
+    );
     widgets
         .composer
         .delete_selected_draft_button()
         .set_sensitive(
             !background_activity
                 && !attachment_cache_pending
+                && !named_draft_migration_pending
                 && widgets.composer.draft_list().selected_row().is_some(),
         );
     widgets
@@ -7834,6 +7842,10 @@ fn composer_cache_selection(state: &SharedState) -> (Option<String>, Option<Stri
 
 fn update_composer_attachment_cache_controls(widgets: &Widgets, state: &SharedState) {
     let cache_pending = widgets.composer_attachment_cache_active.get().is_some();
+    let named_draft_migration_pending = widgets
+        .named_draft_io_coordinator
+        .borrow()
+        .migration_in_progress();
     let background_activity = {
         let state = state.borrow();
         state.sync_in_progress
@@ -7846,7 +7858,7 @@ fn update_composer_attachment_cache_controls(widgets: &Widgets, state: &SharedSt
     widgets
         .composer
         .send_button()
-        .set_sensitive(!background_activity && !cache_pending);
+        .set_sensitive(!background_activity && !cache_pending && !named_draft_migration_pending);
     update_draft_action_buttons(widgets, state);
 }
 
@@ -8625,7 +8637,7 @@ fn finish_draft_save_success(
     if widgets.draft_save_active.get() != Some(generation) {
         return;
     }
-    schedule_named_draft_refresh(widgets, state, false);
+    schedule_named_draft_refresh(widgets, state, false, None);
     announce_draft_save(widgets, state, &report);
     if report.indexed_message_id.is_some() && report.recovery_cleanup_warning.is_none() {
         let current = state.borrow().current_query.clone();
@@ -8944,18 +8956,58 @@ fn detach_deleted_indexed_draft_selection(
     }
 }
 
-fn schedule_named_draft_refresh(widgets: &Widgets, state: &SharedState, migrate_legacy: bool) {
-    let generation = widgets.named_draft_io_coordinator.borrow_mut().begin();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamedDraftRefreshStart {
+    Started(u64),
+    MigrationBusy(u64),
+    PersistenceBusy,
+}
+
+fn schedule_named_draft_refresh(
+    widgets: &Widgets,
+    state: &SharedState,
+    migrate_legacy: bool,
+    legacy_dir_override: Option<PathBuf>,
+) -> NamedDraftRefreshStart {
+    if migrate_legacy
+        && (widgets.draft_save_active.get().is_some() || state.borrow().send_in_progress)
+    {
+        return NamedDraftRefreshStart::PersistenceBusy;
+    }
+    let generation = widgets
+        .named_draft_io_coordinator
+        .borrow_mut()
+        .begin(migrate_legacy);
+    let Some(generation) = generation else {
+        let generation = widgets
+            .named_draft_io_coordinator
+            .borrow()
+            .active_generation()
+            .expect("an exclusive migration has an active generation");
+        return NamedDraftRefreshStart::MigrationBusy(generation);
+    };
+    let application_hold = migrate_legacy
+        .then(|| {
+            widgets
+                .window
+                .application()
+                .map(|application| application.hold())
+        })
+        .flatten();
     let response = draft_io::spawn_named_draft_load(NamedDraftLoadRequest {
         generation,
         current_dir: widgets.composer.drafts_dir().to_path_buf(),
-        legacy_dir: widgets.composer.legacy_drafts_dir().map(Path::to_path_buf),
+        legacy_dir: legacy_dir_override
+            .or_else(|| widgets.composer.legacy_drafts_dir().map(Path::to_path_buf)),
         migrate_legacy,
         fixture_delay: widgets.draft_io_delay.get(),
     });
+    update_composer_attachment_cache_controls(widgets, state);
     let w = widgets.clone();
     let st = state.clone();
+    let mut application_hold = application_hold;
     gtk::glib::timeout_add_local(DRAFT_IO_POLL_INTERVAL, move || {
+        let _keep_application_alive = application_hold.as_ref();
         let response = match response.try_recv() {
             Ok(response) => response,
             Err(mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
@@ -8969,6 +9021,7 @@ fn schedule_named_draft_refresh(widgets: &Widgets, state: &SharedState, migrate_
             .borrow_mut()
             .finish(response.generation)
         {
+            application_hold.take();
             return gtk::glib::ControlFlow::Break;
         }
         match response.result {
@@ -9003,7 +9056,6 @@ fn schedule_named_draft_refresh(widgets: &Widgets, state: &SharedState, migrate_
                     st.borrow_mut().last_operation = Some(message.clone());
                     w.status_label.set_text(&message);
                 }
-                update_draft_action_buttons(&w, &st);
             }
             Err(error) => {
                 let message = format!("Named draft refresh failed: {error}");
@@ -9017,8 +9069,11 @@ fn schedule_named_draft_refresh(widgets: &Widgets, state: &SharedState, migrate_
                 update_debug(&w, &st);
             }
         }
+        update_composer_attachment_cache_controls(&w, &st);
+        application_hold.take();
         gtk::glib::ControlFlow::Break
     });
+    NamedDraftRefreshStart::Started(generation)
 }
 
 fn load_selected_named_draft(
@@ -9125,7 +9180,7 @@ fn delete_captured_named_draft(
                     let fields = compose_fields(&w, &st);
                     schedule_recovery_draft_from_ui(&w, &st, &fields);
                 }
-                schedule_named_draft_refresh(&w, &st, false);
+                schedule_named_draft_refresh(&w, &st, false, None);
                 let message = format!("Deleted saved draft {}", path.display());
                 {
                     let mut state = st.borrow_mut();
@@ -13039,11 +13094,47 @@ fn composer_attachment_cache_block_reason(
     }
 }
 
+fn named_draft_migration_block_reason(
+    migration_in_progress: bool,
+    operation: UserOperation,
+) -> Option<&'static str> {
+    if !migration_in_progress {
+        return None;
+    }
+    match operation {
+        UserOperation::DraftSave => {
+            Some("draft saving is unavailable while legacy drafts are migrating")
+        }
+        UserOperation::DraftDelete => {
+            Some("draft deletion is unavailable while legacy drafts are migrating")
+        }
+        UserOperation::Send => Some("sending is unavailable while legacy drafts are migrating"),
+        UserOperation::ComposeEdit
+        | UserOperation::Tag
+        | UserOperation::DraftLoad
+        | UserOperation::DraftClear
+        | UserOperation::ComposeReplace
+        | UserOperation::Sync => None,
+    }
+}
+
 fn ensure_user_operation_allowed(
     widgets: &Widgets,
     state: &SharedState,
     operation: UserOperation,
 ) -> anyhow::Result<()> {
+    if let Some(message) = named_draft_migration_block_reason(
+        widgets
+            .named_draft_io_coordinator
+            .borrow()
+            .migration_in_progress(),
+        operation,
+    ) {
+        widgets.status_label.set_text(message);
+        state.borrow_mut().last_operation = Some(message.to_string());
+        update_debug(widgets, state);
+        anyhow::bail!(message);
+    }
     if let Some(message) = composer_attachment_cache_block_reason(
         widgets.composer_attachment_cache_active.get().is_some(),
         operation,
@@ -13523,6 +13614,10 @@ fn update_background_activity_controls(
     widgets: &Widgets,
     state: &SharedState,
 ) {
+    let named_draft_migration_pending = widgets
+        .named_draft_io_coordinator
+        .borrow()
+        .migration_in_progress();
     let (background_activity, send_in_progress, attachment_cache_pending) = {
         let state = state.borrow();
         (
@@ -13536,10 +13631,9 @@ fn update_background_activity_controls(
     if let Some(button) = &widgets.manual_sync_button {
         button.set_sensitive(!background_activity && !attachment_cache_pending);
     }
-    widgets
-        .composer
-        .send_button()
-        .set_sensitive(!background_activity && !attachment_cache_pending);
+    widgets.composer.send_button().set_sensitive(
+        !background_activity && !attachment_cache_pending && !named_draft_migration_pending,
+    );
     widgets.compose_button.set_sensitive(!send_in_progress);
     if send_in_progress {
         widgets.response_menu_button.popdown();
@@ -15620,7 +15714,7 @@ fn finish_send_success_after_cleanup(
         state.last_operation = Some(operation);
     }
     pending.widgets.status_label.set_text(&status);
-    schedule_named_draft_refresh(&pending.widgets, &pending.state, false);
+    schedule_named_draft_refresh(&pending.widgets, &pending.state, false, None);
     finish_send_activity(&pending);
 }
 
@@ -16097,6 +16191,7 @@ fn handle_automation_request(
                 "named_draft_io": {
                     "busy": widgets.named_draft_io_coordinator.borrow().active_generation().is_some(),
                     "generation": widgets.named_draft_io_coordinator.borrow().active_generation(),
+                    "migration_busy": widgets.named_draft_io_coordinator.borrow().migration_in_progress(),
                     "completed_generation": widgets.named_draft_io_coordinator.borrow().completed_generation(),
                     "last_error": widgets.named_draft_io_last_error.borrow().clone(),
                 },
@@ -16187,6 +16282,7 @@ fn handle_automation_request(
             "ok": true,
             "list_busy": widgets.named_draft_io_coordinator.borrow().active_generation().is_some(),
             "list_generation": widgets.named_draft_io_coordinator.borrow().active_generation(),
+            "migration_busy": widgets.named_draft_io_coordinator.borrow().migration_in_progress(),
             "list_completed_generation": widgets.named_draft_io_coordinator.borrow().completed_generation(),
             "save_busy": widgets.draft_save_active.get().is_some(),
             "save_generation": widgets.draft_save_active.get(),
@@ -16195,11 +16291,37 @@ fn handle_automation_request(
             "gtk_heartbeat": widgets.gtk_heartbeat.get(),
         }),
         "refresh_named_drafts" => {
-            schedule_named_draft_refresh(widgets, state, false);
-            json!({
-                "ok": true,
-                "generation": widgets.named_draft_io_coordinator.borrow().active_generation(),
-            })
+            let migrate_legacy = req
+                .args
+                .get("migrate_legacy")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let legacy_dir_override = req
+                .args
+                .get("legacy_dir")
+                .and_then(serde_json::Value::as_str)
+                .filter(|_| migrate_legacy)
+                .map(PathBuf::from);
+            match schedule_named_draft_refresh(widgets, state, migrate_legacy, legacy_dir_override)
+            {
+                NamedDraftRefreshStart::Started(generation) => json!({
+                    "ok": true,
+                    "generation": generation,
+                    "migrate_legacy": migrate_legacy,
+                }),
+                NamedDraftRefreshStart::MigrationBusy(generation) => json!({
+                    "ok": false,
+                    "generation": generation,
+                    "migrate_legacy": migrate_legacy,
+                    "error": "named draft refresh is unavailable while legacy drafts are migrating",
+                }),
+                NamedDraftRefreshStart::PersistenceBusy => json!({
+                    "ok": false,
+                    "generation": serde_json::Value::Null,
+                    "migrate_legacy": migrate_legacy,
+                    "error": "legacy draft migration is unavailable while draft persistence or send cleanup is in progress",
+                }),
+            }
         }
         "set_fixture_draft_delay" => {
             let milliseconds = req
@@ -17826,6 +17948,7 @@ fn draft_list_state_json(widgets: &Widgets, state: &SharedState) -> serde_json::
         "active_draft": &state.active_draft,
         "recovery_path": widgets.composer.recovery_path(),
         "drafts_dir": widgets.composer.drafts_dir(),
+        "legacy_drafts_dir": widgets.composer.legacy_drafts_dir(),
         "last_error": &state.last_error,
         "last_operation": &state.last_operation,
         "status_text": widgets.status_label.text().to_string(),
@@ -21185,6 +21308,39 @@ mod tests {
         }
         assert_eq!(
             composer_attachment_cache_block_reason(false, UserOperation::Send),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_draft_migration_blocks_store_mutations_but_not_composer_edits() {
+        for operation in [
+            UserOperation::DraftSave,
+            UserOperation::DraftDelete,
+            UserOperation::Send,
+        ] {
+            assert!(
+                named_draft_migration_block_reason(true, operation)
+                    .is_some_and(|message| message.contains("legacy drafts are migrating")),
+                "legacy draft migration did not block {operation:?}"
+            );
+        }
+        for operation in [
+            UserOperation::ComposeEdit,
+            UserOperation::Tag,
+            UserOperation::DraftLoad,
+            UserOperation::DraftClear,
+            UserOperation::ComposeReplace,
+            UserOperation::Sync,
+        ] {
+            assert_eq!(
+                named_draft_migration_block_reason(true, operation),
+                None,
+                "legacy draft migration unnecessarily blocked {operation:?}"
+            );
+        }
+        assert_eq!(
+            named_draft_migration_block_reason(false, UserOperation::DraftSave),
             None
         );
     }

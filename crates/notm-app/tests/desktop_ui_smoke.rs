@@ -2362,6 +2362,42 @@ fn regular_file_count(path: &Path) -> anyhow::Result<usize> {
         .count())
 }
 
+fn wait_for_named_draft_io_idle(driver: &mut UiDriver, timeout: Duration) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = driver.command("draft_io_status", json!({}))?;
+        if status["list_busy"] == false {
+            return Ok(status);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "named-draft I/O did not become idle within {timeout:?}: {status}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
+fn wait_for_named_draft_generation(
+    driver: &mut UiDriver,
+    generation: u64,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = driver.command("draft_io_status", json!({}))?;
+        if status["list_busy"] == false
+            && status["list_completed_generation"].as_u64() == Some(generation)
+        {
+            return Ok(status);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "named-draft generation {generation} did not complete within {timeout:?}: {status}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
 #[cfg(unix)]
 fn prepare_app_work_dir_for_restart(
     app: &mut FixtureApp,
@@ -2996,6 +3032,263 @@ fn fixture_named_draft_corruption_keeps_valid_rows_and_reports_warning() -> anyh
             .is_some_and(|status| status.contains("Named draft refresh warning:")),
         "partial refresh warning was not visible in the status UI: {ui}"
     );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_legacy_draft_migration_serializes_mutations_and_keeps_gtk_responsive()
+-> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_legacy_draft_migration_serializes_mutations_and_keeps_gtk_responsive: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running legacy draft migration serialization UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-draft-migration-ui-{run_id}"));
+    let legacy_dir = work_dir.join("legacy-drafts");
+    let token = format!("notm-draft-migration-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    wait_for_named_draft_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+
+    assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
+    for (command, value) in [
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Migration serialization sentinel"),
+        ("compose_set_body", "saved before legacy migration"),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(response["ok"], true, "{command} failed: {response}");
+    }
+    let saved = driver.command("save_draft", json!({}))?;
+    assert_eq!(
+        saved["ok"], true,
+        "initial named-draft save failed: {saved}"
+    );
+    let active_path = saved["report"]["local_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("initial save had no local path: {saved}"))?;
+    wait_for_named_draft_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+
+    let paths = driver.command("draft_list_state", json!({}))?;
+    let drafts_dir = paths["drafts_dir"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("fixture exposed no current draft directory: {paths}"))?;
+    fs::create_dir_all(&drafts_dir)?;
+    fs::create_dir_all(&legacy_dir)?;
+    assert_eq!(regular_file_count(&drafts_dir)?, 1);
+
+    let filler = serde_json::to_vec_pretty(&json!({
+        "from": "Fixture User <fixture@example.test>",
+        "to": "recipient@example.test",
+        "cc": "",
+        "bcc": "",
+        "subject": "Pre-existing capacity draft",
+        "body": "bounded migration fixture",
+        "attachments": [],
+        "in_reply_to": null,
+        "references": [],
+        "text_reply_quote": null,
+        "html_reply_quote": null,
+    }))?;
+    for index in 0..254 {
+        fs::write(
+            drafts_dir.join(format!("pre-existing-{index:03}.json")),
+            &filler,
+        )?;
+    }
+    let legacy_path = legacy_dir.join("legacy-newcomer.json");
+    fs::write(
+        &legacy_path,
+        serde_json::to_vec_pretty(&json!({
+            "from": "Fixture User <fixture@example.test>",
+            "to": "recipient@example.test",
+            "cc": "",
+            "bcc": "",
+            "subject": "Legacy capacity draft",
+            "body": "must migrate without racing a 257th write",
+            "attachments": [],
+            "in_reply_to": null,
+            "references": [],
+            "text_reply_quote": null,
+            "html_reply_quote": null,
+        }))?,
+    )?;
+    assert_eq!(regular_file_count(&drafts_dir)?, 255);
+    assert_eq!(regular_file_count(&legacy_dir)?, 1);
+
+    assert_eq!(
+        driver.command("set_fixture_draft_delay", json!({"milliseconds": 1200}))?["ok"],
+        true
+    );
+    let requested = driver.command(
+        "refresh_named_drafts",
+        json!({"migrate_legacy": true, "legacy_dir": legacy_dir}),
+    )?;
+    assert_eq!(
+        requested["ok"], true,
+        "migration was not scheduled: {requested}"
+    );
+    let generation = requested["generation"]
+        .as_u64()
+        .with_context(|| format!("migration had no generation: {requested}"))?;
+    let active = driver.command("draft_io_status", json!({}))?;
+    assert_eq!(
+        active["migration_busy"], true,
+        "migration was not exclusive: {active}"
+    );
+    assert_eq!(active["list_generation"].as_u64(), Some(generation));
+
+    let before_health = driver.command("health", json!({}))?;
+    let edited = driver.command(
+        "compose_set_body",
+        json!({"value": "composer edit while migration is delayed"}),
+    )?;
+    assert_eq!(
+        edited["ok"], true,
+        "migration blocked composer editing: {edited}"
+    );
+    for (command, args) in [
+        ("save_draft", json!({})),
+        ("delete_active_draft", json!({})),
+        ("compose_send", json!({})),
+    ] {
+        let blocked = driver.command(command, args)?;
+        assert_eq!(blocked["ok"], false, "{command} raced migration: {blocked}");
+        ensure!(
+            blocked["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("legacy drafts are migrating")),
+            "{command} did not explain the migration conflict: {blocked}"
+        );
+    }
+    let overlapping = driver.command("refresh_named_drafts", json!({}))?;
+    assert_eq!(
+        overlapping["ok"], false,
+        "refresh superseded a mutating migration: {overlapping}"
+    );
+    assert_eq!(overlapping["generation"].as_u64(), Some(generation));
+    assert_eq!(regular_file_count(&drafts_dir)?, 255);
+    assert_eq!(regular_file_count(&legacy_dir)?, 1);
+
+    thread::sleep(Duration::from_millis(175));
+    let after_health = driver.command("health", json!({}))?;
+    ensure!(
+        after_health["gtk_heartbeat"].as_u64().unwrap_or(0)
+            > before_health["gtk_heartbeat"].as_u64().unwrap_or(0),
+        "GTK heartbeat stopped during delayed migration: before={before_health}, after={after_health}"
+    );
+    let completed =
+        wait_for_named_draft_generation(&mut driver, generation, Duration::from_secs(5))?;
+    assert_eq!(completed["migration_busy"], false);
+    assert_eq!(
+        completed["last_error"],
+        Value::Null,
+        "migration failed: {completed}"
+    );
+    assert_eq!(regular_file_count(&drafts_dir)?, 256);
+    assert_eq!(regular_file_count(&legacy_dir)?, 0);
+    ensure!(
+        !legacy_path.exists(),
+        "migrated legacy source was not removed"
+    );
+
+    assert_eq!(
+        driver.command("set_fixture_draft_delay", json!({"milliseconds": 0}))?["ok"],
+        true
+    );
+    let delete = driver.command("delete_active_draft", json!({}))?;
+    assert_eq!(
+        delete["ok"], true,
+        "delete stayed blocked after migration: {delete}"
+    );
+    assert_eq!(delete["pending_confirmation"], true);
+    let delete_id = pending_confirmation_id(&mut driver, "delete_active_draft")?;
+    let deleted = driver.command(
+        "respond_confirmation",
+        json!({"response": "accept", "id": delete_id}),
+    )?;
+    assert_eq!(
+        deleted["ok"], true,
+        "post-migration delete failed: {deleted}"
+    );
+    wait_for_named_draft_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert!(!active_path.exists());
+    assert_eq!(regular_file_count(&drafts_dir)?, 255);
+
+    for (command, value) in [
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Post-migration save sentinel"),
+        ("compose_set_body", "save after migration gate released"),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(response["ok"], true, "{command} failed: {response}");
+    }
+    let resaved = driver.command("save_draft", json!({}))?;
+    assert_eq!(resaved["ok"], true, "post-migration save failed: {resaved}");
+    wait_for_named_draft_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(regular_file_count(&drafts_dir)?, 256);
+
+    let overflow_legacy = legacy_dir.join("overflow-newcomer.json");
+    fs::write(&overflow_legacy, &filler)?;
+    assert_eq!(
+        driver.command("set_fixture_draft_delay", json!({"milliseconds": 350}))?["ok"],
+        true
+    );
+    let rejected_request = driver.command(
+        "refresh_named_drafts",
+        json!({"migrate_legacy": true, "legacy_dir": legacy_dir}),
+    )?;
+    assert_eq!(rejected_request["ok"], true);
+    let rejected_generation = rejected_request["generation"]
+        .as_u64()
+        .with_context(|| format!("failing migration had no generation: {rejected_request}"))?;
+    let blocked = driver.command("save_draft", json!({}))?;
+    assert_eq!(
+        blocked["ok"], false,
+        "save raced failing migration: {blocked}"
+    );
+    let rejected =
+        wait_for_named_draft_generation(&mut driver, rejected_generation, Duration::from_secs(5))?;
+    assert_eq!(rejected["migration_busy"], false);
+    ensure!(
+        rejected["last_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("would contain 257 JSON files")),
+        "fatal migration policy error was not visible: {rejected}"
+    );
+    assert_eq!(regular_file_count(&drafts_dir)?, 256);
+    assert_eq!(regular_file_count(&legacy_dir)?, 1);
+
+    assert_eq!(
+        driver.command("set_fixture_draft_delay", json!({"milliseconds": 0}))?["ok"],
+        true
+    );
+    let final_delete = driver.command("delete_active_draft", json!({}))?;
+    assert_eq!(
+        final_delete["pending_confirmation"], true,
+        "fatal migration left draft deletion blocked: {final_delete}"
+    );
+    let final_delete_id = pending_confirmation_id(&mut driver, "delete_active_draft")?;
+    let final_deleted = driver.command(
+        "respond_confirmation",
+        json!({"response": "accept", "id": final_delete_id}),
+    )?;
+    assert_eq!(
+        final_deleted["ok"], true,
+        "delete after migration error failed: {final_deleted}"
+    );
+    wait_for_named_draft_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(regular_file_count(&drafts_dir)?, 255);
+    assert_eq!(regular_file_count(&legacy_dir)?, 1);
 
     Ok(())
 }
