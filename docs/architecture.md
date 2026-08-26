@@ -28,16 +28,21 @@ transport or the fake capture transport used in tests.
 Search input is debounced and run through a background worker with stale-generation discard. Search results are paged (`ui.page_size`), expose a Load more action, and auto-load the next page when the thread list is scrolled to the bottom. Search pages use a 64-entry least-recently-used cache keyed by database path, Notmuch UUID/revision, query, page offset/limit, and the complete excluded-tag vector. Thread UI details use a separate 4,096-entry least-recently-used cache keyed by database path, UUID/revision, and thread ID. Hits refresh recency, so new database generations naturally evict stale entries instead of accumulating without a bound. Cache locks cover only lookup or insertion; Notmuch queries, filesystem reads, and MIME parsing run outside them. Thread previews are cached before the configured display-line limit is applied, so that presentation setting is not part of either key.
 
 Tag mutations run on a serialized background writer and target exact thread or
-message IDs captured from the displayed result snapshot. Their batch reports
-retain partial failures and authoritative current Maildir filenames. Search
-generations that overlap a write are discarded and reconciled before another
-tag mutation is accepted; retained message, attachment, draft, and standalone
-window models receive filename mappings without reparsing MIME on the GTK
-callback. Explicit partial reports keep path actions disabled until the
-reconciliation search completes. An unreported result, close/commit failure,
-or unresolved retained filename keeps those actions disabled until restart
-rather than allowing a stale path to escape. Durable undo-history writes are
-serialized on a separate worker.
+message IDs captured from the displayed result snapshot. Thread targets use a
+count-first, ID-only Notmuch query: each thread is limited to 4,096 messages,
+read in 256-ID pages, and every page plus the final pre-mutation check must
+match one shared database UUID/revision. A revision drift aborts the entire
+snapshot before mutation; safely isolated missing, invalid, or oversized
+threads remain explicit partial results for the other exact targets. Their
+batch reports retain partial failures and authoritative current Maildir
+filenames. Search generations that overlap a write are discarded and
+reconciled before another tag mutation is accepted; retained message,
+attachment, draft, and standalone window models receive filename mappings
+without reparsing MIME on the GTK callback. Explicit partial reports keep path
+actions disabled until the reconciliation search completes. An unreported
+result, close/commit failure, or unresolved retained filename keeps those
+actions disabled until restart rather than allowing a stale path to escape.
+Durable undo-history writes are serialized on a separate worker.
 
 ## Implementation notes
 

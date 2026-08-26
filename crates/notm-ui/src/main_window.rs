@@ -688,6 +688,7 @@ struct TagWorkerResponse {
 struct TagWorkerResult {
     report: notm_notmuch::TagBatchReport,
     operation_errors: Vec<String>,
+    discard_retained_message_state: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -12473,33 +12474,20 @@ fn execute_tag_worker(
     operation: TagWorkerOperation,
 ) -> anyhow::Result<TagWorkerResult> {
     let db = Database::open(&open_config, DatabaseMode::ReadWrite)?;
-    let operation_result: anyhow::Result<(notm_notmuch::TagBatchReport, Vec<String>)> =
+    let operation_result: anyhow::Result<(notm_notmuch::TagBatchReport, Vec<String>, bool)> =
         match operation {
             TagWorkerOperation::Threads {
                 thread_ids,
                 mutation,
-            } => db
-                .apply_tags_to_threads(&thread_ids, &mutation)
-                .map(|report| {
-                    let operation_errors = (!report.missing_thread_ids.is_empty())
-                        .then(|| {
-                            format!(
-                                "{} exact target thread ID(s) disappeared before mutation: {}",
-                                report.missing_thread_ids.len(),
-                                report.missing_thread_ids.join(", ")
-                            )
-                        })
-                        .into_iter()
-                        .collect();
-                    (report.batch, operation_errors)
-                })
-                .map_err(Into::into),
+            } => {
+                thread_tag_worker_operation_result(db.apply_tags_to_threads(&thread_ids, &mutation))
+            }
             TagWorkerOperation::Messages {
                 mutations,
                 sync_maildir_flags,
             } => db
                 .apply_tags_to_messages(&mutations, sync_maildir_flags)
-                .map(|report| (report, Vec::new()))
+                .map(|report| (report, Vec::new(), false))
                 .map_err(Into::into),
             TagWorkerOperation::UndoActions { actions } => {
                 let action_count = actions.len();
@@ -12536,27 +12524,78 @@ fn execute_tag_worker(
                         break;
                     }
                 }
-                Ok((combined, operation_errors))
+                Ok((combined, operation_errors, false))
             }
         };
     let close_result = db.close();
     finalize_tag_worker_result(operation_result, close_result)
 }
 
+fn thread_tag_worker_operation_result(
+    result: notm_notmuch::Result<notm_notmuch::ThreadTagReport>,
+) -> anyhow::Result<(notm_notmuch::TagBatchReport, Vec<String>, bool)> {
+    match result {
+        Ok(report) => {
+            let discard_retained_message_state = !report.missing_thread_ids.is_empty()
+                || !report.thread_resolution_failures.is_empty();
+            let mut operation_errors = Vec::new();
+            if !report.missing_thread_ids.is_empty() {
+                operation_errors.push(format!(
+                    "{} exact target thread ID(s) disappeared before mutation: {}",
+                    report.missing_thread_ids.len(),
+                    report.missing_thread_ids.join(", ")
+                ));
+            }
+            if !report.thread_resolution_failures.is_empty() {
+                let failures = report
+                    .thread_resolution_failures
+                    .iter()
+                    .map(|failure| format!("{} ({})", failure.thread_id, failure.detail))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                operation_errors.push(format!(
+                    "{} exact target thread ID(s) were rejected before their messages were mutated: {failures}",
+                    report.thread_resolution_failures.len()
+                ));
+            }
+            Ok((
+                report.batch,
+                operation_errors,
+                discard_retained_message_state,
+            ))
+        }
+        Err(
+            error @ (notm_notmuch::Error::ThreadTagSnapshotChanged { .. }
+            | notm_notmuch::Error::ThreadTagSnapshotFailed { .. }),
+        ) => Ok((
+            notm_notmuch::TagBatchReport::default(),
+            vec![format!(
+                "exact tag target snapshot was invalidated: {error}"
+            )],
+            true,
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn finalize_tag_worker_result(
-    operation_result: anyhow::Result<(notm_notmuch::TagBatchReport, Vec<String>)>,
+    operation_result: anyhow::Result<(notm_notmuch::TagBatchReport, Vec<String>, bool)>,
     close_result: notm_notmuch::Result<()>,
 ) -> anyhow::Result<TagWorkerResult> {
     match (operation_result, close_result) {
-        (Ok((report, operation_errors)), Ok(())) => Ok(TagWorkerResult {
-            report,
-            operation_errors,
-        }),
-        (Ok((mut report, operation_errors)), Err(error)) => {
+        (Ok((report, operation_errors, discard_retained_message_state)), Ok(())) => {
+            Ok(TagWorkerResult {
+                report,
+                operation_errors,
+                discard_retained_message_state,
+            })
+        }
+        (Ok((mut report, operation_errors, discard_retained_message_state)), Err(error)) => {
             report.record_finalization_error(format!("database close/commit failed: {error}"));
             Ok(TagWorkerResult {
                 report,
                 operation_errors,
+                discard_retained_message_state,
             })
         }
         (Err(error), Ok(())) => Err(error),
@@ -12611,8 +12650,8 @@ fn finish_tag_worker(
     match response.result {
         Ok(result) => {
             thread_list::invalidate_search_caches();
-            discard_retained_message_state =
-                tag_report_requires_fresh_message_state(&result.report);
+            discard_retained_message_state = result.discard_retained_message_state
+                || tag_report_requires_fresh_message_state(&result.report);
             let operation_complete = result.is_complete();
             let retained_paths_resolved = apply_completed_tag_report(
                 options,
@@ -19413,6 +19452,132 @@ mod tests {
     }
 
     #[test]
+    fn thread_resolution_failure_discards_retained_state_without_path_uncertainty() {
+        let selected_thread = notm_notmuch::ThreadSummary {
+            thread_id: "oversized-thread".to_string(),
+            subject: "Oversized thread".to_string(),
+            authors: String::new(),
+            oldest_date: 0,
+            newest_date: 0,
+            matched_messages: 4_097,
+            total_messages: 4_097,
+            tags: vec!["inbox".to_string()],
+            has_unread: false,
+            is_flagged: false,
+        };
+        let selected_message = notm_notmuch::MessageSummary {
+            message_id: "retained@example.test".to_string(),
+            thread_id: selected_thread.thread_id.clone(),
+            date: 0,
+            from: String::new(),
+            to: String::new(),
+            cc: String::new(),
+            subject: selected_thread.subject.clone(),
+            tags: vec!["inbox".to_string()],
+            filenames: vec!["/mail/cur/retained:2,S".to_string()],
+        };
+        let report = notm_notmuch::ThreadTagReport {
+            thread_ids: vec![selected_thread.thread_id.clone()],
+            missing_thread_ids: Vec::new(),
+            thread_resolution_failures: vec![notm_notmuch::ThreadResolutionFailure {
+                thread_id: selected_thread.thread_id.clone(),
+                detail: "thread contains 4097 messages, exceeding the 4096-message limit"
+                    .to_string(),
+            }],
+            matched_threads: 0,
+            changed_threads: 0,
+            added: vec!["archive".to_string()],
+            removed: Vec::new(),
+            batch: notm_notmuch::TagBatchReport::default(),
+        };
+        let worker =
+            finalize_tag_worker_result(thread_tag_worker_operation_result(Ok(report)), Ok(()))
+                .expect("known partial worker report");
+        let mut state = UiState {
+            selected_thread: Some(selected_thread),
+            selected_message: Some(selected_message.clone()),
+            messages: vec![selected_message],
+            tag_warning: Some(worker.operation_errors.join("; ")),
+            ..UiState::default()
+        };
+
+        assert!(!worker.is_complete());
+        assert!(worker.discard_retained_message_state);
+        assert_eq!(worker.report.requested_messages, 0);
+        assert!(worker.report.changes.is_empty());
+        assert!(worker.report.path_states.is_empty());
+        assert!(inverse_tag_mutations(&worker.report.changes).is_empty());
+        assert!(!tag_report_has_uncertain_retained_state(&worker.report));
+        assert!(!state.tag_paths_uncertain);
+        assert_eq!(selected_thread_id_for_tag_refresh(&state, true), None);
+
+        reconcile_selected_message_state_after_search(&mut state, None);
+        assert_eq!(state.selected_thread, None);
+        assert_eq!(state.selected_message, None);
+        assert!(state.messages.is_empty());
+        assert!(matches!(
+            reduce_tag_warning_after_search(&mut state, true),
+            TagWarningRefreshOutcome::Reconciled(_)
+        ));
+        assert_eq!(state.tag_warning, None);
+    }
+
+    #[test]
+    fn revision_drift_worker_result_is_known_no_effects_and_discards_retained_state() {
+        let worker = finalize_tag_worker_result(
+            thread_tag_worker_operation_result(Err(
+                notm_notmuch::Error::ThreadTagSnapshotChanged {
+                    expected_uuid: "database".to_string(),
+                    expected_revision: 7,
+                    observed_uuid: "database".to_string(),
+                    observed_revision: 8,
+                },
+            )),
+            Ok(()),
+        )
+        .expect("revision drift has a known no-effects report");
+        let state = UiState {
+            selected_thread: Some(notm_notmuch::ThreadSummary {
+                thread_id: "selected-thread".to_string(),
+                subject: "Selected thread".to_string(),
+                authors: String::new(),
+                oldest_date: 0,
+                newest_date: 0,
+                matched_messages: 1,
+                total_messages: 1,
+                tags: vec!["inbox".to_string()],
+                has_unread: false,
+                is_flagged: false,
+            }),
+            ..UiState::default()
+        };
+
+        assert!(!worker.is_complete());
+        assert!(worker.discard_retained_message_state);
+        assert_eq!(worker.report, notm_notmuch::TagBatchReport::default());
+        assert!(
+            worker.operation_errors[0].contains("no tag mutation was attempted"),
+            "unexpected error: {}",
+            worker.operation_errors[0]
+        );
+        assert!(!tag_report_has_uncertain_retained_state(&worker.report));
+        assert_eq!(selected_thread_id_for_tag_refresh(&state, true), None);
+        assert!(inverse_tag_mutations(&worker.report.changes).is_empty());
+
+        let invalid_id = finalize_tag_worker_result(
+            thread_tag_worker_operation_result(Err(notm_notmuch::Error::ThreadTagSnapshotFailed {
+                detail: "libnotmuch returned a null message ID".to_string(),
+            })),
+            Ok(()),
+        )
+        .expect("invalid ID snapshot has a known no-effects report");
+        assert!(invalid_id.discard_retained_message_state);
+        assert_eq!(invalid_id.report, notm_notmuch::TagBatchReport::default());
+        assert!(!tag_report_has_uncertain_retained_state(&invalid_id.report));
+        assert!(invalid_id.operation_errors[0].contains("no tag mutation was attempted"));
+    }
+
+    #[test]
     fn uncertain_retained_state_warning_persists_after_successful_refresh() {
         let warning = "message at thaw: thaw failed";
         let mut state = UiState {
@@ -19504,6 +19669,7 @@ mod tests {
                     ..notm_notmuch::TagBatchReport::default()
                 },
                 Vec::new(),
+                false,
             )),
             Err(notm_notmuch::Error::Io(std::io::Error::other(
                 "forced close failure",

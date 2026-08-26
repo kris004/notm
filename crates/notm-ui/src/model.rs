@@ -20,7 +20,7 @@ pub const MAX_THREAD_PREVIEW_LINES: usize = 20;
 /// explicit ceiling prevents an unexpectedly large thread from growing that
 /// synchronous state without bound. Threads over this limit are rejected with
 /// their exact count instead of displaying a partial prefix.
-pub const MAX_LOADED_THREAD_MESSAGES: usize = 4_096;
+pub const MAX_LOADED_THREAD_MESSAGES: usize = notm_notmuch::MAX_THREAD_TAG_MESSAGES;
 
 /// Maximum number of messages inspected to derive thread-list row details.
 ///

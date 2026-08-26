@@ -23,7 +23,7 @@ use crate::{
     message::{
         AppliedTagChange, MaildirFilenameChange, MaildirFlagSyncFailure, MaildirPathChange,
         MessagePathState, MessageSummary, MessageTagFailure, MessageTagMutation, TagBatchReport,
-        TagFailureStage, TagMutation, TagOperationReport, ThreadTagReport,
+        TagFailureStage, TagMutation, TagOperationReport, ThreadResolutionFailure, ThreadTagReport,
     },
     query::{QueryOptions, SortOrder},
     safe::{cstr_to_string, path_to_cstring, take_malloc_string},
@@ -117,6 +117,22 @@ impl ThreadMessagePage {
 }
 
 const COMPLETE_THREAD_PAGE_SIZE: usize = 256;
+const THREAD_MESSAGE_ID_PAGE_SIZE: usize = 256;
+
+/// Maximum number of message IDs captured from any one exact thread before a
+/// tag mutation. This mirrors the interactive thread safety ceiling without
+/// making the Notmuch layer depend on the UI crate.
+pub const MAX_THREAD_TAG_MESSAGES: usize = 4_096;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadMessageIdPage {
+    thread_id: String,
+    message_ids: Vec<String>,
+    total: u32,
+    offset: usize,
+    limit: usize,
+    revision: Revision,
+}
 
 pub struct Database {
     ptr: NonNull<ffi::notmuch_database_t>,
@@ -437,6 +453,128 @@ impl Database {
         })
     }
 
+    /// Return one message-ID-only page from an exact thread snapshot.
+    ///
+    /// Tag target capture deliberately avoids [`MessageSummary`] construction:
+    /// it reads only each message's stable ID and validates the database
+    /// revision before and after the count/query work. The caller supplies the
+    /// revision shared by the complete multi-thread snapshot.
+    fn thread_message_ids_page(
+        &self,
+        thread_id: &str,
+        offset: usize,
+        limit: usize,
+        expected_revision: &Revision,
+    ) -> Result<ThreadMessageIdPage> {
+        check_thread_tag_snapshot_revision(expected_revision, &self.revision())?;
+
+        let query = exact_term_query("thread", thread_id);
+        let options = QueryOptions {
+            sort: SortOrder::MessageId,
+            limit,
+            offset,
+            excluded_tags: Vec::new(),
+        };
+        let q = self.create_query(&query, &options)?;
+        let mut total = 0;
+        let count_status = unsafe { ffi::notmuch_query_count_messages(q.as_ptr(), &mut total) };
+        check(count_status, self.status_string())?;
+        let message_ids = if limit == 0 || offset >= total as usize {
+            Vec::new()
+        } else {
+            self.search_message_ids_with_query(q.as_ptr(), &options)?
+        };
+
+        let observed_revision = self.revision();
+        check_thread_tag_snapshot_revision(expected_revision, &observed_revision)?;
+        let expected_page_len = (total as usize).saturating_sub(offset).min(limit);
+        if message_ids.len() != expected_page_len {
+            return Err(Error::InconsistentThreadMessages {
+                thread_id: thread_id.to_string(),
+                expected: total as usize,
+                loaded: offset.saturating_add(message_ids.len()),
+            });
+        }
+
+        Ok(ThreadMessageIdPage {
+            thread_id: thread_id.to_string(),
+            message_ids,
+            total,
+            offset,
+            limit,
+            revision: observed_revision,
+        })
+    }
+
+    /// Capture every exact message ID in a thread without exceeding `maximum`.
+    ///
+    /// The count-only preflight runs before allocating or iterating message IDs.
+    /// Accepted threads are paged in fixed-size ID-only chunks and every page
+    /// must retain the multi-thread snapshot revision and exact count.
+    fn thread_message_ids_bounded(
+        &self,
+        thread_id: &str,
+        maximum: usize,
+        expected_revision: &Revision,
+        mut after_page: impl FnMut(usize),
+    ) -> Result<Vec<String>> {
+        let snapshot = self.thread_message_ids_page(thread_id, 0, 0, expected_revision)?;
+        let expected_total = snapshot.total as usize;
+        if expected_total > maximum {
+            return Err(Error::ThreadMessageLimitExceeded {
+                thread_id: thread_id.to_string(),
+                total: expected_total,
+                limit: maximum,
+            });
+        }
+
+        let mut message_ids = Vec::with_capacity(expected_total);
+        let mut unique_ids = BTreeSet::new();
+        let mut offset = 0usize;
+        while offset < expected_total {
+            let page_limit = THREAD_MESSAGE_ID_PAGE_SIZE.min(expected_total - offset);
+            let page =
+                self.thread_message_ids_page(thread_id, offset, page_limit, expected_revision)?;
+            check_thread_message_id_page_snapshot(
+                thread_id,
+                expected_revision,
+                expected_total,
+                message_ids.len(),
+                &page,
+            )?;
+
+            let page_len = page.message_ids.len();
+            for message_id in page.message_ids {
+                if !unique_ids.insert(message_id.clone()) {
+                    return Err(Error::InconsistentThreadMessages {
+                        thread_id: thread_id.to_string(),
+                        expected: expected_total,
+                        loaded: message_ids.len(),
+                    });
+                }
+                message_ids.push(message_id);
+            }
+            offset = offset.saturating_add(page_len);
+            if page_len == 0 {
+                return Err(Error::InconsistentThreadMessages {
+                    thread_id: thread_id.to_string(),
+                    expected: expected_total,
+                    loaded: message_ids.len(),
+                });
+            }
+            after_page(message_ids.len());
+        }
+
+        if message_ids.len() != expected_total {
+            return Err(Error::InconsistentThreadMessages {
+                thread_id: thread_id.to_string(),
+                expected: expected_total,
+                loaded: message_ids.len(),
+            });
+        }
+        Ok(message_ids)
+    }
+
     /// Resolve and open a message using the database's current filename list.
     ///
     /// Notmuch may associate several paths with one Message-ID, and a summary's
@@ -564,6 +702,16 @@ impl Database {
         thread_ids: &[String],
         mutation: &TagMutation,
     ) -> Result<ThreadTagReport> {
+        self.apply_tags_to_threads_with_hooks(thread_ids, mutation, |_, _| {}, || {})
+    }
+
+    fn apply_tags_to_threads_with_hooks(
+        &self,
+        thread_ids: &[String],
+        mutation: &TagMutation,
+        mut after_snapshot_page: impl FnMut(&str, usize),
+        before_mutation: impl FnOnce(),
+    ) -> Result<ThreadTagReport> {
         validate_mutation(mutation)?;
         let mut seen_threads = BTreeSet::new();
         let unique_thread_ids = thread_ids
@@ -571,25 +719,51 @@ impl Database {
             .filter(|thread_id| seen_threads.insert((*thread_id).clone()))
             .cloned()
             .collect::<Vec<_>>();
+        let snapshot_revision = self.revision();
         let mut missing_thread_ids = Vec::new();
+        let mut thread_resolution_failures = Vec::new();
         let mut message_threads = BTreeMap::new();
-        let mut message_ids = Vec::new();
+        let mut matched_threads = 0usize;
         for thread_id in &unique_thread_ids {
-            let messages = self.thread_messages_exact(thread_id)?;
-            if messages.is_empty() {
-                missing_thread_ids.push(thread_id.clone());
-            }
-            for message in messages {
-                if message_threads
-                    .insert(message.message_id.clone(), thread_id.clone())
-                    .is_none()
-                {
-                    message_ids.push(message.message_id);
+            let resolved = self.thread_message_ids_bounded(
+                thread_id,
+                MAX_THREAD_TAG_MESSAGES,
+                &snapshot_revision,
+                |loaded| after_snapshot_page(thread_id, loaded),
+            );
+            match resolved {
+                Ok(message_ids) if message_ids.is_empty() => {
+                    missing_thread_ids.push(thread_id.clone());
+                }
+                Ok(message_ids) => {
+                    matched_threads = matched_threads.saturating_add(1);
+                    for message_id in message_ids {
+                        message_threads
+                            .entry(message_id)
+                            .or_insert_with(|| thread_id.clone());
+                    }
+                }
+                Err(error @ Error::ThreadTagSnapshotChanged { .. }) => return Err(error),
+                Err(error) if isolated_thread_resolution_failure(&error) => {
+                    thread_resolution_failures.push(ThreadResolutionFailure {
+                        thread_id: thread_id.clone(),
+                        detail: error.to_string(),
+                    });
+                }
+                Err(error) => {
+                    return Err(Error::ThreadTagSnapshotFailed {
+                        detail: error.to_string(),
+                    });
                 }
             }
         }
-        let matched_threads = unique_thread_ids.len() - missing_thread_ids.len();
-        let prepared = prepare_uniform_mutations(message_ids, mutation)?;
+        check_thread_tag_snapshot_revision(&snapshot_revision, &self.revision())?;
+        let prepared = prepare_uniform_mutations(message_threads.keys().cloned(), mutation)
+            .map_err(|error| Error::ThreadTagSnapshotFailed {
+                detail: error.to_string(),
+            })?;
+        check_thread_tag_snapshot_revision(&snapshot_revision, &self.revision())?;
+        before_mutation();
         let batch = self.apply_prepared_tag_mutations(&prepared)?;
         let changed_threads = batch
             .changes
@@ -600,6 +774,7 @@ impl Database {
         Ok(ThreadTagReport {
             thread_ids: unique_thread_ids,
             missing_thread_ids,
+            thread_resolution_failures,
             matched_threads,
             changed_threads,
             added: mutation.add.clone(),
@@ -666,10 +841,6 @@ impl Database {
         Ok(report)
     }
 
-    fn thread_messages_exact(&self, thread_id: &str) -> Result<Vec<MessageSummary>> {
-        self.thread_messages_bounded(thread_id, usize::MAX)
-    }
-
     fn create_query(&self, query: &str, options: &QueryOptions) -> Result<QueryGuard> {
         let query = CString::new(query)?;
         let q = unsafe { ffi::notmuch_query_create(self.ptr.as_ptr(), query.as_ptr()) };
@@ -720,6 +891,46 @@ impl Database {
         check_messages_iterator(messages, self.status_string())?;
         Ok(out)
     }
+
+    fn search_message_ids_with_query(
+        &self,
+        q: *mut ffi::notmuch_query_t,
+        options: &QueryOptions,
+    ) -> Result<Vec<String>> {
+        let mut messages = std::ptr::null_mut();
+        let status = unsafe { ffi::notmuch_query_search_messages(q, &mut messages) };
+        check(status, self.status_string())?;
+        let mut out = Vec::new();
+        let mut skipped = 0usize;
+        while unsafe { ffi::notmuch_messages_valid(messages) } != 0 {
+            let message = unsafe { ffi::notmuch_messages_get(messages) };
+            if !message.is_null() {
+                let message_id =
+                    (skipped >= options.offset && out.len() < options.limit).then(|| unsafe {
+                        required_message_id(ffi::notmuch_message_get_message_id(message))
+                    });
+                skipped = skipped.saturating_add(1);
+                unsafe { ffi::notmuch_message_destroy(message) };
+                if let Some(message_id) = message_id {
+                    out.push(message_id?);
+                }
+            }
+            if out.len() >= options.limit {
+                break;
+            }
+            unsafe { ffi::notmuch_messages_move_to_next(messages) };
+        }
+        check_messages_iterator(messages, self.status_string())?;
+        Ok(out)
+    }
+}
+
+unsafe fn required_message_id(message_id: *const c_char) -> Result<String> {
+    if message_id.is_null() {
+        Err(Error::Null("notmuch_message_get_message_id"))
+    } else {
+        Ok(unsafe { cstr_to_string(message_id) })
+    }
 }
 
 fn check_thread_page_snapshot(
@@ -730,6 +941,47 @@ fn check_thread_page_snapshot(
     page: &ThreadMessagePage,
 ) -> Result<()> {
     if page.revision != *expected_revision || page.total as usize != expected_total {
+        return Err(Error::InconsistentThreadMessages {
+            thread_id: thread_id.to_string(),
+            expected: expected_total,
+            loaded,
+        });
+    }
+    Ok(())
+}
+
+fn check_thread_tag_snapshot_revision(expected: &Revision, observed: &Revision) -> Result<()> {
+    if observed != expected {
+        return Err(Error::ThreadTagSnapshotChanged {
+            expected_uuid: expected.uuid.clone(),
+            expected_revision: expected.revision,
+            observed_uuid: observed.uuid.clone(),
+            observed_revision: observed.revision,
+        });
+    }
+    Ok(())
+}
+
+fn isolated_thread_resolution_failure(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Nul(_) | Error::ThreadMessageLimitExceeded { .. }
+    )
+}
+
+fn check_thread_message_id_page_snapshot(
+    thread_id: &str,
+    expected_revision: &Revision,
+    expected_total: usize,
+    loaded: usize,
+    page: &ThreadMessageIdPage,
+) -> Result<()> {
+    check_thread_tag_snapshot_revision(expected_revision, &page.revision)?;
+    if page.thread_id != thread_id
+        || page.total as usize != expected_total
+        || page.offset != loaded
+        || page.message_ids.len() > page.limit
+    {
         return Err(Error::InconsistentThreadMessages {
             thread_id: thread_id.to_string(),
             expected: expected_total,
@@ -841,7 +1093,26 @@ fn thread_summary(thread: *mut ffi::notmuch_thread_t) -> ThreadSummary {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static MESSAGE_SUMMARY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MESSAGE_FILENAME_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_message_materialization_counters() {
+    MESSAGE_SUMMARY_READS.set(0);
+    MESSAGE_FILENAME_READS.set(0);
+}
+
+#[cfg(test)]
+fn message_materialization_counts() -> (usize, usize) {
+    (MESSAGE_SUMMARY_READS.get(), MESSAGE_FILENAME_READS.get())
+}
+
 fn message_summary(message: *mut ffi::notmuch_message_t) -> MessageSummary {
+    #[cfg(test)]
+    MESSAGE_SUMMARY_READS.set(MESSAGE_SUMMARY_READS.get().saturating_add(1));
     MessageSummary {
         message_id: unsafe { cstr_to_string(ffi::notmuch_message_get_message_id(message)) },
         thread_id: unsafe { cstr_to_string(ffi::notmuch_message_get_thread_id(message)) },
@@ -926,6 +1197,8 @@ unsafe fn collect_filenames(files: *mut ffi::notmuch_filenames_t) -> Vec<String>
 }
 
 unsafe fn collect_filename_paths(files: *mut ffi::notmuch_filenames_t) -> Vec<PathBuf> {
+    #[cfg(test)]
+    MESSAGE_FILENAME_READS.set(MESSAGE_FILENAME_READS.get().saturating_add(1));
     let mut out = Vec::new();
     while unsafe { ffi::notmuch_filenames_valid(files) } != 0 {
         out.push(unsafe { cstr_to_path_buf(ffi::notmuch_filenames_get(files)) });
@@ -1505,6 +1778,35 @@ mod tests {
             .expect("indexed test message")
     }
 
+    fn index_test_thread(
+        database: &Database,
+        maildir: &Path,
+        prefix: &str,
+        message_count: usize,
+    ) -> (String, String) {
+        assert!(message_count > 0);
+        let root_id = format!("{prefix}-0000@example.test");
+        for index in 0..message_count {
+            let message_id = format!("{prefix}-{index:04}@example.test");
+            let reply_headers = if index == 0 {
+                String::new()
+            } else {
+                format!("In-Reply-To: <{root_id}>\r\nReferences: <{root_id}>\r\n")
+            };
+            let raw = format!(
+                "From: sender@example.test\r\nTo: fixture@example.test\r\nSubject: {prefix} thread\r\nDate: Thu, 18 Jun 2037 20:{:02}:00 -0600\r\nMessage-ID: <{message_id}>\r\n{reply_headers}\r\nbody {index}\r\n",
+                index % 60
+            );
+            let path = maildir.join(format!("{prefix}-{index:04}:2,"));
+            std::fs::write(&path, raw).expect("write threaded test message");
+            database
+                .index_file_with_tags(&path, &[])
+                .expect("index threaded test message");
+        }
+        let thread_id = summary_by_id(database, &root_id).thread_id;
+        (thread_id, root_id)
+    }
+
     #[test]
     fn effective_tag_mutation_records_only_net_per_message_delta() {
         let mutation = TagMutation {
@@ -1763,6 +2065,101 @@ mod tests {
         assert_eq!(final_page.messages.len(), 97);
         assert!(!final_page.has_more());
 
+        let tag_snapshot = database.revision();
+        reset_message_materialization_counters();
+        let id_limit_error = database
+            .thread_message_ids_bounded(
+                &root.thread_id,
+                MAX_THREAD_TAG_MESSAGES,
+                &tag_snapshot,
+                |_| panic!("an over-limit thread must fail before reading an ID page"),
+            )
+            .expect_err("reject the tag snapshot before allocating message IDs");
+        assert!(matches!(
+            &id_limit_error,
+            Error::ThreadMessageLimitExceeded {
+                total: MESSAGE_COUNT,
+                limit: MAX_THREAD_TAG_MESSAGES,
+                ..
+            }
+        ));
+        assert_eq!(message_materialization_counts(), (0, 0));
+
+        let (safe_thread_id, safe_message_id) =
+            index_test_thread(&database, &maildir, "bounded-safe", 1);
+        reset_message_materialization_counters();
+        let rejected_tag = "notm/oversized-must-not-change";
+        let rejected = database
+            .apply_tags_to_threads(
+                &[root.thread_id.clone(), safe_thread_id],
+                &TagMutation {
+                    add: vec![rejected_tag.to_string()],
+                    remove: Vec::new(),
+                    sync_maildir_flags: false,
+                },
+            )
+            .expect("return an explicit per-thread resolution failure");
+        assert_eq!(rejected.matched_threads, 1);
+        assert_eq!(rejected.changed_threads, 1);
+        assert_eq!(rejected.thread_resolution_failures.len(), 1);
+        assert!(
+            rejected.thread_resolution_failures[0]
+                .detail
+                .contains("4097 message(s)")
+        );
+        assert_eq!(rejected.batch.requested_messages, 1);
+        assert_eq!(rejected.batch.changed_messages, 1);
+        assert_eq!(message_materialization_counts().0, 0);
+        assert_eq!(
+            database
+                .count_messages(
+                    &format!("tag:{rejected_tag}"),
+                    &QueryOptions {
+                        sort: SortOrder::MessageId,
+                        limit: 1,
+                        offset: 0,
+                        excluded_tags: Vec::new(),
+                    },
+                )
+                .expect("count rejected tag"),
+            1
+        );
+        assert_eq!(
+            database
+                .search_messages(
+                    &format!("tag:{rejected_tag}"),
+                    &QueryOptions {
+                        sort: SortOrder::MessageId,
+                        limit: 2,
+                        offset: 0,
+                        excluded_tags: Vec::new(),
+                    },
+                )
+                .expect("load the isolated safe target")
+                .into_iter()
+                .map(|message| message.message_id)
+                .collect::<Vec<_>>(),
+            [safe_message_id]
+        );
+        assert_eq!(
+            database
+                .count_messages(
+                    &format!(
+                        "{} and tag:{rejected_tag}",
+                        exact_term_query("thread", &root.thread_id)
+                    ),
+                    &QueryOptions {
+                        sort: SortOrder::MessageId,
+                        limit: 1,
+                        offset: 0,
+                        excluded_tags: Vec::new(),
+                    },
+                )
+                .expect("count rejected oversized thread"),
+            0,
+            "the oversized thread itself must remain untouched"
+        );
+
         let too_small = database
             .thread_messages_bounded(&root.thread_id, 4_096)
             .expect_err("reject a thread above the caller's explicit bound");
@@ -1795,6 +2192,62 @@ mod tests {
             Some("bulk-4096@example.test"),
             "the complete oldest-first result must end with the actual newest message"
         );
+
+        let final_path = maildir.join("bulk-4096:2,");
+        database
+            .remove_message_file(&final_path)
+            .expect("remove the final message from the index");
+        std::fs::remove_file(&final_path).expect("remove the final message file");
+        let exact_limit_revision = database.revision();
+        reset_message_materialization_counters();
+        let mut id_page_ends = Vec::new();
+        let exact_limit_ids = database
+            .thread_message_ids_bounded(
+                &root.thread_id,
+                MAX_THREAD_TAG_MESSAGES,
+                &exact_limit_revision,
+                |loaded| id_page_ends.push(loaded),
+            )
+            .expect("accept an ID-only snapshot at the exact 4,096-message bound");
+        assert_eq!(exact_limit_ids.len(), MAX_THREAD_TAG_MESSAGES);
+        assert_eq!(id_page_ends.len(), 16);
+        assert_eq!(id_page_ends.first(), Some(&THREAD_MESSAGE_ID_PAGE_SIZE));
+        assert_eq!(id_page_ends.last(), Some(&MAX_THREAD_TAG_MESSAGES));
+        assert!(
+            id_page_ends
+                .windows(2)
+                .all(|page| page[1] - page[0] == THREAD_MESSAGE_ID_PAGE_SIZE)
+        );
+        assert_eq!(
+            exact_limit_ids.iter().collect::<BTreeSet<_>>().len(),
+            MAX_THREAD_TAG_MESSAGES
+        );
+        assert!(
+            exact_limit_ids
+                .iter()
+                .any(|id| id == "bulk-0000@example.test")
+        );
+        assert!(
+            !exact_limit_ids
+                .iter()
+                .any(|id| id == "bulk-4096@example.test")
+        );
+        assert_eq!(message_materialization_counts(), (0, 0));
+
+        let accepted_tag = "notm/exact-limit-accepted";
+        let accepted = database
+            .apply_tags_to_threads(
+                std::slice::from_ref(&root.thread_id),
+                &TagMutation {
+                    add: vec![accepted_tag.to_string()],
+                    remove: Vec::new(),
+                    sync_maildir_flags: false,
+                },
+            )
+            .expect("tag the exact bounded ID snapshot");
+        assert!(accepted.is_complete(), "unexpected report: {accepted:#?}");
+        assert_eq!(accepted.batch.requested_messages, MAX_THREAD_TAG_MESSAGES);
+        assert_eq!(accepted.batch.changed_messages, MAX_THREAD_TAG_MESSAGES);
     }
 
     #[test]
@@ -1823,5 +2276,191 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn thread_tag_snapshot_revision_checks_number_and_uuid() {
+        let expected = Revision {
+            revision: 7,
+            uuid: "database-a".to_string(),
+        };
+        assert!(check_thread_tag_snapshot_revision(&expected, &expected).is_ok());
+
+        let numeric_drift = Revision {
+            revision: 8,
+            uuid: expected.uuid.clone(),
+        };
+        assert!(matches!(
+            check_thread_tag_snapshot_revision(&expected, &numeric_drift),
+            Err(Error::ThreadTagSnapshotChanged {
+                expected_revision: 7,
+                observed_revision: 8,
+                ..
+            })
+        ));
+
+        let uuid_drift = Revision {
+            revision: expected.revision,
+            uuid: "database-b".to_string(),
+        };
+        assert!(matches!(
+            check_thread_tag_snapshot_revision(&expected, &uuid_drift),
+            Err(Error::ThreadTagSnapshotChanged {
+                expected_uuid,
+                observed_uuid,
+                ..
+            }) if expected_uuid == "database-a" && observed_uuid == "database-b"
+        ));
+    }
+
+    #[test]
+    fn id_only_snapshot_rejects_a_null_libnotmuch_message_id() {
+        let valid = CString::new("message@example.test").expect("valid message ID");
+        assert_eq!(
+            unsafe { required_message_id(valid.as_ptr()) }.expect("copy valid message ID"),
+            "message@example.test"
+        );
+
+        let error = unsafe { required_message_id(std::ptr::null()) }
+            .expect_err("a null ID getter result must invalidate target capture");
+        assert!(matches!(
+            error,
+            Error::Null("notmuch_message_get_message_id")
+        ));
+    }
+
+    #[test]
+    fn thread_tag_snapshot_revision_drift_aborts_before_mutation() {
+        let (_temp, database, maildir) = create_test_database();
+        let (thread_id, root_id) = index_test_thread(&database, &maildir, "drift", 300);
+        let drift_path = maildir.join("drift-interloper:2,");
+        let inserted = std::cell::Cell::new(false);
+        let mutation = TagMutation {
+            add: vec!["notm/must-not-apply-after-drift".to_string()],
+            remove: Vec::new(),
+            sync_maildir_flags: false,
+        };
+
+        let error = database
+            .apply_tags_to_threads_with_hooks(
+                std::slice::from_ref(&thread_id),
+                &mutation,
+                |_, loaded| {
+                    if loaded >= THREAD_MESSAGE_ID_PAGE_SIZE && !inserted.replace(true) {
+                        let raw = format!(
+                            "From: sender@example.test\r\nTo: fixture@example.test\r\nSubject: drift thread\r\nDate: Thu, 18 Jun 2037 19:00:00 -0600\r\nMessage-ID: <drift-interloper@example.test>\r\nIn-Reply-To: <{root_id}>\r\nReferences: <{root_id}>\r\n\r\ninterloper\r\n"
+                        );
+                        std::fs::write(&drift_path, raw).expect("write drift interloper");
+                        database
+                            .index_file_with_tags(&drift_path, &[])
+                            .expect("index drift interloper");
+                    }
+                },
+                || {},
+            )
+            .expect_err("revision drift must abort the whole immutable snapshot");
+        assert!(inserted.get());
+        assert!(matches!(error, Error::ThreadTagSnapshotChanged { .. }));
+        assert_eq!(
+            database
+                .count_messages(
+                    "tag:\"notm/must-not-apply-after-drift\"",
+                    &QueryOptions {
+                        sort: SortOrder::MessageId,
+                        limit: usize::MAX,
+                        offset: 0,
+                        excluded_tags: Vec::new(),
+                    },
+                )
+                .expect("count tags after rejected snapshot"),
+            0,
+            "snapshot-wide revision drift must have no tag effects"
+        );
+    }
+
+    #[test]
+    fn thread_tag_snapshot_keeps_exact_ids_when_new_mail_reorders_after_capture() {
+        let (_temp, database, maildir) = create_test_database();
+        let (thread_id, root_id) = index_test_thread(&database, &maildir, "capture", 2);
+        let interloper_id = "aaaa-capture-interloper@example.test";
+        let interloper_path = maildir.join("aaaa-capture-interloper:2,");
+        let mutation = TagMutation {
+            add: vec!["notm/captured-before-new-mail".to_string()],
+            remove: Vec::new(),
+            sync_maildir_flags: false,
+        };
+
+        let report = database
+            .apply_tags_to_threads_with_hooks(
+                std::slice::from_ref(&thread_id),
+                &mutation,
+                |_, _| {},
+                || {
+                    let raw = format!(
+                        "From: sender@example.test\r\nTo: fixture@example.test\r\nSubject: capture thread\r\nDate: Thu, 18 Jun 1998 19:00:00 -0600\r\nMessage-ID: <{interloper_id}>\r\nIn-Reply-To: <{root_id}>\r\nReferences: <{root_id}>\r\n\r\nnew older mail\r\n"
+                    );
+                    std::fs::write(&interloper_path, raw).expect("write post-snapshot mail");
+                    database
+                        .index_file_with_tags(&interloper_path, &[])
+                        .expect("index post-snapshot mail");
+                },
+            )
+            .expect("mutate the already captured exact message IDs");
+        assert!(report.is_complete(), "unexpected report: {report:#?}");
+        assert_eq!(report.batch.requested_messages, 2);
+        assert_eq!(report.batch.changed_messages, 2);
+
+        let options = QueryOptions {
+            sort: SortOrder::MessageId,
+            limit: usize::MAX,
+            offset: 0,
+            excluded_tags: Vec::new(),
+        };
+        assert_eq!(
+            database
+                .count_messages(&exact_term_query("thread", &thread_id), &options)
+                .expect("count thread after new mail"),
+            3
+        );
+        let tagged_ids = database
+            .search_messages("tag:\"notm/captured-before-new-mail\"", &options)
+            .expect("query captured tag")
+            .into_iter()
+            .map(|message| message.message_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(tagged_ids.len(), 2);
+        assert!(!tagged_ids.contains(interloper_id));
+    }
+
+    #[test]
+    fn thread_tag_report_keeps_missing_and_isolated_resolution_failures_explicit() {
+        let (_temp, database, maildir) = create_test_database();
+        let (thread_id, _) = index_test_thread(&database, &maildir, "partial-targets", 1);
+        let missing = "missing-thread".to_string();
+        let invalid = "invalid\0thread".to_string();
+        let report = database
+            .apply_tags_to_threads(
+                &[thread_id.clone(), missing.clone(), invalid.clone()],
+                &TagMutation {
+                    add: vec!["notm/safe-target".to_string()],
+                    remove: Vec::new(),
+                    sync_maildir_flags: false,
+                },
+            )
+            .expect("retain safe-target effects beside isolated resolution failures");
+
+        assert_eq!(report.matched_threads, 1);
+        assert_eq!(report.changed_threads, 1);
+        assert_eq!(report.missing_thread_ids, [missing]);
+        assert_eq!(report.thread_resolution_failures.len(), 1);
+        assert_eq!(report.thread_resolution_failures[0].thread_id, invalid);
+        assert!(
+            report.thread_resolution_failures[0]
+                .detail
+                .contains("interior NUL")
+        );
+        assert_eq!(report.batch.requested_messages, 1);
+        assert_eq!(report.batch.changed_messages, 1);
+        assert!(!report.is_complete());
     }
 }

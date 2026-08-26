@@ -198,6 +198,12 @@ mutation until that refresh succeeds. `tag_status.paths_uncertain = true`
 means the worker could not prove retained message or draft filenames safe (for
 example, after a close/commit failure); verify the warning and restart the
 isolated app before attempting another path, draft, tag, send, or sync action.
+Thread tag targets are captured as exact message IDs from one database
+UUID/revision, using count-first ID-only pages with a 4,096-message ceiling per
+thread. An oversized or otherwise isolated rejected thread is reported without
+mutating that thread; revision drift rejects the whole captured selection
+before mutation. Both outcomes force an authoritative search reconciliation
+instead of restoring retained message detail optimistically.
 
 For a narrowly scoped responsiveness check, fixture harness requests may pass
 `test_delay_ms` to `run_search` or `tag_selected` (maximum 5000). The delay runs

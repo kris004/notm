@@ -1,6 +1,6 @@
 use notm_notmuch::{
     Database, MessageSummary, MessageTagMutation, QueryOptions, SortOrder, TagBatchReport,
-    TagFailureStage, TagMutation,
+    TagFailureStage, TagMutation, ThreadResolutionFailure, ThreadTagReport,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -191,6 +191,36 @@ fn exact_thread_ids_remain_targets_after_search_reorders() -> anyhow::Result<()>
     assert_eq!(tagged_ids, expected_message_ids);
     assert!(!tagged_ids.contains(&interloper_id));
     db.close()?;
+    Ok(())
+}
+
+#[test]
+fn thread_resolution_failures_are_explicit_and_backward_compatible() -> anyhow::Result<()> {
+    let report = ThreadTagReport {
+        thread_ids: vec!["oversized-thread".to_string()],
+        missing_thread_ids: Vec::new(),
+        thread_resolution_failures: vec![ThreadResolutionFailure {
+            thread_id: "oversized-thread".to_string(),
+            detail: "thread exceeds the 4096-message safety limit".to_string(),
+        }],
+        matched_threads: 0,
+        changed_threads: 0,
+        added: vec!["archive".to_string()],
+        removed: Vec::new(),
+        batch: TagBatchReport::default(),
+    };
+
+    let mut serialized = serde_json::to_value(&report)?;
+    assert_eq!(
+        serialized["thread_resolution_failures"][0]["thread_id"],
+        "oversized-thread"
+    );
+    serialized
+        .as_object_mut()
+        .expect("serialized thread report")
+        .remove("thread_resolution_failures");
+    let legacy: ThreadTagReport = serde_json::from_value(serialized)?;
+    assert!(legacy.thread_resolution_failures.is_empty());
     Ok(())
 }
 

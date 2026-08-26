@@ -26,3 +26,14 @@ final durable-commit status; `Drop` is only a best-effort fallback.
 Callers may use known previous/current mappings from an explicit partial
 Maildir result, but must treat an unresolved filename or close/commit failure
 as unsafe for any retained path-bearing cache.
+
+Exact-thread tag mutation resolves targets through an ID-only query path. It
+counts before allocating IDs, rejects a thread above 4,096 messages, and reads
+accepted threads in 256-ID pages using only
+`notmuch_message_get_message_id`. Every count/page is checked against the one
+UUID/revision captured for the complete selected-thread snapshot, and the
+revision is checked again before mutation. Revision drift or inconsistent
+paging aborts before any tag is changed. Missing threads and safely isolated
+per-thread resolution failures remain distinct in `ThreadTagReport`, allowing
+other successfully captured exact targets to retain an explicit partial-result
+contract without falling back to positional ranges or full message summaries.

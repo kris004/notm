@@ -13,13 +13,14 @@ pub mod thread;
 
 pub use config::{ConfigProfile, LoadedIdentity};
 pub use database::{
-    Database, DatabaseMode, OpenConfig, ResolvedMessageFile, Revision, ThreadMessagePage,
+    Database, DatabaseMode, MAX_THREAD_TAG_MESSAGES, OpenConfig, ResolvedMessageFile, Revision,
+    ThreadMessagePage,
 };
 pub use error::{Error, Result};
 pub use message::{
     AppliedTagChange, MaildirFilenameChange, MaildirFlagSyncFailure, MaildirPathChange,
     MessagePathState, MessageSummary, MessageTagFailure, MessageTagMutation, TagBatchReport,
-    TagFailureStage, TagMutation, TagOperationReport, ThreadTagReport,
+    TagFailureStage, TagMutation, TagOperationReport, ThreadResolutionFailure, ThreadTagReport,
 };
 pub use query::{QueryOptions, SortOrder};
 pub use thread::ThreadSummary;

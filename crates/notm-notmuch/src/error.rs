@@ -40,6 +40,19 @@ pub enum Error {
         total: usize,
         limit: usize,
     },
+    #[error(
+        "Notmuch database revision changed while capturing exact thread tag targets ({expected_uuid}@{expected_revision} -> {observed_uuid}@{observed_revision}); no tag mutation was attempted"
+    )]
+    ThreadTagSnapshotChanged {
+        expected_uuid: String,
+        expected_revision: u64,
+        observed_uuid: String,
+        observed_revision: u64,
+    },
+    #[error(
+        "failed to capture a consistent exact thread tag target snapshot: {detail}; no tag mutation was attempted"
+    )]
+    ThreadTagSnapshotFailed { detail: String },
     #[error("invalid notmuch tag `{0}`")]
     InvalidTag(String),
 }

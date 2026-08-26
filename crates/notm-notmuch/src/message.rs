@@ -166,11 +166,22 @@ impl TagOperationReport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadResolutionFailure {
+    pub thread_id: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadTagReport {
     /// Exact thread IDs supplied by the immutable result snapshot.
     pub thread_ids: Vec<String>,
     #[serde(default)]
     pub missing_thread_ids: Vec<String>,
+    /// Selected threads rejected safely before any of their messages were
+    /// mutated, such as threads above the bounded snapshot limit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thread_resolution_failures: Vec<ThreadResolutionFailure>,
+    /// Non-empty target threads captured successfully at the shared revision.
     pub matched_threads: usize,
     pub changed_threads: usize,
     pub added: Vec<String>,
@@ -181,7 +192,9 @@ pub struct ThreadTagReport {
 impl ThreadTagReport {
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.missing_thread_ids.is_empty() && self.batch.is_complete()
+        self.missing_thread_ids.is_empty()
+            && self.thread_resolution_failures.is_empty()
+            && self.batch.is_complete()
     }
 
     pub fn record_finalization_error(&mut self, error: impl fmt::Display) {
