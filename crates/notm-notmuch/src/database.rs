@@ -300,9 +300,10 @@ impl Database {
 
     /// Collect a complete thread without ever exceeding the caller's bound.
     ///
-    /// The total is checked from the first bounded page before the result
-    /// vector is sized. Threads above `maximum` return an explicit error rather
+    /// A count-only snapshot checks the total before any message summaries are
+    /// materialized. Threads above `maximum` return an explicit error rather
     /// than an oldest-only prefix that could be mistaken for the full thread.
+    /// Accepted threads are then paged against the same database revision.
     /// Callers that do not need to retain the complete thread should consume
     /// [`Self::thread_messages_page`] directly instead.
     pub fn thread_messages_bounded(
@@ -310,45 +311,38 @@ impl Database {
         thread_id: &str,
         maximum: usize,
     ) -> Result<Vec<MessageSummary>> {
-        let mut messages = Vec::new();
+        let snapshot = self.thread_messages_page(thread_id, 0, 0)?;
+        let expected_total = snapshot.total as usize;
+        if expected_total > maximum {
+            return Err(Error::ThreadMessageLimitExceeded {
+                thread_id: thread_id.to_string(),
+                total: expected_total,
+                limit: maximum,
+            });
+        }
+
+        let expected_revision = snapshot.revision;
+        let mut messages = Vec::with_capacity(expected_total);
         let mut message_ids = BTreeSet::new();
-        let mut expected_total = None;
-        let mut expected_revision = None;
         let mut offset = 0usize;
 
-        loop {
-            let page_limit = COMPLETE_THREAD_PAGE_SIZE.min(maximum.saturating_sub(offset));
+        while offset < expected_total {
+            let page_limit = COMPLETE_THREAD_PAGE_SIZE.min(expected_total - offset);
             let page = self.thread_messages_page(thread_id, offset, page_limit)?;
-            let total = page.total as usize;
-            if let Some(expected) = expected_total {
-                check_thread_page_snapshot(
-                    thread_id,
-                    expected_revision
-                        .as_ref()
-                        .expect("thread total and revision are initialized together"),
-                    expected,
-                    messages.len(),
-                    &page,
-                )?;
-            } else {
-                expected_total = Some(total);
-                expected_revision = Some(page.revision.clone());
-                if total > maximum {
-                    return Err(Error::ThreadMessageLimitExceeded {
-                        thread_id: thread_id.to_string(),
-                        total,
-                        limit: maximum,
-                    });
-                }
-                messages.reserve(total);
-            }
+            check_thread_page_snapshot(
+                thread_id,
+                &expected_revision,
+                expected_total,
+                messages.len(),
+                &page,
+            )?;
 
             let page_len = page.messages.len();
             for message in page.messages {
                 if !message_ids.insert(message.message_id.clone()) {
                     return Err(Error::InconsistentThreadMessages {
                         thread_id: thread_id.to_string(),
-                        expected: total,
+                        expected: expected_total,
                         loaded: messages.len(),
                     });
                 }
@@ -356,23 +350,19 @@ impl Database {
             }
             offset = offset.saturating_add(page_len);
 
-            if offset >= total {
-                break;
-            }
             if page_len == 0 {
                 return Err(Error::InconsistentThreadMessages {
                     thread_id: thread_id.to_string(),
-                    expected: total,
+                    expected: expected_total,
                     loaded: messages.len(),
                 });
             }
         }
 
-        let expected = expected_total.unwrap_or_default();
-        if messages.len() != expected {
+        if messages.len() != expected_total {
             return Err(Error::InconsistentThreadMessages {
                 thread_id: thread_id.to_string(),
-                expected,
+                expected: expected_total,
                 loaded: messages.len(),
             });
         }
@@ -1237,6 +1227,12 @@ mod tests {
         }
 
         let root = summary_by_id(&database, "bulk-0000@example.test");
+        let count_only = database
+            .thread_messages_page(&root.thread_id, 0, 0)
+            .expect("load count-only thread snapshot");
+        assert_eq!(count_only.total as usize, MESSAGE_COUNT);
+        assert!(count_only.messages.is_empty());
+        assert_eq!(count_only.limit, 0);
         let first_page = database
             .thread_messages_page(&root.thread_id, 0, 257)
             .expect("load first explicit thread page");
