@@ -1,4 +1,4 @@
-.TH NOTM-CONFIG 5 "2026-08-19" "notm 0.1.1" "File Formats"
+.TH NOTM-CONFIG 5 "2026-08-25" "notm 0.1.1" "File Formats"
 .SH NAME
 notm-config \- configuration file for notm
 .SH SYNOPSIS
@@ -32,6 +32,10 @@ falls back to built-in defaults.
 Configuration is validated before a command or desktop window starts.  Unknown
 sections and keys are errors rather than being silently ignored.  Errors name
 the configuration file and the invalid key or value.
+.PP
+Settings writes first parse the existing TOML and use atomic replacement.
+Parse and write failures are reported without partially updating the
+configuration.
 .SH EXAMPLE
 .nf
 [notmuch]
@@ -168,10 +172,17 @@ Show thread body previews.  Defaults to true.
 Show shortcut hints on buttons.  Defaults to true.
 .TP
 .B remote_images
-Allow remote images globally in the visual HTML view.  Defaults to false.
-.TP
-.B trusted_image_senders
-Sender allow-list for remote images.
+Explicit global privacy override allowing remote images in every visual HTML
+message.  Defaults to false.  With the default, remote content remains blocked
+unless the user chooses
+.B Load remote images once
+for the current message view.  That one-shot permission is not persisted or
+shared and resets on message or view navigation and application restart.
+.PP
+Raw
+.B From:
+headers are not authenticated by Notmuch and cannot grant durable remote-image
+permission.
 .TP
 .B html_mode
 HTML rendering preference.  Supported values are
@@ -414,12 +425,15 @@ locally, and confines tag changes to its disposable database.
 .SH LEGACY KEYS
 The obsolete keys
 .BR ui.confirm_destructive_tag_actions ,
+.BR ui.trusted_image_senders ,
 .BR send.one_live_self_test_per_run ,
 and
 .B sync.show_manual_sync_button
 are accepted for compatibility but ignored and omitted from printed
-configuration.  They can be removed from existing files.  Other unknown keys
-are errors.
+configuration.  A later successful Settings write removes
+.B ui.trusted_image_senders
+instead of converting its entries into broader permissions.  The other keys
+can be removed from existing files.  Other unknown keys are errors.
 .SH SEE ALSO
 .BR notm (1),
 .BR notm-test-harness (7)

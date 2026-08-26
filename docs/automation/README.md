@@ -105,8 +105,8 @@ Implemented test-harness commands include:
 - message actions: `show_raw_source`, `open_raw_source`, `show_full_headers`,
   `full_headers`, `show_text_thread`, `show_rendered_thread`,
   `toggle_text_visual`, `show_visual_html`, `show_html_visual`, `image_policy`,
-  `load_images_once`, `trust_sender_images`, `trusted_image_senders`,
-  `html_view_state`, `html_scroll_state`, `scroll_html_view_lines`,
+  `load_images_once`, `html_view_state`, `html_scroll_state`,
+  `scroll_html_view_lines`,
   `view_preference_state`, `click_sender_view_preference`,
   `start_link_hints`, `link_hint_state`, `input_link_hint`,
   `cancel_link_hints`, `toggle_quote_collapse`, `message_view_text`,
@@ -146,6 +146,10 @@ The custom action also accepts `tag`. These operations target the selected
 message ID only; thread selection and multi-selection are ignored. Like the
 thread tag commands, they require fixture mode or
 `automation.allow_live_tag_test=true`.
+
+`load_images_once` reloads Visual HTML with remote images enabled only for the
+current message view. It creates no durable sender permission and resets when
+the test navigates away or restarts the application.
 
 In fixture mode, `draft_list_state` reports whether the rendered Saved drafts
 section, explicit empty state, bounded scroller, rows, and per-selection Delete

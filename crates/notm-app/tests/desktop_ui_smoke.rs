@@ -13,8 +13,11 @@ use serde_json::{Value, json};
 
 #[path = "support/gui_test_display.rs"]
 mod gui_test_display;
+#[path = "support/local_http_tracker.rs"]
+mod local_http_tracker;
 
 use gui_test_display::{GuiTestDisplay, gtk_display_environment};
+use local_http_tracker::LocalHttpTracker;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -26,6 +29,7 @@ struct FixtureApp {
     socket_path: PathBuf,
     log_path: PathBuf,
     work_dir: PathBuf,
+    cleanup_work_dir: bool,
 }
 
 struct ChildGuard(Child);
@@ -266,6 +270,7 @@ impl FixtureApp {
             socket_path,
             log_path,
             work_dir,
+            cleanup_work_dir: true,
         })
     }
 
@@ -324,6 +329,10 @@ impl FixtureApp {
             }
             thread::sleep(STARTUP_POLL_INTERVAL);
         }
+    }
+
+    fn preserve_work_dir_on_drop(&mut self) {
+        self.cleanup_work_dir = false;
     }
 
     fn request_message_id(
@@ -430,7 +439,9 @@ impl Drop for FixtureApp {
         let _ = self.child.kill();
         let _ = self.child.wait();
         drop(self.display.take());
-        let _ = fs::remove_dir_all(&self.work_dir);
+        if self.cleanup_work_dir {
+            let _ = fs::remove_dir_all(&self.work_dir);
+        }
     }
 }
 
@@ -3646,6 +3657,174 @@ fn fixture_malformed_text_shows_a_decode_warning() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn indexed_remote_images_are_blocked_except_for_one_selected_message_load() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP indexed_remote_images_are_blocked_except_for_one_selected_message_load: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running remote-image privacy desktop UI smoke with {display}");
+
+    let tracker = LocalHttpTracker::start()?;
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    index_remote_html_message(
+        &fixture,
+        "remote-image-load-once@fixture.test",
+        "Account Security <Shared@Example.Test>",
+        "Remote image load once",
+        &remote_image_adversarial_html(&tracker),
+    )?;
+    index_remote_html_message(
+        &fixture,
+        "remote-image-spoofed-peer@fixture.test",
+        "ACCOUNT SECURITY <shared@example.test>",
+        "Same spoofable From",
+        &format!(
+            "<html><body><p>Same raw sender identity.</p><img src=\"{}\" alt=\"tracked\"></body></html>",
+            tracker.url("/spoofed-peer")
+        ),
+    )?;
+    index_remote_html_message(
+        &fixture,
+        "remote-image-malformed-from@fixture.test",
+        "not a valid mailbox ???",
+        "Malformed From remote image",
+        &format!(
+            "<html><body><p>Malformed sender.</p><img src=\"{}\" alt=\"tracked\"></body></html>",
+            tracker.url("/malformed-from")
+        ),
+    )?;
+    index_remote_html_message(
+        &fixture,
+        "remote-image-redirect@fixture.test",
+        "Redirect Sender <redirect@example.test>",
+        "Blocked remote image redirect",
+        &format!(
+            "<html><body><p>Redirect target.</p><img src=\"{}\" alt=\"tracked\"></body></html>",
+            tracker.url("/redirect")
+        ),
+    )?;
+    let run_id = unique_run_id()?;
+    let test_root = tempfile::Builder::new()
+        .prefix("notm-remote-image-ui-")
+        .tempdir()?;
+    let work_dir = test_root.path().join("app");
+    fs::create_dir_all(&work_dir)?;
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+             \n[identity]\nname = \"Fixture User\"\nprimary_email = \"fixture@example.test\"\n\
+             \n[ui]\nremote_images = false\ntrusted_image_senders = [\"shared@example.test\", \"not a valid mailbox ???\"]\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+        ),
+    )?;
+
+    let token = format!("notm-remote-image-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir.clone(), &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+
+    select_first_thread(&mut driver, "id:remote-image-load-once@fixture.test")?;
+    let blocked = show_visual_html_and_wait(&mut driver, false)?;
+    assert_remote_images_blocked(&blocked)?;
+    tracker.ensure_stable(&[], Duration::from_millis(250))?;
+
+    for deprecated_command in ["trust_sender_images", "always_load_sender_images"] {
+        let rejected = driver.command(deprecated_command, json!({}))?;
+        assert_eq!(
+            rejected["ok"], false,
+            "deprecated sender trust unexpectedly succeeded: {rejected}"
+        );
+        ensure!(
+            rejected["error"].as_str().is_some_and(|error| {
+                let error = error.to_ascii_lowercase();
+                (error.contains("unavailable") || error.contains("support"))
+                    && error.contains("not authenticated")
+                    && error.contains("once")
+            }),
+            "deprecated sender trust did not explain its unsafe semantics and replacement: {rejected}"
+        );
+        tracker.ensure_stable(&[], Duration::from_millis(100))?;
+    }
+
+    let loaded = driver.command("load_images_once", json!({}))?;
+    assert_eq!(loaded["ok"], true, "one-shot image load failed: {loaded}");
+    let loaded_view = wait_for_html_view(&mut driver, true, Some(&loaded["html_view"]))?;
+    assert_remote_images_once(&loaded_view)?;
+    tracker.wait_for_requests(&["/load-once"], STARTUP_TIMEOUT)?;
+    tracker.ensure_stable(&["/load-once"], Duration::from_millis(250))?;
+
+    for (message_id, context) in [
+        (
+            "remote-image-spoofed-peer@fixture.test",
+            "a second message with the same case-varied spoofable From",
+        ),
+        (
+            "remote-image-malformed-from@fixture.test",
+            "a malformed From value present in the legacy trust list",
+        ),
+        (
+            "remote-image-redirect@fixture.test",
+            "an unapproved redirecting image",
+        ),
+        (
+            "remote-image-load-once@fixture.test",
+            "the formerly approved message after navigating away",
+        ),
+    ] {
+        select_first_thread(&mut driver, &format!("id:{message_id}"))?;
+        let blocked = show_visual_html_and_wait(&mut driver, false)?;
+        assert_remote_images_blocked(&blocked)
+            .with_context(|| format!("remote content policy failed for {context}"))?;
+        tracker
+            .ensure_stable(&["/load-once"], Duration::from_millis(250))
+            .with_context(|| format!("remote request escaped through {context}"))?;
+    }
+
+    let persisted: toml::Value = fs::read_to_string(&config_path)?.parse()?;
+    assert_eq!(
+        persisted["ui"]["remote_images"].as_bool(),
+        Some(false),
+        "one-shot loading broadened the global remote-image policy: {persisted}"
+    );
+    assert_eq!(
+        persisted["ui"].get("trusted_image_senders"),
+        None,
+        "successful preference persistence did not retire the unsafe legacy trust list: {persisted}"
+    );
+
+    let closed = driver.command("close_main_window", json!({}))?;
+    assert_eq!(closed["ok"], true, "could not close first app: {closed}");
+    drop(driver);
+    let status = app.wait_for_exit(STARTUP_TIMEOUT)?;
+    ensure!(
+        status.success(),
+        "first app did not exit cleanly: {status}\n{}",
+        app.logs()
+    );
+    app.preserve_work_dir_on_drop();
+    drop(app);
+    prepare_fixture_work_dir_for_restart(&work_dir)?;
+
+    let restart_token = format!("{token}-restart");
+    let mut restarted = FixtureApp::spawn_with_config(work_dir, &restart_token, &config_path)?;
+    let mut restarted_driver = restarted.connect(&restart_token)?;
+    select_first_thread(
+        &mut restarted_driver,
+        "id:remote-image-load-once@fixture.test",
+    )?;
+    let restarted_view = show_visual_html_and_wait(&mut restarted_driver, false)?;
+    assert_remote_images_blocked(&restarted_view)?;
+    tracker.ensure_stable(&["/load-once"], Duration::from_millis(250))?;
+
+    Ok(())
+}
+
 #[test]
 fn fixture_html_link_hints_label_visible_links_and_cancel() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
@@ -5593,6 +5772,203 @@ fn select_first_thread(driver: &mut UiDriver, query: &str) -> anyhow::Result<()>
         selected["ok"], true,
         "could not select fixture thread: {selected}"
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn index_remote_html_message(
+    fixture: &notm_test_support::FixtureDatabase,
+    message_id: &str,
+    from: &str,
+    subject: &str,
+    html: &str,
+) -> anyhow::Result<()> {
+    let filename = message_id.replace(['@', '<', '>'], "-");
+    let path = fixture
+        .maildir
+        .join("cur")
+        .join(format!("remote-image-{filename}-{}:2,S", unique_run_id()?));
+    let raw = format!(
+        "From: {from}\r\nTo: fixture@example.test\r\nSubject: {subject}\r\n\
+         Date: Tue, 25 Aug 2026 12:00:00 -0600\r\nMessage-ID: <{message_id}>\r\n\
+         MIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html}"
+    );
+    fs::write(&path, raw)
+        .with_context(|| format!("writing remote-image fixture {}", path.display()))?;
+    fixture
+        .open_readwrite()?
+        .index_file_with_tags(&path, &["inbox"])
+        .with_context(|| format!("indexing remote-image fixture {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remote_image_adversarial_html(tracker: &LocalHttpTracker) -> String {
+    format!(
+        r#"<!doctype html>
+<html>
+<head>
+  <style>@import url("{css_import}"); body {{ background-image: url("{style_block}"); }}</style>
+  <link rel="stylesheet" href="{stylesheet}">
+  <meta http-equiv="refresh" content="0; url={meta_refresh}">
+</head>
+<body background="{background_attribute}">
+  <img src="{load_once}" alt="ordinary approved image">
+  <div style="background-image:url('{inline_style}')">inline CSS URL</div>
+  <img srcset="{srcset_one} 1x, {srcset_two} 2x" alt="srcset only">
+  <picture><source srcset="{picture_source} 1x"><img alt="picture fallback"></picture>
+  <video poster="{video_poster}"><source src="{media_source}"></video>
+  <iframe src="{iframe}" srcdoc="&lt;img src=&quot;{srcdoc_image}&quot;&gt;"></iframe>
+  <object data="{object}"></object>
+  <embed src="{embed}">
+  <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+    <image href="{svg_href}" xlink:href="{svg_xlink}"></image>
+    <use href="{svg_use}"></use>
+  </svg>
+</body>
+</html>"#,
+        css_import = tracker.url("/css-import.css"),
+        style_block = tracker.url("/style-block"),
+        stylesheet = tracker.url("/linked.css"),
+        meta_refresh = tracker.url("/meta-refresh.html"),
+        background_attribute = tracker.url("/background-attribute"),
+        load_once = tracker.url("/load-once"),
+        inline_style = tracker.url("/inline-style"),
+        srcset_one = tracker.url("/srcset-one"),
+        srcset_two = tracker.url("/srcset-two"),
+        picture_source = tracker.url("/picture-source"),
+        video_poster = tracker.url("/video-poster"),
+        media_source = tracker.url("/media-source"),
+        iframe = tracker.url("/iframe.html"),
+        srcdoc_image = tracker.url("/srcdoc-image"),
+        object = tracker.url("/object.html"),
+        embed = tracker.url("/embed"),
+        svg_href = tracker.url("/svg-href"),
+        svg_xlink = tracker.url("/svg-xlink"),
+        svg_use = tracker.url("/svg-use"),
+    )
+}
+
+#[cfg(unix)]
+fn show_visual_html_and_wait(driver: &mut UiDriver, images_allowed: bool) -> anyhow::Result<Value> {
+    let shown = driver.command("show_visual_html", json!({}))?;
+    assert_eq!(shown["ok"], true, "visual HTML render failed: {shown}");
+    wait_for_html_view(driver, images_allowed, Some(&shown["html_view"]))
+}
+
+#[cfg(unix)]
+fn wait_for_html_view(
+    driver: &mut UiDriver,
+    images_allowed: bool,
+    initial: Option<&Value>,
+) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let mut next = initial.cloned();
+    loop {
+        let view = match next.take() {
+            Some(view) => view,
+            None => driver.command("html_view_state", json!({}))?,
+        };
+        ensure!(view["ok"] == true, "HTML view inspection failed: {view}");
+        ensure!(
+            view["html_visible"] == true && view["has_html"] == true,
+            "selected HTML message was not visible: {view}"
+        );
+        assert_eq!(
+            view["global_remote_images_allowed"], false,
+            "isolated privacy fixture unexpectedly enabled global remote images: {view}"
+        );
+        assert_eq!(
+            view["image_loading_allowed"], images_allowed,
+            "WebKit image loading did not match the selected-message policy: {view}"
+        );
+        assert_eq!(
+            view["image_permission"],
+            if images_allowed {
+                "message_once"
+            } else {
+                "blocked"
+            },
+            "HTML view exposed an ambiguous image permission: {view}"
+        );
+        assert_eq!(
+            view["network_session_ephemeral"], true,
+            "HTML view did not use an ephemeral WebKit network session: {view}"
+        );
+        let loading = view["loading"]
+            .as_bool()
+            .with_context(|| format!("HTML view did not expose WebKit loading state: {view}"))?;
+        let load_generation = view["load_generation"]
+            .as_u64()
+            .with_context(|| format!("HTML view did not expose its load generation: {view}"))?;
+        let completed_load_generation = view["completed_load_generation"]
+            .as_u64()
+            .with_context(|| format!("HTML view did not expose its completed load: {view}"))?;
+        ensure!(
+            load_generation > 0,
+            "HTML view did not schedule the requested document load: {view}"
+        );
+        if !loading && completed_load_generation == load_generation {
+            return Ok(view);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "HTML view did not complete a deterministic load cycle: {view}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+fn assert_remote_images_blocked(view: &Value) -> anyhow::Result<()> {
+    let status = view["status_text"]
+        .as_str()
+        .with_context(|| format!("blocked HTML view had no status text: {view}"))?
+        .to_ascii_lowercase();
+    ensure!(
+        status.contains("remote") && status.contains("blocked"),
+        "blocked HTML view did not explain its remote-content state: {view}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn assert_remote_images_once(view: &Value) -> anyhow::Result<()> {
+    let status = view["status_text"]
+        .as_str()
+        .with_context(|| format!("one-shot HTML view had no status text: {view}"))?
+        .to_ascii_lowercase();
+    ensure!(
+        status.contains("remote")
+            && status.contains("message")
+            && (status.contains("once") || status.contains("only")),
+        "one-shot HTML view did not explain its selected-message-only scope: {view}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_fixture_work_dir_for_restart(work_dir: &Path) -> anyhow::Result<()> {
+    for path in [work_dir.join("h.sock"), work_dir.join("notm.log")] {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("removing restart path {}", path.display()));
+            }
+        }
+    }
+    let display_dir = work_dir.join("gui-display");
+    match fs::remove_dir_all(&display_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("removing prior GUI display state {}", display_dir.display())
+            });
+        }
+    }
     Ok(())
 }
 

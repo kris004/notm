@@ -88,7 +88,6 @@ show_keybind_hints = true
 start_maximized = false
 
 remote_images = false
-trusted_image_senders = []
 html_mode = "sanitize_then_render_text_fallback"
 
 custom_saved_searches = [
@@ -101,6 +100,17 @@ hidden_tag_searches = []
 `three_pane` (or `columns`), or `stacked`. `thread_preview_lines` accepts 1
 through 20. `html_mode` accepts `sanitize_then_render_text_fallback` or
 `visual_html_preferred`.
+
+`remote_images` defaults to `false`, which blocks remote content in Visual HTML.
+**Load remote images once** permits sanitized remote images only for the current
+message view; navigating away or restarting restores blocking. Setting
+`remote_images = true` is an explicit global privacy override that permits
+remote images in every message.
+
+Raw `From:` headers are not authenticated by Notmuch and cannot grant durable
+remote-image permission. The retired `trusted_image_senders` key is accepted
+when reading an older configuration but ignored. A later successful Settings
+write removes it rather than converting it into a broader permission.
 
 The additional visibility keys `show_sidebar`, `show_message_list`,
 `show_message_view`, and `show_debug_panel` control startup state. They default
@@ -161,7 +171,9 @@ private local state directory.
 Composer recovery, local named drafts, cached compose attachments, and tag-undo
 history live under `${XDG_STATE_HOME:-$HOME/.local/state}/notm/`. Settings and
 state files that can contain command values or message content are restricted
-to the user when `notm` creates or replaces them on Unix.
+to the user when `notm` creates or replaces them on Unix. Settings writes parse
+the existing TOML before changing it and replace the file atomically; parse or
+write failures are reported without partially updating the configuration.
 
 ## Synchronization
 
