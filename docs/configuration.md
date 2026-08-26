@@ -97,9 +97,9 @@ hidden_tag_searches = []
 ```
 
 `theme` accepts `system`, `light`, or `dark`. `layout` accepts `auto`,
-`three_pane` (or `columns`), or `stacked`. `thread_preview_lines` accepts 1
-through 20. `html_mode` accepts `sanitize_then_render_text_fallback` or
-`visual_html_preferred`.
+`three_pane` (or `columns`), or `stacked`. `page_size` accepts 1 through 1,000,
+and `thread_preview_lines` accepts 1 through 20. `html_mode` accepts
+`sanitize_then_render_text_fallback` or `visual_html_preferred`.
 
 `remote_images` defaults to `false`, which blocks remote content in Visual HTML.
 **Load remote images once** permits sanitized remote images only for the current

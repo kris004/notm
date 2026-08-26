@@ -48,6 +48,7 @@ fn print_config_rejects_invalid_values_with_dotted_keys() -> anyhow::Result<()> 
             "notmuch.open_readwrite_only_for_mutations",
         ),
         ("[ui]\npage_size = 0\n", "ui.page_size"),
+        ("[ui]\npage_size = 1001\n", "ui.page_size"),
         ("[ui]\ntheme = \"sepia\"\n", "ui.theme"),
         (
             "[ui]\nthread_preview_lines = 0\n",

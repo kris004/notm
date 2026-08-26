@@ -142,6 +142,7 @@ fn command_is_available(command: &str) -> bool {
 
 struct HeadlessSway {
     child: Child,
+    _runtime_root: tempfile::TempDir,
     runtime_dir: PathBuf,
     wayland_display: String,
     log_path: PathBuf,
@@ -150,7 +151,14 @@ struct HeadlessSway {
 impl HeadlessSway {
     fn start(work_dir: &Path) -> anyhow::Result<Self> {
         let display_dir = work_dir.join("gui-display");
-        let runtime_dir = display_dir.join("runtime");
+        // Keep compositor socket paths short even when a test's descriptive
+        // working-directory name is long. Sway adds its own IPC suffix to
+        // XDG_RUNTIME_DIR and rejects paths that exceed sockaddr_un::sun_path.
+        let runtime_root = tempfile::Builder::new()
+            .prefix("notm-gui-")
+            .tempdir()
+            .context("creating short GUI runtime root")?;
+        let runtime_dir = runtime_root.path().join("runtime");
         let config_home = display_dir.join("config");
         let cache_home = display_dir.join("cache");
         let data_home = display_dir.join("data");
@@ -215,6 +223,7 @@ impl HeadlessSway {
             if let Some(wayland_display) = wayland_socket_name(&runtime_dir)? {
                 return Ok(Self {
                     child,
+                    _runtime_root: runtime_root,
                     runtime_dir,
                     wayland_display,
                     log_path,
@@ -239,7 +248,12 @@ impl HeadlessSway {
             .env_remove("SWAYSOCK")
             .env("XDG_RUNTIME_DIR", &self.runtime_dir)
             .env("WAYLAND_DISPLAY", &self.wayland_display)
-            .env("GDK_BACKEND", "wayland");
+            .env("GDK_BACKEND", "wayland")
+            // WebKit's bubblewrap helper can race the short-lived private
+            // runtime directory used by these disposable offscreen tests and
+            // abort the application while establishing IPC credentials. The
+            // required private-Weston gate uses the same test-only setting.
+            .env("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
     }
 
     fn logs(&self) -> String {

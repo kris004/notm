@@ -14,6 +14,8 @@ use crate::{
     config,
 };
 
+const FIXTURE_RECOVERY_PATH_ENV: &str = "NOTM_FIXTURE_TEST_RECOVERY_PATH";
+
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     let app_config_path = cli.config.clone().unwrap_or_else(crate::paths::config_path);
     match cli.command {
@@ -46,6 +48,11 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 options.automation_enabled = true;
                 options.automation_socket = automation_socket;
                 options.automation_token = automation_token;
+                if fixture_guard.is_some()
+                    && let Some(path) = std::env::var_os(FIXTURE_RECOVERY_PATH_ENV)
+                {
+                    options.draft_path = Some(PathBuf::from(path));
+                }
             }
             notm_ui::launch(options)
         }

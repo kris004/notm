@@ -1236,6 +1236,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "gtk4",
+ "mailparse",
  "notm-mail",
  "notm-notmuch",
  "parking_lot",

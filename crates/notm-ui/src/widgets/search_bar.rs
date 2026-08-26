@@ -1,8 +1,6 @@
 use std::{
     cell::{Cell, RefCell, RefMut},
     rc::Rc,
-    sync::mpsc,
-    thread,
     time::Duration,
 };
 
@@ -11,7 +9,6 @@ use gtk4 as gtk;
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(350);
 const COMPLETION_FOCUS_LEAVE_DELAY: Duration = Duration::from_millis(150);
-const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_FIXTURE_SEARCH_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
@@ -540,44 +537,6 @@ impl SearchBarSignalState {
             .as_ref()
             .is_some_and(|session| search_session_matches_current(session, text))
     }
-}
-
-pub(crate) fn launch_worker<T, E, C>(
-    request: SearchWorkerRequest,
-    cancellation_message: &'static str,
-    execute: E,
-    complete: C,
-) where
-    T: Send + 'static,
-    E: FnOnce(&str) -> anyhow::Result<T> + Send + 'static,
-    C: FnOnce(u64, anyhow::Result<T>) + 'static,
-{
-    let (tx, rx) = mpsc::channel();
-    let generation = request.generation;
-    thread::spawn(move || {
-        if !request.delay.is_zero() {
-            thread::sleep(request.delay);
-        }
-        let result = execute(&request.query);
-        let _ = tx.send(result);
-    });
-
-    let complete = Rc::new(RefCell::new(Some(complete)));
-    gtk::glib::timeout_add_local(WORKER_POLL_INTERVAL, move || match rx.try_recv() {
-        Ok(result) => {
-            if let Some(complete) = complete.borrow_mut().take() {
-                complete(generation, result);
-            }
-            gtk::glib::ControlFlow::Break
-        }
-        Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
-        Err(mpsc::TryRecvError::Disconnected) => {
-            if let Some(complete) = complete.borrow_mut().take() {
-                complete(generation, Err(anyhow::anyhow!(cancellation_message)));
-            }
-            gtk::glib::ControlFlow::Break
-        }
-    });
 }
 
 pub(crate) fn fixture_search_worker_delay(

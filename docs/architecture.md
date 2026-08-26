@@ -25,7 +25,24 @@ current search is refreshed. Fixture mode never executes configured external
 sync commands. Sending uses the same hardened runner for a configured external
 transport or the fake capture transport used in tests.
 
-Search input is debounced and run through a background worker with stale-generation discard. Search results are paged (`ui.page_size`), expose a Load more action, and auto-load the next page when the thread list is scrolled to the bottom. Search pages use a 64-entry least-recently-used cache keyed by database path, Notmuch UUID/revision, query, page offset/limit, and the complete excluded-tag vector. Thread UI details use a separate 4,096-entry least-recently-used cache keyed by database path, UUID/revision, and thread ID. Hits refresh recency, so new database generations naturally evict stale entries instead of accumulating without a bound. Cache locks cover only lookup or insertion; Notmuch queries, filesystem reads, and MIME parsing run outside them. Thread previews are cached before the configured display-line limit is applied, so that presentation setting is not part of either key.
+Search input is debounced and submitted to one persistent background worker.
+A newer request cancels active work, coalesces queued requests to the latest
+generation, and checks cancellation between the delay, Notmuch query, and
+bounded thread-detail file-read phases. Search results are paged
+(`ui.page_size`, from 1 through 1,000), expose a Load more action, and auto-load
+the next page when the thread list is scrolled to the bottom. GTK removes,
+appends, or refreshes at most 48 thread-model rows per main-loop iteration and
+cancels stale model updates by generation.
+
+Search pages use a 64-entry least-recently-used cache keyed by database path,
+Notmuch UUID/revision, query, page offset/limit, and the complete excluded-tag
+vector. Thread UI details use a separate 4,096-entry least-recently-used cache
+keyed by database path, UUID/revision, and thread ID. Hits refresh recency, so
+new database generations naturally evict stale entries instead of accumulating
+without a bound. Cache locks cover only lookup or insertion; Notmuch queries,
+bounded filesystem reads, and MIME parsing run outside them. Thread previews
+are cached before the configured display-line limit is applied, so that
+presentation setting is not part of either key.
 
 ## Implementation notes
 

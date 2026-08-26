@@ -26,7 +26,9 @@ use notm_mail::TransportMode;
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::model::{LayoutPreference, MAX_THREAD_PREVIEW_LINES, ThemePreference};
+use crate::model::{
+    LayoutPreference, MAX_SEARCH_PAGE_SIZE, MAX_THREAD_PREVIEW_LINES, ThemePreference,
+};
 
 #[derive(Debug, Clone)]
 pub struct RuntimeSettings {
@@ -64,7 +66,7 @@ pub fn update(store: &RuntimeSettingsStore, settings: RuntimeSettings) {
 }
 
 pub fn page_size(store: &RuntimeSettingsStore) -> usize {
-    snapshot(store).page_size.max(1)
+    snapshot(store).page_size.clamp(1, MAX_SEARCH_PAGE_SIZE)
 }
 
 pub fn theme(store: &RuntimeSettingsStore) -> ThemePreference {
@@ -399,8 +401,12 @@ impl SettingsController {
         let page_size = settings_entry_row(
             &form,
             "Page size",
-            &seed.runtime.page_size.max(1).to_string(),
-            "Positive number of threads loaded per search page.",
+            &seed
+                .runtime
+                .page_size
+                .clamp(1, MAX_SEARCH_PAGE_SIZE)
+                .to_string(),
+            "Threads loaded per search page, from 1 through 1000.",
         );
         page_size.set_input_purpose(gtk::InputPurpose::Digits);
         let layout = settings_combo_row(
@@ -1513,10 +1519,9 @@ pub fn validate_thread_preview_lines(lines: usize) -> anyhow::Result<usize> {
 }
 
 pub fn validate_page_size(page_size: usize) -> anyhow::Result<usize> {
-    anyhow::ensure!(page_size > 0, "page size must be greater than zero");
     anyhow::ensure!(
-        i64::try_from(page_size).is_ok(),
-        "page size is too large to store in configuration"
+        (1..=MAX_SEARCH_PAGE_SIZE).contains(&page_size),
+        "page size must be between 1 and {MAX_SEARCH_PAGE_SIZE}"
     );
     Ok(page_size)
 }
@@ -1970,13 +1975,13 @@ mod tests {
     }
 
     #[test]
-    fn page_size_requires_a_positive_whole_number() {
+    fn page_size_requires_a_portably_bounded_positive_whole_number() {
         assert_eq!(parse_settings_page_size(" 25 ").unwrap(), 25);
         assert!(
             parse_settings_page_size("0")
                 .unwrap_err()
                 .to_string()
-                .contains("greater than zero")
+                .contains("between 1 and 1000")
         );
         assert!(
             parse_settings_page_size("many")
@@ -1984,12 +1989,11 @@ mod tests {
                 .to_string()
                 .contains("positive whole number")
         );
-        #[cfg(target_pointer_width = "64")]
         assert!(
-            validate_page_size((i64::MAX as usize) + 1)
+            validate_page_size(MAX_SEARCH_PAGE_SIZE + 1)
                 .unwrap_err()
                 .to_string()
-                .contains("too large")
+                .contains("between 1 and 1000")
         );
     }
 

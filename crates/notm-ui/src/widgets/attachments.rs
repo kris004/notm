@@ -1,29 +1,40 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::BTreeMap,
     io,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::mpsc,
+    time::Duration,
 };
 
+#[cfg(all(test, unix))]
+use std::os::unix::fs::DirBuilderExt;
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 
 use gtk::prelude::*;
 use gtk4 as gtk;
-use notm_mail::{
-    attachments::{
-        sanitize_attachment_filename, save_attachment_to_target_without_overwrite,
-        save_attachment_without_overwrite,
-    },
-    compose::AttachmentInput,
-    mime::{extract_attachments, extract_attachments_from_reader_detailed},
-};
-use notm_notmuch::{Database, DatabaseMode, MessageSummary, OpenConfig};
+#[cfg(test)]
+use notm_mail::mime::extract_attachments_from_file;
+use notm_mail::{attachments::sanitize_attachment_filename, compose::AttachmentInput};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+#[cfg(test)]
 use uuid::Uuid;
 
-use crate::model::ComposeFields;
+use crate::{
+    attachment_io::{
+        self, AttachmentIoAction, AttachmentIoCoordinator, AttachmentIoRequest,
+        AttachmentIoResponse, AttachmentIoSource, AttachmentIoToken, MAX_FIXTURE_DELAY,
+    },
+    model::ComposeFields,
+    thread_loader::PreparedAttachment,
+};
+
+const ATTACHMENT_ROWS_PER_UPDATE: usize = 24;
+const ATTACHMENT_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(20);
+type AttachmentPayloadMap = BTreeMap<(String, usize), AttachmentIoSource>;
 
 pub(crate) struct AttachmentOpenStore {
     directory: tempfile::TempDir,
@@ -52,27 +63,46 @@ impl AttachmentOpenStore {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ThreadAttachmentItem {
-    message_index: usize,
+    pub(crate) message_index: usize,
     /// Stable depth-first attachment MIME-part index within the message.
-    attachment_index: usize,
-    message_id: String,
-    filename: String,
-    content_type: String,
-    size: usize,
+    pub(crate) attachment_index: usize,
+    pub(crate) message_id: String,
+    pub(crate) filename: String,
+    pub(crate) content_type: String,
+    pub(crate) size: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttachmentOrigin {
-    SelectedMessage,
     Thread,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct AttachmentPayload {
-    message: MessageSummary,
+    message_id: String,
     filename: String,
-    bytes: Vec<u8>,
+    source: AttachmentIoSource,
     origin: AttachmentOrigin,
+}
+
+#[derive(Debug)]
+struct AttachmentActionContext {
+    message_id: String,
+    filename: String,
+    origin: AttachmentOrigin,
+}
+
+impl AttachmentPayload {
+    fn into_parts(self) -> (AttachmentActionContext, AttachmentIoSource) {
+        (
+            AttachmentActionContext {
+                message_id: self.message_id,
+                filename: self.filename,
+                origin: self.origin,
+            },
+            self.source,
+        )
+    }
 }
 
 #[allow(
@@ -81,9 +111,43 @@ pub(crate) struct AttachmentPayload {
 )]
 struct PendingAttachmentSave {
     id: u64,
+    token: AttachmentIoToken,
     suggested_name: String,
     payload: AttachmentPayload,
     dialog: gtk::FileChooserNative,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveAttachmentIo {
+    token: AttachmentIoToken,
+    action: AttachmentIoAction,
+    phase: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct AttachmentIoCompletion {
+    token: AttachmentIoToken,
+    action: AttachmentIoAction,
+    applied: bool,
+    path: Option<PathBuf>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct AttachmentIoRuntime {
+    active: Option<ActiveAttachmentIo>,
+    in_flight: usize,
+    completion_count: u64,
+    stale_completion_count: u64,
+    last_completion: Option<AttachmentIoCompletion>,
+}
+
+#[derive(Clone)]
+struct AttachmentIoLauncher {
+    coordinator: Rc<RefCell<AttachmentIoCoordinator>>,
+    runtime: Rc<RefCell<AttachmentIoRuntime>>,
+    fixture_delay: Rc<Cell<Duration>>,
+    opener: AttachmentOpener,
 }
 
 #[derive(Clone)]
@@ -117,7 +181,6 @@ impl AttachmentOpener {
 
 pub(crate) struct AttachmentActionResult {
     pub(crate) message_id: String,
-    pub(crate) path: PathBuf,
     pub(crate) status: String,
     pub(crate) operation: String,
 }
@@ -139,12 +202,12 @@ pub(crate) struct AttachmentController {
     scrolled: gtk::ScrolledWindow,
     list: gtk::ListBox,
     items: Rc<RefCell<Vec<ThreadAttachmentItem>>>,
-    messages: Rc<RefCell<Vec<MessageSummary>>>,
-    open_config: OpenConfig,
+    payloads: Rc<RefCell<AttachmentPayloadMap>>,
     open_dir: PathBuf,
     pending_save: Rc<RefCell<Option<PendingAttachmentSave>>>,
     next_save_id: Rc<Cell<u64>>,
-    opener: AttachmentOpener,
+    render_generation: Rc<Cell<u64>>,
+    io: AttachmentIoLauncher,
 }
 
 impl AttachmentController {
@@ -152,7 +215,6 @@ impl AttachmentController {
         window: &gtk::ApplicationWindow,
         open_dir: PathBuf,
         fixture_mode: bool,
-        open_config: OpenConfig,
     ) -> Self {
         let title = gtk::Label::new(Some("Attachments in thread"));
         title.set_xalign(0.0);
@@ -176,15 +238,20 @@ impl AttachmentController {
             scrolled,
             list,
             items: Rc::new(RefCell::new(Vec::new())),
-            messages: Rc::new(RefCell::new(Vec::new())),
-            open_config,
+            payloads: Rc::new(RefCell::new(BTreeMap::new())),
             open_dir,
             pending_save: Rc::new(RefCell::new(None)),
             next_save_id: Rc::new(Cell::new(1)),
-            opener: if fixture_mode {
-                AttachmentOpener::Fixture(Rc::new(RefCell::new(Vec::new())))
-            } else {
-                AttachmentOpener::System
+            render_generation: Rc::new(Cell::new(0)),
+            io: AttachmentIoLauncher {
+                coordinator: Rc::new(RefCell::new(AttachmentIoCoordinator::default())),
+                runtime: Rc::new(RefCell::new(AttachmentIoRuntime::default())),
+                fixture_delay: Rc::new(Cell::new(Duration::ZERO)),
+                opener: if fixture_mode {
+                    AttachmentOpener::Fixture(Rc::new(RefCell::new(Vec::new())))
+                } else {
+                    AttachmentOpener::System
+                },
             },
         }
     }
@@ -202,62 +269,111 @@ impl AttachmentController {
     }
 
     pub(crate) fn hide(&self) {
+        self.invalidate_content();
+        while let Some(child) = self.list.first_child() {
+            self.list.remove(&child);
+        }
         self.title.set_visible(false);
         self.scrolled.set_visible(false);
     }
 
-    pub(crate) fn refresh(
+    pub(crate) fn refresh_prepared(
         &self,
-        messages: &[MessageSummary],
+        attachments: &[PreparedAttachment],
         event_handler: AttachmentEventHandler,
     ) {
+        let items = attachments
+            .iter()
+            .map(|attachment| ThreadAttachmentItem {
+                message_index: attachment.message_index,
+                attachment_index: attachment.attachment_index,
+                message_id: attachment.message_id.clone(),
+                filename: attachment.filename.clone(),
+                content_type: attachment.content_type.clone(),
+                size: attachment.size,
+            })
+            .collect();
+        let payloads = attachments
+            .iter()
+            .map(|attachment| {
+                (
+                    (attachment.message_id.clone(), attachment.attachment_index),
+                    AttachmentIoSource::mime_part(
+                        attachment.source.clone(),
+                        attachment.attachment_index,
+                    ),
+                )
+            })
+            .collect();
+        self.replace_items(items, payloads, event_handler);
+    }
+
+    fn replace_items(
+        &self,
+        items: Vec<ThreadAttachmentItem>,
+        payloads: AttachmentPayloadMap,
+        event_handler: AttachmentEventHandler,
+    ) {
+        self.invalidate_content();
+        self.payloads.replace(payloads);
+        let generation = self.render_generation.get();
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
-        self.items.borrow_mut().clear();
-        self.messages.replace(messages.to_vec());
-        let database = Database::open(&self.open_config, DatabaseMode::ReadOnly).ok();
+        self.items.replace(items);
+        self.title.set_visible(false);
+        self.scrolled.set_visible(false);
+        self.append_row_chunk(generation, 0, event_handler);
+    }
 
-        for (message_index, message) in messages.iter().enumerate() {
-            let Some(database) = database.as_ref() else {
-                continue;
-            };
-            let Ok(source) = database.open_message_file(message) else {
-                continue;
-            };
-            let Ok(report) = extract_attachments_from_reader_detailed(source) else {
-                continue;
-            };
-            for attachment in report.attachments {
-                let item = ThreadAttachmentItem {
-                    message_index,
-                    attachment_index: attachment.part_index,
-                    message_id: message.message_id.clone(),
-                    filename: attachment.filename,
-                    content_type: attachment.content_type,
-                    size: attachment.bytes.len(),
-                };
-                let row_index = self.items.borrow().len();
-                let row = gtk::ListBoxRow::new();
-                row.set_widget_name(&format!("notm-attachment-row-{row_index}"));
-                let label = gtk::Label::new(Some(&format!(
-                    "Message {}: {} ({}, {} bytes)",
-                    item.message_index + 1,
-                    item.filename,
-                    item.content_type,
-                    item.size
-                )));
-                label.set_xalign(0.0);
-                label.set_wrap(true);
-                label.set_margin_start(6);
-                label.set_margin_end(6);
-                label.set_margin_top(3);
-                label.set_margin_bottom(3);
-                row.set_child(Some(&label));
-                self.connect_context_menu(&row, item.clone(), event_handler.clone());
-                self.list.append(&row);
-                self.items.borrow_mut().push(item);
-            }
+    fn invalidate_content(&self) {
+        self.render_generation
+            .set(self.render_generation.get().saturating_add(1));
+        self.payloads.borrow_mut().clear();
+        self.items.borrow_mut().clear();
+        self.io.coordinator.borrow_mut().cancel();
+        self.io.runtime.borrow_mut().active = None;
+    }
+
+    fn append_row_chunk(
+        &self,
+        generation: u64,
+        start: usize,
+        event_handler: AttachmentEventHandler,
+    ) {
+        if self.render_generation.get() != generation {
+            return;
+        }
+        let end = (start + ATTACHMENT_ROWS_PER_UPDATE).min(self.items.borrow().len());
+        let items = self.items.borrow()[start..end].to_vec();
+        for (offset, item) in items.into_iter().enumerate() {
+            let row_index = start + offset;
+            let row = gtk::ListBoxRow::new();
+            row.set_widget_name(&format!("notm-attachment-row-{row_index}"));
+            let label = gtk::Label::new(Some(&format!(
+                "Message {}: {} ({}, {} bytes)",
+                item.message_index + 1,
+                item.filename,
+                item.content_type,
+                item.size
+            )));
+            label.set_xalign(0.0);
+            label.set_wrap(true);
+            label.set_margin_start(6);
+            label.set_margin_end(6);
+            label.set_margin_top(3);
+            label.set_margin_bottom(3);
+            row.set_child(Some(&label));
+            self.connect_context_menu(&row, item, event_handler.clone());
+            self.list.append(&row);
+        }
+
+        if end < self.items.borrow().len() {
+            let controller = self.clone();
+            gtk::glib::idle_add_local_once(move || {
+                controller.append_row_chunk(generation, end, event_handler);
+            });
+            return;
         }
 
         let attachment_count = self.items.borrow().len();
@@ -303,24 +419,17 @@ impl AttachmentController {
         true
     }
 
-    pub(crate) fn payload_at_index(
-        &self,
-        selected_message: Option<MessageSummary>,
-        index: usize,
-    ) -> anyhow::Result<AttachmentPayload> {
+    pub(crate) fn payload_at_index(&self, index: usize) -> anyhow::Result<AttachmentPayload> {
         match self.items.borrow().get(index).cloned() {
             Some(item) => self.thread_payload(&item),
-            None => selected_attachment_payload(&self.open_config, selected_message, index),
+            None => anyhow::bail!("attachment index {index} is not prepared"),
         }
     }
 
-    pub(crate) fn active_payload(
-        &self,
-        selected_message: Option<MessageSummary>,
-    ) -> anyhow::Result<AttachmentPayload> {
+    pub(crate) fn active_payload(&self) -> anyhow::Result<AttachmentPayload> {
         match self.selected_thread_attachment() {
             Some(item) => self.thread_payload(&item),
-            None => selected_attachment_payload(&self.open_config, selected_message, 0),
+            None => anyhow::bail!("no prepared attachment is selected"),
         }
     }
 
@@ -342,6 +451,7 @@ impl AttachmentController {
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("attachment save chooser id overflowed"))?;
         self.next_save_id.set(next_id);
+        let token = self.begin_action(AttachmentIoAction::SaveToTarget, "chooser");
 
         let suggested_name = sanitize_attachment_filename(&payload.filename);
         let parent = self.window.upgrade();
@@ -355,12 +465,14 @@ impl AttachmentController {
         dialog.set_current_name(&suggested_name);
         self.pending_save.replace(Some(PendingAttachmentSave {
             id: chooser_id,
+            token,
             suggested_name,
             payload,
             dialog: dialog.clone(),
         }));
 
         let pending_save = Rc::downgrade(&self.pending_save);
+        let io = self.io.clone();
         dialog.connect_response(move |dialog, response| {
             let Some(pending_save) = pending_save.upgrade() else {
                 return;
@@ -376,16 +488,19 @@ impl AttachmentController {
             let target = accepted
                 .then(|| dialog.file().and_then(|file| file.path()))
                 .flatten();
-            emit_result(
-                &event_handler,
-                "Save attachment",
-                complete_pending_attachment_save(
-                    pending_save.as_ref(),
-                    chooser_id,
-                    accepted,
-                    target.as_deref(),
-                ),
-            );
+            if let Err(error) = complete_pending_attachment_save(
+                pending_save.as_ref(),
+                chooser_id,
+                accepted,
+                target.as_deref(),
+                &io,
+                event_handler.clone(),
+            ) {
+                event_handler(AttachmentEvent::Failed {
+                    action: "Save attachment",
+                    error,
+                });
+            }
         });
         dialog.show();
         Ok(chooser_id)
@@ -396,33 +511,81 @@ impl AttachmentController {
         chooser_id: u64,
         accepted: bool,
         target: Option<&Path>,
-    ) -> anyhow::Result<Option<AttachmentActionResult>> {
-        complete_pending_attachment_save(self.pending_save.as_ref(), chooser_id, accepted, target)
+        event_handler: AttachmentEventHandler,
+    ) -> anyhow::Result<Option<AttachmentIoToken>> {
+        complete_pending_attachment_save(
+            self.pending_save.as_ref(),
+            chooser_id,
+            accepted,
+            target,
+            &self.io,
+            event_handler,
+        )
     }
 
     pub(crate) fn save_to_directory(
         &self,
-        payload: &AttachmentPayload,
-        target_dir: &Path,
-    ) -> anyhow::Result<AttachmentActionResult> {
-        let path =
-            save_attachment_without_overwrite(target_dir, &payload.filename, &payload.bytes)?;
-        Ok(saved_action(payload, path))
+        payload: AttachmentPayload,
+        target_dir: PathBuf,
+        event_handler: AttachmentEventHandler,
+    ) -> AttachmentIoToken {
+        let token = self.begin_action(AttachmentIoAction::SaveToDirectory, "writing");
+        let (context, source) = payload.into_parts();
+        let request = AttachmentIoRequest::save_to_directory(
+            token,
+            target_dir,
+            context.filename.clone(),
+            source,
+        )
+        .with_fixture_delay(self.io.fixture_delay.get());
+        launch_attachment_worker(request, context, &self.io, event_handler);
+        token
     }
 
     pub(crate) fn open(
         &self,
-        payload: &AttachmentPayload,
-    ) -> anyhow::Result<AttachmentActionResult> {
-        let path =
-            save_attachment_without_overwrite(&self.open_dir, &payload.filename, &payload.bytes)?;
-        self.opener.open(&path)?;
-        Ok(AttachmentActionResult {
-            message_id: payload.message.message_id.clone(),
-            status: format!("Opened attachment {}", path.display()),
-            operation: format!("opened attachment {}", path.display()),
-            path,
-        })
+        payload: AttachmentPayload,
+        event_handler: AttachmentEventHandler,
+    ) -> AttachmentIoToken {
+        let token = self.begin_action(AttachmentIoAction::PrepareOpen, "writing");
+        let (context, source) = payload.into_parts();
+        let request = AttachmentIoRequest::prepare_open(
+            token,
+            self.open_dir.clone(),
+            context.filename.clone(),
+            source,
+        )
+        .with_fixture_delay(self.io.fixture_delay.get());
+        launch_attachment_worker(request, context, &self.io, event_handler);
+        token
+    }
+
+    fn begin_action(&self, action: AttachmentIoAction, phase: &'static str) -> AttachmentIoToken {
+        let token = self.io.coordinator.borrow_mut().begin();
+        self.io.runtime.borrow_mut().active = Some(ActiveAttachmentIo {
+            token,
+            action,
+            phase,
+        });
+        token
+    }
+
+    pub(crate) fn set_fixture_io_delay(&self, delay: Duration) -> Duration {
+        let delay = delay.min(MAX_FIXTURE_DELAY);
+        self.io.fixture_delay.set(delay);
+        delay
+    }
+
+    pub(crate) fn fixture_io_delay(&self) -> Duration {
+        self.io.fixture_delay.get()
+    }
+
+    pub(crate) fn io_status_json(&self) -> serde_json::Value {
+        attachment_io_status_json(
+            &self.io.coordinator.borrow(),
+            &self.io.runtime.borrow(),
+            self.io.fixture_delay.get(),
+        )
     }
 
     pub(crate) fn pending_save_id(&self) -> Option<u64> {
@@ -433,6 +596,10 @@ impl AttachmentController {
     }
 
     pub(crate) fn test_state_json(&self, status_text: &str) -> serde_json::Value {
+        let mut row_count = 0_usize;
+        while self.list.row_at_index(row_count as i32).is_some() {
+            row_count += 1;
+        }
         let save_chooser = self.pending_save.borrow().as_ref().map(|pending| {
             json!({
                 "id": pending.id,
@@ -440,7 +607,7 @@ impl AttachmentController {
                 "visible": pending.dialog.is_visible(),
             })
         });
-        let fake_opener_calls = self.opener.fixture_calls();
+        let fake_opener_calls = self.io.opener.fixture_calls();
         json!({
             "ok": true,
             "save_chooser": save_chooser,
@@ -448,6 +615,8 @@ impl AttachmentController {
             "open_temp_dir": self.open_dir,
             "fake_opener": fake_opener_calls.is_some(),
             "fake_opener_calls": fake_opener_calls.unwrap_or_default(),
+            "row_count": row_count,
+            "io": self.io_status_json(),
         })
     }
 
@@ -493,11 +662,13 @@ impl AttachmentController {
         let open_handler = event_handler.clone();
         open_button.connect_clicked(move |_| {
             open_popover.popdown();
-            emit_result(
-                &open_handler,
-                "Open attachment",
-                controller.open_thread_attachment(&open_item).map(Some),
-            );
+            if let Err(error) = controller.open_thread_attachment(&open_item, open_handler.clone())
+            {
+                open_handler(AttachmentEvent::Failed {
+                    action: "Open attachment",
+                    error,
+                });
+            }
         });
 
         let open_click = gtk::GestureClick::new();
@@ -515,11 +686,14 @@ impl AttachmentController {
             {
                 list.select_row(Some(&open_row));
             }
-            emit_result(
-                &double_click_handler,
-                "Open attachment",
-                controller.open_thread_attachment(&open_item).map(Some),
-            );
+            if let Err(error) =
+                controller.open_thread_attachment(&open_item, double_click_handler.clone())
+            {
+                double_click_handler(AttachmentEvent::Failed {
+                    action: "Open attachment",
+                    error,
+                });
+            }
         });
         row.add_controller(open_click);
 
@@ -540,24 +714,16 @@ impl AttachmentController {
     }
 
     fn thread_payload(&self, item: &ThreadAttachmentItem) -> anyhow::Result<AttachmentPayload> {
-        let message = self
-            .messages
+        let source = self
+            .payloads
             .borrow()
-            .get(item.message_index)
+            .get(&(item.message_id.clone(), item.attachment_index))
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("attachment message index not found"))?;
-        let database = Database::open(&self.open_config, DatabaseMode::ReadOnly)?;
-        let source = database.open_message_file(&message)?;
-        let report = extract_attachments_from_reader_detailed(source)?;
-        let attachment = report
-            .attachments
-            .into_iter()
-            .find(|attachment| attachment.part_index == item.attachment_index)
-            .ok_or_else(|| anyhow::anyhow!("attachment MIME part not found"))?;
+            .ok_or_else(|| anyhow::anyhow!("attachment payload is still loading"))?;
         Ok(AttachmentPayload {
-            message,
-            filename: attachment.filename,
-            bytes: attachment.bytes,
+            message_id: item.message_id.clone(),
+            filename: item.filename.clone(),
+            source,
             origin: AttachmentOrigin::Thread,
         })
     }
@@ -574,9 +740,10 @@ impl AttachmentController {
     fn open_thread_attachment(
         &self,
         item: &ThreadAttachmentItem,
-    ) -> anyhow::Result<AttachmentActionResult> {
+        event_handler: AttachmentEventHandler,
+    ) -> anyhow::Result<AttachmentIoToken> {
         let payload = self.thread_payload(item)?;
-        self.open(&payload)
+        Ok(self.open(payload, event_handler))
     }
 }
 
@@ -585,7 +752,9 @@ fn complete_pending_attachment_save(
     chooser_id: u64,
     accepted: bool,
     target: Option<&Path>,
-) -> anyhow::Result<Option<AttachmentActionResult>> {
+    io: &AttachmentIoLauncher,
+    event_handler: AttachmentEventHandler,
+) -> anyhow::Result<Option<AttachmentIoToken>> {
     let pending = {
         let mut slot = pending_save.borrow_mut();
         let pending = slot
@@ -597,78 +766,281 @@ fn complete_pending_attachment_save(
         );
         slot.take().expect("pending chooser checked above")
     };
-
-    let result = if accepted {
-        let target = target.ok_or_else(|| {
-            anyhow::anyhow!("the attachment save chooser did not return a local target path")
-        });
-        target.and_then(|target| {
-            let path = save_attachment_to_target_without_overwrite(target, &pending.payload.bytes)?;
-            Ok(Some(saved_action(&pending.payload, path)))
-        })
-    } else {
-        Ok(None)
-    };
-
     pending.dialog.hide();
     pending.dialog.destroy();
-    result
+
+    if !accepted {
+        finish_attachment_action_without_worker(io, pending.token);
+        return Ok(None);
+    }
+
+    let Some(target) = target else {
+        finish_attachment_action_without_worker(io, pending.token);
+        anyhow::bail!("the attachment save chooser did not return a local target path");
+    };
+    let token = pending.token;
+    let (context, source) = pending.payload.into_parts();
+    let request = AttachmentIoRequest::save_to_target(token, target.to_path_buf(), source)
+        .with_fixture_delay(io.fixture_delay.get());
+    launch_attachment_worker(request, context, io, event_handler);
+    Ok(Some(token))
 }
 
-fn emit_result(
-    handler: &AttachmentEventHandler,
-    action: &'static str,
-    result: anyhow::Result<Option<AttachmentActionResult>>,
-) {
-    match result {
-        Ok(Some(result)) => handler(AttachmentEvent::Completed(Box::new(result))),
-        Ok(None) => {}
-        Err(error) => handler(AttachmentEvent::Failed { action, error }),
+fn finish_attachment_action_without_worker(io: &AttachmentIoLauncher, token: AttachmentIoToken) {
+    if io.coordinator.borrow_mut().finish(token) {
+        io.runtime.borrow_mut().active = None;
     }
 }
 
-fn selected_attachment_payload(
-    open_config: &OpenConfig,
-    selected_message: Option<MessageSummary>,
-    index: usize,
-) -> anyhow::Result<AttachmentPayload> {
-    let message = selected_message.ok_or_else(|| anyhow::anyhow!("no selected message"))?;
-    let database = Database::open(open_config, DatabaseMode::ReadOnly)?;
-    let source = database.open_message_file(&message)?;
-    let report = extract_attachments_from_reader_detailed(source)?;
-    let attachment = report
-        .attachments
-        .get(index)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("attachment index {index} not found"))?;
-    Ok(AttachmentPayload {
-        message,
-        filename: attachment.filename,
-        bytes: attachment.bytes,
-        origin: AttachmentOrigin::SelectedMessage,
+fn launch_attachment_worker(
+    request: AttachmentIoRequest,
+    context: AttachmentActionContext,
+    io: &AttachmentIoLauncher,
+    event_handler: AttachmentEventHandler,
+) {
+    let token = request.token();
+    let action = request.action();
+    if io.coordinator.borrow().accepts(token)
+        && let Some(active) = io.runtime.borrow_mut().active.as_mut()
+        && active.token == token
+    {
+        active.phase = "writing";
+    }
+    {
+        let mut runtime = io.runtime.borrow_mut();
+        runtime.in_flight = runtime.in_flight.saturating_add(1);
+    }
+    let receiver = attachment_io::spawn(request);
+    let io = io.clone();
+    let mut context = Some(context);
+    gtk::glib::timeout_add_local(ATTACHMENT_WORKER_POLL_INTERVAL, move || {
+        match receiver.try_recv() {
+            Ok(response) => {
+                complete_attachment_worker(
+                    response,
+                    context.take().expect("attachment worker completes once"),
+                    action,
+                    &io.coordinator,
+                    &io.runtime,
+                    &io.opener,
+                    &event_handler,
+                );
+                gtk::glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                complete_disconnected_attachment_worker(
+                    token,
+                    action,
+                    &io.coordinator,
+                    &io.runtime,
+                    &event_handler,
+                );
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+fn complete_attachment_worker(
+    response: AttachmentIoResponse,
+    context: AttachmentActionContext,
+    action: AttachmentIoAction,
+    io_coordinator: &Rc<RefCell<AttachmentIoCoordinator>>,
+    io_runtime: &Rc<RefCell<AttachmentIoRuntime>>,
+    opener: &AttachmentOpener,
+    event_handler: &AttachmentEventHandler,
+) {
+    let applied = io_coordinator.borrow_mut().finish(response.token);
+    {
+        let mut runtime = io_runtime.borrow_mut();
+        runtime.in_flight = runtime.in_flight.saturating_sub(1);
+        runtime.completion_count = runtime.completion_count.saturating_add(1);
+        if applied {
+            runtime.active = None;
+        } else {
+            runtime.stale_completion_count = runtime.stale_completion_count.saturating_add(1);
+        }
+    }
+
+    if !applied {
+        let (path, error) = attachment_response_snapshot(&response);
+        io_runtime.borrow_mut().last_completion = Some(AttachmentIoCompletion {
+            token: response.token,
+            action,
+            applied: false,
+            path,
+            error,
+        });
+        return;
+    }
+
+    match response.result {
+        Ok(completed) => {
+            debug_assert_eq!(completed.action, action);
+            let path = completed.path;
+            let action_result = if action == AttachmentIoAction::PrepareOpen {
+                opener
+                    .open(&path)
+                    .map(|()| opened_action(&context, path.clone()))
+            } else {
+                Ok(saved_action(&context, path.clone()))
+            };
+            match action_result {
+                Ok(result) => {
+                    io_runtime.borrow_mut().last_completion = Some(AttachmentIoCompletion {
+                        token: response.token,
+                        action,
+                        applied: true,
+                        path: Some(path),
+                        error: None,
+                    });
+                    event_handler(AttachmentEvent::Completed(Box::new(result)));
+                }
+                Err(error) => {
+                    let error_text = error.to_string();
+                    io_runtime.borrow_mut().last_completion = Some(AttachmentIoCompletion {
+                        token: response.token,
+                        action,
+                        applied: true,
+                        path: Some(path),
+                        error: Some(error_text),
+                    });
+                    event_handler(AttachmentEvent::Failed {
+                        action: attachment_action_label(action),
+                        error,
+                    });
+                }
+            }
+        }
+        Err(error) => {
+            let error_text = error.to_string();
+            io_runtime.borrow_mut().last_completion = Some(AttachmentIoCompletion {
+                token: response.token,
+                action,
+                applied: true,
+                path: None,
+                error: Some(error_text),
+            });
+            event_handler(AttachmentEvent::Failed {
+                action: attachment_action_label(action),
+                error: anyhow::Error::new(error),
+            });
+        }
+    }
+}
+
+fn complete_disconnected_attachment_worker(
+    token: AttachmentIoToken,
+    action: AttachmentIoAction,
+    io_coordinator: &Rc<RefCell<AttachmentIoCoordinator>>,
+    io_runtime: &Rc<RefCell<AttachmentIoRuntime>>,
+    event_handler: &AttachmentEventHandler,
+) {
+    let error = "attachment worker stopped without returning a result".to_string();
+    let applied = io_coordinator.borrow_mut().finish(token);
+    {
+        let mut runtime = io_runtime.borrow_mut();
+        runtime.in_flight = runtime.in_flight.saturating_sub(1);
+        runtime.completion_count = runtime.completion_count.saturating_add(1);
+        if applied {
+            runtime.active = None;
+        } else {
+            runtime.stale_completion_count = runtime.stale_completion_count.saturating_add(1);
+        }
+        runtime.last_completion = Some(AttachmentIoCompletion {
+            token,
+            action,
+            applied,
+            path: None,
+            error: Some(error.clone()),
+        });
+    }
+    if applied {
+        event_handler(AttachmentEvent::Failed {
+            action: attachment_action_label(action),
+            error: anyhow::anyhow!(error),
+        });
+    }
+}
+
+fn attachment_response_snapshot(
+    response: &AttachmentIoResponse,
+) -> (Option<PathBuf>, Option<String>) {
+    match &response.result {
+        Ok(completed) => (Some(completed.path.clone()), None),
+        Err(error) => (None, Some(error.to_string())),
+    }
+}
+
+fn attachment_action_label(action: AttachmentIoAction) -> &'static str {
+    match action {
+        AttachmentIoAction::SaveToDirectory | AttachmentIoAction::SaveToTarget => "Save attachment",
+        AttachmentIoAction::PrepareOpen => "Open attachment",
+    }
+}
+
+fn attachment_io_status_json(
+    coordinator: &AttachmentIoCoordinator,
+    runtime: &AttachmentIoRuntime,
+    fixture_delay: Duration,
+) -> serde_json::Value {
+    let active = runtime.active.as_ref().map(|active| {
+        json!({
+            "generation": active.token.generation,
+            "request_id": active.token.request_id,
+            "action": active.action.as_str(),
+            "phase": active.phase,
+        })
+    });
+    let last_completion = runtime.last_completion.as_ref().map(|completion| {
+        json!({
+            "generation": completion.token.generation,
+            "request_id": completion.token.request_id,
+            "action": completion.action.as_str(),
+            "applied": completion.applied,
+            "path": completion.path,
+            "error": completion.error,
+        })
+    });
+    json!({
+        "ok": true,
+        "busy": runtime.in_flight > 0,
+        "in_flight": runtime.in_flight,
+        "pending": active.is_some(),
+        "active": active,
+        "active_token": coordinator.active_token().map(|token| json!({
+            "generation": token.generation,
+            "request_id": token.request_id,
+        })),
+        "completion_count": runtime.completion_count,
+        "stale_completion_count": runtime.stale_completion_count,
+        "last_completion": last_completion,
+        "fixture_delay_ms": u64::try_from(fixture_delay.as_millis()).unwrap_or(u64::MAX),
     })
 }
 
-fn saved_action(payload: &AttachmentPayload, path: PathBuf) -> AttachmentActionResult {
-    let operation = match payload.origin {
-        AttachmentOrigin::SelectedMessage => format!(
-            "saved attachment {} from {} to {}",
-            payload.filename,
-            payload.message.message_id,
-            path.display()
-        ),
+fn saved_action(context: &AttachmentActionContext, path: PathBuf) -> AttachmentActionResult {
+    let operation = match context.origin {
         AttachmentOrigin::Thread => format!(
             "saved thread attachment {} from message {} to {}",
-            payload.filename,
-            payload.message.message_id,
+            context.filename,
+            context.message_id,
             path.display()
         ),
     };
     AttachmentActionResult {
-        message_id: payload.message.message_id.clone(),
+        message_id: context.message_id.clone(),
         status: format!("Attachment saved to {}", path.display()),
         operation,
-        path,
+    }
+}
+
+fn opened_action(context: &AttachmentActionContext, path: PathBuf) -> AttachmentActionResult {
+    AttachmentActionResult {
+        message_id: context.message_id.clone(),
+        status: format!("Opened attachment {}", path.display()),
+        operation: format!("opened attachment {}", path.display()),
     }
 }
 
@@ -704,8 +1076,9 @@ pub(crate) fn load_compose_attachments(
         .collect()
 }
 
-pub(crate) fn attachment_inputs_from_bytes(bytes: &[u8]) -> anyhow::Result<Vec<AttachmentInput>> {
-    Ok(extract_attachments(bytes)?
+#[cfg(test)]
+pub(crate) fn attachment_inputs_from_file(path: &Path) -> anyhow::Result<Vec<AttachmentInput>> {
+    Ok(extract_attachments_from_file(path)?
         .into_iter()
         .map(|attachment| AttachmentInput {
             filename: attachment.filename,
@@ -716,6 +1089,7 @@ pub(crate) fn attachment_inputs_from_bytes(bytes: &[u8]) -> anyhow::Result<Vec<A
         .collect())
 }
 
+#[cfg(test)]
 pub(crate) fn cache_composer_attachments(
     attachments: &[AttachmentInput],
     directory: &Path,
@@ -746,6 +1120,7 @@ pub(crate) fn cache_composer_attachments(
         .collect()
 }
 
+#[cfg(test)]
 fn ensure_private_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -777,6 +1152,7 @@ fn attachment_content_type(path: &Path) -> String {
     .to_string()
 }
 
+#[cfg(test)]
 fn safe_filename(filename: &str) -> String {
     let cleaned = filename
         .chars()

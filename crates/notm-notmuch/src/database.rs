@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::{CStr, CString},
     fs::File,
     io::{Read, Seek},
@@ -109,6 +109,46 @@ pub struct ThreadMessagePage {
 impl ThreadMessagePage {
     pub fn has_more(&self) -> bool {
         self.offset.saturating_add(self.messages.len()) < self.total as usize
+    }
+}
+
+/// Per-thread outcome from a bounded batched message lookup.
+///
+/// Limit outcomes never contain a partial message prefix. Callers can still
+/// use successfully loaded sibling threads from the same batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundedThreadMessages {
+    Loaded(Vec<MessageSummary>),
+    ThreadLimitExceeded {
+        thread_id: String,
+        total: usize,
+        limit: usize,
+    },
+    BatchLimitExceeded {
+        total: usize,
+        limit: usize,
+    },
+}
+
+impl std::fmt::Display for BoundedThreadMessages {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Loaded(messages) => {
+                write!(formatter, "loaded {} message(s)", messages.len())
+            }
+            Self::ThreadLimitExceeded {
+                thread_id,
+                total,
+                limit,
+            } => write!(
+                formatter,
+                "thread `{thread_id}` contains {total} message(s), exceeding the requested safety limit of {limit}; no partial thread was loaded"
+            ),
+            Self::BatchLimitExceeded { total, limit } => write!(
+                formatter,
+                "the requested thread-detail batch contains {total} loadable message(s), exceeding the aggregate safety limit of {limit}; no partial batch was loaded"
+            ),
+        }
     }
 }
 
@@ -420,19 +460,182 @@ impl Database {
     /// the message up again, orders and de-duplicates its current filenames, and
     /// tries every candidate until one can be opened as a regular file.
     pub fn open_message_file(&self, message: &MessageSummary) -> Result<ResolvedMessageFile> {
-        let message_id = CString::new(message.message_id.as_str())?;
+        self.open_message_id_file(&message.message_id)
+    }
+
+    /// Resolve and open a message directly from its Message-ID.
+    ///
+    /// This performs one current database lookup, so lazy callers do not need
+    /// to materialize a [`MessageSummary`] or trust a filename retained before
+    /// a Maildir move.
+    pub fn open_message_id_file(&self, message_id: &str) -> Result<ResolvedMessageFile> {
+        let message_id_cstring = CString::new(message_id)?;
         let mut current = std::ptr::null_mut();
         let status = unsafe {
-            ffi::notmuch_database_find_message(self.ptr.as_ptr(), message_id.as_ptr(), &mut current)
+            ffi::notmuch_database_find_message(
+                self.ptr.as_ptr(),
+                message_id_cstring.as_ptr(),
+                &mut current,
+            )
         };
         check(status, self.status_string())?;
         if current.is_null() {
-            return Err(Error::MessageNotFound(message.message_id.clone()));
+            return Err(Error::MessageNotFound(message_id.to_string()));
         }
         let filenames =
             unsafe { collect_filename_paths(ffi::notmuch_message_get_filenames(current)) };
         unsafe { ffi::notmuch_message_destroy(current) };
-        open_message_candidates(&message.message_id, filenames)
+        open_message_candidates(message_id, filenames)
+    }
+
+    /// Looks up one message directly without materializing the messages from
+    /// every thread that may have appeared in a surrounding search result.
+    pub fn find_message(&self, message_id: &str) -> Result<Option<MessageSummary>> {
+        let message_id = CString::new(message_id)?;
+        let mut message = std::ptr::null_mut();
+        let status = unsafe {
+            ffi::notmuch_database_find_message(self.ptr.as_ptr(), message_id.as_ptr(), &mut message)
+        };
+        check(status, self.status_string())?;
+        if message.is_null() {
+            return Ok(None);
+        }
+        let summary = message_summary(message);
+        unsafe { ffi::notmuch_message_destroy(message) };
+        Ok(Some(summary))
+    }
+
+    /// Fetch complete message sets for several threads with one combined query.
+    ///
+    /// A lightweight thread iterator checks every per-thread count before any
+    /// message summaries are materialized. If the sum of otherwise loadable
+    /// threads exceeds `batch_maximum`, no message summaries are materialized
+    /// for that batch. Otherwise a second iterator over the same query loads
+    /// only threads within `thread_maximum`. The result contains an entry for
+    /// every distinct requested ID, including IDs that no longer exist, and
+    /// every loaded message list is ordered oldest first.
+    pub fn thread_messages_for_threads_bounded(
+        &self,
+        thread_ids: &[String],
+        thread_maximum: usize,
+        batch_maximum: usize,
+    ) -> Result<BTreeMap<String, BoundedThreadMessages>> {
+        let requested = thread_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if requested.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let query = thread_query(&requested);
+        let options = QueryOptions {
+            sort: SortOrder::OldestFirst,
+            limit: usize::MAX,
+            offset: 0,
+            excluded_tags: Vec::new(),
+        };
+        let query = self.create_query(&query, &options)?;
+        let mut outcomes = requested
+            .iter()
+            .map(|thread_id| {
+                (
+                    (*thread_id).to_string(),
+                    BoundedThreadMessages::Loaded(Vec::new()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut expected_counts = BTreeMap::new();
+        let mut loadable_total = 0usize;
+
+        let mut threads = std::ptr::null_mut();
+        let status = unsafe { ffi::notmuch_query_search_threads(query.as_ptr(), &mut threads) };
+        check(status, self.status_string())?;
+        while unsafe { ffi::notmuch_threads_valid(threads) } != 0 {
+            let thread = unsafe { ffi::notmuch_threads_get(threads) };
+            if !thread.is_null() {
+                let thread_id =
+                    unsafe { cstr_to_string(ffi::notmuch_thread_get_thread_id(thread)) };
+                let total =
+                    usize::try_from(unsafe { ffi::notmuch_thread_get_total_messages(thread) })
+                        .unwrap_or_default();
+                if requested.contains(thread_id.as_str()) {
+                    expected_counts.insert(thread_id.clone(), total);
+                    if total > thread_maximum {
+                        outcomes.insert(
+                            thread_id.clone(),
+                            BoundedThreadMessages::ThreadLimitExceeded {
+                                thread_id,
+                                total,
+                                limit: thread_maximum,
+                            },
+                        );
+                    } else {
+                        loadable_total = loadable_total.saturating_add(total);
+                    }
+                }
+                unsafe { ffi::notmuch_thread_destroy(thread) };
+            }
+            unsafe { ffi::notmuch_threads_move_to_next(threads) };
+        }
+        check_threads_iterator(threads, self.status_string())?;
+
+        if loadable_total > batch_maximum {
+            for (thread_id, outcome) in &mut outcomes {
+                if expected_counts.get(thread_id).copied().unwrap_or_default() > 0
+                    && matches!(outcome, BoundedThreadMessages::Loaded(_))
+                {
+                    *outcome = BoundedThreadMessages::BatchLimitExceeded {
+                        total: loadable_total,
+                        limit: batch_maximum,
+                    };
+                }
+            }
+            return Ok(outcomes);
+        }
+        if loadable_total == 0 {
+            return Ok(outcomes);
+        }
+
+        for (thread_id, outcome) in &mut outcomes {
+            if let BoundedThreadMessages::Loaded(messages) = outcome {
+                messages.reserve(expected_counts.get(thread_id).copied().unwrap_or_default());
+            }
+        }
+
+        let mut messages = std::ptr::null_mut();
+        let status = unsafe { ffi::notmuch_query_search_messages(query.as_ptr(), &mut messages) };
+        check(status, self.status_string())?;
+        while unsafe { ffi::notmuch_messages_valid(messages) } != 0 {
+            let message = unsafe { ffi::notmuch_messages_get(messages) };
+            if !message.is_null() {
+                let thread_id =
+                    unsafe { cstr_to_string(ffi::notmuch_message_get_thread_id(message)) };
+                if let Some(BoundedThreadMessages::Loaded(thread_messages)) =
+                    outcomes.get_mut(&thread_id)
+                {
+                    thread_messages.push(message_summary(message));
+                }
+                unsafe { ffi::notmuch_message_destroy(message) };
+            }
+            unsafe { ffi::notmuch_messages_move_to_next(messages) };
+        }
+        check_messages_iterator(messages, self.status_string())?;
+
+        for (thread_id, outcome) in &outcomes {
+            let BoundedThreadMessages::Loaded(messages) = outcome else {
+                continue;
+            };
+            let expected = expected_counts.get(thread_id).copied().unwrap_or_default();
+            if messages.len() != expected {
+                return Err(Error::InconsistentThreadMessages {
+                    thread_id: thread_id.clone(),
+                    expected,
+                    loaded: messages.len(),
+                });
+            }
+        }
+        Ok(outcomes)
     }
 
     pub fn index_file_with_tags(&self, path: &Path, tags: &[&str]) -> Result<String> {
@@ -755,6 +958,34 @@ fn sort_to_ffi(sort: SortOrder) -> ffi::notmuch_sort_t {
     }
 }
 
+fn thread_query(thread_ids: &BTreeSet<&str>) -> String {
+    thread_ids
+        .iter()
+        .map(|thread_id| format!("thread:{thread_id}"))
+        .collect::<Vec<_>>()
+        .join(" or ")
+}
+
+#[cfg(test)]
+fn group_thread_messages(
+    requested: &BTreeSet<&str>,
+    messages: Vec<MessageSummary>,
+) -> BTreeMap<String, Vec<MessageSummary>> {
+    let mut grouped = requested
+        .iter()
+        .map(|thread_id| ((*thread_id).to_string(), Vec::new()))
+        .collect::<BTreeMap<_, _>>();
+    for message in messages {
+        if let Some(thread_messages) = grouped.get_mut(message.thread_id.as_str()) {
+            thread_messages.push(message);
+        }
+    }
+    for thread_messages in grouped.values_mut() {
+        thread_messages.sort_by_key(|message| message.date);
+    }
+    grouped
+}
+
 fn thread_summary(thread: *mut ffi::notmuch_thread_t) -> ThreadSummary {
     let tags = unsafe { collect_tags(ffi::notmuch_thread_get_tags(thread)) };
     ThreadSummary {
@@ -1044,6 +1275,229 @@ fn effective_tag_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, path::PathBuf, sync::atomic::AtomicU64};
+
+    static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> std::io::Result<Self> {
+            loop {
+                let sequence = NEXT_TEMP_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "notm-notmuch-batch-test-{}-{sequence}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Ok(Self(path)),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn message(thread_id: &str, message_id: &str, date: i64) -> MessageSummary {
+        MessageSummary {
+            message_id: message_id.to_string(),
+            thread_id: thread_id.to_string(),
+            date,
+            from: String::new(),
+            to: String::new(),
+            cc: String::new(),
+            subject: String::new(),
+            tags: Vec::new(),
+            filenames: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn batched_thread_query_deduplicates_requested_threads() {
+        let requested = ["thread-b", "thread-a", "thread-b"]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            thread_query(&requested),
+            "thread:thread-a or thread:thread-b"
+        );
+    }
+
+    #[test]
+    fn grouped_thread_messages_include_missing_threads_and_sort_each_group_oldest_first() {
+        let requested = ["thread-a", "thread-b", "thread-missing"]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let grouped = group_thread_messages(
+            &requested,
+            vec![
+                message("thread-a", "newest-a", 30),
+                message("thread-b", "only-b", 20),
+                message("unrequested", "ignored", 1),
+                message("thread-a", "oldest-a", 10),
+                message("thread-a", "middle-a", 20),
+            ],
+        );
+
+        assert_eq!(grouped.len(), 3);
+        assert_eq!(
+            grouped["thread-a"]
+                .iter()
+                .map(|message| message.message_id.as_str())
+                .collect::<Vec<_>>(),
+            ["oldest-a", "middle-a", "newest-a"]
+        );
+        assert_eq!(grouped["thread-b"][0].message_id, "only-b");
+        assert!(grouped["thread-missing"].is_empty());
+        assert!(!grouped.contains_key("unrequested"));
+    }
+
+    #[test]
+    fn batched_thread_message_lookup_groups_real_notmuch_results() -> Result<()> {
+        let temp = TestDirectory::new()?;
+        let root = temp.path().join("mail");
+        let maildir = root.join("inbox/cur");
+        fs::create_dir_all(&maildir)?;
+        let config_path = temp.path().join("notmuch-config");
+        fs::write(
+            &config_path,
+            format!(
+                "[database]\npath={}\n\n[user]\nname=Fixture User\nprimary_email=fixture@example.test\n",
+                root.display()
+            ),
+        )?;
+        let open_config = OpenConfig {
+            database_path: Some(root),
+            config_path: Some(config_path),
+            profile: None,
+        };
+        let db = Database::create(&open_config)?;
+        let fixtures = [
+            (
+                "root:2,",
+                "From: sender@example.test\nTo: fixture@example.test\nSubject: Batch thread\nMessage-ID: <batch-root@fixture.test>\nDate: Tue, 25 Aug 2026 12:00:00 -0600\n\nOldest.\n",
+            ),
+            (
+                "newest:2,",
+                "From: sender@example.test\nTo: fixture@example.test\nSubject: Re: Batch thread\nMessage-ID: <batch-newest@fixture.test>\nIn-Reply-To: <batch-middle@fixture.test>\nReferences: <batch-root@fixture.test> <batch-middle@fixture.test>\nDate: Tue, 25 Aug 2026 12:02:00 -0600\n\nNewest.\n",
+            ),
+            (
+                "middle:2,",
+                "From: sender@example.test\nTo: fixture@example.test\nSubject: Re: Batch thread\nMessage-ID: <batch-middle@fixture.test>\nIn-Reply-To: <batch-root@fixture.test>\nReferences: <batch-root@fixture.test>\nDate: Tue, 25 Aug 2026 12:01:00 -0600\n\nMiddle.\n",
+            ),
+            (
+                "other:2,",
+                "From: other@example.test\nTo: fixture@example.test\nSubject: Other batch thread\nMessage-ID: <batch-other@fixture.test>\nDate: Tue, 25 Aug 2026 12:03:00 -0600\n\nOther.\n",
+            ),
+        ];
+        for (filename, raw) in fixtures {
+            let path = maildir.join(filename);
+            fs::write(&path, raw)?;
+            db.index_file_with_tags(&path, &["batch-test"])?;
+        }
+
+        let threads = db.search_threads(
+            "tag:batch-test",
+            &QueryOptions {
+                sort: SortOrder::NewestFirst,
+                limit: 10,
+                offset: 0,
+                excluded_tags: Vec::new(),
+            },
+        )?;
+        assert_eq!(threads.len(), 2);
+        let multi_thread_id = threads
+            .iter()
+            .find(|thread| thread.total_messages == 3)
+            .expect("three-message thread")
+            .thread_id
+            .clone();
+        let other_thread_id = threads
+            .iter()
+            .find(|thread| thread.total_messages == 1)
+            .expect("single-message thread")
+            .thread_id
+            .clone();
+        let missing_thread_id = "missing-thread-id".to_string();
+
+        let requested = [
+            other_thread_id.clone(),
+            missing_thread_id.clone(),
+            multi_thread_id.clone(),
+            multi_thread_id.clone(),
+        ];
+        let grouped = db.thread_messages_for_threads_bounded(&requested, 3, 4)?;
+
+        assert_eq!(grouped.len(), 3);
+        let BoundedThreadMessages::Loaded(multi_thread) = &grouped[&multi_thread_id] else {
+            panic!("three-message thread should load at its exact bound");
+        };
+        assert_eq!(
+            multi_thread
+                .iter()
+                .map(|message| message.message_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "batch-root@fixture.test",
+                "batch-middle@fixture.test",
+                "batch-newest@fixture.test"
+            ]
+        );
+        let BoundedThreadMessages::Loaded(other_thread) = &grouped[&other_thread_id] else {
+            panic!("single-message sibling should load");
+        };
+        assert_eq!(other_thread[0].message_id, "batch-other@fixture.test");
+        assert_eq!(
+            grouped[&missing_thread_id],
+            BoundedThreadMessages::Loaded(Vec::new())
+        );
+
+        let per_thread_limited = db.thread_messages_for_threads_bounded(&requested, 2, 4)?;
+        assert!(matches!(
+            &per_thread_limited[&multi_thread_id],
+            BoundedThreadMessages::ThreadLimitExceeded {
+                thread_id,
+                total: 3,
+                limit: 2,
+            } if thread_id == &multi_thread_id
+        ));
+        let BoundedThreadMessages::Loaded(other_thread) = &per_thread_limited[&other_thread_id]
+        else {
+            panic!("oversized thread must not hide an in-bound sibling");
+        };
+        assert_eq!(other_thread.len(), 1);
+
+        let batch_limited = db.thread_messages_for_threads_bounded(&requested, 3, 3)?;
+        for thread_id in [&multi_thread_id, &other_thread_id] {
+            assert_eq!(
+                batch_limited[thread_id],
+                BoundedThreadMessages::BatchLimitExceeded { total: 4, limit: 3 }
+            );
+        }
+        assert_eq!(
+            batch_limited[&missing_thread_id],
+            BoundedThreadMessages::Loaded(Vec::new()),
+            "a missing requested ID consumes no materialization budget"
+        );
+        let direct = db
+            .find_message("batch-middle@fixture.test")?
+            .expect("direct message lookup");
+        assert_eq!(direct.message_id, "batch-middle@fixture.test");
+        assert_eq!(direct.thread_id, multi_thread_id);
+        assert!(db.find_message("missing@fixture.test")?.is_none());
+        Ok(())
+    }
 
     fn create_test_database() -> (tempfile::TempDir, Database, PathBuf) {
         let temp = tempfile::tempdir().expect("temporary Notmuch test root");
@@ -1189,6 +1643,14 @@ mod tests {
             preferred,
             "current readable candidates should be chosen in deterministic path order"
         );
+        let resolved_by_id = database
+            .open_message_id_file("resolver@example.test")
+            .expect("resolve the moved message directly by Message-ID");
+        assert_eq!(resolved_by_id.path(), preferred);
+        assert!(matches!(
+            database.open_message_id_file("missing@example.test"),
+            Err(Error::MessageNotFound(message_id)) if message_id == "missing@example.test"
+        ));
     }
 
     #[cfg(unix)]

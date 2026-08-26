@@ -1,8 +1,8 @@
 use std::{
     cell::{Cell, RefCell},
     ffi::OsStr,
-    fs::OpenOptions,
-    io::{Read, Write},
+    fs::{File, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     rc::Rc,
     time::Duration,
@@ -12,20 +12,22 @@ use chrono::Utc;
 use gtk::glib::translate::IntoGlib;
 use gtk::prelude::*;
 use gtk4 as gtk;
+#[cfg(test)]
+use notm_mail::mime::parse_file;
 use notm_mail::{
-    ComposedMessage, ReplyKind,
+    ComposedMessage, ParsedMessage,
     address::{format_address, parse_address_list_checked, parse_one_checked},
-    build_reply,
-    compose::{AttachmentInput, Identity},
-    forward::{build_attachment_forward, build_inline_forward},
-    message_io::read_message_bytes,
-    mime::{parse_reader, parse_rfc5322},
+    compose::AttachmentInput,
 };
 use serde::{Deserialize, Serialize};
 use sourceview5::{Buffer as SourceBuffer, View as SourceView, VimIMContext};
 use uuid::Uuid;
 
-use crate::model::{ActiveDraft, ComposeFields};
+use crate::{
+    draft_io::ensure_named_draft_save_fits,
+    draft_recovery::MAX_RECOVERY_BYTES,
+    model::{ActiveDraft, ComposeFields},
+};
 
 use super::attachments;
 
@@ -311,75 +313,40 @@ fn checked_recipient_field(label: &str, value: &str) -> anyhow::Result<Vec<Strin
         .map_err(|err| anyhow::anyhow!("invalid {label} recipients: {err}"))
 }
 
-#[cfg(test)]
-pub(crate) fn prepare_draft_fields_from_message_file(
-    path: impl AsRef<Path>,
-) -> anyhow::Result<(ComposeFields, Vec<AttachmentInput>)> {
-    prepare_draft_fields_from_message_reader(std::fs::File::open(path)?)
-}
-
-pub(crate) fn prepare_draft_fields_from_message_reader(
-    reader: impl Read,
-) -> anyhow::Result<(ComposeFields, Vec<AttachmentInput>)> {
-    let raw = read_message_bytes(reader)?;
-    let parsed = parse_rfc5322(&raw)?;
-    let attachment_inputs = attachments::attachment_inputs_from_bytes(&raw)?;
+pub(crate) fn prepare_draft_fields_from_message(
+    parsed: &ParsedMessage,
+    attachment_inputs: Vec<AttachmentInput>,
+) -> (ComposeFields, Vec<AttachmentInput>) {
     let body = if parsed.text_body.trim().is_empty() {
-        parsed.safe_body
+        parsed.safe_body.clone()
     } else {
-        parsed.text_body
+        parsed.text_body.clone()
     };
-    Ok((
+    (
         ComposeFields {
-            from: parsed.from,
-            to: parsed.to,
-            cc: parsed.cc,
+            from: parsed.from.clone(),
+            to: parsed.to.clone(),
+            cc: parsed.cc.clone(),
             bcc: header_value(&parsed.headers, "Bcc"),
-            subject: parsed.subject,
+            subject: parsed.subject.clone(),
             body,
             attachments: Vec::new(),
-            in_reply_to: nonempty_string(parsed.in_reply_to),
+            in_reply_to: nonempty_string(parsed.in_reply_to.clone()),
             references: references_from_header(&parsed.references),
             text_reply_quote: None,
             html_reply_quote: None,
         },
         attachment_inputs,
-    ))
-}
-
-pub(crate) fn composed_reply_from_reader(
-    reader: impl Read,
-    identity: &Identity,
-    own_emails: &[String],
-    kind: ReplyKind,
-) -> anyhow::Result<ComposedMessage> {
-    Ok(build_reply(
-        &parse_reader(reader)?,
-        identity,
-        own_emails,
-        kind,
-    ))
-}
-
-pub(crate) fn composed_inline_forward_from_reader(
-    reader: impl Read,
-    identity: &Identity,
-) -> anyhow::Result<ComposedMessage> {
-    Ok(build_inline_forward(&parse_reader(reader)?, identity))
-}
-
-pub(crate) fn composed_attachment_forward_from_reader(
-    reader: impl Read,
-    identity: &Identity,
-) -> anyhow::Result<ComposedMessage> {
-    let raw = read_message_bytes(reader)?;
-    let parsed = notm_mail::mime::parse_rfc5322(&raw)?;
-    Ok(build_attachment_forward(&parsed, identity, raw))
+    )
 }
 
 #[cfg(test)]
 fn draft_fields_from_message_file(path: impl AsRef<Path>) -> anyhow::Result<ComposeFields> {
-    let (mut fields, attachment_inputs) = prepare_draft_fields_from_message_file(path)?;
+    let path = path.as_ref();
+    let parsed = parse_file(path)?;
+    let attachment_inputs = attachments::attachment_inputs_from_file(path)?;
+    let (mut fields, attachment_inputs) =
+        prepare_draft_fields_from_message(&parsed, attachment_inputs);
     fields.attachments = attachments::cache_composer_attachments(
         &attachment_inputs,
         &default_attachment_cache_dir(),
@@ -633,18 +600,19 @@ pub(crate) fn default_attachment_cache_dir() -> PathBuf {
     compose_state_path(&default_state_home(), "compose-attachments")
 }
 
-pub(crate) fn save_draft_fields(path: &Path, fields: &ComposeFields) -> anyhow::Result<PathBuf> {
-    atomic_write(path, &serde_json::to_vec_pretty(fields)?)?;
-    Ok(path.to_path_buf())
-}
-
 pub(crate) fn persist_recovery_draft(
     path: &Path,
     legacy_path: Option<&Path>,
     fields: &ComposeFields,
 ) -> anyhow::Result<()> {
     if fields_has_content(fields) {
-        save_draft_fields(path, fields)?;
+        let bytes = serde_json::to_vec_pretty(fields)?;
+        anyhow::ensure!(
+            bytes.len() <= MAX_RECOVERY_BYTES,
+            "recovery draft serializes to {} bytes; limit is {MAX_RECOVERY_BYTES}",
+            bytes.len()
+        );
+        atomic_write_durable(path, &bytes)?;
         if let Some(legacy_path) = legacy_path {
             remove_file_if_present(legacy_path)?;
         }
@@ -652,10 +620,6 @@ pub(crate) fn persist_recovery_draft(
         clear_recovery_draft_files(path, legacy_path)?;
     }
     Ok(())
-}
-
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    atomic_write_with_sync(path, bytes, false)
 }
 
 pub(crate) fn atomic_write_durable(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
@@ -689,6 +653,9 @@ fn atomic_write_with_sync(path: &Path, bytes: &[u8], sync_to_disk: bool) -> anyh
         }
         drop(temporary);
         std::fs::rename(&temporary_path, path)?;
+        if sync_to_disk {
+            sync_directory(parent)?;
+        }
         Ok(())
     })();
     if write_result.is_err() {
@@ -697,7 +664,18 @@ fn atomic_write_with_sync(path: &Path, bytes: &[u8], sync_to_disk: bool) -> anyh
     write_result.map_err(|err| anyhow::anyhow!("writing {} atomically: {err}", path.display()))
 }
 
-fn ensure_private_directory(path: &Path) -> anyhow::Result<()> {
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> anyhow::Result<()> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+pub(crate) fn ensure_private_directory(path: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         let mut builder = std::fs::DirBuilder::new();
@@ -713,18 +691,25 @@ fn ensure_private_directory(path: &Path) -> anyhow::Result<()> {
 pub(crate) fn save_named_draft_fields(
     dir: &Path,
     fields: &ComposeFields,
+    replacement: Option<&Path>,
 ) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(fields_has_content(fields), "draft has no content");
+    let bytes = serde_json::to_vec_pretty(fields)?;
+    ensure_named_draft_save_fits(dir, replacement, bytes.len())?;
     ensure_private_directory(dir)?;
-    let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
-    let slug = widget_token(&fields.subject);
-    let slug = if slug.is_empty() {
-        "untitled".to_string()
+    let path = if let Some(replacement) = replacement {
+        replacement.to_path_buf()
     } else {
-        slug.chars().take(32).collect()
+        let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
+        let slug = widget_token(&fields.subject);
+        let slug = if slug.is_empty() {
+            "untitled".to_string()
+        } else {
+            slug.chars().take(32).collect()
+        };
+        dir.join(format!("{stamp}-{slug}-{}.json", Uuid::new_v4()))
     };
-    let path = dir.join(format!("{stamp}-{slug}-{}.json", Uuid::new_v4()));
-    atomic_write_durable(&path, &serde_json::to_vec_pretty(fields)?)?;
+    atomic_write_durable(&path, &bytes)?;
     Ok(path)
 }
 
@@ -738,6 +723,7 @@ pub(crate) struct DraftSaveReport {
     pub(crate) recovery_cleanup_warning: Option<String>,
 }
 
+#[cfg(test)]
 pub(crate) fn migrate_legacy_named_drafts(dir: &Path, legacy_dir: &Path) -> anyhow::Result<usize> {
     let entries = match std::fs::read_dir(legacy_dir) {
         Ok(entries) => entries,
@@ -773,6 +759,7 @@ pub(crate) fn migrate_legacy_named_drafts(dir: &Path, legacy_dir: &Path) -> anyh
     Ok(migrated)
 }
 
+#[cfg(test)]
 pub(crate) fn list_named_drafts(
     dir: &Path,
     legacy_dir: Option<&Path>,
@@ -827,7 +814,7 @@ pub(crate) fn migrate_legacy_recovery_draft(
     Ok(true)
 }
 
-fn remove_file_if_present(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn remove_file_if_present(path: &Path) -> anyhow::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -843,6 +830,10 @@ pub(crate) fn clear_recovery_draft_files(
     for path in std::iter::once(path).chain(legacy_path) {
         if let Err(err) = remove_file_if_present(path) {
             errors.push(format!("{}: {err}", path.display()));
+        } else if let Some(parent) = path.parent().filter(|parent| parent.exists())
+            && let Err(err) = sync_directory(parent)
+        {
+            errors.push(format!("syncing {}: {err}", parent.display()));
         }
     }
     if !errors.is_empty() {
@@ -865,6 +856,13 @@ pub(crate) fn clear_transient_autosave_error(last_error: &mut Option<String>) ->
     } else {
         false
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NamedDraftEntry {
+    pub(crate) modified: Option<std::time::SystemTime>,
+    pub(crate) path: PathBuf,
+    pub(crate) fields: ComposeFields,
 }
 
 #[derive(Clone)]
@@ -893,6 +891,7 @@ pub(crate) struct ComposerController {
     draft_empty: gtk::Label,
     draft_scrolled: gtk::ScrolledWindow,
     draft_list: gtk::ListBox,
+    named_drafts: Rc<RefCell<Vec<NamedDraftEntry>>>,
     delete_selected_draft: gtk::Button,
     paths: ComposerPaths,
     confirmation: Rc<RefCell<ConfirmationController>>,
@@ -1056,6 +1055,7 @@ impl ComposerController {
             draft_empty,
             draft_scrolled,
             draft_list,
+            named_drafts: Rc::new(RefCell::new(Vec::new())),
             delete_selected_draft,
             paths,
             confirmation: Rc::new(RefCell::new(ConfirmationController {
@@ -1182,6 +1182,14 @@ impl ComposerController {
             .pending
             .as_ref()
             .is_some_and(|pending| matches!(pending.action, PendingAction::SendComposer(_)))
+    }
+
+    pub(crate) fn pending_confirmation_is_close_main_window(&self) -> bool {
+        self.confirmation
+            .borrow()
+            .pending
+            .as_ref()
+            .is_some_and(|pending| matches!(pending.action, PendingAction::CloseMainWindow(_)))
     }
 
     pub(crate) fn take_allow_close_once(&self) -> bool {
@@ -1405,7 +1413,6 @@ impl ComposerController {
         let completion_for_key = self.address_completion.clone();
         let list_weak = self.address_suggestions.downgrade();
         let suggestions_for_key = suggestions;
-        let edited_for_key = edited;
         controller.connect_key_pressed(move |_, key, _, _| {
             let Some(entry) = entry_weak.upgrade() else {
                 return gtk::glib::Propagation::Proceed;
@@ -1424,7 +1431,6 @@ impl ComposerController {
                     )
                 })
             {
-                edited_for_key();
                 return gtk::glib::Propagation::Stop;
             }
             if key == gtk::gdk::Key::Escape {
@@ -1469,7 +1475,7 @@ impl ComposerController {
         entry.add_controller(focus);
     }
 
-    pub(crate) fn connect_address_suggestion_list(&self, edited: ComposerEditedHandler) {
+    pub(crate) fn connect_address_suggestion_list(&self) {
         let active_entry = self.active_address_entry.clone();
         let list_weak = self.address_suggestions.downgrade();
         self.address_suggestions
@@ -1487,7 +1493,6 @@ impl ComposerController {
                 if let Some(list) = list_weak.upgrade() {
                     hide_address_suggestions_list(&list);
                 }
-                edited();
             });
     }
 
@@ -1635,22 +1640,26 @@ impl ComposerController {
     }
 
     pub(crate) fn apply_fields(&self, fields: &ComposeFields) {
+        self.autosave_suppressed.set(true);
         self.from.set_text(&fields.from);
         self.to.set_text(&fields.to);
         self.cc.set_text(&fields.cc);
         self.bcc.set_text(&fields.bcc);
         self.subject.set_text(&fields.subject);
         self.body.buffer().set_text(&fields.body);
+        self.autosave_suppressed.set(false);
         self.move_cursor_to_start();
     }
 
     pub(crate) fn apply_message_fields(&self, message: &ComposedMessage) {
+        self.autosave_suppressed.set(true);
         self.from.set_text(&message.from);
         self.to.set_text(&message.to.join(", "));
         self.cc.set_text(&message.cc.join(", "));
         self.bcc.set_text(&message.bcc.join(", "));
         self.subject.set_text(&message.subject);
         self.body.buffer().set_text(&message.body);
+        self.autosave_suppressed.set(false);
         self.move_cursor_to_start();
     }
 
@@ -1714,13 +1723,46 @@ impl ComposerController {
         move_focus_in_targets(&self.focus_targets(), delta);
     }
 
+    pub(crate) fn replace_named_drafts(&self, drafts: Vec<NamedDraftEntry>) {
+        *self.named_drafts.borrow_mut() = drafts;
+        self.refresh_draft_list();
+    }
+
+    pub(crate) fn named_drafts(&self) -> Vec<NamedDraftEntry> {
+        self.named_drafts.borrow().clone()
+    }
+
+    pub(crate) fn upsert_named_draft(&self, path: PathBuf, fields: ComposeFields) {
+        let mut drafts = self.named_drafts.borrow_mut();
+        drafts.retain(|draft| draft.path != path);
+        drafts.insert(
+            0,
+            NamedDraftEntry {
+                modified: Some(std::time::SystemTime::now()),
+                path,
+                fields,
+            },
+        );
+        drop(drafts);
+        self.refresh_draft_list();
+    }
+
+    pub(crate) fn remove_named_draft(&self, path: &Path) {
+        self.named_drafts
+            .borrow_mut()
+            .retain(|draft| draft.path != path);
+        self.refresh_draft_list();
+    }
+
     pub(crate) fn refresh_draft_list(&self) {
         while let Some(child) = self.draft_list.first_child() {
             self.draft_list.remove(&child);
         }
-        let drafts = list_named_drafts(self.drafts_dir(), self.legacy_drafts_dir());
+        let drafts = self.named_drafts.borrow();
         let is_empty = drafts.is_empty();
-        for (index, (path, fields)) in drafts.into_iter().enumerate() {
+        for (index, draft) in drafts.iter().enumerate() {
+            let path = &draft.path;
+            let fields = &draft.fields;
             let row = gtk::ListBoxRow::new();
             row.set_widget_name(&format!("notm-draft-row-{index}"));
             let subject = if fields.subject.trim().is_empty() {
@@ -1758,9 +1800,11 @@ impl ComposerController {
             .selected_row()
             .map(|row| row.index() as usize)
             .unwrap_or(0);
-        list_named_drafts(self.drafts_dir(), self.legacy_drafts_dir())
-            .into_iter()
-            .nth(index)
+        self.named_drafts
+            .borrow()
+            .get(index)
+            .cloned()
+            .map(|draft| (draft.path, draft.fields))
             .ok_or_else(|| anyhow::anyhow!("no selected draft"))
     }
 }
@@ -2060,6 +2104,37 @@ fn focus_widget_at(targets: &[gtk::Widget], index: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::draft_io::{MAX_NAMED_DRAFT_BYTES, MAX_NAMED_DRAFT_TOTAL_BYTES, MAX_NAMED_DRAFTS};
+
+    fn fields_with_serialized_len(target_len: usize) -> ComposeFields {
+        let empty_len = serde_json::to_vec_pretty(&ComposeFields::default())
+            .expect("serialize empty draft")
+            .len();
+        assert!(target_len > empty_len);
+        let fields = ComposeFields {
+            body: "x".repeat(target_len - empty_len),
+            ..ComposeFields::default()
+        };
+        assert_eq!(
+            serde_json::to_vec_pretty(&fields)
+                .expect("serialize sized draft")
+                .len(),
+            target_len
+        );
+        fields
+    }
+
+    fn assert_named_draft_entries(dir: &Path, expected: usize) {
+        let entries = std::fs::read_dir(dir)
+            .expect("list named-draft directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read named-draft entries");
+        assert_eq!(entries.len(), expected);
+        assert!(entries.iter().all(|entry| {
+            entry.path().extension().and_then(OsStr::to_str) == Some("json")
+                && !entry.file_name().to_string_lossy().ends_with(".tmp")
+        }));
+    }
 
     fn hooks() -> TransitionHooks {
         TransitionHooks::new(|| true, || {})
@@ -2465,6 +2540,250 @@ mod tests {
         }
     }
 
+    #[test]
+    fn oversized_recovery_persist_preserves_last_good_file_without_temporary_artifacts() {
+        let directory = tempfile::tempdir().expect("temporary recovery directory");
+        let state_directory = directory.path().join("notm");
+        let path = state_directory.join("draft.json");
+        let valid = ComposeFields {
+            subject: "Last good recovery".to_string(),
+            body: "recoverable body".to_string(),
+            ..ComposeFields::default()
+        };
+        persist_recovery_draft(&path, None, &valid).expect("seed valid recovery draft");
+        let valid_bytes = std::fs::read(&path).expect("read valid recovery draft");
+
+        let oversized = ComposeFields {
+            body: "x".repeat(MAX_RECOVERY_BYTES),
+            ..ComposeFields::default()
+        };
+        let error = persist_recovery_draft(&path, None, &oversized)
+            .expect_err("oversized recovery draft must be rejected");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("recovery draft serializes to")
+                && message.contains(&format!("limit is {MAX_RECOVERY_BYTES}")),
+            "{message}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read recovery draft after rejected persist"),
+            valid_bytes
+        );
+        let entries = std::fs::read_dir(&state_directory)
+            .expect("list recovery directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read recovery entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path(), path);
+    }
+
+    #[test]
+    fn oversized_named_draft_save_preserves_existing_file_without_temporary_artifacts() {
+        let directory = tempfile::tempdir().expect("temporary named-draft directory");
+        let drafts_directory = directory.path().join("notm/drafts");
+        let valid = ComposeFields {
+            subject: "Last good named draft".to_string(),
+            body: "saved body".to_string(),
+            ..ComposeFields::default()
+        };
+        let valid_path = save_named_draft_fields(&drafts_directory, &valid, None)
+            .expect("seed valid named draft");
+        let valid_bytes = std::fs::read(&valid_path).expect("read valid named draft");
+
+        let oversized = ComposeFields {
+            body: "x".repeat(MAX_NAMED_DRAFT_BYTES),
+            ..ComposeFields::default()
+        };
+        let error = save_named_draft_fields(&drafts_directory, &oversized, None)
+            .expect_err("oversized named draft must be rejected");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("named draft serializes to")
+                && message.contains(&format!("limit is {MAX_NAMED_DRAFT_BYTES}")),
+            "{message}"
+        );
+        assert_eq!(
+            std::fs::read(&valid_path).expect("read named draft after rejected save"),
+            valid_bytes
+        );
+        let entries = std::fs::read_dir(&drafts_directory)
+            .expect("list named-draft directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read named-draft entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path(), valid_path);
+    }
+
+    #[test]
+    fn named_draft_save_at_count_limit_requires_in_place_replacement() {
+        let directory = tempfile::tempdir().expect("temporary named-draft directory");
+        let drafts_directory = directory.path().join("notm/drafts");
+        std::fs::create_dir_all(&drafts_directory).expect("create named-draft directory");
+        let seed = serde_json::to_vec_pretty(&ComposeFields {
+            body: "saved body".to_string(),
+            ..ComposeFields::default()
+        })
+        .expect("serialize seed draft");
+        for index in 0..MAX_NAMED_DRAFTS {
+            std::fs::write(
+                drafts_directory.join(format!("draft-{index:03}.json")),
+                &seed,
+            )
+            .expect("write seed draft");
+        }
+        let replacement = drafts_directory.join("draft-000.json");
+        let prior_bytes = std::fs::read(&replacement).expect("read replacement draft");
+
+        let error = save_named_draft_fields(
+            &drafts_directory,
+            &ComposeFields {
+                body: "new draft".to_string(),
+                ..ComposeFields::default()
+            },
+            None,
+        )
+        .expect_err("new draft at the file-count limit must be rejected");
+        assert!(
+            error.to_string().contains(&format!(
+                "would contain {} JSON files; limit is {MAX_NAMED_DRAFTS}",
+                MAX_NAMED_DRAFTS + 1
+            )),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&replacement).expect("read draft after rejected save"),
+            prior_bytes
+        );
+        assert_named_draft_entries(&drafts_directory, MAX_NAMED_DRAFTS);
+
+        let updated = ComposeFields {
+            subject: "Updated in place".to_string(),
+            body: "replacement body".to_string(),
+            ..ComposeFields::default()
+        };
+        let returned =
+            save_named_draft_fields(&drafts_directory, &updated, Some(replacement.as_path()))
+                .expect("replace named draft at the file-count limit");
+        assert_eq!(returned, replacement);
+        assert_eq!(
+            serde_json::from_slice::<ComposeFields>(
+                &std::fs::read(&returned).expect("read replaced draft")
+            )
+            .expect("parse replaced draft"),
+            updated
+        );
+        assert_named_draft_entries(&drafts_directory, MAX_NAMED_DRAFTS);
+    }
+
+    #[test]
+    fn named_draft_save_rejects_replacement_outside_the_draft_directory() {
+        let directory = tempfile::tempdir().expect("temporary named-draft directory");
+        let drafts_directory = directory.path().join("notm/drafts");
+        std::fs::create_dir_all(&drafts_directory).expect("create named-draft directory");
+        let outside = directory.path().join("outside.json");
+        std::fs::write(&outside, b"last good outside data").expect("write outside file");
+
+        let error = save_named_draft_fields(
+            &drafts_directory,
+            &ComposeFields {
+                body: "replacement body".to_string(),
+                ..ComposeFields::default()
+            },
+            Some(&outside),
+        )
+        .expect_err("out-of-directory replacement must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("is not an existing JSON file directly in"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&outside).expect("read outside file after rejected replacement"),
+            b"last good outside data"
+        );
+        assert_named_draft_entries(&drafts_directory, 0);
+    }
+
+    #[test]
+    fn named_draft_save_near_total_limit_preserves_the_existing_store() {
+        let directory = tempfile::tempdir().expect("temporary named-draft directory");
+        let drafts_directory = directory.path().join("notm/drafts");
+        std::fs::create_dir_all(&drafts_directory).expect("create named-draft directory");
+
+        let full = serde_json::to_vec_pretty(&fields_with_serialized_len(MAX_NAMED_DRAFT_BYTES))
+            .expect("serialize full-sized draft");
+        let first_full = drafts_directory.join("full-00.json");
+        std::fs::write(&first_full, &full).expect("write full-sized draft");
+        for index in 1..15 {
+            std::fs::hard_link(
+                &first_full,
+                drafts_directory.join(format!("full-{index:02}.json")),
+            )
+            .expect("hard-link full-sized draft");
+        }
+        let empty_len = serde_json::to_vec_pretty(&ComposeFields::default())
+            .expect("serialize empty draft")
+            .len();
+        let replacement_len = empty_len + 64;
+        let replacement = drafts_directory.join("replacement.json");
+        let replacement_bytes =
+            serde_json::to_vec_pretty(&fields_with_serialized_len(replacement_len))
+                .expect("serialize replacement draft");
+        std::fs::write(&replacement, &replacement_bytes).expect("write replacement draft");
+        let filler_len = MAX_NAMED_DRAFT_TOTAL_BYTES
+            .checked_sub(15 * MAX_NAMED_DRAFT_BYTES + replacement_len)
+            .expect("calculate filler size");
+        let filler = serde_json::to_vec_pretty(&fields_with_serialized_len(filler_len))
+            .expect("serialize filler draft");
+        std::fs::write(drafts_directory.join("filler.json"), filler).expect("write filler draft");
+        assert_named_draft_entries(&drafts_directory, 17);
+
+        let error = save_named_draft_fields(
+            &drafts_directory,
+            &ComposeFields {
+                body: "another draft".to_string(),
+                ..ComposeFields::default()
+            },
+            None,
+        )
+        .expect_err("new draft at the aggregate-byte limit must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("limit is {MAX_NAMED_DRAFT_TOTAL_BYTES}")),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&replacement).expect("read draft after rejected new save"),
+            replacement_bytes
+        );
+        assert_named_draft_entries(&drafts_directory, 17);
+
+        let larger_replacement = fields_with_serialized_len(replacement_len + 1);
+        let error = save_named_draft_fields(
+            &drafts_directory,
+            &larger_replacement,
+            Some(replacement.as_path()),
+        )
+        .expect_err("growing replacement beyond aggregate-byte limit must be rejected");
+        assert!(
+            error.to_string().contains(&format!(
+                "would use {} bytes; limit is {MAX_NAMED_DRAFT_TOTAL_BYTES}",
+                MAX_NAMED_DRAFT_TOTAL_BYTES + 1
+            )),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&replacement).expect("read draft after rejected replacement"),
+            replacement_bytes
+        );
+        assert_named_draft_entries(&drafts_directory, 17);
+    }
+
     #[cfg(unix)]
     #[test]
     fn named_drafts_are_created_in_a_private_directory() {
@@ -2475,7 +2794,8 @@ mod tests {
             ..ComposeFields::default()
         };
 
-        let path = save_named_draft_fields(&drafts_directory, &fields).expect("save named draft");
+        let path =
+            save_named_draft_fields(&drafts_directory, &fields, None).expect("save named draft");
 
         assert_eq!(
             std::fs::metadata(&drafts_directory)

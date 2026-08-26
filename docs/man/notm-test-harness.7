@@ -67,6 +67,10 @@ outstanding; non-fixture runs reject that test-only argument.
 .BR health ,
 .BR app_state ,
 .BR search_status ,
+.BR thread_load_status ,
+.BR composer_preparation_status ,
+.BR draft_autosave_status ,
+.BR recovery_load_status ,
 .BR get_logs ,
 .BR screenshot .
 .SS Search and navigation
@@ -142,15 +146,50 @@ It targets the selected message ID only and ignores thread multi-selection.
 .BR load_draft ,
 .BR clear_draft ,
 .BR draft_list_state ,
+.BR set_fixture_draft_delay ,
+.BR fail_next_draft_write ,
 .BR activate_draft_by_index ,
 .BR click_delete_selected_draft ,
 .BR pending_confirmation ,
 .BR respond_confirmation .
+.PP
+Startup recovery begins before a harness command can inject latency.  For a
+fixture test-harness process only,
+.B NOTM_FIXTURE_TEST_STARTUP_RECOVERY_DELAY_MS
+delays the recovery worker by at most 5000 milliseconds.  It is ignored unless
+fixture mode and the harness are both enabled.  Poll
+.B recovery_load_status
+and compare the
+.B gtk_heartbeat
+values from two
+.B health
+requests to verify that GTK remains responsive.
+.PP
+.B thread_load_status
+reports prepared message and attachment counts, estimated retained bytes, and
+active/peak payload-preparation workers.  The peak is bounded to one and stale
+queued generations are coalesced.  Fixture tests may set
+.B NOTM_FIXTURE_TEST_LARGE_ATTACHMENT_BYTES
+to enlarge the first attachment-heavy payload, capped at 8 MiB; ordinary
+fixture runs are unchanged.
+.PP
+.B load_draft
+schedules the same bounded recovery reader and returns
+.B pending
+with its generation.  Poll
+.B recovery_load_status
+until
+.B busy
+is false.  A newer composer edit produces a
+.B superseded
+outcome instead of being overwritten by late recovery completion.
 .SS Replies and forwards
 .BR reply_selected ,
 .BR reply_all_selected ,
 .BR forward_selected ,
-.BR forward_as_attachment_selected .
+.BR forward_as_attachment_selected ,
+.BR composer_preparation_status ,
+.BR set_fixture_composer_preparation_delay .
 .SS Message display and attachments
 .BR show_raw_source ,
 .BR show_full_headers ,
@@ -172,6 +211,8 @@ It targets the selected message ID only and ignores thread multi-selection.
 .BR open_selected_attachment ,
 .BR open_attachment ,
 .BR attachment_test_state ,
+.BR attachment_io_status ,
+.BR set_fixture_attachment_delay ,
 .BR respond_attachment_save .
 .PP
 .B load_images_once
@@ -361,12 +402,36 @@ rejected outside fixture mode.  Supplying an explicit
 .B dir
 to
 .B save_selected_attachment
-is a synchronous storage-test bypass and does not exercise the chooser.
+only bypasses the chooser.  Both paths return
+.B pending
+with a generation and request identifier and perform collision-safe writes on
+a worker.  Poll
+.B attachment_io_status
+until
+.B busy
+is false; its
+.B last_completion
+reports the resulting path or error and whether the completion was current.
+.B set_fixture_attachment_delay
+adds at most 5000 milliseconds of worker-side delay in fixture mode and also
+applies to composer attachment caching.
 .PP
-Attachment Open writes a safely named file below an application-owned private
-temporary directory before launching it.  The directory has mode 0700 on Unix
-and is removed on normal process exit.  Fixture mode records the path in a fake
-opener rather than starting an external application.
+Reply, reply-all, inline-forward, forward-as-attachment, and indexed-draft
+message preparation run on a worker and return a pending generation.  Poll
+.B composer_preparation_status
+until
+.B busy
+is false.  The fixture-only
+.B set_fixture_composer_preparation_delay
+adds at most 5000 milliseconds of worker-side delay.  Newer response actions,
+search or thread selection, composer edits, and window/composer close invalidate
+stale generations rather than applying them.
+.PP
+Attachment Open prepares a safely named file below an application-owned private
+temporary directory on a worker, then launches it only after the current
+completion returns to GTK.  The directory has mode 0700 on Unix and is removed
+on normal process exit.  Fixture mode records the path in a fake opener rather
+than starting an external application.
 .PP
 After
 .BR open_settings ,
