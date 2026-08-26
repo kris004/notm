@@ -286,6 +286,9 @@ fn parse_obsolete_threading_phrase(
 
 fn parse_obsolete_threading_word(field: &str, value: &str, index: usize) -> anyhow::Result<usize> {
     let bytes = value.as_bytes();
+    if bytes.get(index..index + 2) == Some(b"=?") {
+        return parse_obsolete_threading_encoded_word(field, value, index);
+    }
     if bytes.get(index) == Some(&b'"') {
         return parse_obsolete_threading_quoted_word(value, index).ok_or_else(|| {
             anyhow::anyhow!(
@@ -302,9 +305,112 @@ fn parse_obsolete_threading_word(field: &str, value: &str, index: usize) -> anyh
     })
 }
 
+fn parse_obsolete_threading_encoded_word(
+    field: &str,
+    value: &str,
+    index: usize,
+) -> anyhow::Result<usize> {
+    let bytes = value.as_bytes();
+    ensure!(
+        index == 0
+            || bytes[..index]
+                .last()
+                .is_some_and(|byte| matches!(byte, b' ' | b'\t')),
+        "{field} contains text adjacent to an RFC 2047 encoded-word near {:?}",
+        &value[index..]
+    );
+    let encoded = &bytes[index..];
+    let charset_end = encoded[2..]
+        .iter()
+        .position(|byte| *byte == b'?')
+        .map(|offset| index + 2 + offset)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{field} contains an unterminated RFC 2047 encoded-word near {:?}",
+                &value[index..]
+            )
+        })?;
+    let charset = &bytes[index + 2..charset_end];
+    ensure!(
+        valid_rfc2047_token(charset),
+        "{field} contains an invalid RFC 2047 charset near {:?}",
+        &value[index..]
+    );
+
+    let encoding_start = charset_end + 1;
+    let encoding_end = bytes[encoding_start..]
+        .iter()
+        .position(|byte| *byte == b'?')
+        .map(|offset| encoding_start + offset)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{field} contains an incomplete RFC 2047 encoded-word near {:?}",
+                &value[index..]
+            )
+        })?;
+    let encoding = &bytes[encoding_start..encoding_end];
+    ensure!(
+        valid_rfc2047_token(encoding),
+        "{field} contains an invalid RFC 2047 encoding near {:?}",
+        &value[index..]
+    );
+
+    let text_start = encoding_end + 1;
+    let text_end = bytes[text_start..]
+        .iter()
+        .position(|byte| *byte == b'?')
+        .map(|offset| text_start + offset)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{field} contains an unterminated RFC 2047 encoded-word near {:?}",
+                &value[index..]
+            )
+        })?;
+    ensure!(
+        bytes.get(text_end + 1) == Some(&b'=') && text_end != text_start,
+        "{field} contains an invalid RFC 2047 encoded-text near {:?}",
+        &value[index..]
+    );
+    let text = &bytes[text_start..text_end];
+    ensure!(
+        text.iter()
+            .all(|byte| byte.is_ascii_graphic() && *byte != b'?'),
+        "{field} contains an invalid RFC 2047 encoded-text near {:?}",
+        &value[index..]
+    );
+    let end = text_end + 2;
+    ensure!(
+        end - index <= 75,
+        "{field} contains an RFC 2047 encoded-word longer than 75 characters"
+    );
+
+    // RFC 2047 sections 6.1 and 6.3 tell readers to recognize the section 2
+    // encoded-word syntax before decoding and not to block handling merely
+    // because its B/Q payload is malformed. We never decode phrase words
+    // here, so syntax-valid payloads stay opaque even when their encoding is
+    // unsupported, incorrectly formed, or violates composer-side placement
+    // restrictions.
+    if let Some(&next) = bytes.get(end) {
+        ensure!(
+            matches!(next, b' ' | b'\t'),
+            "{field} contains text adjacent to an RFC 2047 encoded-word near {:?}",
+            &value[index..]
+        );
+    }
+    Ok(end)
+}
+
+fn valid_rfc2047_token(value: &[u8]) -> bool {
+    !value.is_empty()
+        && value
+            .iter()
+            .all(|byte| byte.is_ascii_graphic() && !b"()<>@,;:\"/[]?.=".contains(byte))
+}
+
 fn parse_obsolete_threading_atom(value: &str, index: usize) -> Option<usize> {
-    // Keep IDs on the ASCII atext parser. Unicode is accepted only here
-    // because mailparse exposes decoded RFC 2047 phrase words to callers.
+    // Keep IDs on the ASCII atext parser. Raw RFC 6532 Unicode is accepted
+    // only in ignored legacy phrase words; RFC 2047 encoded-words take the
+    // dedicated opaque path above and are never decoded into syntax.
     let mut end = index;
     for (offset, character) in value[index..].char_indices() {
         if character.is_ascii() {
@@ -335,9 +441,8 @@ fn parse_obsolete_threading_quoted_word(value: &str, mut index: usize) -> Option
             b' ' | b'\t' | b'!' | b'#'..=b'[' | b']'..=b'~' => index += 1,
             byte if byte.is_ascii() => return None,
             _ => {
-                // mailparse decodes RFC 2047 encoded-words before returning
-                // header values, so an otherwise valid ignored phrase can be
-                // Unicode at this semantic boundary. IDs remain ASCII-only.
+                // RFC 6532 permits raw Unicode header text. It remains
+                // semantically ignored in a legacy phrase; IDs are ASCII-only.
                 let character = value[index..].chars().next()?;
                 if character.is_control() {
                     return None;
@@ -1709,6 +1814,55 @@ mod tests {
                     .unwrap_or_else(|error| panic!("{field} rejected obsolete phrases: {error:#}")),
                 ["<first@example.test>", "<second@example.test>"]
             );
+        }
+    }
+
+    #[test]
+    fn encoded_threading_phrase_words_are_opaque_and_validated() {
+        let sequence = "=?US-ASCII?Q?=3Cfake=40example=2Etest=3E?= \
+                        =?US-ASCII?Q?=2C_=3Cother=40example=2Etest=3E?= \
+                        <real@example.test>";
+        for field in ["In-Reply-To", "References"] {
+            assert_eq!(
+                message_id_tokens(field, &[sequence.to_string()])
+                    .unwrap_or_else(|error| panic!("{field} rejected encoded phrase: {error:#}")),
+                ["<real@example.test>"]
+            );
+        }
+        assert!(
+            message_id_tokens("Message-ID", &[sequence.to_string()]).is_err(),
+            "strict Message-ID accepted an encoded phrase"
+        );
+
+        for tolerated in [
+            "=?UTF-8?Q?bad=ZZ?= <real@example.test>",
+            "=?UTF-8?B?not-base64!?= <real@example.test>",
+            "=?UTF-8?X?value?= <real@example.test>",
+            "=?US-ASCII?Q?=3Cfake@example.test=3E?= <real@example.test>",
+            "=?US-ASCII?Q?phrase,with,commas?= <real@example.test>",
+        ] {
+            for field in ["In-Reply-To", "References"] {
+                assert_eq!(
+                    message_id_tokens(field, &[tolerated.to_string()]).unwrap_or_else(|error| {
+                        panic!("{field} rejected opaque malformed payload {tolerated:?}: {error:#}")
+                    }),
+                    ["<real@example.test>"]
+                );
+            }
+        }
+
+        for invalid in [
+            "=?UTF.8?Q?value?= <real@example.test>",
+            "=?UTF-8?Q??= <real@example.test>",
+            "=?UTF-8?Q?unterminated <real@example.test>",
+            "=?UTF-8?Q?valid?=adjacent <real@example.test>",
+        ] {
+            for field in ["In-Reply-To", "References"] {
+                assert!(
+                    message_id_tokens(field, &[invalid.to_string()]).is_err(),
+                    "{field} accepted malformed encoded-word {invalid:?}"
+                );
+            }
         }
     }
 

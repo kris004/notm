@@ -75,8 +75,9 @@ Content-Type: text/plain; charset=utf-8
 Body"#;
     let parsed = parse_rfc5322(raw)?;
     assert!(
-        parsed.references.contains("日本語") && parsed.references.contains("Café"),
-        "mailparse should expose decoded RFC 2047 phrase words: {:?}",
+        parsed.references.contains("=?UTF-8?B?5pel5pys6Kqe?=")
+            && parsed.references.contains("=?UTF-8?Q?Caf=C3=A9?="),
+        "threading fields should preserve opaque RFC 2047 phrase words: {:?}",
         parsed.references
     );
     let identity = Identity {
@@ -101,6 +102,119 @@ Body"#;
         reparsed.headers.get_first_value("In-Reply-To").as_deref(),
         Some("<current@example.test>")
     );
+    Ok(())
+}
+
+#[test]
+fn reply_ignores_encoded_threading_syntax_and_preserves_real_folded_ids() -> anyhow::Result<()> {
+    let raw = concat!(
+        "From: Alice <alice@example.test>\r\n",
+        "To: Me <me@example.test>\r\n",
+        "Subject: Encoded threading phrases\r\n",
+        "Message-ID: <current@example.test>\r\n",
+        "References: =?US-ASCII?Q?=3Cfake@example.test=3E?=\r\n",
+        "\t=?US-ASCII?Q?,_=3Cother@example.test=3E?=\r\n",
+        " <root@example.test>\r\n",
+        "Content-Type: text/plain; charset=utf-8\r\n",
+        "\r\n",
+        "Body",
+    )
+    .as_bytes();
+    let parsed = parse_rfc5322(raw)?;
+    assert_eq!(
+        parsed.references,
+        "=?US-ASCII?Q?=3Cfake@example.test=3E?=\t\
+         =?US-ASCII?Q?,_=3Cother@example.test=3E?= <root@example.test>"
+    );
+    let identity = Identity {
+        name: Some("Me".into()),
+        email: "me@example.test".into(),
+    };
+
+    let reply = build_reply(
+        &parsed,
+        &identity,
+        &["me@example.test".into()],
+        ReplyKind::Sender,
+    );
+    let rendered = reply.to_rfc5322()?;
+    let reparsed = mailparse::parse_mail(&rendered)?;
+
+    assert_eq!(
+        reparsed.headers.get_first_value("References").as_deref(),
+        Some("<root@example.test> <current@example.test>")
+    );
+    assert_eq!(
+        reparsed.headers.get_first_value("In-Reply-To").as_deref(),
+        Some("<current@example.test>")
+    );
+    let semantic_roundtrip = parse_rfc5322(&rendered)?;
+    assert_eq!(
+        semantic_roundtrip.references,
+        "<root@example.test> <current@example.test>"
+    );
+    assert_eq!(semantic_roundtrip.in_reply_to, "<current@example.test>");
+    Ok(())
+}
+
+#[test]
+fn malformed_encoded_threading_payload_is_ignored_without_blocking_reply() -> anyhow::Result<()> {
+    let raw = b"From: Alice <alice@example.test>\r\n\
+                To: Me <me@example.test>\r\n\
+                Subject: Malformed encoded phrase\r\n\
+                Message-ID: <current@example.test>\r\n\
+                References: =?US-ASCII?Q?=3Cfake=40example=2Etest=3G?= <real@example.test>\r\n\
+                Content-Type: text/plain; charset=utf-8\r\n\r\n\
+                Body";
+    let parsed = parse_rfc5322(raw)?;
+    let identity = Identity {
+        name: Some("Me".into()),
+        email: "me@example.test".into(),
+    };
+    let reply = build_reply(
+        &parsed,
+        &identity,
+        &["me@example.test".into()],
+        ReplyKind::Sender,
+    );
+
+    let rendered = reply.to_rfc5322()?;
+    let reparsed = mailparse::parse_mail(&rendered)?;
+    assert_eq!(
+        reparsed.headers.get_first_value("References").as_deref(),
+        Some("<real@example.test> <current@example.test>")
+    );
+    Ok(())
+}
+
+#[test]
+fn encoded_message_id_spoof_is_not_promoted_into_reply_threading() -> anyhow::Result<()> {
+    let raw = b"From: Alice <alice@example.test>\r\n\
+                To: Me <me@example.test>\r\n\
+                Subject: Encoded Message-ID spoof\r\n\
+                Message-ID: =?US-ASCII?Q?=3Cfake=40example=2Etest=3E?=\r\n\
+                Content-Type: text/plain; charset=utf-8\r\n\r\n\
+                Body";
+    let parsed = parse_rfc5322(raw)?;
+    assert_eq!(
+        parsed.message_id,
+        "=?US-ASCII?Q?=3Cfake=40example=2Etest=3E?="
+    );
+    let identity = Identity {
+        name: Some("Me".into()),
+        email: "me@example.test".into(),
+    };
+    let reply = build_reply(
+        &parsed,
+        &identity,
+        &["me@example.test".into()],
+        ReplyKind::Sender,
+    );
+
+    let error = reply
+        .to_rfc5322()
+        .expect_err("encoded Message-ID text must not become a reply identifier");
+    assert!(error.to_string().contains("In-Reply-To"), "{error:#}");
     Ok(())
 }
 

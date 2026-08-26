@@ -256,18 +256,12 @@ pub fn parse_rfc5322_with_limits(
             .headers
             .get_first_value("Reply-To")
             .unwrap_or_default(),
-        message_id: parsed
-            .headers
-            .get_first_value("Message-ID")
-            .unwrap_or_default(),
-        references: parsed
-            .headers
-            .get_first_value("References")
-            .unwrap_or_default(),
-        in_reply_to: parsed
-            .headers
-            .get_first_value("In-Reply-To")
-            .unwrap_or_default(),
+        // Threading fields are structured syntax, not display text. Keep RFC
+        // 2047 encoded-words opaque here so decoded angle brackets, commas, or
+        // other punctuation can never be reinterpreted as message-id syntax.
+        message_id: first_raw_structured_header(&parsed.headers, "Message-ID")?,
+        references: first_raw_structured_header(&parsed.headers, "References")?,
+        in_reply_to: first_raw_structured_header(&parsed.headers, "In-Reply-To")?,
         headers,
         text_body,
         html_body,
@@ -276,6 +270,59 @@ pub fn parse_rfc5322_with_limits(
         attachments: state.attachments,
         mime_tree: state.tree,
         classification: state.classification,
+    })
+}
+
+fn first_raw_structured_header(
+    headers: &[mailparse::MailHeader<'_>],
+    field: &str,
+) -> anyhow::Result<String> {
+    let Some(header) = headers.get_first_header(field) else {
+        return Ok(String::new());
+    };
+    unfold_raw_structured_header(field, header.get_value_raw())
+}
+
+fn unfold_raw_structured_header(field: &str, raw: &[u8]) -> anyhow::Result<String> {
+    let mut unfolded = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        let byte = raw[index];
+        if matches!(byte, b'\r' | b'\n') {
+            if byte == b'\r' {
+                anyhow::ensure!(
+                    raw.get(index + 1) == Some(&b'\n'),
+                    "{field} contains a bare carriage return"
+                );
+                index += 2;
+            } else {
+                // mailparse also accepts messages whose header lines use LF.
+                // Treat an LF followed by WSP as folding, but never as an
+                // opportunity to introduce another structured header token.
+                index += 1;
+            }
+            anyhow::ensure!(
+                raw.get(index)
+                    .is_some_and(|byte| matches!(byte, b' ' | b'\t')),
+                "{field} contains a non-folding line break"
+            );
+            // RFC unfolding removes only the line break. Preserve the
+            // continuation WSP verbatim because it can be meaningful inside
+            // an obsolete quoted id-left.
+            continue;
+        }
+        anyhow::ensure!(
+            byte == b'\t' || byte >= b' ' && byte != 0x7f,
+            "{field} contains an invalid control character"
+        );
+        unfolded.push(byte);
+        index += 1;
+    }
+    // Match mailparse's UTF-8-first, Latin-1-fallback compatibility without
+    // invoking its RFC 2047 decoder for these structured fields.
+    Ok(match String::from_utf8(unfolded) {
+        Ok(value) => value,
+        Err(error) => error.into_bytes().into_iter().map(char::from).collect(),
     })
 }
 
@@ -1343,6 +1390,64 @@ mod tests {
           Z29vZCBzaWJsaW5n\r\n\
           --x--\r\n"
             .to_vec()
+    }
+
+    #[test]
+    fn structured_threading_headers_preserve_raw_words_and_unfold_fws() {
+        let raw = concat!(
+            "Message-ID: =?US-ASCII?Q?=3Cfake=40example=2Etest=3E?=\r\n",
+            "References: =?UTF-8?Q?encoded=2C_phrase?=\r\n",
+            "\t<root@example.test>\r\n",
+            "In-Reply-To: Café\r\n",
+            " <parent@example.test>\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "Body",
+        );
+
+        let parsed = parse_rfc5322(raw.as_bytes()).expect("parse raw structured headers");
+
+        assert_eq!(
+            parsed.message_id,
+            "=?US-ASCII?Q?=3Cfake=40example=2Etest=3E?="
+        );
+        assert_eq!(
+            parsed.references,
+            "=?UTF-8?Q?encoded=2C_phrase?=\t<root@example.test>"
+        );
+        assert_eq!(parsed.in_reply_to, "Café <parent@example.test>");
+        assert_eq!(
+            parsed.headers.get("Message-ID").map(String::as_str),
+            Some("<fake@example.test>")
+        );
+    }
+
+    #[test]
+    fn structured_threading_headers_reject_controls() {
+        for (raw, expected) in [
+            (
+                b"Message-ID: <real@example.test>\rinjected\r\n\r\nBody".as_slice(),
+                "bare carriage return",
+            ),
+            (
+                b"References: <real@example.test>\x7f\r\n\r\nBody".as_slice(),
+                "invalid control character",
+            ),
+        ] {
+            let error = parse_rfc5322(raw)
+                .expect_err("unsafe structured header text must be rejected")
+                .to_string();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn structured_threading_headers_preserve_folding_and_legacy_bytes() {
+        let raw = b"References: legacy-\xff <\"a\r\n  b\"@example.test>\r\n\r\nBody";
+
+        let parsed = parse_rfc5322(raw).expect("parse legacy structured header text");
+
+        assert_eq!(parsed.references, "legacy-ÿ <\"a  b\"@example.test>");
     }
 
     #[test]
