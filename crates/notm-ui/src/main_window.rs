@@ -4,7 +4,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::{Arc, mpsc},
+    sync::{Arc, OnceLock, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -584,6 +584,7 @@ struct Widgets {
     status_label: gtk::Label,
     composer: ComposerController,
     close_when_idle: Rc<Cell<bool>>,
+    tag_refresh_selected_thread_id: Rc<RefCell<Option<String>>>,
     standalone_messages: StandaloneMessageController,
 }
 
@@ -591,6 +592,15 @@ type SharedState = Rc<RefCell<UiState>>;
 type UndoState = Rc<RefCell<Vec<UndoTagAction>>>;
 type SavedSearchStore = Rc<RefCell<Vec<SavedSearch>>>;
 type HiddenTagSearchStore = Rc<RefCell<BTreeSet<String>>>;
+
+struct ThreadRangeSelectionResponse {
+    request_generation: u64,
+    generation: u64,
+    anchor_index: usize,
+    cursor_index: usize,
+    revision: notm_notmuch::Revision,
+    result: anyhow::Result<BTreeMap<String, notm_notmuch::ThreadSummary>>,
+}
 
 impl SearchActivityState for UiState {
     fn search_generation(&self) -> u64 {
@@ -637,6 +647,58 @@ struct UndoTagHistory {
 }
 
 const UNDO_TAG_HISTORY_VERSION: u8 = 2;
+
+#[derive(Clone)]
+enum PendingTagUiAction {
+    Threads {
+        target_thread_ids: BTreeSet<String>,
+        mutation: TagMutation,
+        undo_detail: Option<String>,
+    },
+    Message {
+        message: notm_notmuch::MessageSummary,
+        mutation: TagMutation,
+    },
+    Undo {
+        actions: Vec<UndoTagAction>,
+    },
+}
+
+enum TagWorkerOperation {
+    Threads {
+        thread_ids: Vec<String>,
+        mutation: TagMutation,
+    },
+    Messages {
+        mutations: Vec<MessageTagMutation>,
+        sync_maildir_flags: bool,
+    },
+    UndoActions {
+        actions: Vec<UndoTagAction>,
+    },
+}
+
+struct TagWorkerResponse {
+    generation: u64,
+    result: anyhow::Result<TagWorkerResult>,
+}
+
+struct TagWorkerResult {
+    report: notm_notmuch::TagBatchReport,
+    operation_errors: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+struct TagCompletionContext {
+    interrupted_search: bool,
+    reserved_search_generation: u64,
+}
+
+impl TagWorkerResult {
+    fn is_complete(&self) -> bool {
+        self.operation_errors.is_empty() && self.report.is_complete()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MessageViewKind {
@@ -751,6 +813,7 @@ struct PreparedActiveDraft {
 const SIDEBAR_MIN_WIDTH: i32 = 136;
 const THREAD_LIST_MIN_WIDTH: i32 = 320;
 const MAX_SYNC_REFRESH_DELAY: Duration = Duration::from_secs(5);
+const MAX_TAG_WORKER_DELAY: Duration = Duration::from_secs(5);
 // GTK measures the message header at unbounded width during compact pane allocation.
 // Reserving multiple lines per metadata row can force the whole message pane taller
 // than the available window; full values stay available via selection and tooltip.
@@ -1536,6 +1599,7 @@ fn build_ui(
         status_label,
         composer,
         close_when_idle: Rc::new(Cell::new(false)),
+        tag_refresh_selected_thread_id: Rc::new(RefCell::new(None)),
         standalone_messages: StandaloneMessageController::new(),
     };
     debug_assert!(
@@ -1624,6 +1688,7 @@ fn build_ui(
         let st = state.clone();
         window.connect_close_request(move |window| {
             if w.composer.take_allow_close_once() {
+                flush_undo_tag_persistence();
                 return gtk::glib::Propagation::Proceed;
             }
             if w.composer.has_pending_confirmation() {
@@ -1631,7 +1696,7 @@ fn build_ui(
             }
             let background_activity = {
                 let state = st.borrow();
-                state.send_in_progress || state.sync_in_progress
+                background_activity_requires_deferred_close(&state)
             };
             if background_activity {
                 w.close_when_idle.set(true);
@@ -1641,6 +1706,9 @@ fn build_ui(
                 let fields = compose_fields(&w, &st);
                 let active_draft = st.borrow().active_draft.clone();
                 if !composer_requires_confirmation(&fields, active_draft.as_ref()) {
+                    // Durable undo history is written off the GTK thread during normal
+                    // operation. Only a final close waits for queued writes to finish.
+                    flush_undo_tag_persistence();
                     return gtk::glib::Propagation::Proceed;
                 }
                 let _ = request_pending_action(&opts, &w, &st, PendingTransition::CloseMainWindow);
@@ -3115,7 +3183,7 @@ fn update_custom_tag_controls(widgets: &Widgets, state: &SharedState) {
     let can_remove = custom_tag_can_remove(widgets, state);
     let background_activity = {
         let state = state.borrow();
-        state.sync_in_progress || state.send_in_progress
+        state.sync_in_progress || state.send_in_progress || tag_path_actions_blocked(&state)
     };
     widgets.single_tag_action_label.set_text(if !has_tag {
         "Add/remove tag: type a tag"
@@ -3170,25 +3238,10 @@ fn prepare_custom_tag_entry_for_next(widgets: &Widgets, state: &SharedState) {
     widgets.custom_tag_entry.select_region(0, -1);
 }
 
-fn visual_selection_range_from_state(state: &UiState) -> Option<(usize, usize)> {
-    if !state.visual_select_mode {
-        return None;
-    }
-    let anchor = state.visual_select_anchor?;
-    let cursor = state.visual_select_cursor.unwrap_or(anchor);
-    Some((anchor.min(cursor), anchor.max(cursor)))
-}
-
 fn tag_target_thread_ids(state: &SharedState) -> BTreeSet<String> {
     let state = state.borrow();
-    if let Some((start, end)) = visual_selection_range_from_state(&state) {
-        state
-            .thread_list_items
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| (start..=end).contains(&(state.thread_window_offset + *index)))
-            .map(|(_, thread)| thread.thread_id.clone())
-            .collect()
+    if state.visual_select_mode {
+        state.visual_selected_threads.clone()
     } else if !state.multi_selected_threads.is_empty() {
         state.multi_selected_threads.clone()
     } else {
@@ -3202,42 +3255,17 @@ fn tag_target_thread_ids(state: &SharedState) -> BTreeSet<String> {
 
 fn tag_target_threads(state: &SharedState) -> Vec<notm_notmuch::ThreadSummary> {
     let state = state.borrow();
-    let target_ids: BTreeSet<String> =
-        if let Some((start, end)) = visual_selection_range_from_state(&state) {
-            state
-                .thread_list_items
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| (start..=end).contains(&(state.thread_window_offset + *index)))
-                .map(|(_, thread)| thread.thread_id.clone())
-                .collect()
-        } else if !state.multi_selected_threads.is_empty() {
-            state.multi_selected_threads.clone()
-        } else {
-            state
-                .selected_thread
-                .iter()
-                .map(|thread| thread.thread_id.clone())
-                .collect()
-        };
-    if target_ids.is_empty() {
+    let snapshots = if state.visual_select_mode {
+        &state.visual_selected_thread_snapshots
+    } else if !state.multi_selected_threads.is_empty() {
+        &state.multi_selected_thread_snapshots
+    } else {
+        return state.selected_thread.iter().cloned().collect();
+    };
+    if snapshots.is_empty() {
         return Vec::new();
     }
-
-    let mut seen = BTreeSet::new();
-    let mut threads = Vec::new();
-    for thread in &state.thread_list_items {
-        if target_ids.contains(&thread.thread_id) && seen.insert(thread.thread_id.clone()) {
-            threads.push(thread.clone());
-        }
-    }
-    if let Some(thread) = &state.selected_thread
-        && target_ids.contains(&thread.thread_id)
-        && seen.insert(thread.thread_id.clone())
-    {
-        threads.push(thread.clone());
-    }
-    threads
+    snapshots.values().cloned().collect()
 }
 
 fn tag_targets_any<F>(state: &SharedState, predicate: F) -> bool
@@ -3245,25 +3273,6 @@ where
     F: FnMut(&notm_notmuch::ThreadSummary) -> bool,
 {
     tag_target_threads(state).iter().any(predicate)
-}
-
-fn tag_query_for_thread_ids(thread_ids: &BTreeSet<String>) -> String {
-    thread_ids
-        .iter()
-        .map(|thread_id| format!("thread:{thread_id}"))
-        .collect::<Vec<_>>()
-        .join(" or ")
-}
-
-#[cfg(test)]
-fn thread_ids_from_tag_query(query: &str) -> BTreeSet<String> {
-    query
-        .split_whitespace()
-        .filter_map(|token| token.strip_prefix("thread:"))
-        .map(|thread_id| thread_id.trim_matches(['(', ')']))
-        .filter(|thread_id| !thread_id.is_empty())
-        .map(ToString::to_string)
-        .collect()
 }
 
 fn tag_target_status_label(count: usize) -> String {
@@ -4988,6 +4997,9 @@ fn select_thread_edge(
     state: &SharedState,
     bottom: bool,
 ) {
+    if !ensure_message_file_actions_allowed(widgets, state) {
+        return;
+    }
     let (window_offset, len, total, query) = {
         let state = state.borrow();
         (
@@ -5022,6 +5034,9 @@ fn select_thread_absolute(
     state: &SharedState,
     one_based: usize,
 ) {
+    if !ensure_message_file_actions_allowed(widgets, state) {
+        return;
+    }
     let mut target = one_based.saturating_sub(1);
     let (window_offset, len, total, query) = {
         let state = state.borrow();
@@ -5051,6 +5066,9 @@ fn select_thread_index_clamped(
     state: &SharedState,
     index: usize,
 ) {
+    if tag_path_actions_blocked(&state.borrow()) {
+        return;
+    }
     let len = state.borrow().thread_list_items.len();
     if len == 0 {
         return;
@@ -5073,12 +5091,32 @@ fn load_thread_page_containing_index(
     query: &str,
     target_index: usize,
 ) {
+    if !ensure_message_file_actions_allowed(widgets, state) {
+        return;
+    }
     if state.borrow().search_loading {
         widgets
             .status_label
             .set_text("Wait for the current search before loading another page");
         return;
     }
+    let visual_snapshot = {
+        let state = state.borrow();
+        if state.visual_select_mode {
+            state.database_revision.clone().map(|revision| {
+                (
+                    state.current_query.clone(),
+                    revision,
+                    state.visual_select_anchor,
+                    state.visual_select_cursor,
+                    state.visual_selected_threads.clone(),
+                    state.visual_selected_thread_snapshots.clone(),
+                )
+            })
+        } else {
+            None
+        }
+    };
     let plan = LocatePagePlan::new(
         query,
         target_index,
@@ -5107,15 +5145,38 @@ fn load_thread_page_containing_index(
         }
         match response.result {
             Ok(data) => {
+                if let Some((expected_query, expected_revision, ..)) = &visual_snapshot
+                    && (&data.query != expected_query || &data.revision != expected_revision)
+                {
+                    let error = format!(
+                        "Visual selection snapshot changed before page navigation (expected revision {}, got {}); reselect it",
+                        expected_revision.revision, data.revision.revision
+                    );
+                    st.borrow_mut().last_error = Some(error.clone());
+                    w.status_label.set_text(&error);
+                    update_thread_result_label(&w, &st);
+                    update_debug(&w, &st);
+                    return;
+                }
                 let outcome = thread_list::reduce_replace_search(data);
-                let keep_visual = plan.visual_anchor_index.is_some()
-                    && st.borrow().visual_select_mode
-                    && st.borrow().current_query == outcome.update.current_query;
                 finish_replaced_search(&opts, &w, &st, outcome, false);
-                if keep_visual {
+                if let Some((
+                    _,
+                    _,
+                    anchor,
+                    cursor,
+                    selected_threads,
+                    selected_thread_snapshots,
+                )) = &visual_snapshot
+                {
                     let mut state = st.borrow_mut();
                     state.visual_select_mode = true;
-                    state.visual_select_anchor = plan.visual_anchor_index;
+                    state.visual_select_anchor = *anchor;
+                    state.visual_select_cursor = *cursor;
+                    state.visual_selected_threads.clone_from(selected_threads);
+                    state
+                        .visual_selected_thread_snapshots
+                        .clone_from(selected_thread_snapshots);
                 }
                 let local_index = plan
                     .target_index
@@ -5155,8 +5216,10 @@ fn thread_row_snapshot(state: &SharedState, index: usize) -> Option<ThreadRowSna
         .cloned()
         .unwrap_or_default();
     let absolute_index = state.thread_window_offset + index;
-    let visual_selected = visual_selection_range_from_state(&state)
-        .is_some_and(|(start, end)| (start..=end).contains(&absolute_index))
+    let visual_selected = state.visual_selected_threads.contains(&thread.thread_id)
+        || state
+            .visual_selection_pending_range
+            .is_some_and(|(start, end)| (start..=end).contains(&absolute_index))
         || state.multi_selected_threads.contains(&thread.thread_id);
     Some(ThreadRowSnapshot {
         thread,
@@ -5169,14 +5232,15 @@ fn thread_row_snapshot(state: &SharedState, index: usize) -> Option<ThreadRowSna
 
 fn thread_model_snapshot(state: &SharedState) -> ThreadModelSnapshot {
     let state = state.borrow();
-    let range = visual_selection_range_from_state(&state);
+    let pending_range = state.visual_selection_pending_range;
     let marked_indices = state
         .thread_list_items
         .iter()
         .enumerate()
         .filter_map(|(index, thread)| {
             let absolute = state.thread_window_offset + index;
-            (range.is_some_and(|(start, end)| (start..=end).contains(&absolute))
+            (state.visual_selected_threads.contains(&thread.thread_id)
+                || pending_range.is_some_and(|(start, end)| (start..=end).contains(&absolute))
                 || state.multi_selected_threads.contains(&thread.thread_id))
             .then_some(index)
         })
@@ -5190,16 +5254,28 @@ fn thread_model_snapshot(state: &SharedState) -> ThreadModelSnapshot {
 
 fn toggle_thread_multi_selection(state: &SharedState, thread_id: &str) -> bool {
     let mut state = state.borrow_mut();
+    let thread = state
+        .thread_list_items
+        .iter()
+        .find(|thread| thread.thread_id == thread_id)
+        .cloned();
     state.visual_select_mode = false;
     state.visual_select_anchor = None;
     state.visual_select_cursor = None;
     state.visual_selected_threads.clear();
+    state.visual_selected_thread_snapshots.clear();
     state.visual_selection_pending_range = None;
     if state.multi_selected_threads.contains(thread_id) {
         state.multi_selected_threads.remove(thread_id);
+        state.multi_selected_thread_snapshots.remove(thread_id);
         false
     } else {
         state.multi_selected_threads.insert(thread_id.to_string());
+        if let Some(thread) = thread {
+            state
+                .multi_selected_thread_snapshots
+                .insert(thread_id.to_string(), thread);
+        }
         true
     }
 }
@@ -6787,6 +6863,23 @@ fn select_thread_index_for_open_message(widgets: &Widgets, index: usize) {
     widgets.thread_list.select_silently(index);
 }
 
+fn restore_thread_list_selection(widgets: &Widgets, state: &SharedState) {
+    let selected_index = {
+        let state = state.borrow();
+        state.selected_thread.as_ref().and_then(|selected| {
+            state
+                .thread_list_items
+                .iter()
+                .position(|thread| thread.thread_id == selected.thread_id)
+        })
+    };
+    if let Some(index) = selected_index {
+        widgets.thread_list.select_silently(index);
+    } else {
+        widgets.thread_list.clear_selection_silently();
+    }
+}
+
 fn scroll_thread_index_into_view(widgets: &Widgets, index: usize) {
     widgets.thread_list.scroll_into_view(index);
 }
@@ -6835,6 +6928,9 @@ fn select_relative_thread(
     state: &SharedState,
     delta: isize,
 ) {
+    if !ensure_message_file_actions_allowed(widgets, state) {
+        return;
+    }
     let (window_offset, len, total, query) = {
         let state = state.borrow();
         (
@@ -7106,12 +7202,13 @@ fn report_draft_persistence_error(
 }
 
 fn update_draft_action_buttons(widgets: &Widgets, state: &SharedState) {
-    let (active_draft, background_activity, send_in_progress) = {
+    let (active_draft, background_activity, response_io_in_progress) = {
         let state = state.borrow();
+        let tag_paths_blocked = tag_path_actions_blocked(&state);
         (
             state.active_draft.clone(),
-            state.sync_in_progress || state.send_in_progress,
-            state.send_in_progress,
+            state.sync_in_progress || state.send_in_progress || tag_paths_blocked,
+            state.send_in_progress || tag_paths_blocked,
         )
     };
     if let Some(active_draft) = active_draft {
@@ -7148,7 +7245,7 @@ fn update_draft_action_buttons(widgets: &Widgets, state: &SharedState) {
     widgets
         .composer
         .clear_draft_button()
-        .set_sensitive(!send_in_progress);
+        .set_sensitive(!response_io_in_progress);
     widgets
         .composer
         .delete_local_draft_button()
@@ -7162,7 +7259,7 @@ fn update_draft_action_buttons(widgets: &Widgets, state: &SharedState) {
     widgets
         .composer
         .draft_list()
-        .set_sensitive(!send_in_progress);
+        .set_sensitive(!response_io_in_progress);
     update_button_binding_labels(widgets, state);
 }
 
@@ -7924,7 +8021,9 @@ fn detach_deleted_indexed_draft_selection(
                     .retain(|thread| thread.thread_id != thread_id);
                 state.thread_details.remove(&thread_id);
                 state.multi_selected_threads.remove(&thread_id);
+                state.multi_selected_thread_snapshots.remove(&thread_id);
                 state.visual_selected_threads.remove(&thread_id);
+                state.visual_selected_thread_snapshots.remove(&thread_id);
                 state.thread_loaded_count = state.thread_list_items.len();
                 if state.thread_list_items.len() < before {
                     state.thread_total_count = state.thread_total_count.saturating_sub(1);
@@ -8580,7 +8679,9 @@ fn update_sender_view_preference_button(widgets: &Widgets, state: &SharedState) 
             "Sender: {sender}. {action} A per-message view choice still takes precedence."
         )));
     widgets.sender_view_preference_button.set_visible(true);
-    widgets.sender_view_preference_button.set_sensitive(true);
+    widgets
+        .sender_view_preference_button
+        .set_sensitive(!tag_path_actions_blocked(&state.borrow()));
 }
 
 fn toggle_text_visual_view(
@@ -8601,6 +8702,9 @@ fn choose_selected_message_view(
     state: &SharedState,
     view: MessageViewKind,
 ) -> bool {
+    if !ensure_message_file_actions_allowed(widgets, state) {
+        return false;
+    }
     let Some(message) = state.borrow().selected_message.clone() else {
         widgets.status_label.set_text("No selected message");
         return false;
@@ -8642,7 +8746,37 @@ fn choose_selected_message_view(
     true
 }
 
+fn ensure_message_file_actions_allowed(widgets: &Widgets, state: &SharedState) -> bool {
+    let (tag_in_progress, tag_paths_uncertain, tag_reconciliation_pending) = {
+        let state = state.borrow();
+        (
+            state.tag_in_progress,
+            state.tag_paths_uncertain,
+            state.tag_warning.is_some(),
+        )
+    };
+    if !tag_in_progress && !tag_paths_uncertain && !tag_reconciliation_pending {
+        return true;
+    }
+    let message = if tag_in_progress {
+        "Message file actions are unavailable while tags are changing"
+    } else {
+        "Message and draft file actions are unavailable until the previous tag result is reconciled; restart notm if uncertainty remains"
+    };
+    widgets.status_label.set_text(message);
+    state.borrow_mut().last_operation = Some(message.to_string());
+    update_debug(widgets, state);
+    false
+}
+
+fn tag_path_actions_blocked(state: &UiState) -> bool {
+    state.tag_in_progress || state.tag_paths_uncertain || state.tag_warning.is_some()
+}
+
 fn activate_image_policy_button(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    if !ensure_message_file_actions_allowed(widgets, state) {
+        return;
+    }
     if selected_message_allows_images(options, state) {
         update_message_action_buttons(options, widgets, state);
         return;
@@ -8659,7 +8793,7 @@ fn update_message_tag_controls(widgets: &Widgets, state: &SharedState) {
         let state = state.borrow();
         (
             state.selected_message.clone(),
-            state.sync_in_progress || state.send_in_progress,
+            state.sync_in_progress || state.send_in_progress || tag_path_actions_blocked(&state),
         )
     };
     let has_message = selected.is_some() && !compose_view_is_visible(widgets);
@@ -8731,18 +8865,48 @@ fn update_message_tag_controls(widgets: &Widgets, state: &SharedState) {
 }
 
 fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    update_message_action_buttons_with_mime_refresh(options, widgets, state, true);
+}
+
+fn update_message_action_buttons_for_activity(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) {
+    update_message_action_buttons_with_mime_refresh(options, widgets, state, false);
+}
+
+fn update_message_action_buttons_with_mime_refresh(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    refresh_mime: bool,
+) {
     let html_visible = html_view_is_visible(widgets);
-    let has_html = selected_message_has_html(state);
-    let (has_message, selected_thread, message_count, background_activity, send_in_progress) = {
+    let (
+        has_message,
+        selected_thread,
+        message_count,
+        background_activity,
+        response_io_in_progress,
+        tag_paths_blocked,
+    ) = {
         let state = state.borrow();
         (
             state.selected_message.is_some(),
             state.selected_thread.clone(),
             state.messages.len(),
-            state.sync_in_progress || state.send_in_progress,
-            state.send_in_progress,
+            state.sync_in_progress || state.send_in_progress || tag_path_actions_blocked(&state),
+            state.send_in_progress || tag_path_actions_blocked(&state),
+            tag_path_actions_blocked(&state),
         )
     };
+    let has_html = has_message
+        && if refresh_mime {
+            selected_message_has_html(state)
+        } else {
+            widgets.view_html_button.is_visible()
+        };
     let has_thread = selected_thread.is_some();
     let multiple_messages = message_count > 1;
     if !has_message {
@@ -8754,7 +8918,7 @@ fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, sta
         .set_visible(multiple_messages);
     widgets
         .response_menu_button
-        .set_sensitive(has_message && !send_in_progress);
+        .set_sensitive(has_message && !response_io_in_progress);
     let tag_targets = tag_target_threads(state);
     let can_mutate_tags = !background_activity && !tag_targets.is_empty();
     for button in [
@@ -8797,17 +8961,25 @@ fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, sta
     widgets
         .image_policy_button
         .set_visible(html_visible && has_html);
-    widgets.message_menu_button.set_sensitive(has_thread);
+    widgets
+        .message_menu_button
+        .set_sensitive(has_thread && !tag_paths_blocked);
     widgets
         .view_menu_button
-        .set_sensitive(has_message || has_thread);
+        .set_sensitive((has_message || has_thread) && !tag_paths_blocked);
     widgets
         .view_text_button
-        .set_sensitive(has_message || has_thread);
+        .set_sensitive((has_message || has_thread) && !tag_paths_blocked);
     widgets.view_html_button.set_visible(has_html);
-    widgets.view_html_button.set_sensitive(has_html);
-    widgets.view_headers_button.set_sensitive(has_message);
-    widgets.view_raw_button.set_sensitive(has_message);
+    widgets
+        .view_html_button
+        .set_sensitive(has_html && !tag_paths_blocked);
+    widgets
+        .view_headers_button
+        .set_sensitive(has_message && !tag_paths_blocked);
+    widgets
+        .view_raw_button
+        .set_sensitive(has_message && !tag_paths_blocked);
     update_sender_view_preference_button(widgets, state);
     widgets
         .copy_menu_button
@@ -8856,10 +9028,12 @@ fn update_message_action_buttons(options: &LaunchOptions, widgets: &Widgets, sta
         widgets.image_policy_button.set_label("Trust sender images");
         widgets
             .image_policy_button
-            .set_sensitive(selected_sender_email(state).is_some());
+            .set_sensitive(!tag_paths_blocked && selected_sender_email(state).is_some());
     } else {
         widgets.image_policy_button.set_label("Load images once");
-        widgets.image_policy_button.set_sensitive(true);
+        widgets
+            .image_policy_button
+            .set_sensitive(!tag_paths_blocked);
     }
     update_button_binding_labels(widgets, state);
 }
@@ -8872,6 +9046,9 @@ fn html_view_is_visible(widgets: &Widgets) -> bool {
 }
 
 fn start_link_hint_mode(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) -> bool {
+    if !ensure_message_file_actions_allowed(widgets, state) {
+        return true;
+    }
     if !message_pane_shortcuts_available(widgets) {
         widgets
             .status_label
@@ -9001,6 +9178,9 @@ fn header_block(raw: &str) -> String {
 }
 
 fn toggle_quote_collapse(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    if !ensure_message_file_actions_allowed(widgets, state) {
+        return;
+    }
     let enabled = !widgets.quote_collapse.get();
     widgets.quote_collapse.set(enabled);
     state.borrow_mut().quote_collapse_enabled = enabled;
@@ -9284,6 +9464,9 @@ fn show_visual_html_with_image_policy(
     state: &SharedState,
     image_policy: ImagePolicy,
 ) {
+    if !ensure_message_file_actions_allowed(widgets, state) {
+        return;
+    }
     let result = {
         let message = state.borrow().selected_message.clone();
         (|| -> anyhow::Result<(String, String, bool, Option<String>, usize)> {
@@ -10175,14 +10358,17 @@ fn start_full_search(
         "search cancelled",
         move |response| {
             if accept_search_page_response(&w, &st, &response) {
-                match response.result {
-                    Ok(data) => finish_replaced_search(
-                        &opts,
-                        &w,
-                        &st,
-                        thread_list::reduce_replace_search(data),
-                        response.select_first,
-                    ),
+                let refreshed = match response.result {
+                    Ok(data) => {
+                        finish_replaced_search(
+                            &opts,
+                            &w,
+                            &st,
+                            thread_list::reduce_replace_search(data),
+                            response.select_first,
+                        );
+                        true
+                    }
                     Err(err) => {
                         let has_threads = !st.borrow().thread_list_items.is_empty();
                         finish_search_error(
@@ -10190,12 +10376,63 @@ fn start_full_search(
                             &st,
                             thread_list::reduce_search_error(err, has_threads),
                         );
+                        false
                     }
+                };
+                restore_tag_warning_after_search(&opts, &w, &st, refreshed);
+                if !refreshed {
+                    w.tag_refresh_selected_thread_id.borrow_mut().take();
                 }
                 record_full_search_outcome(&st, response.generation);
             }
         },
     );
+}
+
+fn restore_tag_warning_after_search(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    refreshed: bool,
+) {
+    let warning = state.borrow().tag_warning.clone();
+    if let Some(warning) = warning {
+        if refreshed && state.borrow().tag_paths_uncertain {
+            let combined = format!(
+                "Tag effects remain uncertain ({warning}); the thread list was refreshed, but retained message and draft filenames cannot be verified safely. Restart notm before using message, draft, tag, send, or sync actions"
+            );
+            let mut state_ref = state.borrow_mut();
+            state_ref.last_error = Some(combined.clone());
+            state_ref.last_operation = Some(combined.clone());
+            drop(state_ref);
+            widgets.status_label.set_text(&combined);
+            update_background_activity_controls(options, widgets, state);
+            close_main_window_after_background_activity(widgets, state);
+        } else if refreshed {
+            let mut state_ref = state.borrow_mut();
+            state_ref.tag_warning = None;
+            state_ref.last_error = Some(warning.clone());
+            drop(state_ref);
+            widgets.status_label.set_text(&format!(
+                "Search state refreshed after the tag operation warning: {warning}"
+            ));
+            update_background_activity_controls(options, widgets, state);
+            close_main_window_after_background_activity(widgets, state);
+        } else {
+            let search_error = state.borrow().search_error.clone().unwrap_or_else(|| {
+                "the reconciliation search did not complete successfully".to_string()
+            });
+            let combined = format!(
+                "Tag effects remain uncertain ({warning}); reconciliation failed: {search_error}"
+            );
+            state.borrow_mut().last_error = Some(combined.clone());
+            widgets.status_label.set_text(&combined);
+            if widgets.close_when_idle.replace(false) {
+                widgets.window.present();
+            }
+        }
+        update_debug(widgets, state);
+    }
 }
 
 fn record_full_search_outcome(state: &SharedState, generation: u64) {
@@ -10275,17 +10512,36 @@ fn finish_replaced_search(
     let cached = outcome.cached;
     let preserve_search_focus = widgets.search_bar.has_focus();
     apply_thread_search_state_update(state, outcome.update);
+    let restored_thread = widgets
+        .tag_refresh_selected_thread_id
+        .borrow_mut()
+        .take()
+        .and_then(|thread_id| {
+            state
+                .borrow()
+                .thread_list_items
+                .iter()
+                .enumerate()
+                .find(|(_, thread)| thread.thread_id == thread_id)
+                .map(|(index, thread)| (index, thread.clone()))
+        });
     {
         let mut state = state.borrow_mut();
-        state.selected_thread = None;
-        state.selected_message = None;
-        state.messages.clear();
+        if let Some((_, thread)) = &restored_thread {
+            state.selected_thread = Some(thread.clone());
+        } else {
+            state.selected_thread = None;
+            state.selected_message = None;
+            state.messages.clear();
+        }
         state.visual_select_mode = false;
         state.visual_select_anchor = None;
         state.visual_select_cursor = None;
         state.visual_selected_threads.clear();
+        state.visual_selected_thread_snapshots.clear();
         state.visual_selection_pending_range = None;
         state.multi_selected_threads.clear();
+        state.multi_selected_thread_snapshots.clear();
     }
     widgets
         .thread_list
@@ -10326,6 +10582,14 @@ fn finish_replaced_search(
 
     if select_first && !state.borrow().thread_list_items.is_empty() {
         select_thread_index_clamped(options, widgets, state, 0);
+    } else if let Some((index, _)) = restored_thread {
+        select_thread_index_for_open_message(widgets, index);
+        widgets.status_label.set_text(&format!(
+            "{} for {}{}; preserved the selected exact thread ID",
+            thread_window_status(state),
+            query,
+            if cached { " (cached)" } else { "" }
+        ));
     } else {
         refresh_thread_attachment_list(widgets, state);
         update_message_menu(options, widgets, state);
@@ -10460,6 +10724,7 @@ fn clear_visual_selection(widgets: &Widgets, state: &SharedState) {
         state.visual_select_anchor = None;
         state.visual_select_cursor = None;
         state.visual_selected_threads.clear();
+        state.visual_selected_thread_snapshots.clear();
         state.visual_selection_pending_range = None;
         state.input_mode = InputMode::Normal;
         state.active_pane = ActivePane::Threads;
@@ -10479,6 +10744,10 @@ fn toggle_multi_selected_thread(widgets: &Widgets, state: &SharedState) {
 }
 
 fn toggle_multi_selected_thread_index(widgets: &Widgets, state: &SharedState, index: usize) {
+    if !ensure_message_file_actions_allowed(widgets, state) {
+        restore_thread_list_selection(widgets, state);
+        return;
+    }
     let (thread_id, count, selected) = {
         let mut state = state.borrow_mut();
         let Some(thread_id) = state
@@ -10495,12 +10764,24 @@ fn toggle_multi_selected_thread_index(widgets: &Widgets, state: &SharedState, in
         state.visual_select_anchor = None;
         state.visual_select_cursor = None;
         state.visual_selected_threads.clear();
+        state.visual_selected_thread_snapshots.clear();
         state.visual_selection_pending_range = None;
         let selected = if state.multi_selected_threads.contains(&thread_id) {
             state.multi_selected_threads.remove(&thread_id);
+            state.multi_selected_thread_snapshots.remove(&thread_id);
             false
         } else {
             state.multi_selected_threads.insert(thread_id.clone());
+            if let Some(thread) = state
+                .thread_list_items
+                .iter()
+                .find(|thread| thread.thread_id == thread_id)
+                .cloned()
+            {
+                state
+                    .multi_selected_thread_snapshots
+                    .insert(thread_id.clone(), thread);
+            }
             true
         };
         (thread_id, state.multi_selected_threads.len(), selected)
@@ -10518,6 +10799,7 @@ fn clear_multi_selection(widgets: &Widgets, state: &SharedState) {
     {
         let mut state = state.borrow_mut();
         state.multi_selected_threads.clear();
+        state.multi_selected_thread_snapshots.clear();
     }
     update_visual_selection_rows_with_force(widgets, state, true);
     widgets.status_label.set_text("Multi-selection cleared");
@@ -10527,7 +10809,7 @@ fn update_visual_selection_to_cursor(widgets: &Widgets, state: &SharedState) {
     let Some(cursor) = selected_thread_index(widgets) else {
         return;
     };
-    let (anchor, cursor, count) = {
+    let (anchor, cursor, count, snapshots) = {
         let state = state.borrow();
         if !state.visual_select_mode {
             return;
@@ -10536,13 +10818,26 @@ fn update_visual_selection_to_cursor(widgets: &Widgets, state: &SharedState) {
         let anchor = state.visual_select_anchor.unwrap_or(cursor);
         let start = anchor.min(cursor);
         let end = anchor.max(cursor);
-        (anchor, cursor, end.saturating_sub(start).saturating_add(1))
+        let snapshots: BTreeMap<String, notm_notmuch::ThreadSummary> = state
+            .thread_list_items
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| (start..=end).contains(&(state.thread_window_offset + *index)))
+            .map(|(_, thread)| (thread.thread_id.clone(), thread.clone()))
+            .collect();
+        (
+            anchor,
+            cursor,
+            end.saturating_sub(start).saturating_add(1),
+            snapshots,
+        )
     };
     {
         let mut state = state.borrow_mut();
         state.visual_select_anchor = Some(anchor);
         state.visual_select_cursor = Some(cursor);
-        state.visual_selected_threads.clear();
+        state.visual_selected_threads = snapshots.keys().cloned().collect();
+        state.visual_selected_thread_snapshots = snapshots;
         state.visual_selection_pending_range = None;
     }
     update_visual_selection_rows(widgets, state);
@@ -10564,6 +10859,215 @@ fn visual_selection_anchor_index(widgets: &Widgets, state: &SharedState) -> Opti
             .or_else(|| cursor.map(|index| state.thread_window_offset + index))
             .unwrap_or(state.thread_window_offset),
     )
+}
+
+fn maybe_load_visual_selection_range(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    cursor_index: usize,
+) {
+    let Some(anchor_index) = visual_selection_anchor_index(widgets, state) else {
+        return;
+    };
+    let snapshot = {
+        let state = state.borrow();
+        state.database_revision.clone().map(|revision| {
+            (
+                state.current_query.clone(),
+                state.thread_window_offset,
+                state.thread_list_items.len(),
+                state.search_generation,
+                revision,
+            )
+        })
+    };
+    let Some((query, window_offset, loaded_len, generation, revision)) = snapshot else {
+        let mut state = state.borrow_mut();
+        state.visual_selection_request_generation =
+            state.visual_selection_request_generation.saturating_add(1);
+        state.visual_selection_pending_range = None;
+        return;
+    };
+    let start = anchor_index.min(cursor_index);
+    let end = anchor_index.max(cursor_index);
+    if loaded_len == 0
+        || (window_offset..window_offset + loaded_len).contains(&start)
+            && (window_offset..window_offset + loaded_len).contains(&end)
+    {
+        let mut state = state.borrow_mut();
+        state.visual_selection_request_generation =
+            state.visual_selection_request_generation.saturating_add(1);
+        state.visual_selection_pending_range = None;
+        return;
+    }
+
+    let request_generation = {
+        let mut state = state.borrow_mut();
+        state.visual_selection_request_generation =
+            state.visual_selection_request_generation.saturating_add(1);
+        state.visual_selection_pending_range = Some((start, end));
+        state.visual_selection_request_generation
+    };
+    update_visual_selection_rows(widgets, state);
+    widgets.status_label.set_text(&format!(
+        "Visual select: resolving immutable IDs for messages {}-{}…",
+        format_count(start + 1),
+        format_count(end + 1)
+    ));
+
+    let open = open_config(options);
+    let runtime = settings::snapshot(&options.runtime_settings);
+    let page_size = runtime.page_size.max(1);
+    let excluded_tags = runtime.excluded_tags;
+    let (tx, rx) = mpsc::channel::<ThreadRangeSelectionResponse>();
+    let expected_revision = revision.clone();
+    let request_revision = revision.clone();
+    thread::spawn(move || {
+        let result = collect_thread_ids_for_range(
+            &open,
+            &query,
+            start,
+            end,
+            page_size,
+            excluded_tags,
+            &expected_revision,
+        );
+        let _ = tx.send(ThreadRangeSelectionResponse {
+            request_generation,
+            generation,
+            anchor_index,
+            cursor_index,
+            revision,
+            result,
+        });
+    });
+
+    let w = widgets.clone();
+    let st = state.clone();
+    gtk::glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(response) => {
+            let current_cursor =
+                selected_thread_index(&w).map(|index| st.borrow().thread_window_offset + index);
+            let response_is_current = response.request_generation
+                == st.borrow().visual_selection_request_generation
+                && response.generation == w.search_bar.current_generation()
+                && response.generation == st.borrow().search_generation
+                && st.borrow().database_revision.as_ref() == Some(&response.revision)
+                && st.borrow().visual_select_mode
+                && st.borrow().visual_select_anchor == Some(response.anchor_index)
+                && current_cursor == Some(response.cursor_index);
+            if response_is_current {
+                match response.result {
+                    Ok(snapshots) => {
+                        let count = snapshots.len();
+                        {
+                            let mut state = st.borrow_mut();
+                            state.visual_selected_threads = snapshots.keys().cloned().collect();
+                            state.visual_selected_thread_snapshots = snapshots;
+                            state.visual_selection_pending_range = None;
+                            state.last_error = None;
+                        }
+                        update_visual_selection_rows(&w, &st);
+                        w.status_label.set_text(&format!(
+                            "Visual select: {} thread(s) selected",
+                            format_count(count)
+                        ));
+                    }
+                    Err(err) => {
+                        {
+                            let mut state = st.borrow_mut();
+                            state.visual_selected_threads.clear();
+                            state.visual_selected_thread_snapshots.clear();
+                            state.visual_selection_pending_range = None;
+                            state.last_error = Some(err.to_string());
+                        }
+                        update_visual_selection_rows(&w, &st);
+                        w.status_label
+                            .set_text(&format!("Visual selection changed; reselect it: {err}"));
+                        update_debug(&w, &st);
+                    }
+                }
+            }
+            gtk::glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            let current_cursor =
+                selected_thread_index(&w).map(|index| st.borrow().thread_window_offset + index);
+            let request_is_current = request_generation
+                == st.borrow().visual_selection_request_generation
+                && generation == w.search_bar.current_generation()
+                && generation == st.borrow().search_generation
+                && st.borrow().database_revision.as_ref() == Some(&request_revision)
+                && st.borrow().visual_select_mode
+                && st.borrow().visual_select_anchor == Some(anchor_index)
+                && current_cursor == Some(cursor_index);
+            if request_is_current {
+                {
+                    let mut state = st.borrow_mut();
+                    state.visual_selected_threads.clear();
+                    state.visual_selected_thread_snapshots.clear();
+                    state.visual_selection_pending_range = None;
+                    state.last_error = Some("visual selection ID worker disconnected".to_string());
+                }
+                update_visual_selection_rows(&w, &st);
+                update_debug(&w, &st);
+            }
+            gtk::glib::ControlFlow::Break
+        }
+    });
+}
+
+fn collect_thread_ids_for_range(
+    open_config: &OpenConfig,
+    query: &str,
+    start: usize,
+    end: usize,
+    page_size: usize,
+    excluded_tags: Vec<String>,
+    expected_revision: &notm_notmuch::Revision,
+) -> anyhow::Result<BTreeMap<String, notm_notmuch::ThreadSummary>> {
+    let db = Database::open(open_config, DatabaseMode::ReadOnly)?;
+    let opened_revision = db.revision();
+    anyhow::ensure!(
+        &opened_revision == expected_revision,
+        "Notmuch revision changed from {} to {}",
+        expected_revision.revision,
+        opened_revision.revision
+    );
+    let mut offset = (start / page_size.max(1)) * page_size.max(1);
+    let mut snapshots = BTreeMap::new();
+    while offset <= end {
+        let options = QueryOptions {
+            limit: page_size.max(1),
+            offset,
+            sort: SortOrder::NewestFirst,
+            excluded_tags: excluded_tags.clone(),
+        };
+        let threads = db.search_threads(query, &options)?;
+        if threads.is_empty() {
+            break;
+        }
+        for (index, thread) in threads.iter().enumerate() {
+            let absolute_index = offset + index;
+            if (start..=end).contains(&absolute_index) {
+                snapshots.insert(thread.thread_id.clone(), thread.clone());
+            }
+        }
+        let next_offset = offset.saturating_add(page_size.max(1));
+        if next_offset <= offset {
+            break;
+        }
+        offset = next_offset;
+    }
+    let expected_count = end.saturating_sub(start).saturating_add(1);
+    anyhow::ensure!(
+        snapshots.len() == expected_count,
+        "selected range expected {expected_count} thread IDs but resolved {}",
+        snapshots.len()
+    );
+    Ok(snapshots)
 }
 
 fn update_visual_selection_rows(widgets: &Widgets, state: &SharedState) {
@@ -10654,6 +11158,10 @@ fn select_thread_by_index(
     index: usize,
     open: bool,
 ) {
+    if !ensure_message_file_actions_allowed(widgets, state) {
+        restore_thread_list_selection(widgets, state);
+        return;
+    }
     let Some(thread) = state.borrow().thread_list_items.get(index).cloned() else {
         return;
     };
@@ -10731,6 +11239,8 @@ fn select_thread_by_index(
     }
     if state.borrow().visual_select_mode {
         update_visual_selection_to_cursor(widgets, state);
+        let absolute_index = state.borrow().thread_window_offset + index;
+        maybe_load_visual_selection_range(options, widgets, state, absolute_index);
     }
     update_custom_tag_controls(widgets, state);
     update_message_action_buttons(options, widgets, state);
@@ -10771,6 +11281,9 @@ fn open_loaded_thread_at_message(
     state: &SharedState,
     message_id: &str,
 ) -> bool {
+    if !ensure_message_file_actions_allowed(widgets, state) {
+        return false;
+    }
     let rejection_restore = capture_message_selection_snapshot(state);
     let threads = state.borrow().thread_list_items.clone();
     for (index, thread) in threads.iter().enumerate() {
@@ -10865,6 +11378,9 @@ fn open_thread_by_index(
     state: &SharedState,
     index: usize,
 ) {
+    if !ensure_message_file_actions_allowed(widgets, state) {
+        return;
+    }
     let Some(thread) = state.borrow().thread_list_items.get(index).cloned() else {
         return;
     };
@@ -10976,6 +11492,10 @@ fn open_standalone_message_window(
     messages: Vec<notm_notmuch::MessageSummary>,
     selected_index: usize,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        ensure_message_file_actions_allowed(widgets, state),
+        "message file actions are unavailable while tags are changing"
+    );
     let policy_options = options.clone();
     let policy_state = state.clone();
     let policy_quote_collapse = widgets.quote_collapse.clone();
@@ -10987,7 +11507,7 @@ fn open_standalone_message_window(
             trusted_image_senders: state.trusted_image_senders.clone(),
             show_keybind_hints: state.show_keybind_hints,
             normal_input_mode: state.input_mode == InputMode::Normal,
-            response_sensitive: !state.send_in_progress,
+            response_sensitive: !state.send_in_progress && !tag_path_actions_blocked(&state),
         }
     });
     let message_has_html: StandaloneMessageHasHtml = Rc::new(message_has_html);
@@ -11189,8 +11709,70 @@ fn composed_attachment_forward_for_message(
     composer::composed_attachment_forward_from_file(path, &identity)
 }
 
+const MAX_UNDO_TAG_ACTIONS: usize = 30;
+
+enum UndoPersistenceRequest {
+    Persist {
+        path: PathBuf,
+        actions: Vec<UndoTagAction>,
+    },
+    Flush(mpsc::Sender<()>),
+}
+
+fn undo_persistence_sender() -> Option<&'static mpsc::Sender<UndoPersistenceRequest>> {
+    static SENDER: OnceLock<Option<mpsc::Sender<UndoPersistenceRequest>>> = OnceLock::new();
+    SENDER
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<UndoPersistenceRequest>();
+            thread::Builder::new()
+                .name("notm-tag-undo-persistence".to_string())
+                .spawn(move || {
+                    while let Ok(request) = rx.recv() {
+                        match request {
+                            UndoPersistenceRequest::Persist { path, actions } => {
+                                let _ = persist_undo_tag_actions_to_path(&path, &actions);
+                            }
+                            UndoPersistenceRequest::Flush(done) => {
+                                let _ = done.send(());
+                            }
+                        }
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+}
+
+fn queue_undo_tag_persistence(actions: Vec<UndoTagAction>) {
+    queue_undo_tag_persistence_to_path(default_undo_history_path(), actions);
+}
+
+fn queue_undo_tag_persistence_to_path(path: PathBuf, actions: Vec<UndoTagAction>) {
+    let mut request = Some(UndoPersistenceRequest::Persist { path, actions });
+    if let Some(sender) = undo_persistence_sender() {
+        match sender.send(request.take().expect("undo persistence request")) {
+            Ok(()) => return,
+            Err(error) => request = Some(error.0),
+        }
+    }
+    let Some(UndoPersistenceRequest::Persist { path, actions }) = request else {
+        return;
+    };
+    let _ = persist_undo_tag_actions_to_path(&path, &actions);
+}
+
+fn flush_undo_tag_persistence() {
+    let Some(sender) = undo_persistence_sender() else {
+        return;
+    };
+    let (done_tx, done_rx) = mpsc::channel();
+    if sender.send(UndoPersistenceRequest::Flush(done_tx)).is_ok() {
+        let _ = done_rx.recv();
+    }
+}
+
 fn push_undo_tag_action(undo_state: &UndoState, action: UndoTagAction) {
-    const MAX_UNDO_TAG_ACTIONS: usize = 30;
     let snapshot = {
         let mut actions = undo_state.borrow_mut();
         actions.push(action);
@@ -11200,7 +11782,26 @@ fn push_undo_tag_action(undo_state: &UndoState, action: UndoTagAction) {
         }
         actions.clone()
     };
-    let _ = persist_undo_tag_actions(&snapshot);
+    queue_undo_tag_persistence(snapshot);
+}
+
+/// Restore actions supplied in execution order (newest first) so retrying
+/// pops them in that same order.
+fn restore_undo_tag_actions(undo_state: &UndoState, actions: &[UndoTagAction]) {
+    let snapshot = {
+        let mut history = undo_state.borrow_mut();
+        restore_undo_tag_actions_in_memory(&mut history, actions);
+        history.clone()
+    };
+    queue_undo_tag_persistence(snapshot);
+}
+
+fn restore_undo_tag_actions_in_memory(history: &mut Vec<UndoTagAction>, actions: &[UndoTagAction]) {
+    history.extend(actions.iter().rev().cloned());
+    if history.len() > MAX_UNDO_TAG_ACTIONS {
+        let overflow = history.len() - MAX_UNDO_TAG_ACTIONS;
+        history.drain(0..overflow);
+    }
 }
 
 fn pop_last_undo_tag_action(undo_state: &UndoState) -> Option<UndoTagAction> {
@@ -11209,7 +11810,7 @@ fn pop_last_undo_tag_action(undo_state: &UndoState) -> Option<UndoTagAction> {
         let action = actions.pop();
         (action, actions.clone())
     };
-    let _ = persist_undo_tag_actions(&snapshot);
+    queue_undo_tag_persistence(snapshot);
     action
 }
 
@@ -11222,7 +11823,7 @@ fn remove_undo_tag_action(undo_state: &UndoState, index: usize) -> Option<UndoTa
             (Some(actions.remove(index)), actions.clone())
         }
     };
-    let _ = persist_undo_tag_actions(&snapshot);
+    queue_undo_tag_persistence(snapshot);
     action
 }
 
@@ -11240,11 +11841,6 @@ fn load_undo_tag_actions() -> Vec<UndoTagAction> {
         .filter(|history| history.version == UNDO_TAG_HISTORY_VERSION)
         .map(|history| history.actions)
         .unwrap_or_default()
-}
-
-fn persist_undo_tag_actions(actions: &[UndoTagAction]) -> anyhow::Result<()> {
-    let path = default_undo_history_path();
-    persist_undo_tag_actions_to_path(&path, actions)
 }
 
 fn persist_undo_tag_actions_to_path(path: &Path, actions: &[UndoTagAction]) -> anyhow::Result<()> {
@@ -11288,15 +11884,6 @@ fn tag_mutation_label(mutation: &TagMutation) -> String {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn undo_detail_for_visual_range(query: &str, start: usize, end: usize) -> String {
-    format!(
-        "Range {}-{} in query: {}",
-        format_count(start.saturating_add(1)),
-        format_count(end.saturating_add(1)),
-        truncate_status_text(query, 180)
-    )
 }
 
 fn undo_detail_for_thread_targets(state: &SharedState, target_threads: usize) -> Option<String> {
@@ -11364,6 +11951,7 @@ enum UserOperation {
 fn background_activity_block_reason(
     sync_in_progress: bool,
     send_in_progress: bool,
+    tag_in_progress: bool,
     operation: UserOperation,
 ) -> Option<&'static str> {
     if operation == UserOperation::ComposeEdit {
@@ -11401,6 +11989,21 @@ fn background_activity_block_reason(
             UserOperation::Sync => "sync is unavailable while send is in progress",
         });
     }
+    if tag_in_progress {
+        return Some(match operation {
+            UserOperation::ComposeEdit => unreachable!(),
+            UserOperation::Tag => "a tag change is already in progress",
+            UserOperation::DraftSave => "draft saving is unavailable while tags are changing",
+            UserOperation::DraftDelete => "draft deletion is unavailable while tags are changing",
+            UserOperation::DraftLoad => "draft loading is unavailable while tags are changing",
+            UserOperation::DraftClear => "draft clearing is unavailable while tags are changing",
+            UserOperation::ComposeReplace => {
+                "replacing the composer is unavailable while tags are changing"
+            }
+            UserOperation::Send => "sending is unavailable while tags are changing",
+            UserOperation::Sync => "sync is unavailable while tags are changing",
+        });
+    }
     None
 }
 
@@ -11409,8 +12012,28 @@ fn ensure_user_operation_allowed(
     state: &SharedState,
     operation: UserOperation,
 ) -> anyhow::Result<()> {
-    if operation == UserOperation::Send && widgets.composer.has_pending_confirmation() {
-        let message = "sending is unavailable while a confirmation is pending";
+    if matches!(operation, UserOperation::Send | UserOperation::Tag)
+        && widgets.composer.has_pending_confirmation()
+    {
+        let message = if operation == UserOperation::Send {
+            "sending is unavailable while a confirmation is pending"
+        } else {
+            "tag changes are unavailable while a composer confirmation is pending"
+        };
+        widgets.status_label.set_text(message);
+        state.borrow_mut().last_operation = Some(message.to_string());
+        update_debug(widgets, state);
+        anyhow::bail!(message);
+    }
+    if operation != UserOperation::ComposeEdit && state.borrow().tag_paths_uncertain {
+        let message = "message, draft, tag, send, and sync operations are unavailable after an uncertain tag result; restart notm before reusing retained paths";
+        widgets.status_label.set_text(message);
+        state.borrow_mut().last_operation = Some(message.to_string());
+        update_debug(widgets, state);
+        anyhow::bail!(message);
+    }
+    if operation != UserOperation::ComposeEdit && state.borrow().tag_warning.is_some() {
+        let message = "message, draft, tag, send, and sync operations are unavailable until a successful search reconciles the previous tag result";
         widgets.status_label.set_text(message);
         state.borrow_mut().last_operation = Some(message.to_string());
         update_debug(widgets, state);
@@ -11418,7 +12041,12 @@ fn ensure_user_operation_allowed(
     }
     let message = {
         let state = state.borrow();
-        background_activity_block_reason(state.sync_in_progress, state.send_in_progress, operation)
+        background_activity_block_reason(
+            state.sync_in_progress,
+            state.send_in_progress,
+            state.tag_in_progress,
+            operation,
+        )
     };
     let Some(message) = message else {
         return Ok(());
@@ -11496,66 +12124,23 @@ fn tag_selected_message(
             .set_text("No selected message for tag operation");
         return false;
     };
-    let message_id = message.message_id.clone();
-    let result = (|| -> anyhow::Result<usize> {
-        let db = Database::open(&open_config(options), DatabaseMode::ReadWrite)?;
-        let changes = db.apply_tags_to_messages(
-            &[MessageTagMutation {
-                message_id: message_id.clone(),
-                add: mutation.add.clone(),
-                remove: mutation.remove.clone(),
-            }],
-            mutation.sync_maildir_flags,
-        )?;
-        if !changes.is_empty() {
-            push_undo_tag_action(
-                undo_state,
-                UndoTagAction {
-                    mutations: changes.iter().map(|change| change.inverse()).collect(),
-                    sync_maildir_flags: mutation.sync_maildir_flags,
-                    label: message_tag_undo_label(&mutation, changes.len()),
-                    detail: Some(undo_detail_for_message(&message)),
-                },
-            );
-        }
-        let mut state = state.borrow_mut();
-        state.last_operation = Some(format!(
-            "tagged current message {}: +{:?} -{:?}",
-            message_id, mutation.add, mutation.remove
-        ));
-        state.last_error = None;
-        Ok(changes.len())
-    })();
-    match result {
-        Ok(changed_messages) => {
-            if changed_messages > 0 {
-                apply_local_message_tag_mutation(widgets, state, &message_id, &mutation);
-            }
-            update_message_header(widgets, state);
-            update_message_tag_controls(widgets, state);
-            update_message_action_buttons(options, widgets, state);
-            set_undo_tag_available(widgets, !undo_state.borrow().is_empty());
-            if changed_messages > 0 {
-                widgets.status_label.set_text(
-                    "Tag operation complete for current message; Undo menu shows recent tag actions",
-                );
-            } else {
-                widgets
-                    .status_label
-                    .set_text("Message tag operation made no changes");
-            }
-            update_debug(widgets, state);
-            true
-        }
-        Err(err) => {
-            state.borrow_mut().last_error = Some(err.to_string());
-            widgets
-                .status_label
-                .set_text(&format!("Message tag operation failed: {err}"));
-            update_debug(widgets, state);
-            false
-        }
-    }
+    let operation = TagWorkerOperation::Messages {
+        mutations: vec![MessageTagMutation {
+            message_id: message.message_id.clone(),
+            add: mutation.add.clone(),
+            remove: mutation.remove.clone(),
+        }],
+        sync_maildir_flags: mutation.sync_maildir_flags,
+    };
+    schedule_tag_mutation(
+        options,
+        widgets,
+        state,
+        undo_state,
+        PendingTagUiAction::Message { message, mutation },
+        operation,
+        Duration::ZERO,
+    )
 }
 
 fn tag_selected(
@@ -11565,93 +12150,35 @@ fn tag_selected(
     undo_state: &UndoState,
     mutation: TagMutation,
 ) -> bool {
-    if ensure_user_operation_allowed(widgets, state, UserOperation::Tag).is_err() {
-        return false;
-    }
-    let visual_target = {
-        let state = state.borrow();
-        visual_selection_range_from_state(&state).map(|(start, end)| {
-            (
-                start,
-                end,
-                state.current_query.clone(),
-                end.saturating_sub(start).saturating_add(1),
-            )
-        })
-    };
-    if let Some((start, end, query, target_count)) = visual_target {
-        let result = (|| -> anyhow::Result<notm_notmuch::ThreadRangeTagReport> {
-            let db = Database::open(&open_config(options), DatabaseMode::ReadWrite)?;
-            let opts = QueryOptions {
-                limit: usize::MAX,
-                offset: 0,
-                sort: SortOrder::NewestFirst,
-                excluded_tags: settings::excluded_tags(&options.runtime_settings),
-            };
-            let report = db.apply_tags_to_thread_range(&query, &opts, start, end, &mutation)?;
-            if !report.changes.is_empty() {
-                push_undo_tag_action(
-                    undo_state,
-                    UndoTagAction {
-                        mutations: report
-                            .changes
-                            .iter()
-                            .map(|change| change.inverse())
-                            .collect(),
-                        sync_maildir_flags: mutation.sync_maildir_flags,
-                        label: tag_undo_label(&mutation, target_count, report.changed_messages),
-                        detail: Some(undo_detail_for_visual_range(&query, start, end)),
-                    },
-                );
-            }
-            state.borrow_mut().last_operation = Some(format!(
-                "tagged {} message(s) across {} selected thread(s): +{:?} -{:?}",
-                report.changed_messages, report.changed_threads, report.added, report.removed
-            ));
-            Ok(report)
-        })();
-        match result {
-            Ok(report) => {
-                apply_local_tag_mutation_to_visual_range(widgets, state, &mutation, start, end);
-                update_message_header(widgets, state);
-                update_custom_tag_controls(widgets, state);
-                update_message_action_buttons(options, widgets, state);
-                let undo_available = !undo_state.borrow().is_empty();
-                set_undo_tag_available(widgets, undo_available);
-                if report.changed_messages > 0 {
-                    widgets.status_label.set_text(&format!(
-                        "Tag operation complete for {}; {} message(s) changed",
-                        tag_target_status_label(target_count),
-                        format_count(report.changed_messages)
-                    ));
-                } else {
-                    widgets
-                        .status_label
-                        .set_text("Tag operation made no changes");
-                }
-                true
-            }
-            Err(err) => {
-                state.borrow_mut().last_error = Some(err.to_string());
-                widgets
-                    .status_label
-                    .set_text(&format!("Tag operation failed: {err}"));
-                update_debug(widgets, state);
-                false
-            }
-        }
-    } else {
-        tag_selected_threads(options, widgets, state, undo_state, mutation)
-    }
+    tag_selected_with_delay(
+        options,
+        widgets,
+        state,
+        undo_state,
+        mutation,
+        Duration::ZERO,
+    )
 }
 
-fn tag_selected_threads(
+fn tag_selected_with_delay(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
     undo_state: &UndoState,
     mutation: TagMutation,
+    worker_delay: Duration,
 ) -> bool {
+    if ensure_user_operation_allowed(widgets, state, UserOperation::Tag).is_err() {
+        return false;
+    }
+    if let Some((start, end)) = state.borrow().visual_selection_pending_range {
+        widgets.status_label.set_text(&format!(
+            "Visual selection {}-{} is still resolving immutable IDs; wait before tagging",
+            format_count(start + 1),
+            format_count(end + 1)
+        ));
+        return false;
+    }
     let target_thread_ids = tag_target_thread_ids(state);
     if target_thread_ids.is_empty() {
         widgets
@@ -11661,80 +12188,535 @@ fn tag_selected_threads(
     }
     let target_count = target_thread_ids.len();
     let undo_detail = undo_detail_for_thread_targets(state, target_count);
-    let query = tag_query_for_thread_ids(&target_thread_ids);
-    let result = (|| -> anyhow::Result<usize> {
-        let db = Database::open(&open_config(options), DatabaseMode::ReadWrite)?;
-        let report = db.apply_tags_to_query(&query, &mutation)?;
-        if !report.changes.is_empty() {
-            push_undo_tag_action(
-                undo_state,
-                UndoTagAction {
-                    mutations: report
-                        .changes
-                        .iter()
-                        .map(|change| change.inverse())
-                        .collect(),
-                    sync_maildir_flags: mutation.sync_maildir_flags,
-                    label: tag_undo_label(&mutation, target_count, report.changed_messages),
-                    detail: undo_detail,
-                },
-            );
-        }
-        state.borrow_mut().last_operation = Some(format!(
-            "tagged {} message(s): +{:?} -{:?}",
-            report.changed_messages, report.added, report.removed
-        ));
-        Ok(report.changed_messages)
-    })();
-    match result {
-        Ok(changed_messages) => {
-            apply_local_tag_mutation(widgets, state, &mutation, &target_thread_ids);
-            update_message_header(widgets, state);
-            update_custom_tag_controls(widgets, state);
-            update_message_action_buttons(options, widgets, state);
-            let undo_available = !undo_state.borrow().is_empty();
-            set_undo_tag_available(widgets, undo_available);
-            if changed_messages > 0 {
-                widgets.status_label.set_text(&format!(
-                    "Tag operation complete for {}; Undo menu shows recent tag actions",
-                    tag_target_status_label(target_count)
-                ));
-            } else {
-                widgets
-                    .status_label
-                    .set_text("Tag operation made no changes");
+    let operation = TagWorkerOperation::Threads {
+        thread_ids: target_thread_ids.iter().cloned().collect(),
+        mutation: mutation.clone(),
+    };
+    schedule_tag_mutation(
+        options,
+        widgets,
+        state,
+        undo_state,
+        PendingTagUiAction::Threads {
+            target_thread_ids,
+            mutation,
+            undo_detail,
+        },
+        operation,
+        worker_delay,
+    )
+}
+
+fn schedule_tag_mutation(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    undo_state: &UndoState,
+    ui_action: PendingTagUiAction,
+    worker_operation: TagWorkerOperation,
+    worker_delay: Duration,
+) -> bool {
+    let Some(application) = widgets.window.application() else {
+        widgets
+            .status_label
+            .set_text("Tag operation failed: application is unavailable");
+        return false;
+    };
+    let application_hold = application.hold();
+    let (generation, completion_context) = {
+        let interrupted_search = state.borrow().search_loading;
+        let search_generation = reserve_search_generation(widgets);
+        cancel_search_activity(&mut state.borrow_mut(), search_generation);
+        let mut state = state.borrow_mut();
+        let generation = state.tag_generation.saturating_add(1);
+        state.tag_generation = generation;
+        state.tag_in_progress = true;
+        state.tag_warning = None;
+        state.tag_paths_uncertain = false;
+        state.last_error = None;
+        state.last_operation = Some(format!("tag mutation {generation} started"));
+        (
+            generation,
+            TagCompletionContext {
+                interrupted_search,
+                reserved_search_generation: search_generation,
+            },
+        )
+    };
+    widgets
+        .status_label
+        .set_text("Applying tag changes in the background…");
+    update_background_activity_controls(options, widgets, state);
+    update_thread_result_label(widgets, state);
+    update_debug(widgets, state);
+
+    let open = open_config(options);
+    let (tx, rx) = mpsc::channel::<TagWorkerResponse>();
+    let spawn_result = thread::Builder::new()
+        .name("notm-tag-mutation".to_string())
+        .spawn(move || {
+            if !worker_delay.is_zero() {
+                thread::sleep(worker_delay);
             }
-            true
+            let result = execute_tag_worker(open, worker_operation);
+            let _ = tx.send(TagWorkerResponse { generation, result });
+        });
+    if let Err(err) = spawn_result {
+        let error = format!("Tag operation could not start: {err}");
+        let mut state_ref = state.borrow_mut();
+        state_ref.tag_in_progress = false;
+        state_ref.last_error = Some(error.clone());
+        state_ref.last_operation = Some(error.clone());
+        if completion_context.interrupted_search {
+            state_ref.tag_warning = Some(error.clone());
         }
-        Err(err) => {
-            state.borrow_mut().last_error = Some(err.to_string());
-            widgets
-                .status_label
-                .set_text(&format!("Tag operation failed: {err}"));
-            update_debug(widgets, state);
-            false
+        drop(state_ref);
+        update_background_activity_controls(options, widgets, state);
+        if completion_context.interrupted_search {
+            let query = sync_refresh_query(widgets, state);
+            schedule_search(options, widgets, state, &query, false, Duration::ZERO);
+            widgets.status_label.set_text(&format!(
+                "{error}; resuming the interrupted search in the background"
+            ));
+        } else {
+            widgets.status_label.set_text(&error);
         }
+        update_debug(widgets, state);
+        close_main_window_after_background_activity(widgets, state);
+        drop(application_hold);
+        return false;
+    }
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let undo = undo_state.clone();
+    let mut application_hold = Some(application_hold);
+    gtk::glib::timeout_add_local(Duration::from_millis(25), move || match rx.try_recv() {
+        Ok(response) => {
+            finish_tag_worker(
+                &opts,
+                &w,
+                &st,
+                &undo,
+                &ui_action,
+                response,
+                completion_context,
+            );
+            drop(application_hold.take());
+            gtk::glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            finish_tag_worker(
+                &opts,
+                &w,
+                &st,
+                &undo,
+                &ui_action,
+                TagWorkerResponse {
+                    generation,
+                    result: Err(anyhow::anyhow!("tag mutation worker disconnected")),
+                },
+                completion_context,
+            );
+            drop(application_hold.take());
+            gtk::glib::ControlFlow::Break
+        }
+    });
+    true
+}
+
+fn execute_tag_worker(
+    open_config: OpenConfig,
+    operation: TagWorkerOperation,
+) -> anyhow::Result<TagWorkerResult> {
+    let db = Database::open(&open_config, DatabaseMode::ReadWrite)?;
+    let operation_result: anyhow::Result<(notm_notmuch::TagBatchReport, Vec<String>)> =
+        match operation {
+            TagWorkerOperation::Threads {
+                thread_ids,
+                mutation,
+            } => db
+                .apply_tags_to_threads(&thread_ids, &mutation)
+                .map(|report| {
+                    let operation_errors = (!report.missing_thread_ids.is_empty())
+                        .then(|| {
+                            format!(
+                                "{} exact target thread ID(s) disappeared before mutation: {}",
+                                report.missing_thread_ids.len(),
+                                report.missing_thread_ids.join(", ")
+                            )
+                        })
+                        .into_iter()
+                        .collect();
+                    (report.batch, operation_errors)
+                })
+                .map_err(Into::into),
+            TagWorkerOperation::Messages {
+                mutations,
+                sync_maildir_flags,
+            } => db
+                .apply_tags_to_messages(&mutations, sync_maildir_flags)
+                .map(|report| (report, Vec::new()))
+                .map_err(Into::into),
+            TagWorkerOperation::UndoActions { actions } => {
+                let action_count = actions.len();
+                let mut combined = notm_notmuch::TagBatchReport::default();
+                let mut operation_errors = Vec::new();
+                for (index, action) in actions.into_iter().enumerate() {
+                    let report = match db
+                        .apply_tags_to_messages(&action.mutations, action.sync_maildir_flags)
+                    {
+                        Ok(report) => report,
+                        Err(error) => {
+                            operation_errors.push(format!(
+                                    "selected undo action {} failed before a report was available: {error}",
+                                    index + 1
+                                ));
+                            let remaining = action_count.saturating_sub(index + 1);
+                            if remaining > 0 {
+                                operation_errors.push(format!(
+                                    "stopped before {remaining} later selected undo action(s)"
+                                ));
+                            }
+                            break;
+                        }
+                    };
+                    let complete = report.is_complete();
+                    merge_tag_batch_report(&mut combined, report);
+                    if !complete {
+                        let remaining = action_count.saturating_sub(index + 1);
+                        if remaining > 0 {
+                            operation_errors.push(format!(
+                                "stopped before {remaining} later selected undo action(s) after a partial result"
+                            ));
+                        }
+                        break;
+                    }
+                }
+                Ok((combined, operation_errors))
+            }
+        };
+    let close_result = db.close();
+    finalize_tag_worker_result(operation_result, close_result)
+}
+
+fn finalize_tag_worker_result(
+    operation_result: anyhow::Result<(notm_notmuch::TagBatchReport, Vec<String>)>,
+    close_result: notm_notmuch::Result<()>,
+) -> anyhow::Result<TagWorkerResult> {
+    match (operation_result, close_result) {
+        (Ok((report, operation_errors)), Ok(())) => Ok(TagWorkerResult {
+            report,
+            operation_errors,
+        }),
+        (Ok((mut report, operation_errors)), Err(error)) => {
+            report.record_finalization_error(format!("database close/commit failed: {error}"));
+            Ok(TagWorkerResult {
+                report,
+                operation_errors,
+            })
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close_error)) => Err(anyhow::anyhow!(
+            "tag mutation failed: {error}; database close/commit also failed: {close_error}"
+        )),
     }
 }
 
-fn apply_local_tag_mutation_to_visual_range(
+fn merge_tag_batch_report(
+    combined: &mut notm_notmuch::TagBatchReport,
+    report: notm_notmuch::TagBatchReport,
+) {
+    combined.requested_messages = combined
+        .requested_messages
+        .saturating_add(report.requested_messages);
+    combined.changed_messages = combined
+        .changed_messages
+        .saturating_add(report.changed_messages);
+    combined.changes.extend(report.changes);
+    combined.failures.extend(report.failures);
+    combined
+        .finalization_errors
+        .extend(report.finalization_errors);
+}
+
+fn finish_tag_worker(
+    options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
-    mutation: &TagMutation,
-    start: usize,
-    end: usize,
+    undo_state: &UndoState,
+    ui_action: &PendingTagUiAction,
+    response: TagWorkerResponse,
+    completion_context: TagCompletionContext,
 ) {
-    let target_thread_ids = {
-        let state = state.borrow();
-        state
-            .thread_list_items
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| (start..=end).contains(&(state.thread_window_offset + *index)))
-            .map(|(_, thread)| thread.thread_id.clone())
-            .collect::<BTreeSet<_>>()
-    };
-    apply_local_tag_mutation(widgets, state, mutation, &target_thread_ids);
+    if state.borrow().tag_generation != response.generation {
+        return;
+    }
+
+    let concurrent_search = state.borrow().search_loading
+        || widgets.search_bar.current_generation() > completion_context.reserved_search_generation;
+    let requested_query = sync_refresh_query(widgets, state);
+    let search_generation = reserve_search_generation(widgets);
+    cancel_search_activity(&mut state.borrow_mut(), search_generation);
+    state.borrow_mut().tag_in_progress = false;
+
+    let mut refresh_required = completion_context.interrupted_search
+        || concurrent_search
+        || matches!(ui_action, PendingTagUiAction::Undo { .. });
+    match response.result {
+        Ok(result) => {
+            thread_list::invalidate_search_caches();
+            let operation_complete = result.is_complete();
+            let retained_paths_resolved = apply_completed_tag_report(
+                options,
+                widgets,
+                state,
+                undo_state,
+                ui_action,
+                &result.report,
+                operation_complete,
+            );
+            let complete = operation_complete && retained_paths_resolved;
+            state.borrow_mut().tag_paths_uncertain =
+                !retained_paths_resolved || tag_report_has_uncertain_retained_paths(&result.report);
+            refresh_required |= !complete;
+            if complete {
+                let mut state = state.borrow_mut();
+                state.tag_warning = None;
+                state.last_error = None;
+            } else {
+                let mut operation_errors = result.operation_errors;
+                if !retained_paths_resolved {
+                    operation_errors.push(
+                        "an active draft retained a filename absent from the authoritative message paths"
+                            .to_string(),
+                    );
+                }
+                let error = tag_batch_failure_summary(&result.report, &operation_errors);
+                let mut state = state.borrow_mut();
+                state.tag_warning = Some(error.clone());
+                state.last_error = Some(error.clone());
+                drop(state);
+                widgets.status_label.set_text(&format!(
+                    "Tag operation had partial or uncertain effects: {error}"
+                ));
+            }
+        }
+        Err(error) => {
+            thread_list::invalidate_search_caches();
+            refresh_required = true;
+            if let PendingTagUiAction::Undo { actions } = ui_action {
+                restore_undo_tag_actions(undo_state, actions);
+            }
+            let error = format!(
+                "tag worker failed before it could provide a complete report; database state will be reconciled: {error}"
+            );
+            let mut state = state.borrow_mut();
+            state.tag_warning = Some(error.clone());
+            state.tag_paths_uncertain = true;
+            state.last_error = Some(error.clone());
+            drop(state);
+            widgets.status_label.set_text(&error);
+        }
+    }
+
+    set_undo_tag_available(widgets, !undo_state.borrow().is_empty());
+    update_background_activity_controls(options, widgets, state);
+    update_message_header(widgets, state);
+    update_thread_result_label(widgets, state);
+    update_debug(widgets, state);
+
+    if refresh_required {
+        let selected_thread_id = {
+            let state = state.borrow();
+            if state.tag_paths_uncertain {
+                None
+            } else {
+                state
+                    .selected_thread
+                    .as_ref()
+                    .map(|thread| thread.thread_id.clone())
+            }
+        };
+        widgets
+            .tag_refresh_selected_thread_id
+            .replace(selected_thread_id);
+        schedule_search(
+            options,
+            widgets,
+            state,
+            &requested_query,
+            false,
+            Duration::ZERO,
+        );
+        widgets
+            .status_label
+            .set_text("Tag operation finished; refreshing the latest search…");
+    } else {
+        widgets.tag_refresh_selected_thread_id.borrow_mut().take();
+    }
+    close_main_window_after_background_activity(widgets, state);
+}
+
+fn apply_completed_tag_report(
+    _options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    undo_state: &UndoState,
+    ui_action: &PendingTagUiAction,
+    report: &notm_notmuch::TagBatchReport,
+    complete: bool,
+) -> bool {
+    let changed_messages = report.changed_messages;
+    match ui_action {
+        PendingTagUiAction::Threads {
+            target_thread_ids,
+            mutation,
+            undo_detail,
+        } => {
+            if complete {
+                apply_local_tag_mutation(widgets, state, mutation, target_thread_ids);
+            }
+            let inverse_mutations = inverse_tag_mutations(&report.changes);
+            let undo_created = !inverse_mutations.is_empty();
+            if undo_created {
+                push_undo_tag_action(
+                    undo_state,
+                    UndoTagAction {
+                        mutations: inverse_mutations,
+                        sync_maildir_flags: mutation.sync_maildir_flags,
+                        label: tag_undo_label(mutation, target_thread_ids.len(), changed_messages),
+                        detail: undo_detail.clone(),
+                    },
+                );
+            }
+            state.borrow_mut().last_operation = Some(format!(
+                "tagged {} message(s) across {} exact thread ID(s): +{:?} -{:?}",
+                changed_messages,
+                target_thread_ids.len(),
+                mutation.add,
+                mutation.remove
+            ));
+            if complete {
+                widgets.status_label.set_text(if changed_messages == 0 {
+                    "Tag operation made no changes"
+                } else if undo_created {
+                    "Tag operation complete; Undo menu shows recent tag actions"
+                } else {
+                    "Maildir filenames synchronized; no tag delta to undo"
+                });
+            }
+        }
+        PendingTagUiAction::Message { message, mutation } => {
+            let inverse_mutations = inverse_tag_mutations(&report.changes);
+            if !inverse_mutations.is_empty() {
+                push_undo_tag_action(
+                    undo_state,
+                    UndoTagAction {
+                        mutations: inverse_mutations,
+                        sync_maildir_flags: mutation.sync_maildir_flags,
+                        label: message_tag_undo_label(mutation, changed_messages),
+                        detail: Some(undo_detail_for_message(message)),
+                    },
+                );
+            }
+            state.borrow_mut().last_operation = Some(format!(
+                "tagged current message {}: +{:?} -{:?}",
+                message.message_id, mutation.add, mutation.remove
+            ));
+            if complete {
+                widgets.status_label.set_text(if changed_messages == 0 {
+                    "Message tag operation made no changes"
+                } else {
+                    "Tag operation complete for current message"
+                });
+            }
+        }
+        PendingTagUiAction::Undo { actions } => {
+            if !complete {
+                restore_undo_tag_actions(undo_state, actions);
+            }
+            state.borrow_mut().last_operation = Some(format!(
+                "{} {} tag undo action(s)",
+                if complete { "completed" } else { "incomplete" },
+                actions.len()
+            ));
+            if complete {
+                widgets
+                    .status_label
+                    .set_text(&format!("Undid {} tag operation(s)", actions.len()));
+            }
+        }
+    }
+    apply_authoritative_tag_changes(widgets, state, &report.changes)
+}
+
+fn inverse_tag_mutations(changes: &[notm_notmuch::AppliedTagChange]) -> Vec<MessageTagMutation> {
+    changes
+        .iter()
+        .filter(|change| !change.added.is_empty() || !change.removed.is_empty())
+        .map(notm_notmuch::AppliedTagChange::inverse)
+        .collect()
+}
+
+fn tag_batch_failure_summary(
+    report: &notm_notmuch::TagBatchReport,
+    operation_errors: &[String],
+) -> String {
+    let mut parts = operation_errors.to_vec();
+    const FAILURE_DETAIL_LIMIT: usize = 3;
+    for failure in report.failures.iter().take(FAILURE_DETAIL_LIMIT) {
+        let mut summary = format!(
+            "message {} at {}: {}",
+            truncate_status_text(&failure.message_id, 96),
+            failure.stage,
+            truncate_status_text(&failure.detail, 180)
+        );
+        if let Some(file) = failure.file_failures.first() {
+            summary.push_str(&format!(
+                "; file {} -> {} (current: {})",
+                truncate_status_text(&file.previous_filename, 120),
+                truncate_status_text(&file.expected_filename, 120),
+                file.current_filename
+                    .as_deref()
+                    .map(|filename| truncate_status_text(filename, 120))
+                    .unwrap_or_else(|| "unresolved".to_string())
+            ));
+            if failure.file_failures.len() > 1 {
+                summary.push_str(&format!(
+                    "; {} more file mismatch(es)",
+                    failure.file_failures.len() - 1
+                ));
+            }
+        }
+        parts.push(summary);
+    }
+    if report.failures.len() > FAILURE_DETAIL_LIMIT {
+        parts.push(format!(
+            "{} more message/file failure(s)",
+            report.failures.len() - FAILURE_DETAIL_LIMIT
+        ));
+    }
+    if !report.finalization_errors.is_empty() {
+        parts.push(report.finalization_errors.join("; "));
+    }
+    if parts.is_empty() {
+        "completion could not be confirmed".to_string()
+    } else {
+        parts.join("; ")
+    }
+}
+
+fn tag_report_has_uncertain_retained_paths(report: &notm_notmuch::TagBatchReport) -> bool {
+    !report.finalization_errors.is_empty()
+        || report.failures.iter().any(|failure| {
+            failure.stage == notm_notmuch::TagFailureStage::MaildirFlagSync
+                && failure.file_failures.iter().any(|file| {
+                    file.current_filename.as_deref() != Some(file.previous_filename.as_str())
+                })
+        })
 }
 
 fn apply_local_tag_mutation(
@@ -11757,6 +12739,16 @@ fn apply_local_tag_mutation(
         {
             apply_tag_mutation_to_thread(thread, mutation);
         }
+        for thread in state.visual_selected_thread_snapshots.values_mut() {
+            if target_thread_ids.contains(&thread.thread_id) {
+                apply_tag_mutation_to_thread(thread, mutation);
+            }
+        }
+        for thread in state.multi_selected_thread_snapshots.values_mut() {
+            if target_thread_ids.contains(&thread.thread_id) {
+                apply_tag_mutation_to_thread(thread, mutation);
+            }
+        }
         for message in &mut state.messages {
             if target_thread_ids.contains(&message.thread_id) {
                 apply_tag_mutation_to_tags(&mut message.tags, mutation);
@@ -11773,50 +12765,112 @@ fn apply_local_tag_mutation(
     update_visual_selection_rows(widgets, state);
 }
 
-fn apply_local_message_tag_mutation(
+fn apply_authoritative_tag_changes(
     widgets: &Widgets,
     state: &SharedState,
-    message_id: &str,
-    mutation: &TagMutation,
-) {
+    changes: &[notm_notmuch::AppliedTagChange],
+) -> bool {
+    if changes.is_empty() {
+        return true;
+    }
     let row_updates = {
         let mut state = state.borrow_mut();
-        let Some(thread_id) = state
-            .messages
-            .iter()
-            .find(|message| message.message_id == message_id)
-            .map(|message| message.thread_id.clone())
-        else {
-            return;
-        };
+        let mut affected_thread_ids = BTreeSet::new();
         for message in &mut state.messages {
-            if message.message_id == message_id {
-                apply_tag_mutation_to_tags(&mut message.tags, mutation);
+            if let Some(change) = changes
+                .iter()
+                .rev()
+                .find(|change| change.message_id == message.message_id)
+            {
+                message.tags.clone_from(&change.tags);
+                message.filenames.clone_from(&change.filenames);
+                affected_thread_ids.insert(message.thread_id.clone());
             }
         }
         if let Some(message) = &mut state.selected_message
-            && message.message_id == message_id
+            && let Some(change) = changes
+                .iter()
+                .rev()
+                .find(|change| change.message_id == message.message_id)
         {
-            apply_tag_mutation_to_tags(&mut message.tags, mutation);
+            message.tags.clone_from(&change.tags);
+            message.filenames.clone_from(&change.filenames);
+            affected_thread_ids.insert(message.thread_id.clone());
         }
 
-        let aggregate_tags = aggregate_thread_tags(&state.messages, &thread_id);
+        let active_draft_paths_resolved =
+            apply_active_draft_filename_changes(&mut state.active_draft, changes);
+
         let mut updated_thread_indices = Vec::new();
-        for (index, thread) in state.thread_list_items.iter_mut().enumerate() {
-            if thread.thread_id == thread_id {
+        for thread_id in affected_thread_ids {
+            if !state
+                .messages
+                .iter()
+                .any(|message| message.thread_id == thread_id)
+            {
+                continue;
+            }
+            let aggregate_tags = aggregate_thread_tags(&state.messages, &thread_id);
+            for (index, thread) in state.thread_list_items.iter_mut().enumerate() {
+                if thread.thread_id == thread_id {
+                    set_thread_tags(thread, &aggregate_tags);
+                    updated_thread_indices.push(index);
+                }
+            }
+            if let Some(thread) = &mut state.selected_thread
+                && thread.thread_id == thread_id
+            {
                 set_thread_tags(thread, &aggregate_tags);
-                updated_thread_indices.push(index);
+            }
+            if let Some(thread) = state.visual_selected_thread_snapshots.get_mut(&thread_id) {
+                set_thread_tags(thread, &aggregate_tags);
+            }
+            if let Some(thread) = state.multi_selected_thread_snapshots.get_mut(&thread_id) {
+                set_thread_tags(thread, &aggregate_tags);
             }
         }
-        if let Some(thread) = &mut state.selected_thread
-            && thread.thread_id == thread_id
-        {
-            set_thread_tags(thread, &aggregate_tags);
-        }
-        updated_thread_indices
+        (updated_thread_indices, active_draft_paths_resolved)
     };
-    refresh_thread_model_rows(widgets, state, &row_updates);
+    widgets
+        .standalone_messages
+        .apply_authoritative_tag_changes(changes);
+    widgets
+        .attachments
+        .apply_authoritative_messages(&state.borrow().messages);
+    refresh_thread_model_rows(widgets, state, &row_updates.0);
     update_visual_selection_rows(widgets, state);
+    row_updates.1
+}
+
+fn apply_active_draft_filename_changes(
+    active_draft: &mut Option<ActiveDraft>,
+    changes: &[notm_notmuch::AppliedTagChange],
+) -> bool {
+    let Some(active_draft) = active_draft else {
+        return true;
+    };
+    let Some(message_id) = active_draft.message_id.as_deref() else {
+        return true;
+    };
+    let matching_changes = changes
+        .iter()
+        .filter(|change| change.message_id == message_id)
+        .collect::<Vec<_>>();
+    for change in &matching_changes {
+        if let Some(filename_change) = change
+            .filename_changes
+            .iter()
+            .find(|mapping| active_draft.path == Path::new(&mapping.previous_filename))
+        {
+            active_draft.path = PathBuf::from(&filename_change.current_filename);
+        }
+    }
+    matching_changes.last().is_none_or(|change| {
+        change
+            .filenames
+            .iter()
+            .any(|filename| active_draft.path == Path::new(filename))
+    })
 }
 
 fn aggregate_thread_tags(
@@ -11872,11 +12926,13 @@ fn update_background_activity_controls(
     widgets: &Widgets,
     state: &SharedState,
 ) {
-    let (background_activity, send_in_progress) = {
+    let (background_activity, response_io_in_progress, tag_paths_blocked) = {
         let state = state.borrow();
+        let tag_paths_blocked = tag_path_actions_blocked(&state);
         (
-            state.sync_in_progress || state.send_in_progress,
-            state.send_in_progress,
+            state.sync_in_progress || state.send_in_progress || tag_paths_blocked,
+            state.send_in_progress || tag_paths_blocked,
+            tag_paths_blocked,
         )
     };
     if let Some(button) = &widgets.manual_sync_button {
@@ -11886,8 +12942,13 @@ fn update_background_activity_controls(
         .composer
         .send_button()
         .set_sensitive(!background_activity);
-    widgets.compose_button.set_sensitive(!send_in_progress);
-    if send_in_progress {
+    widgets
+        .compose_button
+        .set_sensitive(!response_io_in_progress);
+    widgets
+        .thread_list
+        .set_selection_sensitive(!tag_paths_blocked);
+    if response_io_in_progress {
         widgets.response_menu_button.popdown();
     }
     for button in [
@@ -11896,11 +12957,14 @@ fn update_background_activity_controls(
         &widgets.forward_button,
         &widgets.forward_attachment_button,
     ] {
-        button.set_sensitive(!send_in_progress);
+        button.set_sensitive(!response_io_in_progress);
     }
     widgets
         .standalone_messages
-        .set_response_sensitive(!send_in_progress);
+        .set_path_actions_sensitive(!response_io_in_progress);
+    widgets
+        .attachments
+        .set_actions_sensitive(!response_io_in_progress);
     widgets.undo_tag_button.set_sensitive(!background_activity);
     widgets
         .undo_last_tag_button
@@ -11908,7 +12972,7 @@ fn update_background_activity_controls(
     widgets
         .undo_list_tag_button
         .set_sensitive(!background_activity);
-    update_message_action_buttons(options, widgets, state);
+    update_message_action_buttons_for_activity(options, widgets, state);
     update_custom_tag_controls(widgets, state);
     update_draft_action_buttons(widgets, state);
 }
@@ -11960,12 +13024,15 @@ fn select_message_by_index(
     widgets: &Widgets,
     state: &SharedState,
     index: usize,
-) {
+) -> bool {
+    if !ensure_message_file_actions_allowed(widgets, state) {
+        return false;
+    }
     let rejection_restore = capture_message_selection_snapshot(state);
     let message = state.borrow().messages.get(index).cloned();
     if message.is_none() {
         widgets.status_label.set_text("Message index not found");
-        return;
+        return false;
     }
     state.borrow_mut().selected_message = message;
     widgets.attachments.select_first_for_message(index);
@@ -11998,6 +13065,7 @@ fn select_message_by_index(
             Some(rejection_restore),
         );
     }
+    true
 }
 
 fn shifted_shortcut_key(
@@ -12154,8 +13222,7 @@ fn select_relative_message(
         });
         return true;
     }
-    select_message_by_index(options, widgets, state, target);
-    true
+    select_message_by_index(options, widgets, state, target)
 }
 
 fn undo_last_tag(
@@ -12172,50 +13239,43 @@ fn undo_last_tag(
         widgets.status_label.set_text("No tag operation to undo");
         return false;
     };
-    undo_tag_action(options, widgets, state, undo_state, action)
+    undo_tag_actions(options, widgets, state, undo_state, vec![action])
 }
 
-fn undo_tag_action(
+fn undo_tag_actions(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
     undo_state: &UndoState,
-    action: UndoTagAction,
+    actions: Vec<UndoTagAction>,
 ) -> bool {
+    if actions.is_empty() {
+        return false;
+    }
     if ensure_user_operation_allowed(widgets, state, UserOperation::Tag).is_err() {
-        push_undo_tag_action(undo_state, action);
+        restore_undo_tag_actions(undo_state, &actions);
         set_undo_tag_available(widgets, true);
         return false;
     }
-    let mutations = action.mutations.clone();
-    let result = (|| -> anyhow::Result<()> {
-        let db = Database::open(&open_config(options), DatabaseMode::ReadWrite)?;
-        db.apply_tags_to_messages(&mutations, action.sync_maildir_flags)?;
-        state.borrow_mut().last_operation = Some(format!("undid tag operation: {}", action.label));
-        Ok(())
-    })();
-    match result {
-        Ok(()) => {
-            set_undo_tag_available(widgets, !undo_state.borrow().is_empty());
-            let current = state.borrow().current_query.clone();
-            run_search(options, widgets, state, &current);
-            widgets.status_label.set_text(&format!(
-                "Undid tag operation: {}; reloading search…",
-                action.label
-            ));
-            true
-        }
-        Err(err) => {
-            push_undo_tag_action(undo_state, action);
-            set_undo_tag_available(widgets, true);
-            state.borrow_mut().last_error = Some(err.to_string());
-            widgets
-                .status_label
-                .set_text(&format!("Undo failed: {err}"));
-            update_debug(widgets, state);
-            false
-        }
+    let operation = TagWorkerOperation::UndoActions {
+        actions: actions.clone(),
+    };
+    let scheduled = schedule_tag_mutation(
+        options,
+        widgets,
+        state,
+        undo_state,
+        PendingTagUiAction::Undo {
+            actions: actions.clone(),
+        },
+        operation,
+        Duration::ZERO,
+    );
+    if !scheduled {
+        restore_undo_tag_actions(undo_state, &actions);
+        set_undo_tag_available(widgets, true);
     }
+    scheduled
 }
 
 #[allow(deprecated)]
@@ -12613,18 +13673,19 @@ fn apply_selected_undo_dialog_actions(
         }
     }
     removed.sort_by_key(|(display_index, _)| *display_index);
-    let count = removed.len();
-    for (_, action) in removed {
-        let _ = undo_tag_action(options, widgets, state, undo_state, action);
-    }
+    let actions = removed
+        .into_iter()
+        .map(|(_, action)| action)
+        .collect::<Vec<_>>();
+    let count = actions.len();
     if count == 0 {
         widgets
             .status_label
             .set_text("No selected undo action found");
-    } else {
+    } else if undo_tag_actions(options, widgets, state, undo_state, actions) {
         widgets
             .status_label
-            .set_text(&format!("Undid {count} tag operation(s)"));
+            .set_text(&format!("Undoing {count} tag operation(s)…"));
     }
     dialog.close();
 }
@@ -12899,11 +13960,18 @@ fn finish_sync_activity(options: &LaunchOptions, widgets: &Widgets, state: &Shar
 fn close_main_window_after_background_activity(widgets: &Widgets, state: &SharedState) {
     let background_activity = {
         let state = state.borrow();
-        state.send_in_progress || state.sync_in_progress
+        background_activity_requires_deferred_close(&state)
     };
     if !background_activity && widgets.close_when_idle.replace(false) {
         widgets.window.close();
     }
+}
+
+fn background_activity_requires_deferred_close(state: &UiState) -> bool {
+    state.send_in_progress
+        || state.sync_in_progress
+        || state.tag_in_progress
+        || (state.tag_warning.is_some() && state.search_loading)
 }
 
 fn spawn_sync_commands(
@@ -13169,6 +14237,9 @@ fn reply_selected(
     state: &SharedState,
     kind: ReplyKind,
 ) -> bool {
+    if !ensure_message_file_actions_allowed(widgets, state) {
+        return false;
+    }
     let Some(message) = state.borrow().selected_message.clone() else {
         widgets
             .status_label
@@ -13208,6 +14279,9 @@ fn reply_selected(
 }
 
 fn forward_selected(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) -> bool {
+    if !ensure_message_file_actions_allowed(widgets, state) {
+        return false;
+    }
     let Some(message) = state.borrow().selected_message.clone() else {
         widgets
             .status_label
@@ -13247,6 +14321,9 @@ fn forward_as_attachment_selected(
     widgets: &Widgets,
     state: &SharedState,
 ) -> bool {
+    if !ensure_message_file_actions_allowed(widgets, state) {
+        return false;
+    }
     let Some(message) = state.borrow().selected_message.clone() else {
         widgets
             .status_label
@@ -14039,6 +15116,18 @@ fn search_status_json(state: &SharedState) -> serde_json::Value {
     })
 }
 
+fn tag_status_json(state: &SharedState) -> serde_json::Value {
+    let state = state.borrow();
+    json!({
+        "ok": true,
+        "in_progress": state.tag_in_progress,
+        "generation": state.tag_generation,
+        "paths_uncertain": state.tag_paths_uncertain,
+        "error": state.last_error,
+        "last_operation": state.last_operation,
+    })
+}
+
 fn fixture_search_worker_delay(
     options: &LaunchOptions,
     args: &serde_json::Value,
@@ -14047,9 +15136,30 @@ fn fixture_search_worker_delay(
         SearchHarnessPolicy {
             fixture_mode: options.fixture_mode,
             automation_enabled: options.automation_enabled,
+            allow_live_tag_test: options.allow_live_tag_test,
         },
         args,
     )
+}
+
+fn tag_worker_delay(options: &LaunchOptions, args: &serde_json::Value) -> anyhow::Result<Duration> {
+    let Some(value) = args.get("test_delay_ms") else {
+        return Ok(Duration::ZERO);
+    };
+    anyhow::ensure!(
+        options.automation_enabled && (options.fixture_mode || options.allow_live_tag_test),
+        "test_delay_ms requires fixture mode or automation.allow_live_tag_test=true"
+    );
+    let delay_ms = value
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("test_delay_ms must be a non-negative whole number"))?;
+    let delay = Duration::from_millis(delay_ms);
+    anyhow::ensure!(
+        delay <= MAX_TAG_WORKER_DELAY,
+        "test_delay_ms must not exceed {}",
+        MAX_TAG_WORKER_DELAY.as_millis()
+    );
+    Ok(delay)
 }
 
 fn handle_automation_request(
@@ -14116,6 +15226,7 @@ fn handle_automation_request(
         }
         "app_state" => json!({"ok": true, "state": &*state.borrow()}),
         "search_status" => search_status_json(state),
+        "tag_status" => tag_status_json(state),
         "screenshot" => {
             let name = req
                 .args
@@ -14474,9 +15585,13 @@ fn handle_automation_request(
         }
         "select_thread_by_index" => {
             let index = req.args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            select_thread_index_in_list(widgets, index);
-            select_thread_by_index(options, widgets, state, index, false);
-            json!({"ok": true, "selected_thread_index": selected_thread_index(widgets), "selected_thread": state.borrow().selected_thread})
+            if ensure_message_file_actions_allowed(widgets, state) {
+                select_thread_index_in_list(widgets, index);
+                select_thread_by_index(options, widgets, state, index, false);
+                json!({"ok": true, "selected_thread_index": selected_thread_index(widgets), "selected_thread": state.borrow().selected_thread})
+            } else {
+                json!({"ok": false, "error": widgets.status_label.text().to_string(), "selected_thread_index": selected_thread_index(widgets), "selected_thread": state.borrow().selected_thread})
+            }
         }
         "toggle_multi_select_thread" => {
             let index = req
@@ -14485,12 +15600,16 @@ fn handle_automation_request(
                 .and_then(|v| v.as_u64())
                 .map(|value| value as usize)
                 .or_else(|| selected_thread_index(widgets));
-            if let Some(index) = index {
+            if let Some(index) = index
+                && ensure_message_file_actions_allowed(widgets, state)
+            {
                 select_thread_index_in_list(widgets, index);
                 select_thread_by_index(options, widgets, state, index, false);
                 toggle_multi_selected_thread_index(widgets, state, index);
+                json!({"ok": true, "selected_thread_index": selected_thread_index(widgets), "multi_selected_threads": state.borrow().multi_selected_threads})
+            } else {
+                json!({"ok": false, "error": widgets.status_label.text().to_string(), "selected_thread_index": selected_thread_index(widgets), "multi_selected_threads": state.borrow().multi_selected_threads})
             }
-            json!({"ok": index.is_some(), "selected_thread_index": selected_thread_index(widgets), "multi_selected_threads": state.borrow().multi_selected_threads})
         }
         "clear_multi_selection" => {
             clear_multi_selection(widgets, state);
@@ -14498,8 +15617,12 @@ fn handle_automation_request(
         }
         "select_relative_thread" => {
             let delta = req.args.get("delta").and_then(|v| v.as_i64()).unwrap_or(0) as isize;
-            select_relative_thread(options, widgets, state, delta);
-            json!({"ok": true, "selected_thread_index": selected_thread_index(widgets), "state": &*state.borrow()})
+            if ensure_message_file_actions_allowed(widgets, state) {
+                select_relative_thread(options, widgets, state, delta);
+                json!({"ok": true, "selected_thread_index": selected_thread_index(widgets), "state": &*state.borrow()})
+            } else {
+                json!({"ok": false, "error": widgets.status_label.text().to_string(), "selected_thread_index": selected_thread_index(widgets), "state": &*state.borrow()})
+            }
         }
         "select_thread_edge" => {
             let bottom = req
@@ -14507,13 +15630,17 @@ fn handle_automation_request(
                 .get("bottom")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            select_thread_edge(options, widgets, state, bottom);
-            json!({"ok": true, "selected_thread_index": selected_thread_index(widgets), "state": &*state.borrow()})
+            if ensure_message_file_actions_allowed(widgets, state) {
+                select_thread_edge(options, widgets, state, bottom);
+                json!({"ok": true, "selected_thread_index": selected_thread_index(widgets), "state": &*state.borrow()})
+            } else {
+                json!({"ok": false, "error": widgets.status_label.text().to_string(), "selected_thread_index": selected_thread_index(widgets), "state": &*state.borrow()})
+            }
         }
         "select_message_by_index" => {
             let index = req.args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            select_message_by_index(options, widgets, state, index);
-            json!({"ok": true, "selected_message": state.borrow().selected_message})
+            let ok = select_message_by_index(options, widgets, state, index);
+            json!({"ok": ok, "selected_message": state.borrow().selected_message})
         }
         "select_relative_message" => {
             let delta = req
@@ -14530,12 +15657,20 @@ fn handle_automation_request(
         }
         "open_selected_thread" => {
             let idx = selected_thread_index(widgets).unwrap_or(0);
-            open_thread_by_index(options, widgets, state, idx);
-            json!({"ok": true, "state": &*state.borrow()})
+            if ensure_message_file_actions_allowed(widgets, state) {
+                open_thread_by_index(options, widgets, state, idx);
+                json!({"ok": true, "state": &*state.borrow()})
+            } else {
+                json!({"ok": false, "error": widgets.status_label.text().to_string(), "state": &*state.borrow()})
+            }
         }
         "standalone_message_windows" => {
             spin_main_context_for(Duration::from_millis(100));
             standalone_message_windows_json(widgets, state)
+        }
+        "close_standalone_message_windows" => {
+            let closed = widgets.standalone_messages.close_all();
+            json!({"ok": true, "closed": closed})
         }
         "standalone_select_message" => {
             let window_index = req
@@ -14823,20 +15958,30 @@ fn handle_automation_request(
             if req.command == "remove_tag_selected" && remove.is_empty() {
                 remove = string_array_arg(&req.args, "tags");
             }
-            let ok = tag_selected(
-                options,
-                widgets,
-                state,
-                undo_state,
-                TagMutation {
-                    add,
-                    remove,
-                    sync_maildir_flags: settings::sync_maildir_flags_after_tag_change(
-                        &options.runtime_settings,
-                    ),
-                },
-            );
-            automation_mutation_response(ok, widgets, state)
+            match tag_worker_delay(options, &req.args) {
+                Ok(delay) => {
+                    let ok = tag_selected_with_delay(
+                        options,
+                        widgets,
+                        state,
+                        undo_state,
+                        TagMutation {
+                            add,
+                            remove,
+                            sync_maildir_flags: settings::sync_maildir_flags_after_tag_change(
+                                &options.runtime_settings,
+                            ),
+                        },
+                        delay,
+                    );
+                    automation_mutation_response(ok, widgets, state)
+                }
+                Err(error) => json!({
+                    "ok": false,
+                    "error": error.to_string(),
+                    "state": &*state.borrow(),
+                }),
+            }
         }
         "undo_last_tag" => {
             let ok = undo_last_tag(options, widgets, state, undo_state);
@@ -15466,6 +16611,7 @@ fn automation_command_allowed_while_confirmation_pending(command: &str) -> bool 
         "health"
             | "app_state"
             | "search_status"
+            | "tag_status"
             | "entry_state"
             | "thread_page_info"
             | "thread_selection_view_state"
@@ -15504,7 +16650,14 @@ fn automation_mutation_response(
     state: &SharedState,
 ) -> serde_json::Value {
     let error = (!ok).then(|| widgets.status_label.text().to_string());
-    json!({"ok": ok, "error": error, "state": &*state.borrow()})
+    let state = state.borrow();
+    json!({
+        "ok": ok,
+        "error": error,
+        "pending": ok && state.tag_in_progress,
+        "generation": state.tag_generation,
+        "state": &*state,
+    })
 }
 
 fn draft_list_state_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
@@ -17572,6 +18725,270 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tag_targets_remain_snapshot_ids_after_visible_rows_reorder() {
+        let thread = |thread_id: &str| notm_notmuch::ThreadSummary {
+            thread_id: thread_id.to_string(),
+            subject: thread_id.to_string(),
+            authors: String::new(),
+            oldest_date: 0,
+            newest_date: 0,
+            matched_messages: 1,
+            total_messages: 1,
+            tags: vec!["inbox".to_string()],
+            has_unread: false,
+            is_flagged: false,
+        };
+        let expected = BTreeSet::from(["thread-a".to_string(), "thread-b".to_string()]);
+        let mut state = UiState {
+            visual_select_mode: true,
+            visual_selected_threads: expected.clone(),
+            visual_selected_thread_snapshots: [
+                ("thread-a".to_string(), thread("thread-a")),
+                ("thread-b".to_string(), thread("thread-b")),
+            ]
+            .into_iter()
+            .collect(),
+            thread_list_items: vec![thread("new-front-row"), thread("different-row")],
+            ..UiState::default()
+        };
+        let shared = Rc::new(RefCell::new(state.clone()));
+
+        assert_eq!(tag_target_thread_ids(&shared), expected);
+        assert_eq!(
+            tag_target_threads(&shared)
+                .into_iter()
+                .map(|thread| thread.thread_id)
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+
+        state.visual_select_mode = false;
+        state.visual_selected_threads.clear();
+        state.visual_selected_thread_snapshots.clear();
+        state.multi_selected_threads = expected.clone();
+        state.multi_selected_thread_snapshots = [
+            ("thread-a".to_string(), thread("thread-a")),
+            ("thread-b".to_string(), thread("thread-b")),
+        ]
+        .into_iter()
+        .collect();
+        *shared.borrow_mut() = state;
+
+        assert_eq!(tag_target_thread_ids(&shared), expected);
+        assert_eq!(
+            tag_target_threads(&shared)
+                .into_iter()
+                .map(|thread| thread.thread_id)
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn authoritative_filename_mappings_follow_active_draft_across_renames() {
+        let mut active_draft = Some(ActiveDraft {
+            path: PathBuf::from("/mail/new/draft"),
+            message_id: Some("draft@example.test".to_string()),
+            indexed: true,
+            saved_fields: ComposeFields::default(),
+        });
+        let changes = vec![
+            notm_notmuch::AppliedTagChange {
+                message_id: "draft@example.test".to_string(),
+                added: vec!["flagged".to_string()],
+                removed: Vec::new(),
+                tags: vec!["draft".to_string(), "flagged".to_string()],
+                filenames: vec!["/mail/cur/draft:2,DF".to_string()],
+                filename_changes: vec![notm_notmuch::MaildirFilenameChange {
+                    previous_filename: "/mail/new/draft".to_string(),
+                    current_filename: "/mail/cur/draft:2,DF".to_string(),
+                }],
+            },
+            notm_notmuch::AppliedTagChange {
+                message_id: "draft@example.test".to_string(),
+                added: Vec::new(),
+                removed: vec!["flagged".to_string()],
+                tags: vec!["draft".to_string()],
+                filenames: vec!["/mail/cur/draft:2,D".to_string()],
+                filename_changes: vec![notm_notmuch::MaildirFilenameChange {
+                    previous_filename: "/mail/cur/draft:2,DF".to_string(),
+                    current_filename: "/mail/cur/draft:2,D".to_string(),
+                }],
+            },
+        ];
+
+        assert!(apply_active_draft_filename_changes(
+            &mut active_draft,
+            &changes
+        ));
+
+        assert_eq!(
+            active_draft.expect("active draft").path,
+            PathBuf::from("/mail/cur/draft:2,D")
+        );
+    }
+
+    #[test]
+    fn active_draft_rejects_an_authoritative_path_set_without_its_retained_path() {
+        let mut active_draft = Some(ActiveDraft {
+            path: PathBuf::from("/mail/cur/draft:2,D"),
+            message_id: Some("draft@example.test".to_string()),
+            indexed: true,
+            saved_fields: ComposeFields::default(),
+        });
+        let changes = vec![notm_notmuch::AppliedTagChange {
+            message_id: "draft@example.test".to_string(),
+            added: vec!["flagged".to_string()],
+            removed: Vec::new(),
+            tags: vec!["draft".to_string(), "flagged".to_string()],
+            filenames: vec!["/mail/cur/unexpected:2,DF".to_string()],
+            filename_changes: Vec::new(),
+        }];
+
+        assert!(!apply_active_draft_filename_changes(
+            &mut active_draft,
+            &changes
+        ));
+    }
+
+    #[test]
+    fn tag_failure_summary_keeps_bounded_actionable_details() {
+        let report = notm_notmuch::TagBatchReport {
+            failures: vec![notm_notmuch::MessageTagFailure {
+                message_id: "message@example.test".to_string(),
+                stage: notm_notmuch::TagFailureStage::MaildirFlagSync,
+                detail: "rename was blocked".to_string(),
+                current_filenames: vec!["/mail/cur/message:2,S".to_string()],
+                file_failures: vec![notm_notmuch::MaildirFlagSyncFailure {
+                    previous_filename: "/mail/cur/message:2,S".to_string(),
+                    expected_filename: "/mail/cur/message:2,".to_string(),
+                    current_filename: Some("/mail/cur/message:2,S".to_string()),
+                }],
+            }],
+            ..notm_notmuch::TagBatchReport::default()
+        };
+
+        let summary = tag_batch_failure_summary(&report, &[]);
+
+        assert!(summary.contains("message@example.test"));
+        assert!(summary.contains("maildir_flag_sync"));
+        assert!(summary.contains("rename was blocked"));
+        assert!(summary.contains("/mail/cur/message:2,S -> /mail/cur/message:2,"));
+    }
+
+    #[test]
+    fn retained_path_uncertainty_distinguishes_known_partial_results() {
+        let failure = |current_filename: Option<&str>| notm_notmuch::MessageTagFailure {
+            message_id: "message@example.test".to_string(),
+            stage: notm_notmuch::TagFailureStage::MaildirFlagSync,
+            detail: "rename mismatch".to_string(),
+            current_filenames: current_filename.into_iter().map(str::to_string).collect(),
+            file_failures: vec![notm_notmuch::MaildirFlagSyncFailure {
+                previous_filename: "/mail/cur/message:2,S".to_string(),
+                expected_filename: "/mail/cur/message:2,".to_string(),
+                current_filename: current_filename.map(str::to_string),
+            }],
+        };
+
+        let known_unchanged = notm_notmuch::TagBatchReport {
+            failures: vec![failure(Some("/mail/cur/message:2,S"))],
+            ..notm_notmuch::TagBatchReport::default()
+        };
+        assert!(!tag_report_has_uncertain_retained_paths(&known_unchanged));
+
+        let unresolved = notm_notmuch::TagBatchReport {
+            failures: vec![failure(None)],
+            ..notm_notmuch::TagBatchReport::default()
+        };
+        assert!(tag_report_has_uncertain_retained_paths(&unresolved));
+
+        let database_mismatch = notm_notmuch::TagBatchReport {
+            failures: vec![failure(Some("/mail/cur/message:2,"))],
+            ..notm_notmuch::TagBatchReport::default()
+        };
+        assert!(tag_report_has_uncertain_retained_paths(&database_mismatch));
+
+        let lookup_failure = notm_notmuch::TagBatchReport {
+            failures: vec![notm_notmuch::MessageTagFailure {
+                message_id: "missing@example.test".to_string(),
+                stage: notm_notmuch::TagFailureStage::Lookup,
+                detail: "not found".to_string(),
+                current_filenames: Vec::new(),
+                file_failures: Vec::new(),
+            }],
+            ..notm_notmuch::TagBatchReport::default()
+        };
+        assert!(!tag_report_has_uncertain_retained_paths(&lookup_failure));
+
+        let close_failure = notm_notmuch::TagBatchReport {
+            finalization_errors: vec!["database close/commit failed".to_string()],
+            ..notm_notmuch::TagBatchReport::default()
+        };
+        assert!(tag_report_has_uncertain_retained_paths(&close_failure));
+    }
+
+    #[test]
+    fn filename_only_repairs_do_not_create_empty_undo_mutations() {
+        let changes = vec![notm_notmuch::AppliedTagChange {
+            message_id: "message@example.test".to_string(),
+            added: Vec::new(),
+            removed: Vec::new(),
+            tags: vec!["inbox".to_string()],
+            filenames: vec!["/mail/cur/message:2,S".to_string()],
+            filename_changes: vec![notm_notmuch::MaildirFilenameChange {
+                previous_filename: "/mail/new/message".to_string(),
+                current_filename: "/mail/cur/message:2,S".to_string(),
+            }],
+        }];
+
+        assert!(inverse_tag_mutations(&changes).is_empty());
+    }
+
+    #[test]
+    fn writable_close_failure_marks_an_otherwise_clean_batch_uncertain() {
+        let worker = finalize_tag_worker_result(
+            Ok((
+                notm_notmuch::TagBatchReport {
+                    requested_messages: 1,
+                    changed_messages: 1,
+                    ..notm_notmuch::TagBatchReport::default()
+                },
+                Vec::new(),
+            )),
+            Err(notm_notmuch::Error::Io(std::io::Error::other(
+                "forced close failure",
+            ))),
+        )
+        .expect("partial worker result");
+
+        assert!(!worker.is_complete());
+        assert_eq!(worker.report.changed_messages, 1);
+        assert_eq!(worker.report.finalization_errors.len(), 1);
+        assert!(worker.report.finalization_errors[0].contains("forced close failure"));
+    }
+
+    #[test]
+    fn retrying_multiple_undo_actions_preserves_newest_first_execution_order() {
+        let action = |label: &str| UndoTagAction {
+            mutations: Vec::new(),
+            sync_maildir_flags: false,
+            label: label.to_string(),
+            detail: None,
+        };
+        let mut history = vec![action("unselected")];
+        let selected = vec![action("newest"), action("older")];
+
+        restore_undo_tag_actions_in_memory(&mut history, &selected);
+
+        assert_eq!(history.pop().expect("newest retry").label, "newest");
+        assert_eq!(history.pop().expect("older retry").label, "older");
+        assert_eq!(
+            history.pop().expect("unselected history").label,
+            "unselected"
+        );
+    }
+
+    #[test]
     fn mailto_requests_map_to_editable_composer_fields() {
         let fields = compose_fields_from_mailto(
             "Fixture User <fixture@example.test>".to_string(),
@@ -17946,6 +19363,32 @@ mod tests {
     }
 
     #[test]
+    fn queued_undo_persistence_preserves_snapshot_order() {
+        let temp = tempfile::tempdir().expect("temporary state root");
+        let path = temp.path().join("notm/tag-undo.json");
+        let action = |label: &str| UndoTagAction {
+            mutations: vec![MessageTagMutation {
+                message_id: format!("{label}@example.test"),
+                add: vec![label.to_string()],
+                remove: Vec::new(),
+            }],
+            sync_maildir_flags: false,
+            label: label.to_string(),
+            detail: None,
+        };
+
+        queue_undo_tag_persistence_to_path(path.clone(), vec![action("first")]);
+        queue_undo_tag_persistence_to_path(path.clone(), vec![action("latest")]);
+        flush_undo_tag_persistence();
+
+        let stored: UndoTagHistory =
+            serde_json::from_slice(&std::fs::read(path).expect("read queued undo history"))
+                .expect("parse queued undo history");
+        assert_eq!(stored.actions.len(), 1);
+        assert_eq!(stored.actions[0].label, "latest");
+    }
+
+    #[test]
     fn sent_persistence_defaults_to_mail_root_before_database_path() {
         let temp = tempfile::tempdir().expect("temporary parent");
         let mail_root = temp.path().join("mail-root");
@@ -18225,7 +19668,7 @@ mod tests {
         };
         assert_eq!(action.operation(), UserOperation::Send);
         assert!(
-            background_activity_block_reason(true, false, action.operation()).is_some(),
+            background_activity_block_reason(true, false, false, action.operation()).is_some(),
             "accepting a pending saved-draft Send must revalidate a newly started sync"
         );
     }
@@ -18700,15 +20143,6 @@ mod tests {
     }
 
     #[test]
-    fn multi_thread_tag_query_round_trips_thread_ids() {
-        let ids = BTreeSet::from(["thread-a".to_string(), "thread-b".to_string()]);
-        let query = tag_query_for_thread_ids(&ids);
-
-        assert_eq!(query, "thread:thread-a or thread:thread-b");
-        assert_eq!(thread_ids_from_tag_query(&query), ids);
-    }
-
-    #[test]
     fn background_activity_rules_keep_edits_safe_and_serialize_writers() {
         let operations = [
             UserOperation::ComposeEdit,
@@ -18723,7 +20157,7 @@ mod tests {
         ];
         for operation in operations {
             assert_eq!(
-                background_activity_block_reason(false, false, operation),
+                background_activity_block_reason(false, false, false, operation),
                 None,
                 "idle operation was blocked: {operation:?}"
             );
@@ -18736,7 +20170,7 @@ mod tests {
             UserOperation::Sync,
         ] {
             assert!(
-                background_activity_block_reason(true, false, operation).is_some(),
+                background_activity_block_reason(true, false, false, operation).is_some(),
                 "sync did not block {operation:?}"
             );
         }
@@ -18747,7 +20181,7 @@ mod tests {
             UserOperation::ComposeReplace,
         ] {
             assert_eq!(
-                background_activity_block_reason(true, false, operation),
+                background_activity_block_reason(true, false, false, operation),
                 None,
                 "sync unnecessarily blocked {operation:?}"
             );
@@ -18757,15 +20191,39 @@ mod tests {
             .filter(|operation| *operation != UserOperation::ComposeEdit)
         {
             assert!(
-                background_activity_block_reason(false, true, operation)
+                background_activity_block_reason(false, true, false, operation)
                     .is_some_and(|message| message.contains("send is")),
                 "send did not block {operation:?}"
             );
         }
         assert_eq!(
-            background_activity_block_reason(false, true, UserOperation::ComposeEdit),
+            background_activity_block_reason(false, true, false, UserOperation::ComposeEdit),
             None
         );
+        for operation in operations
+            .into_iter()
+            .filter(|operation| *operation != UserOperation::ComposeEdit)
+        {
+            assert!(
+                background_activity_block_reason(false, false, true, operation)
+                    .is_some_and(|message| message.contains("tag") || message.contains("tags")),
+                "tag mutation did not block {operation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn close_waits_for_tag_reconciliation_but_allows_uncertain_restart() {
+        let mut state = UiState {
+            tag_warning: Some("partial tag result".to_string()),
+            search_loading: true,
+            ..UiState::default()
+        };
+        assert!(background_activity_requires_deferred_close(&state));
+
+        state.search_loading = false;
+        state.tag_paths_uncertain = true;
+        assert!(!background_activity_requires_deferred_close(&state));
     }
 
     #[test]

@@ -15,8 +15,9 @@ pub use config::{ConfigProfile, LoadedIdentity};
 pub use database::{Database, DatabaseMode, OpenConfig, Revision};
 pub use error::{Error, Result};
 pub use message::{
-    AppliedTagChange, MessageSummary, MessageTagMutation, TagMutation, TagOperationReport,
-    ThreadRangeTagReport,
+    AppliedTagChange, MaildirFilenameChange, MaildirFlagSyncFailure, MessageSummary,
+    MessageTagFailure, MessageTagMutation, TagBatchReport, TagFailureStage, TagMutation,
+    TagOperationReport, ThreadTagReport,
 };
 pub use query::{QueryOptions, SortOrder};
 pub use thread::ThreadSummary;

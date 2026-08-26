@@ -144,6 +144,7 @@ pub(crate) struct AttachmentController {
     pending_save: Rc<RefCell<Option<PendingAttachmentSave>>>,
     next_save_id: Rc<Cell<u64>>,
     opener: AttachmentOpener,
+    actions_sensitive: Rc<Cell<bool>>,
 }
 
 impl AttachmentController {
@@ -183,6 +184,7 @@ impl AttachmentController {
             } else {
                 AttachmentOpener::System
             },
+            actions_sensitive: Rc::new(Cell::new(true)),
         }
     }
 
@@ -201,6 +203,18 @@ impl AttachmentController {
     pub(crate) fn hide(&self) {
         self.title.set_visible(false);
         self.scrolled.set_visible(false);
+    }
+
+    pub(crate) fn set_actions_sensitive(&self, sensitive: bool) {
+        self.actions_sensitive.set(sensitive);
+        self.list.set_sensitive(sensitive);
+    }
+
+    /// Replace retained message paths/tags without reparsing MIME bodies.
+    /// Existing attachment rows remain valid because tag mutations do not
+    /// change message content or MIME part ordering.
+    pub(crate) fn apply_authoritative_messages(&self, messages: &[MessageSummary]) {
+        self.messages.replace(messages.to_vec());
     }
 
     pub(crate) fn refresh(
@@ -301,6 +315,10 @@ impl AttachmentController {
         selected_message: Option<MessageSummary>,
         index: usize,
     ) -> anyhow::Result<AttachmentPayload> {
+        anyhow::ensure!(
+            self.actions_sensitive.get(),
+            "attachment actions are unavailable while tags are changing"
+        );
         match self.items.borrow().get(index).cloned() {
             Some(item) => self.thread_payload(&item),
             None => selected_attachment_payload(selected_message, index),
@@ -311,6 +329,10 @@ impl AttachmentController {
         &self,
         selected_message: Option<MessageSummary>,
     ) -> anyhow::Result<AttachmentPayload> {
+        anyhow::ensure!(
+            self.actions_sensitive.get(),
+            "attachment actions are unavailable while tags are changing"
+        );
         match self.selected_thread_attachment() {
             Some(item) => self.thread_payload(&item),
             None => selected_attachment_payload(selected_message, 0),
@@ -533,6 +555,10 @@ impl AttachmentController {
     }
 
     fn thread_payload(&self, item: &ThreadAttachmentItem) -> anyhow::Result<AttachmentPayload> {
+        anyhow::ensure!(
+            self.actions_sensitive.get(),
+            "attachment actions are unavailable while tags are changing"
+        );
         let message = self
             .messages
             .borrow()

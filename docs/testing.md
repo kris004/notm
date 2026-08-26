@@ -130,10 +130,21 @@ means the composed snapshot was queued, not that sending finished. Poll
 `app_state.state.send_in_progress` until it becomes false before checking
 `last_send_report`, `last_error`, or send-related file changes.
 
+Tag commands are also asynchronous. A successful scheduling response includes
+`pending: true`; poll `tag_status` until `in_progress` is false before checking
+tags, filenames, undo history, or path-based message actions. An incomplete
+batch forces a search reconciliation and remains unavailable for another tag
+mutation until that refresh succeeds. `tag_status.paths_uncertain = true`
+means the worker could not prove retained message or draft filenames safe (for
+example, after a close/commit failure); verify the warning and restart the
+isolated app before attempting another path, draft, tag, send, or sync action.
+
 For a narrowly scoped responsiveness check, fixture harness requests may pass
-`test_delay_ms` to `run_search` (maximum 5000). The delay runs on the search
-worker, so `health` and `search_status` must remain responsive while the search
-is outstanding. This argument is rejected outside fixture harness mode.
+`test_delay_ms` to `run_search` or `tag_selected` (maximum 5000). The delay runs
+on the corresponding worker, so `health`, `search_status`, and `tag_status`
+must remain responsive while work is outstanding. A disposable non-fixture
+tag-race harness may use the same delay only when
+`automation.allow_live_tag_test = true`; other non-fixture runs reject it.
 
 For a bug fix, capture or reproduce the symptom first, then rerun the same
 fixture/live path after the change and confirm the symptom is gone. Rust compile,
@@ -219,6 +230,22 @@ NOTM_REQUIRE_GTK_DISPLAY=1 \
   fixture_current_message_navigation_and_tagging_are_explicit \
   -- --exact --nocapture --test-threads=1
 ```
+
+Exact multi-selection, refresh races, Maildir filename propagation, and restart
+persistence have a standard-user regression backed by a disposable Maildir,
+Notmuch database, XDG tree, Wayland display, and D-Bus session:
+
+```sh
+tests/run_with_headless_weston.sh dbus-run-session -- \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
+  indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after_restart \
+  -- --exact --nocapture --test-threads=1
+```
+
+The test is required-display and fails rather than skips when its isolated GUI
+environment is unavailable. It verifies exact thread IDs after a reorder,
+multi-file rename propagation into raw/attachment/reply/standalone paths,
+conflicting-action rejection, and persistence after a clean restart.
 
 Visual-HTML link hints have a fixture-backed GTK smoke that verifies visible
 links receive distinct labels and that cancelling clears the mode:

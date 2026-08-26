@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::BTreeMap,
     rc::Rc,
 };
 
@@ -7,7 +8,7 @@ use chrono::Utc;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use notm_mail::{ReplyKind, address::parse_address_list};
-use notm_notmuch::MessageSummary;
+use notm_notmuch::{AppliedTagChange, MessageSummary};
 use serde::Serialize;
 use webkit6::prelude::WebViewExt;
 
@@ -362,6 +363,8 @@ impl StandaloneMessageController {
             remember_view: options.remember_view,
             sender_view: options.sender_view,
             toggle_sender_view: options.toggle_sender_view,
+            path_actions_sensitive: Cell::new(policy.response_sensitive),
+            message_html_by_id: RefCell::new(BTreeMap::new()),
             state: RefCell::new(StandaloneMessageState {
                 messages: options.messages,
                 selected_index,
@@ -388,10 +391,78 @@ impl StandaloneMessageController {
         Ok(())
     }
 
-    pub(crate) fn set_response_sensitive(&self, sensitive: bool) {
+    pub(crate) fn set_path_actions_sensitive(&self, sensitive: bool) {
         for standalone in self.windows.borrow().iter() {
+            standalone.path_actions_sensitive.set(sensitive);
             update_response_controls(standalone, sensitive);
+            standalone.message_menu_button.set_sensitive(sensitive);
+            standalone.view_menu_button.set_sensitive(sensitive);
+            if sensitive {
+                standalone.view_text_button.set_sensitive(true);
+                standalone.view_headers_button.set_sensitive(true);
+                standalone.view_raw_button.set_sensitive(true);
+                if let Some(message) = current_message(standalone) {
+                    update_message_buttons(standalone, &message);
+                    update_sender_view_preference_button(standalone, &message);
+                }
+            } else {
+                for button in [
+                    &standalone.view_text_button,
+                    &standalone.view_html_button,
+                    &standalone.view_headers_button,
+                    &standalone.view_raw_button,
+                    &standalone.sender_view_preference_button,
+                    &standalone.image_policy_button,
+                ] {
+                    button.set_sensitive(false);
+                }
+            }
         }
+    }
+
+    /// Replaces the cached tag and filename data in every open message window.
+    ///
+    /// Maildir flag synchronization can rename a message's backing files. Keep
+    /// each standalone window's retained summaries authoritative so later raw,
+    /// reply, forward, and attachment operations never reuse the old paths.
+    pub(crate) fn apply_authoritative_tag_changes(&self, changes: &[AppliedTagChange]) -> usize {
+        if changes.is_empty() {
+            return 0;
+        }
+
+        // Drop the controller's RefCell borrow before updating window chrome.
+        let windows = self.windows.borrow().clone();
+        let mut updated_messages = 0;
+        for standalone in windows {
+            let (updated, selected_affected) = {
+                let mut state = standalone.state.borrow_mut();
+                let selected_index = state.selected_index;
+                let updated = apply_authoritative_changes_to_messages(&mut state.messages, changes);
+                let selected_affected = updated.contains(&selected_index);
+                (updated.len(), selected_affected)
+            };
+            if updated == 0 {
+                continue;
+            }
+
+            updated_messages += updated;
+            if selected_affected && let Some(message) = current_message(&standalone) {
+                standalone
+                    .window
+                    .set_title(Some(&standalone_message_window_title(&message)));
+                refresh_message_header(&standalone, &message);
+            }
+        }
+        updated_messages
+    }
+
+    pub(crate) fn close_all(&self) -> usize {
+        let windows = self.windows.borrow().clone();
+        let count = windows.len();
+        for standalone in windows {
+            standalone.window.close();
+        }
+        count
     }
 
     pub(crate) fn snapshots(&self) -> Vec<StandaloneWindowSnapshot> {
@@ -428,6 +499,28 @@ impl StandaloneMessageController {
         let accepted = run_response_action(&standalone, action);
         Some((accepted, standalone.snapshot()))
     }
+}
+
+fn apply_authoritative_changes_to_messages(
+    messages: &mut [MessageSummary],
+    changes: &[AppliedTagChange],
+) -> Vec<usize> {
+    messages
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            let change = changes
+                .iter()
+                .rev()
+                .find(|change| change.message_id == message.message_id)?;
+            if message.tags == change.tags && message.filenames == change.filenames {
+                return None;
+            }
+            message.tags.clone_from(&change.tags);
+            message.filenames.clone_from(&change.filenames);
+            Some(index)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -514,6 +607,8 @@ struct StandaloneMessageWindow {
     remember_view: StandaloneRememberView,
     sender_view: StandaloneSenderView,
     toggle_sender_view: StandaloneToggleSenderView,
+    path_actions_sensitive: Cell<bool>,
+    message_html_by_id: RefCell<BTreeMap<String, bool>>,
     state: RefCell<StandaloneMessageState>,
 }
 
@@ -1001,6 +1096,9 @@ fn response_sequence_action(key: gtk::gdk::Key) -> Option<StandaloneResponseActi
 }
 
 fn run_view_key(standalone: &StandaloneMessageWindow, key: gtk::gdk::Key) -> bool {
+    if !ensure_path_actions_sensitive(standalone) {
+        return true;
+    }
     let Some(action) = view_sequence_action(key) else {
         return false;
     };
@@ -1010,7 +1108,7 @@ fn run_view_key(standalone: &StandaloneMessageWindow, key: gtk::gdk::Key) -> boo
     };
     if view == MessageViewKind::Html
         && current_message(standalone)
-            .is_none_or(|message| !(standalone.message_has_html)(&message))
+            .is_none_or(|message| !cached_message_has_html(standalone, &message))
     {
         standalone.status_label.set_text("No visual HTML part");
         return true;
@@ -1071,7 +1169,21 @@ fn current_message(standalone: &StandaloneMessageWindow) -> Option<MessageSummar
     state.messages.get(state.selected_index).cloned()
 }
 
+fn ensure_path_actions_sensitive(standalone: &StandaloneMessageWindow) -> bool {
+    if standalone.path_actions_sensitive.get() {
+        true
+    } else {
+        standalone
+            .status_label
+            .set_text("Message file actions are unavailable while tags are changing");
+        false
+    }
+}
+
 fn select_message(standalone: &Rc<StandaloneMessageWindow>, index: usize) -> bool {
+    if !ensure_path_actions_sensitive(standalone) {
+        return false;
+    }
     let message = {
         let mut state = standalone.state.borrow_mut();
         if index >= state.messages.len() {
@@ -1170,7 +1282,7 @@ fn show_message_view(standalone: &StandaloneMessageWindow, view: MessageViewKind
         standalone.status_label.set_text("No selected message");
         return false;
     };
-    if view == MessageViewKind::Html && !(standalone.message_has_html)(&message) {
+    if view == MessageViewKind::Html && !cached_message_has_html(standalone, &message) {
         standalone.status_label.set_text("No visual HTML part");
         return false;
     }
@@ -1190,11 +1302,14 @@ fn show_message_view(standalone: &StandaloneMessageWindow, view: MessageViewKind
 }
 
 fn choose_message_view(standalone: &StandaloneMessageWindow, view: MessageViewKind) -> bool {
+    if !ensure_path_actions_sensitive(standalone) {
+        return false;
+    }
     let Some(message) = current_message(standalone) else {
         standalone.status_label.set_text("No selected message");
         return false;
     };
-    if view == MessageViewKind::Html && !(standalone.message_has_html)(&message) {
+    if view == MessageViewKind::Html && !cached_message_has_html(standalone, &message) {
         standalone.status_label.set_text("No visual HTML part");
         return false;
     }
@@ -1248,7 +1363,9 @@ fn update_sender_view_preference_button(
         .sender_view_preference_button
         .set_tooltip_text(Some(&sender_view_preference_tooltip(&sender, enabled)));
     standalone.sender_view_preference_button.set_visible(true);
-    standalone.sender_view_preference_button.set_sensitive(true);
+    standalone
+        .sender_view_preference_button
+        .set_sensitive(standalone.path_actions_sensitive.get());
 }
 
 fn sender_view_preference_label(preference: MessageViewPreference) -> String {
@@ -1265,6 +1382,9 @@ fn sender_view_preference_tooltip(sender: &str, enabled: bool) -> String {
 }
 
 fn activate_sender_view_preference(standalone: &StandaloneMessageWindow) {
+    if !ensure_path_actions_sensitive(standalone) {
+        return;
+    }
     let Some(message) = current_message(standalone) else {
         standalone.status_label.set_text("No selected message");
         standalone.view_menu_button.popdown();
@@ -1289,11 +1409,14 @@ fn activate_sender_view_preference(standalone: &StandaloneMessageWindow) {
 }
 
 fn start_link_hint_mode(standalone: &StandaloneMessageWindow) -> bool {
+    if !ensure_path_actions_sensitive(standalone) {
+        return true;
+    }
     let Some(message) = current_message(standalone) else {
         standalone.status_label.set_text("No message selected");
         return true;
     };
-    if !(standalone.message_has_html)(&message) {
+    if !cached_message_has_html(standalone, &message) {
         standalone
             .status_label
             .set_text("The selected message has no Visual HTML links");
@@ -1432,6 +1555,9 @@ fn set_active_message_view(standalone: &StandaloneMessageWindow, active: Message
 }
 
 fn toggle_quote_collapse(standalone: &StandaloneMessageWindow) {
+    if !ensure_path_actions_sensitive(standalone) {
+        return;
+    }
     let enabled = {
         let mut state = standalone.state.borrow_mut();
         state.collapse_quotes = !state.collapse_quotes;
@@ -1446,6 +1572,9 @@ fn toggle_quote_collapse(standalone: &StandaloneMessageWindow) {
 }
 
 fn activate_image_policy_button(standalone: &StandaloneMessageWindow) {
+    if !ensure_path_actions_sensitive(standalone) {
+        return;
+    }
     let Some(message) = current_message(standalone) else {
         standalone.status_label.set_text("No message selected");
         return;
@@ -1466,10 +1595,13 @@ fn activate_image_policy_button(standalone: &StandaloneMessageWindow) {
 }
 
 fn update_message_buttons(standalone: &StandaloneMessageWindow, message: &MessageSummary) {
-    let has_html = (standalone.message_has_html)(message);
+    let has_html = cached_message_has_html(standalone, message);
     let html_visible = standalone.state.borrow().view == MessageViewKind::Html;
+    let path_actions_sensitive = standalone.path_actions_sensitive.get();
     standalone.view_html_button.set_visible(has_html);
-    standalone.view_html_button.set_sensitive(has_html);
+    standalone
+        .view_html_button
+        .set_sensitive(has_html && path_actions_sensitive);
     standalone
         .html_policy_row
         .set_visible(html_visible && has_html);
@@ -1514,12 +1646,31 @@ fn update_message_buttons(standalone: &StandaloneMessageWindow, message: &Messag
             .set_label("Trust sender images");
         standalone
             .image_policy_button
-            .set_sensitive(message_sender_email(message).is_some());
+            .set_sensitive(path_actions_sensitive && message_sender_email(message).is_some());
     } else {
         standalone.image_policy_button.set_label("Load images once");
-        standalone.image_policy_button.set_sensitive(true);
+        standalone
+            .image_policy_button
+            .set_sensitive(path_actions_sensitive);
     }
     update_button_binding_labels(standalone);
+}
+
+fn cached_message_has_html(standalone: &StandaloneMessageWindow, message: &MessageSummary) -> bool {
+    if let Some(has_html) = standalone
+        .message_html_by_id
+        .borrow()
+        .get(&message.message_id)
+        .copied()
+    {
+        return has_html;
+    }
+    let has_html = (standalone.message_has_html)(message);
+    standalone
+        .message_html_by_id
+        .borrow_mut()
+        .insert(message.message_id.clone(), has_html);
+    has_html
 }
 
 fn refresh_message_header(standalone: &StandaloneMessageWindow, message: &MessageSummary) {
@@ -1596,6 +1747,9 @@ fn run_response_action(
     standalone: &StandaloneMessageWindow,
     action: StandaloneResponseAction,
 ) -> bool {
+    if !ensure_path_actions_sensitive(standalone) {
+        return false;
+    }
     let Some(message) = current_message(standalone) else {
         standalone.status_label.set_text("No message selected");
         return false;
@@ -1919,6 +2073,78 @@ fn scroll_window_to_edge(scrolled: &gtk::ScrolledWindow, bottom: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn message_summary(message_id: &str, tags: &[&str], filenames: &[&str]) -> MessageSummary {
+        MessageSummary {
+            message_id: message_id.to_string(),
+            thread_id: "thread-1".to_string(),
+            date: 0,
+            from: "Sender <sender@example.test>".to_string(),
+            to: "Recipient <recipient@example.test>".to_string(),
+            cc: String::new(),
+            subject: format!("Subject for {message_id}"),
+            tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
+            filenames: filenames
+                .iter()
+                .map(|filename| (*filename).to_string())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn authoritative_tag_changes_replace_matching_standalone_message_state() {
+        let mut messages = vec![
+            message_summary("message-1", &["inbox", "unread"], &["old-1", "old-2"]),
+            message_summary("message-2", &["inbox"], &["unchanged"]),
+        ];
+        let changes = vec![AppliedTagChange {
+            message_id: "message-1".to_string(),
+            added: vec!["flagged".to_string()],
+            removed: vec!["unread".to_string()],
+            tags: vec!["flagged".to_string(), "inbox".to_string()],
+            filenames: vec!["new-1:2,F".to_string(), "new-2:2,F".to_string()],
+            filename_changes: Vec::new(),
+        }];
+
+        assert_eq!(
+            apply_authoritative_changes_to_messages(&mut messages, &changes),
+            vec![0]
+        );
+        assert_eq!(messages[0].tags, ["flagged", "inbox"]);
+        assert_eq!(messages[0].filenames, ["new-1:2,F", "new-2:2,F"]);
+        assert_eq!(messages[1].tags, ["inbox"]);
+        assert_eq!(messages[1].filenames, ["unchanged"]);
+    }
+
+    #[test]
+    fn authoritative_tag_changes_use_the_latest_change_for_a_message() {
+        let mut messages = vec![message_summary("message-1", &["inbox"], &["old"])];
+        let changes = vec![
+            AppliedTagChange {
+                message_id: "message-1".to_string(),
+                added: vec!["flagged".to_string()],
+                removed: Vec::new(),
+                tags: vec!["flagged".to_string(), "inbox".to_string()],
+                filenames: vec!["intermediate:2,F".to_string()],
+                filename_changes: Vec::new(),
+            },
+            AppliedTagChange {
+                message_id: "message-1".to_string(),
+                added: Vec::new(),
+                removed: vec!["flagged".to_string()],
+                tags: vec!["inbox".to_string()],
+                filenames: vec!["final:2,".to_string()],
+                filename_changes: Vec::new(),
+            },
+        ];
+
+        assert_eq!(
+            apply_authoritative_changes_to_messages(&mut messages, &changes),
+            vec![0]
+        );
+        assert_eq!(messages[0].tags, ["inbox"]);
+        assert_eq!(messages[0].filenames, ["final:2,"]);
+    }
 
     #[test]
     fn standalone_message_shortcut_sequences_match_their_menu_bindings() {

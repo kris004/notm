@@ -550,6 +550,10 @@ impl ThreadListController {
         self.load_more_button.set_sensitive(sensitive);
     }
 
+    pub(crate) fn set_selection_sensitive(&self, sensitive: bool) {
+        self.list.set_sensitive(sensitive);
+    }
+
     pub(crate) fn connect_activate<F>(&self, callback: F)
     where
         F: Fn(usize) + 'static,

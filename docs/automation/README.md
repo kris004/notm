@@ -40,9 +40,16 @@ Example request:
 the new generation. `select_saved_search` and `load_more_threads` use the same
 background-search state. Poll `search_status` until `loading` is false before
 inspecting final rows; a non-null `error` means the current generation failed.
-Fixture harnesses may add `test_delay_ms` (up to 5000) when testing that the UI
-and harness remain responsive during an outstanding search. The delay option is
-rejected for non-fixture runs.
+Tag commands likewise return `pending: true` after scheduling. Poll
+`tag_status` until `in_progress` is false before inspecting tags, current
+filenames, undo history, or path-based message actions. Fixture harnesses may
+add `test_delay_ms` (up to 5000) to `run_search` or `tag_selected` when testing
+responsiveness. A disposable non-fixture tag-race harness may use the delay only
+with `automation.allow_live_tag_test = true`; other non-fixture runs reject it.
+If `tag_status.paths_uncertain` is true, retained message and draft paths are
+intentionally disabled and the process must be restarted before driving any
+path, tag, send, or sync action. A reported partial result with known paths
+instead remains blocked only through its automatic reconciliation search.
 
 ## Safety boundaries
 
@@ -74,7 +81,8 @@ rejected for non-fixture runs.
 
 Implemented test-harness commands include:
 
-- health/state: `health`, `app_state`, `search_status`, `get_logs`, `screenshot`
+- health/state: `health`, `app_state`, `search_status`, `tag_status`, `get_logs`,
+  `screenshot`
 - search/navigation: `focus_search`, `set_search_query`, `run_search`,
   `load_more_threads`, `scroll_thread_list_to_bottom`, `thread_page_info`,
   `thread_selection_view_state`, `thread_row_layout`, `thread_list_rows`,
@@ -111,6 +119,9 @@ Implemented test-harness commands include:
   `start_link_hints`, `link_hint_state`, `input_link_hint`,
   `cancel_link_hints`, `toggle_quote_collapse`, `message_view_text`,
   `copy_message_id`, `copy_thread_id`
+- standalone windows: `standalone_message_windows`,
+  `close_standalone_message_windows`, `standalone_select_message`,
+  `standalone_respond`
 - UI/debug: `send_key`, `open_command_palette`, `command_completion`,
   `open_shortcuts`, `show_shortcuts`, `help_search`, `run_command`,
   `run_manual_sync`, `open_settings`, `settings_test_state`,
