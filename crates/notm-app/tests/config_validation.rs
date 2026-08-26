@@ -98,6 +98,7 @@ fn print_config_distinguishes_missing_explicit_and_default_paths() -> anyhow::Re
 fn print_config_accepts_but_omits_legacy_keys() -> anyhow::Result<()> {
     let config = PrivateConfig::create(
         "[ui]\nconfirm_destructive_tag_actions = false\n\
+         trusted_image_senders = [\"SPOOFED@EXAMPLE.TEST\", \"malformed sender\"]\n\
          \n[send]\none_live_self_test_per_run = true\n\
          \n[send.env]\nNOTM_CUSTOM_VARIABLE = \"custom value\"\n\
          \n[sync]\nshow_manual_sync_button = true\n",
@@ -119,6 +120,7 @@ fn print_config_accepts_but_omits_legacy_keys() -> anyhow::Result<()> {
     );
     for (section, legacy_key) in [
         ("ui", "confirm_destructive_tag_actions"),
+        ("ui", "trusted_image_senders"),
         ("send", "one_live_self_test_per_run"),
         ("sync", "show_manual_sync_button"),
     ] {
@@ -127,6 +129,10 @@ fn print_config_accepts_but_omits_legacy_keys() -> anyhow::Result<()> {
             "legacy key {section}.{legacy_key} was not omitted: {printed}"
         );
     }
+    assert_eq!(
+        printed["ui"]["remote_images"], false,
+        "ignored legacy sender entries broadened the effective image policy"
+    );
     Ok(())
 }
 
