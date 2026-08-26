@@ -21,7 +21,7 @@ use notm_mail::{
     html_sanitize::sanitize_html,
     message_io::{BoundedText, read_header_text, read_raw_text},
     mime::parse_reader,
-    parse_mailto_uri, validate_send_timeout_seconds,
+    parse_mailto_uri, send_timeout_duration, validate_send_timeout_seconds,
 };
 use notm_notmuch::{
     Database, DatabaseMode, MessageTagMutation, OpenConfig, QueryOptions, SortOrder, TagMutation,
@@ -13927,7 +13927,7 @@ fn send_message_with_config(
             mode: options.send_mode.clone(),
             working_dir: options.send_working_dir.clone(),
             env: options.send_env.clone(),
-            timeout: Duration::from_secs(options.send_timeout_seconds),
+            timeout: send_timeout_duration(options.send_timeout_seconds)?,
         };
         return rt.block_on(transport.send(message));
     }
@@ -18722,8 +18722,8 @@ mod tests {
     }
 
     #[test]
-    fn launch_rejects_unpersistable_send_timeouts_before_gtk_startup() {
-        for send_timeout_seconds in [0, notm_mail::MAX_SEND_TIMEOUT_SECONDS + 1] {
+    fn launch_rejects_unsupported_send_timeouts_before_gtk_startup() {
+        for send_timeout_seconds in [0, notm_mail::MAX_SEND_TIMEOUT_SECONDS + 1, i64::MAX as u64] {
             let options = LaunchOptions {
                 send_timeout_seconds,
                 ..LaunchOptions::default()
@@ -18739,7 +18739,7 @@ mod tests {
             send_timeout_seconds: notm_mail::MAX_SEND_TIMEOUT_SECONDS,
             ..LaunchOptions::default()
         };
-        validate_launch_options(&options).expect("maximum persistable timeout must be valid");
+        validate_launch_options(&options).expect("maximum supported timeout must be valid");
     }
 
     #[test]

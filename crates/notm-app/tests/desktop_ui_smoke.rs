@@ -7281,13 +7281,15 @@ fn fixture_send_timeout_validation_preserves_last_valid_value_across_restart() -
         .map(PathBuf::from)
         .with_context(|| format!("Settings state has no output config path: {initial}"))?;
     let original_settings_output = fs::read(&settings_output_path).ok();
+    let timeout_above_maximum = (notm_mail::MAX_SEND_TIMEOUT_SECONDS + 1).to_string();
 
     for (timeout, response) in [
         ("0", "apply"),
         ("-0", "save"),
         ("-1", "save"),
         ("not-a-number", "save"),
-        ("9223372036854775808", "save"),
+        (&timeout_above_maximum, "save"),
+        ("9223372036854775807", "save"),
         ("340282366920938463463374607431768211455", "save"),
     ] {
         let rejected = first_driver.command(
@@ -7355,7 +7357,7 @@ fn fixture_send_timeout_validation_preserves_last_valid_value_across_restart() -
     let saved_toml: toml::Value = toml::from_str(&saved_config)?;
     assert_eq!(
         saved_toml["send"]["timeout_seconds"].as_integer(),
-        Some(i64::MAX),
+        Some(i64::try_from(notm_mail::MAX_SEND_TIMEOUT_SECONDS)?),
         "Settings did not persist the maximum valid timeout: {saved_config}"
     );
     assert_eq!(

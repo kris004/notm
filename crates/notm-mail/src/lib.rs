@@ -20,6 +20,7 @@ pub use mime::{Attachment, ParsedMessage};
 pub use reply::{ReplyKind, build_reply};
 pub use send::{ProbeReport, SendReport, TransportDescription};
 pub use send_timeout::{
-    MAX_SEND_TIMEOUT_SECONDS, parse_send_timeout_seconds, validate_send_timeout_seconds,
+    MAX_SEND_TIMEOUT_SECONDS, parse_send_timeout_seconds, send_timeout_duration,
+    validate_send_timeout_seconds,
 };
 pub use transport::{ExternalCommandTransport, FakeSendTransport, SendTransport, TransportMode};

@@ -76,7 +76,7 @@ fn print_config_rejects_invalid_values_with_dotted_keys() -> anyhow::Result<()> 
 }
 
 #[test]
-fn print_config_enforces_the_persistable_send_timeout_range() -> anyhow::Result<()> {
+fn print_config_enforces_the_supported_send_timeout_range() -> anyhow::Result<()> {
     let config = PrivateConfig::create(&format!(
         "[send]\ntimeout_seconds = {MAX_SEND_TIMEOUT_SECONDS}\n"
     ))?;
@@ -96,6 +96,7 @@ fn print_config_enforces_the_persistable_send_timeout_range() -> anyhow::Result<
         "-1".to_string(),
         "\"not-a-number\"".to_string(),
         (MAX_SEND_TIMEOUT_SECONDS + 1).to_string(),
+        i64::MAX.to_string(),
         u128::MAX.to_string(),
     ] {
         let contents = format!("[send]\ntimeout_seconds = {timeout}\n");

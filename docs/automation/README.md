@@ -238,10 +238,11 @@ drives that same GTK dialog's response signal. It accepts optional `id`,
 
 This is a fixture-only UI-test seam, not an alternate settings API. Invalid
 theme, preview, or send-timeout values leave the dialog open and do not update
-runtime state or the config file. `apply` changes the running window without
-writing; `save` writes and then applies. Send changes require relaunch. The
-older `save_settings` command persists only its basic direct-test fields and
-does not exercise the dialog.
+runtime state or the config file. Send timeouts use the same inclusive
+1..=946080000-second range as normal configuration. `apply` changes the running
+window without writing; `save` writes and then applies. Send changes require
+relaunch. The older `save_settings` command persists only its basic direct-test
+fields and does not exercise the dialog.
 
 `run_manual_sync` returns with `pending: true` after the configured commands
 have started in the background. Poll `app_state.state.sync_in_progress` until
