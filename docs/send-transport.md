@@ -29,6 +29,25 @@ Transport mode behavior:
 
 Any helper-specific flags must be set explicitly in config. notm does not inspect helper scripts or add implicit arguments.
 
+Before invoking the helper, notm constructs and validates the complete wire
+message. It uses CRLF line endings throughout, folds address, subject, and
+threading fields, applies RFC 2047 encoded-words to Unicode or otherwise
+overlong display names and subjects, and uses RFC 2231 continuations for
+Unicode or long attachment filenames. Text and HTML parts use wrapped
+quoted-printable encoding; ordinary attachments use wrapped Base64. Attached
+`message/rfc822` messages are parsed, normalized, checked for wire line limits,
+and sent with the standards-permitted `8bit` transfer encoding rather than an
+illegal Base64 encoding. Multipart boundaries, the Date, and Message-ID are
+stored with the composed message, so repeated rendering produces identical
+bytes for transport and Sent persistence.
+
+Header values containing CR, LF, or control characters other than the RFC 5322
+HTAB whitespace character are rejected, not silently repaired. Invalid mailbox
+or threading identifiers and unsafe embedded messages also fail before the
+helper starts or a fake capture is written. The composer reports that
+validation error so the user can correct the message rather than unknowingly
+sending altered headers.
+
 The helper runs with the configured `timeout_seconds` (120 by default). On
 timeout, `notm` terminates its process group and reaps the direct child. Stdout
 and stderr are drained with bounded capture; a nonzero exit is reported as a
@@ -37,7 +56,10 @@ rejected send together with the available status and stderr.
 When the composer has Bcc recipients, notm includes a `Bcc` field in the
 submitted RFC5322 message so a header-reading helper can add those recipients to
 the delivery envelope. The helper must remove that field before final delivery;
-the sendmail-style `-t` configuration in the README follows this contract.
+the sendmail-style `-t` configuration in the README follows this contract. The
+field is therefore expected in a pre-helper fixture capture, but must not appear
+in a message captured after a correctly configured delivery helper has applied
+its normal Bcc stripping.
 
 Optional post-send persistence is explicit:
 

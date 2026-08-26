@@ -56,10 +56,9 @@ pub fn build_reply(
     message.cc = cc;
     if !original.message_id.is_empty() {
         message.in_reply_to = Some(original.message_id.clone());
-        message.references = original
-            .references
-            .split_whitespace()
-            .map(ToOwned::to_owned)
+        message.references = (!original.references.trim().is_empty())
+            .then(|| original.references.trim().to_string())
+            .into_iter()
             .chain(std::iter::once(original.message_id.clone()))
             .collect();
     }

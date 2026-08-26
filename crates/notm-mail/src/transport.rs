@@ -60,7 +60,7 @@ impl SendTransport for FakeSendTransport {
             "{}.eml",
             message.message_id.trim_matches(['<', '>'])
         ));
-        std::fs::write(&path, message.to_rfc5322())?;
+        std::fs::write(&path, message.to_rfc5322()?)?;
         Ok(SendReport {
             accepted: true,
             exit_status: Some(0),
@@ -202,20 +202,16 @@ impl ExternalCommandTransport {
     async fn send_stdin(&self, message: ComposedMessage) -> anyhow::Result<SendReport> {
         let mut command = self.base_command();
         command.args(&self.args);
-        let output = run_external_command(
-            "send",
-            command,
-            Some(message.to_rfc5322().into_bytes()),
-            self.timeout,
-        )
-        .await?;
+        let output =
+            run_external_command("send", command, Some(message.to_rfc5322()?), self.timeout)
+                .await?;
         Ok(report_from_output(output))
     }
 
     async fn send_file_arg(&self, message: ComposedMessage) -> anyhow::Result<SendReport> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("message.eml");
-        std::fs::write(&path, message.to_rfc5322())?;
+        std::fs::write(&path, message.to_rfc5322()?)?;
         let mut command = self.base_command();
         command.args(&self.args).arg(&path);
         let output = run_external_command("send", command, None, self.timeout).await?;
@@ -230,7 +226,7 @@ impl ExternalCommandTransport {
         }
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("message.eml");
-        std::fs::write(&path, message.to_rfc5322())?;
+        std::fs::write(&path, message.to_rfc5322()?)?;
         let rendered_args = self
             .args
             .iter()

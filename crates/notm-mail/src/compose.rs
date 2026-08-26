@@ -79,7 +79,7 @@ impl ComposedMessage {
         }
     }
 
-    pub fn to_rfc5322(&self) -> String {
+    pub fn to_rfc5322(&self) -> anyhow::Result<Vec<u8>> {
         render_message(self)
     }
 }

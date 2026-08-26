@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use anyhow::Context;
+use notm_mail::validate_send_timeout_seconds;
 use notm_ui::model::{MAX_THREAD_PREVIEW_LINES, MessageViewPreference, ThemePreference};
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +79,7 @@ impl AppConfig {
                 || self.send.args.iter().any(|arg| arg.contains("{file}")),
             "send.args must include an entry containing {{file}} when send.mode is command_template"
         );
+        validate_send_timeout_seconds(self.send.timeout_seconds)?;
         anyhow::ensure!(
             self.sync.timeout_seconds > 0,
             "sync.timeout_seconds must be greater than zero"

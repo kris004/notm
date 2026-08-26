@@ -22,7 +22,10 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
 use gtk::prelude::*;
 use gtk4 as gtk;
-use notm_mail::TransportMode;
+use notm_mail::{
+    MAX_SEND_TIMEOUT_SECONDS, TransportMode, parse_send_timeout_seconds,
+    validate_send_timeout_seconds,
+};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -211,6 +214,7 @@ pub struct SettingsDialogTestState {
     pub thread_preview_lines: String,
     pub show_thread_preview: bool,
     pub remote_images: bool,
+    pub send_timeout_seconds: String,
 }
 
 struct PendingSettingsDialog {
@@ -220,6 +224,7 @@ struct PendingSettingsDialog {
     thread_preview_lines: gtk::Entry,
     show_thread_preview: gtk::CheckButton,
     remote_images: gtk::CheckButton,
+    send_timeout_seconds: gtk::Entry,
 }
 
 struct SettingsControllerInner {
@@ -567,12 +572,18 @@ impl SettingsController {
             &format_env_map(&seed.send_env),
             "Extra environment for the send command as KEY=value pairs, comma or newline separated.",
         );
+        let send_timeout_help = format!(
+            "External send command timeout as a whole number from 1 through \
+             {MAX_SEND_TIMEOUT_SECONDS}."
+        );
         let send_timeout_seconds = settings_entry_row(
             &form,
             "Timeout seconds",
             &seed.send_timeout_seconds.to_string(),
-            "External send command timeout.",
+            &send_timeout_help,
         );
+        send_timeout_seconds.set_widget_name("notm-settings-send-timeout-seconds");
+        send_timeout_seconds.set_input_purpose(gtk::InputPurpose::Digits);
         let save_sent = settings_check_row(
             &form,
             "Save sent locally",
@@ -754,6 +765,7 @@ impl SettingsController {
             thread_preview_lines: thread_preview_lines.clone(),
             show_thread_preview: show_thread_preview.clone(),
             remote_images: remote_images.clone(),
+            send_timeout_seconds: send_timeout_seconds.clone(),
         });
         let app_config_path = seed.app_config_path.clone();
         let pending_for_response = Rc::downgrade(&self.inner);
@@ -786,6 +798,15 @@ impl SettingsController {
                         Err(err) => {
                             (status_for_response)(format!("Settings validation failed: {err}"));
                             thread_preview_lines.grab_focus();
+                            return;
+                        }
+                    };
+                let send_timeout_seconds_value =
+                    match parse_send_timeout_seconds(&send_timeout_seconds.text()) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            (status_for_response)(format!("Settings validation failed: {err}"));
+                            send_timeout_seconds.grab_focus();
                             return;
                         }
                     };
@@ -824,7 +845,7 @@ impl SettingsController {
                     send_mode: combo_active_id(&send_mode),
                     send_working_dir: send_working_dir.text().to_string(),
                     send_env: send_env.text().to_string(),
-                    send_timeout_seconds: send_timeout_seconds.text().parse::<u64>().unwrap_or(120),
+                    send_timeout_seconds: send_timeout_seconds_value,
                     save_sent: save_sent.is_active(),
                     sent_maildir: sent_maildir.text().to_string(),
                     sent_tags: sent_tags.text().to_string(),
@@ -919,11 +940,20 @@ impl SettingsController {
                 thread_preview_lines: pending.thread_preview_lines.text().to_string(),
                 show_thread_preview: pending.show_thread_preview.is_active(),
                 remote_images: pending.remote_images.is_active(),
+                send_timeout_seconds: pending.send_timeout_seconds.text().to_string(),
             })
     }
 
     pub fn respond_test(&self, args: &serde_json::Value) -> anyhow::Result<u64> {
-        let (dialog_id, dialog, theme_combo, preview_entry, preview_check, remote_images) = {
+        let (
+            dialog_id,
+            dialog,
+            theme_combo,
+            preview_entry,
+            preview_check,
+            remote_images,
+            send_timeout_entry,
+        ) = {
             let pending = self.inner.pending.borrow();
             let pending = pending
                 .as_ref()
@@ -947,6 +977,7 @@ impl SettingsController {
                 pending.thread_preview_lines.clone(),
                 pending.show_thread_preview.clone(),
                 pending.remote_images.clone(),
+                pending.send_timeout_seconds.clone(),
             )
         };
 
@@ -975,6 +1006,14 @@ impl SettingsController {
             .and_then(serde_json::Value::as_bool)
         {
             remote_images.set_active(enabled);
+        }
+        if let Some(timeout) = args.get("send_timeout_seconds") {
+            let text = match timeout {
+                serde_json::Value::String(value) => value.clone(),
+                serde_json::Value::Number(value) => value.to_string(),
+                _ => anyhow::bail!("send_timeout_seconds must be a string or whole number"),
+            };
+            send_timeout_entry.set_text(&text);
         }
 
         let response_name = args
@@ -1064,6 +1103,7 @@ struct SettingsValues {
 fn apply_settings_values(values: &SettingsValues) -> anyhow::Result<SettingsApplication> {
     validate_page_size(values.page_size)?;
     validate_thread_preview_lines(values.thread_preview_lines)?;
+    validate_send_timeout_seconds(values.send_timeout_seconds)?;
     Ok(SettingsApplication {
         runtime: RuntimeSettings {
             page_size: values.page_size,
@@ -1568,6 +1608,9 @@ fn transport_mode_name(mode: &TransportMode) -> String {
 fn persist_settings_values(path: Option<&Path>, values: &SettingsValues) -> anyhow::Result<()> {
     let page_size = validate_page_size(values.page_size)?;
     let thread_preview_lines = validate_thread_preview_lines(values.thread_preview_lines)?;
+    let send_timeout_seconds = validate_send_timeout_seconds(values.send_timeout_seconds)?;
+    let send_timeout_seconds = i64::try_from(send_timeout_seconds)
+        .map_err(|_| anyhow::anyhow!("send.timeout_seconds is too large to store"))?;
     let send_args = parse_string_list(&values.send_args);
     validate_send_settings(&values.send_mode, &send_args)?;
     let Some(path) = path else {
@@ -1657,12 +1700,7 @@ fn persist_settings_values(path: Option<&Path>, values: &SettingsValues) -> anyh
     set_string(root, "send", "mode", &values.send_mode);
     set_optional_string(root, "send", "working_dir", &values.send_working_dir);
     set_string_map(root, "send", "env", parse_env_map(&values.send_env));
-    set_int(
-        root,
-        "send",
-        "timeout_seconds",
-        values.send_timeout_seconds as i64,
-    );
+    set_int(root, "send", "timeout_seconds", send_timeout_seconds);
     set_bool(root, "send", "save_sent", values.save_sent);
     set_optional_string(root, "send", "sent_maildir", &values.sent_maildir);
     set_string_array(

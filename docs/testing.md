@@ -200,7 +200,7 @@ fixture/live path after the change and confirm the symptom is gone. Rust compile
 Clippy, and unit tests are still useful, but they do not replace a runtime smoke
 check for UI warnings or behavior regressions.
 
-The Settings dialog has two named, fixture-backed GTK smokes. Required-display
+The Settings dialog has three named, fixture-backed GTK smokes. Required-display
 mode turns a missing display into a failure instead of a skip:
 
 ```sh
@@ -212,13 +212,20 @@ NOTM_REQUIRE_GTK_DISPLAY=1 \
   cargo test --locked -p notm-app --test desktop_ui_smoke \
   fixture_theme_modes_follow_both_simulated_system_preferences \
   -- --exact --nocapture --test-threads=1
+NOTM_REQUIRE_GTK_DISPLAY=1 \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
+  fixture_send_timeout_validation_preserves_last_valid_value_across_restart \
+  -- --exact --nocapture --test-threads=1
 ```
 
 The first drives the real dialog responses for one-line, three-line, and hidden
 previews and verifies that invalid values do not mutate runtime or persisted
 state. The second starts separate deterministic system-light and system-dark
 processes, exercises System/Light/Dark plus Save, and checks the resolved GTK
-theme background rather than trusting the requested enum.
+theme background rather than trusting the requested enum. The third rejects
+zero, negative, nonnumeric, and overflowing send timeouts without changing the
+config, saves the maximum valid value, then restarts from those exact persisted
+TOML bytes and verifies that the timeout is loaded and shown.
 
 The draft confirmation flow also has a named, fixture-backed GTK smoke. It
 drives the real modal through `pending_confirmation` and
@@ -256,6 +263,29 @@ NOTM_REQUIRE_GTK_DISPLAY=1 \
   indexed_maildir_saved_draft_restart_does_not_prompt_as_unsaved \
   -- --exact --nocapture --test-threads=1
 ```
+
+Outbound wire interoperability has a required-display, clean-XDG E2E. It uses
+only a disposable Notmuch database, `.test` addresses, a Python submission
+helper, and a Rust SMTP capture server bound to `127.0.0.1` on an ephemeral
+port. The test composes, saves, restarts, reopens, replies, forwards as an
+attachment, and sends Unicode/long-header/Bcc messages. Python's independent
+standard-library MIME parser then checks the exact captured bytes, including
+envelope recipients, Bcc removal, folding, CRLF and line limits, threading,
+alternatives, and attachment hashes:
+
+```sh
+NOTM_REQUIRE_GTK_DISPLAY=1 \
+WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 \
+tests/run_with_headless_weston.sh \
+  dbus-run-session -- \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
+    clean_xdg_local_smtp_wire_interoperability -- \
+    --exact --nocapture --test-threads=1
+```
+
+This smoke must not be redirected to a real account, SMTP relay, or installed
+sendmail implementation. A skip is not a pass; keep
+`NOTM_REQUIRE_GTK_DISPLAY=1` set for delivery validation.
 
 Indexed-draft deletion has a fixture-backed regression that confirms the row
 is removed, the file is deleted, and the message pane never attempts to render
