@@ -43,10 +43,18 @@ serialized on a separate worker.
 
 The UI uses gtk4-rs directly, keeping widget behavior and the dependency
 surface explicit. The message pane has a safe text renderer plus a visual
-WebKitGTK HTML view. HTML is sanitized before loading into WebKit; JavaScript,
-file and universal-file access, in-app navigation, and remote image loading are
-disabled by default. Users can allow images for the current HTML view only or
-persist a sender-specific allow-list entry in `[ui].trusted_image_senders`.
-View selections are persisted by Message-ID, with optional normalized-sender
-defaults and message-over-sender precedence; standalone message windows use the
-same resolver and stores.
+WebKitGTK HTML view. Remote content is blocked by default. Blocked rendering
+sanitizes resource-bearing markup, disables automatic image loading, and uses a
+restrictive document and WebView content security policy; the WebView also uses
+an ephemeral network session. These layers cover direct images, redirects,
+CSS URLs, `srcset`, and nested resource markup while JavaScript, file and
+universal-file access, and in-app navigation remain disabled.
+
+**Load remote images once** reloads only the selected message view with sanitized
+HTTP(S) image sources enabled. The permission is not persisted or shared and
+is reset by message/view navigation or application restart. Raw `From:` values
+are unauthenticated message data, so they cannot establish durable permission.
+`[ui].remote_images = true` remains an explicit global privacy override for all
+messages. View selections are persisted by Message-ID, with optional
+normalized-sender defaults and message-over-sender precedence; standalone
+message windows use the same resolver and stores.

@@ -199,10 +199,16 @@ and the same action removes a matching sender default.
 
 ## Security and privacy
 
-`notm` has no telemetry or hosted service. Remote images are blocked by default,
-HTML is sanitized before display, JavaScript and in-app navigation are disabled,
-and the local developer test harness is off unless explicitly enabled. Sending
-and synchronization run only through commands configured by the user.
+`notm` has no telemetry or hosted service. Visual HTML blocks remote content by
+default. **Load remote images once** permits sanitized remote images only in the
+current message view; navigating away or restarting blocks them again. A raw
+`From:` header is not authenticated and never grants durable image permission.
+Setting `ui.remote_images = true` is an explicit privacy override that permits
+remote images in every Visual HTML message. HTML sanitization, restrictive
+content security policies, and an ephemeral WebKit network session provide
+defense in depth. JavaScript and in-app navigation are disabled, and the local
+developer test harness is off unless explicitly enabled. Sending and
+synchronization run only through commands configured by the user.
 
 Email is untrusted input, and sanitization is not a substitute for keeping GTK,
 WebKitGTK, Notmuch, and `notm` updated. Read the [security policy](SECURITY.md)

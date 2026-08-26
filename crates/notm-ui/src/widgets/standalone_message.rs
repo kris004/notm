@@ -22,14 +22,12 @@ const STATUS_BAR_MAX_WIDTH_CHARS: i32 = 120;
 pub(crate) enum StandaloneImagePolicy {
     Config,
     Once,
-    TrustSender,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct StandalonePolicySnapshot {
     pub(crate) collapse_quotes: bool,
     pub(crate) remote_images: bool,
-    pub(crate) trusted_image_senders: Vec<String>,
     pub(crate) show_keybind_hints: bool,
     pub(crate) normal_input_mode: bool,
     pub(crate) response_sensitive: bool,
@@ -68,6 +66,7 @@ pub(crate) type StandaloneTextRenderer =
     Rc<dyn Fn(&MessageSummary, bool) -> anyhow::Result<String>>;
 pub(crate) type StandaloneHtmlRenderer =
     Rc<dyn Fn(&MessageSummary, StandaloneImagePolicy) -> anyhow::Result<StandaloneHtmlRender>>;
+pub(crate) type StandaloneHtmlViewFactory = Rc<dyn Fn() -> webkit6::WebView>;
 pub(crate) type StandaloneHtmlViewInitializer = Rc<dyn Fn(&webkit6::WebView, &gtk::Label, bool)>;
 pub(crate) type StandaloneHtmlScrollHandler =
     Rc<dyn Fn(&webkit6::WebView, &gtk::Label, StandaloneHtmlScroll)>;
@@ -87,6 +86,7 @@ pub(crate) struct StandaloneOpenOptions {
     pub(crate) message_has_html: StandaloneMessageHasHtml,
     pub(crate) render_text: StandaloneTextRenderer,
     pub(crate) render_html: StandaloneHtmlRenderer,
+    pub(crate) create_html_view: StandaloneHtmlViewFactory,
     pub(crate) initialize_html_view: StandaloneHtmlViewInitializer,
     pub(crate) scroll_html: StandaloneHtmlScrollHandler,
     pub(crate) open_link: LinkHintOpener,
@@ -105,8 +105,17 @@ pub(crate) struct StandaloneWindowSnapshot {
     pub(crate) selected_message: Option<MessageSummary>,
     pub(crate) message_ids: Vec<String>,
     pub(crate) view: &'static str,
+    pub(crate) html_visible: bool,
+    pub(crate) loading: bool,
     pub(crate) collapse_quotes: bool,
     pub(crate) image_policy: String,
+    pub(crate) global_remote_images_allowed: bool,
+    pub(crate) image_loading_allowed: bool,
+    pub(crate) image_permission: &'static str,
+    pub(crate) html_policy_text: String,
+    pub(crate) image_policy_button_label: String,
+    pub(crate) image_policy_button_sensitive: bool,
+    pub(crate) network_session_ephemeral: bool,
     pub(crate) title: Option<String>,
     pub(crate) status: String,
     pub(crate) link_hints: LinkHintSnapshot,
@@ -256,8 +265,11 @@ impl StandaloneMessageController {
         action_row.append(&copy_menu_button);
         root.append(&action_row);
 
-        let image_policy_button = gtk::Button::with_label("Load images once");
+        let image_policy_button = gtk::Button::with_label("Load remote images once");
         image_policy_button.set_widget_name("notm-message-window-image-policy-button");
+        image_policy_button.set_tooltip_text(Some(
+            "Remote images can reveal that you opened a message and expose your network address. This action applies only to the current message and resets when you leave it.",
+        ));
         let html_policy_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         html_policy_row.set_widget_name("notm-message-window-html-policy-row");
         html_policy_row.set_visible(false);
@@ -288,7 +300,7 @@ impl StandaloneMessageController {
 
         let status_label = gtk::Label::new(Some("Ready"));
         configure_status_label(&status_label);
-        let html_view = webkit6::WebView::new();
+        let html_view = (options.create_html_view)();
         html_view.set_widget_name("notm-message-window-html");
         html_view.set_hexpand(true);
         html_view.set_vexpand(true);
@@ -465,6 +477,30 @@ impl StandaloneMessageController {
         count
     }
 
+    pub(crate) fn refresh_remote_image_policy(&self, previous: bool, current: bool) {
+        if previous == current {
+            return;
+        }
+
+        let windows = self.windows.borrow().clone();
+        for standalone in windows {
+            standalone.state.borrow_mut().image_policy = StandaloneImagePolicy::Config;
+            let html_visible = standalone.state.borrow().view == MessageViewKind::Html;
+
+            if html_visible || !current {
+                standalone.link_hints.cancel_silent();
+                standalone.html_view.stop_loading();
+                set_html_image_loading(&standalone.html_view, false);
+            }
+
+            if html_visible {
+                show_message_view(&standalone, MessageViewKind::Html);
+            } else if let Some(message) = current_message(&standalone) {
+                update_message_buttons(&standalone, &message);
+            }
+        }
+    }
+
     pub(crate) fn snapshots(&self) -> Vec<StandaloneWindowSnapshot> {
         self.windows
             .borrow()
@@ -615,6 +651,15 @@ struct StandaloneMessageWindow {
 impl StandaloneMessageWindow {
     fn snapshot(&self) -> StandaloneWindowSnapshot {
         let state = self.state.borrow();
+        let global_remote_images_allowed = (self.policy)().remote_images;
+        let image_loading_allowed = webkit_view_images_allowed(&self.html_view);
+        let image_permission = if global_remote_images_allowed {
+            "all_messages"
+        } else if state.view == MessageViewKind::Html && image_loading_allowed {
+            "message_once"
+        } else {
+            "blocked"
+        };
         StandaloneWindowSnapshot {
             id: self.id,
             selected_index: state.selected_index,
@@ -631,8 +676,24 @@ impl StandaloneMessageWindow {
                 MessageViewKind::Headers => "headers",
                 MessageViewKind::Raw => "raw",
             },
+            html_visible: state.view == MessageViewKind::Html,
+            loading: self.html_view.is_loading(),
             collapse_quotes: state.collapse_quotes,
             image_policy: format!("{:?}", state.image_policy).to_ascii_lowercase(),
+            global_remote_images_allowed,
+            image_loading_allowed,
+            image_permission,
+            html_policy_text: self.html_policy_label.text().to_string(),
+            image_policy_button_label: self
+                .image_policy_button
+                .label()
+                .map(|label| strip_binding_suffix(&label))
+                .unwrap_or_default(),
+            image_policy_button_sensitive: self.image_policy_button.is_sensitive(),
+            network_session_ephemeral: self
+                .html_view
+                .network_session()
+                .is_some_and(|session| session.is_ephemeral()),
             title: self.window.title().map(|title| title.to_string()),
             status: self.status_label.text().to_string(),
             link_hints: self.link_hints.snapshot(),
@@ -1449,9 +1510,10 @@ fn show_text_message(standalone: &StandaloneMessageWindow, message: &MessageSumm
 }
 
 fn show_html_message(standalone: &StandaloneMessageWindow, message: &MessageSummary) -> bool {
-    let image_policy = standalone.state.borrow().image_policy;
+    let image_policy = take_image_policy_for_render(&standalone.state);
     match (standalone.render_html)(message, image_policy) {
         Ok(rendered) => {
+            standalone.html_view.stop_loading();
             set_html_image_loading(&standalone.html_view, rendered.allow_remote_images);
             standalone
                 .html_view
@@ -1467,6 +1529,13 @@ fn show_html_message(standalone: &StandaloneMessageWindow, message: &MessageSumm
             false
         }
     }
+}
+
+fn take_image_policy_for_render(state: &RefCell<StandaloneMessageState>) -> StandaloneImagePolicy {
+    std::mem::replace(
+        &mut state.borrow_mut().image_policy,
+        StandaloneImagePolicy::Config,
+    )
 }
 
 fn show_headers(standalone: &StandaloneMessageWindow, message: &MessageSummary) -> bool {
@@ -1518,6 +1587,8 @@ fn show_raw(standalone: &StandaloneMessageWindow, message: &MessageSummary) -> b
 fn set_active_message_view(standalone: &StandaloneMessageWindow, active: MessageViewKind) {
     if active != MessageViewKind::Html {
         standalone.link_hints.cancel_silent();
+        standalone.html_view.stop_loading();
+        set_html_image_loading(&standalone.html_view, false);
     }
     for button in [
         &standalone.view_text_button,
@@ -1579,18 +1650,17 @@ fn activate_image_policy_button(standalone: &StandaloneMessageWindow) {
         standalone.status_label.set_text("No message selected");
         return;
     };
-    if message_allows_images(&(standalone.policy)(), &message) {
+    if message_allows_images(&(standalone.policy)()) {
         update_message_buttons(standalone, &message);
         return;
     }
-    let policy = if standalone.state.borrow().view == MessageViewKind::Html
+    if standalone.state.borrow().view == MessageViewKind::Html
         && webkit_view_images_allowed(&standalone.html_view)
     {
-        StandaloneImagePolicy::TrustSender
-    } else {
-        StandaloneImagePolicy::Once
-    };
-    standalone.state.borrow_mut().image_policy = policy;
+        update_message_buttons(standalone, &message);
+        return;
+    }
+    standalone.state.borrow_mut().image_policy = StandaloneImagePolicy::Once;
     show_message_view(standalone, MessageViewKind::Html);
 }
 
@@ -1609,7 +1679,9 @@ fn update_message_buttons(standalone: &StandaloneMessageWindow, message: &Messag
         .image_policy_button
         .set_visible(html_visible && has_html);
     if !has_html {
-        standalone.image_policy_button.set_label("Load images once");
+        standalone
+            .image_policy_button
+            .set_label("Load remote images once");
         standalone.image_policy_button.set_sensitive(false);
         update_button_binding_labels(standalone);
         return;
@@ -1617,38 +1689,32 @@ fn update_message_buttons(standalone: &StandaloneMessageWindow, message: &Messag
     let policy = (standalone.policy)();
     if html_visible {
         let image_policy = if webkit_view_images_allowed(&standalone.html_view) {
-            if message_allows_images(&policy, message) {
-                "remote images allowed"
+            if policy.remote_images {
+                "remote images allowed for all messages by settings"
             } else {
-                "remote images loaded for this view"
+                "remote images loaded once for this message"
             }
         } else {
-            "remote images blocked"
+            "remote content blocked"
         };
         standalone.html_policy_label.set_text(&format!(
-            "Sanitized HTML view: message JavaScript disabled; {image_policy}; links open externally (F shows link hints)."
+            "Privacy-protected HTML: {image_policy}; message scripts and in-app navigation are blocked; links open externally (F shows link hints)."
         ));
     }
-    if message_allows_images(&policy, message) {
-        let sender = message_sender_email(message);
-        let sender_trusted = sender
-            .as_deref()
-            .is_some_and(|sender| image_sender_is_trusted(&policy, sender));
-        standalone.image_policy_button.set_label(if sender_trusted {
-            "Images trusted"
-        } else {
-            "Images allowed"
-        });
+    if policy.remote_images {
+        standalone
+            .image_policy_button
+            .set_label("Images allowed for all messages");
         standalone.image_policy_button.set_sensitive(false);
     } else if html_visible && webkit_view_images_allowed(&standalone.html_view) {
         standalone
             .image_policy_button
-            .set_label("Trust sender images");
+            .set_label("Images loaded once for this message");
+        standalone.image_policy_button.set_sensitive(false);
+    } else {
         standalone
             .image_policy_button
-            .set_sensitive(path_actions_sensitive && message_sender_email(message).is_some());
-    } else {
-        standalone.image_policy_button.set_label("Load images once");
+            .set_label("Load remote images once");
         standalone
             .image_policy_button
             .set_sensitive(path_actions_sensitive);
@@ -1902,11 +1968,8 @@ fn set_menu_button_label(
     widget.set_label(&button_label(base, binding, standalone));
 }
 
-fn message_allows_images(policy: &StandalonePolicySnapshot, message: &MessageSummary) -> bool {
+fn message_allows_images(policy: &StandalonePolicySnapshot) -> bool {
     policy.remote_images
-        || message_sender_email(message)
-            .as_deref()
-            .is_some_and(|sender| image_sender_is_trusted(policy, sender))
 }
 
 fn message_sender_email(message: &MessageSummary) -> Option<String> {
@@ -1918,14 +1981,6 @@ fn message_sender_email(message: &MessageSummary) -> Option<String> {
 
 fn normalize_sender(sender: &str) -> String {
     sender.trim().to_ascii_lowercase()
-}
-
-fn image_sender_is_trusted(policy: &StandalonePolicySnapshot, sender: &str) -> bool {
-    let sender = normalize_sender(sender);
-    policy
-        .trusted_image_senders
-        .iter()
-        .any(|trusted| trusted == &sender)
 }
 
 fn set_html_image_loading(view: &webkit6::WebView, allow_remote_images: bool) {
@@ -2238,5 +2293,26 @@ mod tests {
             sender_view_preference_tooltip("sender@example.test", true),
             "Sender: sender@example.test. Activate to remove this sender default. A per-message view choice still takes precedence."
         );
+    }
+
+    #[test]
+    fn standalone_one_shot_image_policy_is_consumed_by_one_html_render() {
+        let state = RefCell::new(StandaloneMessageState {
+            messages: Vec::new(),
+            selected_index: 0,
+            view: MessageViewKind::Text,
+            collapse_quotes: false,
+            image_policy: StandaloneImagePolicy::Once,
+        });
+
+        assert_eq!(
+            take_image_policy_for_render(&state),
+            StandaloneImagePolicy::Once
+        );
+        assert_eq!(
+            take_image_policy_for_render(&state),
+            StandaloneImagePolicy::Config
+        );
+        assert_eq!(state.borrow().image_policy, StandaloneImagePolicy::Config);
     }
 }

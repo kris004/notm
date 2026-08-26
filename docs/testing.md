@@ -315,6 +315,36 @@ NOTM_REQUIRE_GTK_DISPLAY=1 \
   -- --exact --nocapture --test-threads=1
 ```
 
+Remote-image privacy has an indexed, clean-XDG GTK smoke under a private Weston
+Wayland compositor and D-Bus session. It starts a temporary loopback HTTP
+tracker and verifies default blocking, exactly one selected-message load,
+spoofed and malformed `From:` isolation, navigation and restart reset,
+legacy-entry retirement, redirects, CSS URLs, `srcset`, and nested resource
+markup. No live user mail or settings and no external tracking service are
+used:
+
+```sh
+WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 \
+  tests/run_with_headless_weston.sh dbus-run-session -- \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
+  indexed_remote_images_are_blocked_except_for_one_selected_message_load \
+  -- --exact --nocapture --test-threads=1
+```
+
+A second loopback-only smoke opens Visual HTML in two simultaneously live
+standalone message windows while the global override is enabled, disables it
+through the real Settings dialog, and verifies that both existing WebViews are
+immediately re-rendered with remote content blocked and no additional tracker
+requests:
+
+```sh
+WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 \
+  tests/run_with_headless_weston.sh dbus-run-session -- \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
+  standalone_remote_images_are_revoked_when_settings_disable_them \
+  -- --exact --nocapture --test-threads=1
+```
+
 Desktop `mailto` handling has cold-start and existing-instance GTK smokes. The
 first verifies RFC 6068 fields remain visible while the startup search loads;
 the second verifies D-Bus routing and the dirty-composer replacement prompt:

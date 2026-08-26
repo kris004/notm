@@ -61,12 +61,12 @@ use crate::{
     },
     widgets::standalone_message::{
         StandaloneHtmlRender, StandaloneHtmlRenderer, StandaloneHtmlScroll,
-        StandaloneHtmlScrollHandler, StandaloneHtmlViewInitializer, StandaloneImagePolicy,
-        StandaloneMessageController, StandaloneMessageHasHtml, StandaloneOpenOptions,
-        StandalonePolicyProvider, StandalonePolicySnapshot, StandalonePreferredView,
-        StandaloneRememberView, StandaloneResponseAction, StandaloneResponseHandler,
-        StandaloneResponseRequest, StandaloneSenderView, StandaloneTextRenderer,
-        StandaloneToggleSenderView,
+        StandaloneHtmlScrollHandler, StandaloneHtmlViewFactory, StandaloneHtmlViewInitializer,
+        StandaloneImagePolicy, StandaloneMessageController, StandaloneMessageHasHtml,
+        StandaloneOpenOptions, StandalonePolicyProvider, StandalonePolicySnapshot,
+        StandalonePreferredView, StandaloneRememberView, StandaloneResponseAction,
+        StandaloneResponseHandler, StandaloneResponseRequest, StandaloneSenderView,
+        StandaloneTextRenderer, StandaloneToggleSenderView,
     },
     widgets::thread_list::{
         self, AppendSearchOutcome, LoadMoreDecision, LocatePagePlan, ReplaceSearchOutcome,
@@ -152,7 +152,6 @@ pub struct LaunchOptions {
     pub show_keybind_hints: bool,
     pub layout: String,
     pub html_mode: String,
-    pub trusted_image_senders: Vec<String>,
     pub message_view_preferences: BTreeMap<String, MessageViewPreference>,
     pub sender_view_preferences: BTreeMap<String, MessageViewPreference>,
     pub hidden_tag_searches: Vec<String>,
@@ -227,7 +226,6 @@ impl Default for LaunchOptions {
             show_keybind_hints: true,
             layout: "auto".to_string(),
             html_mode: "sanitize_then_render_text_fallback".to_string(),
-            trusted_image_senders: Vec::new(),
             message_view_preferences: BTreeMap::new(),
             sender_view_preferences: BTreeMap::new(),
             hidden_tag_searches: Vec::new(),
@@ -535,6 +533,8 @@ struct Widgets {
     message_view: gtk::TextView,
     message_scrolled: gtk::ScrolledWindow,
     html_view: webkit6::WebView,
+    html_load_generation: Rc<Cell<u64>>,
+    html_completed_load_generation: Rc<Cell<u64>>,
     html_scrolled: gtk::ScrolledWindow,
     link_hints: LinkHintController,
     response_menu_button: gtk::MenuButton,
@@ -821,6 +821,7 @@ const MESSAGE_HEADER_VALUE_LINES: i32 = 1;
 const KEYBOARD_CURSOR_CLASS: &str = "notm-keyboard-cursor";
 const STATUS_BAR_MAX_WIDTH_CHARS: i32 = 120;
 const HTML_LINK_STATUS_URI_MAX_CHARS: usize = 96;
+const HTML_DEFAULT_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; img-src http: https:; style-src 'unsafe-inline'; script-src 'none'; connect-src 'none'; frame-src 'none'; font-src 'none'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 // Cache enough normalized content for visual preview limits without keying the
 // thread-detail cache by a presentation setting.
 const AUTO_STACKED_BELOW_WIDTH: i32 = 1280;
@@ -903,7 +904,6 @@ fn build_ui(
         show_keybind_hints: options.show_keybind_hints,
         layout_preference,
         content_layout: initial_layout,
-        trusted_image_senders: normalize_sender_list(&options.trusted_image_senders),
         pending_open_message_id: options.open_message_id.clone(),
         compose_fields: ComposeFields {
             from: identity(&options)
@@ -1331,8 +1331,11 @@ fn build_ui(
     view_menu_box.append(&sender_view_preference_button);
     let active_message_view = Rc::new(Cell::new(MessageViewKind::Text));
     let pending_html_scroll_fraction = Rc::new(Cell::new(None));
-    let image_policy_button = gtk::Button::with_label("Load images once");
+    let image_policy_button = gtk::Button::with_label("Load remote images once");
     image_policy_button.set_widget_name("notm-image-policy-button");
+    image_policy_button.set_tooltip_text(Some(
+        "Remote images can reveal that you opened a message and expose your network address. This action applies only to the current message and resets when you leave it.",
+    ));
     let collapse_quotes_button = gtk::Button::with_label("Collapse quotes");
     collapse_quotes_button.set_widget_name("notm-collapse-quotes-button");
     let (copy_menu_button, copy_menu_box) =
@@ -1401,10 +1404,19 @@ fn build_ui(
         .vexpand(true)
         .child(&message_view)
         .build();
-    let html_view = webkit6::WebView::new();
+    let html_view = new_privacy_html_webview();
     html_view.set_widget_name("notm-html-view");
     html_view.set_hexpand(true);
     html_view.set_vexpand(true);
+    let html_load_generation = Rc::new(Cell::new(0));
+    let html_load_lifecycle = Rc::new(RefCell::new(HtmlLoadLifecycle::default()));
+    let html_completed_load_generation = Rc::new(Cell::new(0));
+    connect_html_load_completion(
+        &html_view,
+        &html_load_generation,
+        &html_load_lifecycle,
+        &html_completed_load_generation,
+    );
     configure_html_webview(
         &html_view,
         settings::remote_images(&options.runtime_settings),
@@ -1490,7 +1502,13 @@ fn build_ui(
     window.set_child(Some(&overlay));
     connect_html_navigation_policy(&html_view, &status_label);
     connect_html_hover_status(&html_view, &status_label);
-    connect_html_scroll_restore(&html_view, &status_label, &pending_html_scroll_fraction);
+    connect_html_scroll_restore(
+        &html_view,
+        &status_label,
+        &pending_html_scroll_fraction,
+        &html_load_generation,
+        &html_completed_load_generation,
+    );
     let link_opener: LinkHintOpener = Rc::new(open_html_link_externally);
     let link_hints = LinkHintController::new(&html_view, &status_label, link_opener);
 
@@ -1550,6 +1568,8 @@ fn build_ui(
         message_view,
         message_scrolled: scrolled_message.clone(),
         html_view,
+        html_load_generation,
+        html_completed_load_generation,
         html_scrolled: scrolled_html.clone(),
         link_hints,
         response_menu_button,
@@ -2735,21 +2755,6 @@ fn persist_hidden_tag_searches(
         options.app_config_path.as_deref(),
         "hidden_tag_searches",
         toml::Value::Array(hidden),
-    )
-}
-
-fn persist_trusted_image_senders(
-    options: &LaunchOptions,
-    senders: &[String],
-) -> anyhow::Result<()> {
-    let trusted = normalize_sender_list(senders)
-        .into_iter()
-        .map(toml::Value::String)
-        .collect::<Vec<_>>();
-    settings::persist_ui_value(
-        options.app_config_path.as_deref(),
-        "trusted_image_senders",
-        toml::Value::Array(trusted),
     )
 }
 
@@ -4891,11 +4896,15 @@ fn connect_html_scroll_restore(
     view: &webkit6::WebView,
     status_label: &gtk::Label,
     pending_fraction: &Rc<Cell<Option<f64>>>,
+    requested_generation: &Rc<Cell<u64>>,
+    completed_generation: &Rc<Cell<u64>>,
 ) {
     let pending_fraction = pending_fraction.clone();
+    let requested_generation = requested_generation.clone();
+    let completed_generation = completed_generation.clone();
     let status = status_label.clone();
-    view.connect_load_changed(move |view, event| {
-        if event != webkit6::LoadEvent::Finished {
+    view.connect_is_loading_notify(move |view| {
+        if view.is_loading() || completed_generation.get() != requested_generation.get() {
             return;
         }
         let Some(fraction) = pending_fraction.take() else {
@@ -4912,6 +4921,84 @@ fn connect_html_scroll_restore(
             ),
         );
     });
+}
+
+fn connect_html_load_completion(
+    view: &webkit6::WebView,
+    requested_generation: &Rc<Cell<u64>>,
+    lifecycle: &Rc<RefCell<HtmlLoadLifecycle>>,
+    completed_generation: &Rc<Cell<u64>>,
+) {
+    let requested_generation_for_load = requested_generation.clone();
+    let requested_generation_for_resource = requested_generation.clone();
+    let lifecycle_for_load = lifecycle.clone();
+    view.connect_load_changed(move |_, event| {
+        lifecycle_for_load
+            .borrow_mut()
+            .load_changed(event, requested_generation_for_load.get());
+    });
+
+    let lifecycle_for_resource = lifecycle.clone();
+    let completed_generation = completed_generation.clone();
+    view.connect_resource_load_started(move |view, resource, _| {
+        let is_main_resource = view
+            .main_resource()
+            .is_some_and(|main_resource| main_resource == resource.clone());
+        if !is_main_resource {
+            return;
+        }
+
+        let Some(generation) = lifecycle_for_resource.borrow_mut().bind_main_resource() else {
+            return;
+        };
+        let lifecycle = lifecycle_for_resource.clone();
+        let requested_generation = requested_generation_for_resource.clone();
+        let completed_generation = completed_generation.clone();
+        // WebView Finished events have no load identity. The main WebResource
+        // object does, so only its captured generation may advance completion;
+        // callers additionally require WebView::is_loading() to be false.
+        resource.connect_finished(move |_| {
+            if let Some(generation) = lifecycle
+                .borrow_mut()
+                .finish_main_resource(generation, requested_generation.get())
+            {
+                completed_generation.set(generation);
+            }
+        });
+    });
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HtmlLoadLifecycle {
+    active_generation: Option<u64>,
+    awaiting_main_resource_generation: Option<u64>,
+}
+
+impl HtmlLoadLifecycle {
+    fn load_changed(&mut self, event: webkit6::LoadEvent, requested_generation: u64) {
+        if event == webkit6::LoadEvent::Started {
+            self.start(requested_generation);
+        }
+    }
+
+    fn start(&mut self, generation: u64) {
+        self.active_generation = Some(generation);
+        self.awaiting_main_resource_generation = Some(generation);
+    }
+
+    fn bind_main_resource(&mut self) -> Option<u64> {
+        let generation = self.awaiting_main_resource_generation.take()?;
+        (self.active_generation == Some(generation)).then_some(generation)
+    }
+
+    fn finish_main_resource(&mut self, generation: u64, requested_generation: u64) -> Option<u64> {
+        if self.active_generation != Some(generation) || generation != requested_generation {
+            return None;
+        }
+        self.active_generation = None;
+        self.awaiting_main_resource_generation = None;
+        Some(generation)
+    }
 }
 
 fn evaluate_web_view_scroll_script(
@@ -8618,6 +8705,8 @@ fn set_active_message_view(widgets: &Widgets, active: MessageViewKind) {
     widgets.active_message_view.set(active);
     if active != MessageViewKind::Html {
         widgets.link_hints.cancel_silent();
+        widgets.html_view.stop_loading();
+        set_html_image_loading(&widgets.html_view, false);
     }
     for button in [
         &widgets.view_text_button,
@@ -8773,19 +8862,50 @@ fn tag_path_actions_blocked(state: &UiState) -> bool {
     state.tag_in_progress || state.tag_paths_uncertain || state.tag_warning.is_some()
 }
 
+fn settings_application_block_reason(state: &UiState) -> Option<&'static str> {
+    if state.tag_in_progress {
+        Some("Settings changes are unavailable while tags are changing")
+    } else if state.tag_paths_uncertain || state.tag_warning.is_some() {
+        Some(
+            "Settings changes are unavailable until the previous tag result is reconciled; restart notm if uncertainty remains",
+        )
+    } else {
+        None
+    }
+}
+
 fn activate_image_policy_button(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     if !ensure_message_file_actions_allowed(widgets, state) {
         return;
     }
-    if selected_message_allows_images(options, state) {
+    if settings::remote_images(&options.runtime_settings)
+        || (html_view_is_visible(widgets) && html_view_images_allowed(widgets))
+    {
+        state.borrow_mut().last_error = None;
         update_message_action_buttons(options, widgets, state);
         return;
     }
-    if html_view_is_visible(widgets) && html_view_images_allowed(widgets) {
-        show_visual_html_with_image_policy(options, widgets, state, ImagePolicy::TrustSender);
-    } else {
-        show_visual_html_with_image_policy(options, widgets, state, ImagePolicy::Once);
+    show_visual_html_with_image_policy(options, widgets, state, ImagePolicy::Once);
+}
+
+fn reject_persistent_sender_image_trust(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) -> serde_json::Value {
+    let error = "Persistent sender image trust is unavailable because email From headers are not authenticated; use Load remote images once for the current message";
+    widgets.status_label.set_text(error);
+    {
+        let mut state = state.borrow_mut();
+        state.last_error = Some(error.to_string());
+        state.last_operation = Some("rejected unsafe persistent sender image trust".to_string());
     }
+    update_debug(widgets, state);
+    json!({
+        "ok": false,
+        "error": error,
+        "html_view": html_view_state(options, widgets, state),
+    })
 }
 
 fn update_message_tag_controls(widgets: &Widgets, state: &SharedState) {
@@ -8907,6 +9027,7 @@ fn update_message_action_buttons_with_mime_refresh(
         } else {
             widgets.view_html_button.is_visible()
         };
+    widgets.settings_button.set_sensitive(!tag_paths_blocked);
     let has_thread = selected_thread.is_some();
     let multiple_messages = message_count > 1;
     if !has_message {
@@ -8993,44 +9114,42 @@ fn update_message_action_buttons_with_mime_refresh(
     update_message_tag_controls(widgets, state);
     if html_visible && has_html {
         let image_policy = if html_view_images_allowed(widgets) {
-            if selected_message_allows_images(options, state) {
-                "remote images allowed"
+            if settings::remote_images(&options.runtime_settings) {
+                "remote images allowed for all messages by settings"
             } else {
-                "remote images loaded for this view"
+                "remote images loaded once for this message"
             }
         } else {
-            "remote images blocked"
+            "remote content blocked"
         };
         widgets.html_policy_label.set_text(&format!(
-            "Sanitized HTML view: message JavaScript disabled; {image_policy}; links open externally (F shows link hints)."
+            "Privacy-protected HTML: {image_policy}; message scripts and in-app navigation are blocked; links open externally (F shows link hints)."
         ));
     }
 
     if !has_html {
-        widgets.image_policy_button.set_label("Load images once");
+        widgets
+            .image_policy_button
+            .set_label("Load remote images once");
         widgets.image_policy_button.set_sensitive(false);
         update_button_binding_labels(widgets, state);
         return;
     }
 
-    if selected_message_allows_images(options, state) {
-        let sender = selected_sender_email(state);
-        let sender_trusted = sender
-            .as_deref()
-            .is_some_and(|sender| image_sender_is_trusted(state, sender));
-        widgets.image_policy_button.set_label(if sender_trusted {
-            "Images trusted"
-        } else {
-            "Images allowed"
-        });
-        widgets.image_policy_button.set_sensitive(false);
-    } else if html_visible && html_view_images_allowed(widgets) {
-        widgets.image_policy_button.set_label("Trust sender images");
+    if settings::remote_images(&options.runtime_settings) {
         widgets
             .image_policy_button
-            .set_sensitive(!tag_paths_blocked && selected_sender_email(state).is_some());
+            .set_label("Images allowed for all messages");
+        widgets.image_policy_button.set_sensitive(false);
+    } else if html_visible && html_view_images_allowed(widgets) {
+        widgets
+            .image_policy_button
+            .set_label("Images loaded once for this message");
+        widgets.image_policy_button.set_sensitive(false);
     } else {
-        widgets.image_policy_button.set_label("Load images once");
+        widgets
+            .image_policy_button
+            .set_label("Load remote images once");
         widgets
             .image_policy_button
             .set_sensitive(!tag_paths_blocked);
@@ -9331,11 +9450,25 @@ fn configure_status_label(label: &gtk::Label) {
     label.set_max_width_chars(STATUS_BAR_MAX_WIDTH_CHARS);
 }
 
+fn new_privacy_html_webview() -> webkit6::WebView {
+    let network_session = webkit6::NetworkSession::new_ephemeral();
+    if let Some(cookie_manager) = network_session.cookie_manager() {
+        cookie_manager.set_accept_policy(webkit6::CookieAcceptPolicy::Never);
+    }
+    webkit6::WebView::builder()
+        .network_session(&network_session)
+        .default_content_security_policy(HTML_DEFAULT_CONTENT_SECURITY_POLICY)
+        .build()
+}
+
 fn configure_html_webview(view: &webkit6::WebView, allow_remote_images: bool) {
     if let Some(settings) = WebViewExt::settings(view) {
         settings.set_enable_javascript(true);
         settings.set_enable_javascript_markup(false);
         settings.set_enable_developer_extras(false);
+        settings.set_enable_dns_prefetching(false);
+        settings.set_enable_hyperlink_auditing(false);
+        settings.set_load_icons_ignoring_image_load_setting(false);
         settings.set_allow_file_access_from_file_urls(false);
         settings.set_allow_universal_access_from_file_urls(false);
         settings.set_auto_load_images(allow_remote_images);
@@ -9343,6 +9476,7 @@ fn configure_html_webview(view: &webkit6::WebView, allow_remote_images: bool) {
     view.load_html(
         &visual_html_document(
             "<p class=\"notm-empty-html\">Open an HTML message and choose Visual HTML.</p>",
+            false,
         ),
         Some("about:blank"),
     );
@@ -9447,7 +9581,6 @@ fn navigation_decision_uri(decision: &webkit6::PolicyDecision) -> Option<String>
 enum ImagePolicy {
     Config,
     Once,
-    TrustSender,
 }
 
 fn show_visual_html_selected_message(
@@ -9469,14 +9602,18 @@ fn show_visual_html_with_image_policy(
     }
     let result = {
         let message = state.borrow().selected_message.clone();
-        (|| -> anyhow::Result<(String, String, bool, Option<String>, usize)> {
+        (|| -> anyhow::Result<(String, String, bool, usize)> {
             let message = message.ok_or_else(|| anyhow::anyhow!("no selected message"))?;
-            render_visual_html_for_message(options, state, &message, image_policy)
+            render_visual_html_for_message(options, &message, image_policy)
         })()
     };
     match result {
-        Ok((document, original_html, allow_remote_images, sender, decode_warning_count)) => {
+        Ok((document, original_html, allow_remote_images, decode_warning_count)) => {
+            widgets.html_view.stop_loading();
             set_html_image_loading(&widgets.html_view, allow_remote_images);
+            widgets
+                .html_load_generation
+                .set(widgets.html_load_generation.get().saturating_add(1));
             widgets.html_view.load_html(&document, Some("about:blank"));
             widgets.message_stack.set_visible_child_name("html");
             update_message_header(widgets, state);
@@ -9484,7 +9621,6 @@ fn show_visual_html_with_image_policy(
             widgets.status_label.set_text(&html_status_text(
                 image_policy,
                 allow_remote_images,
-                sender.as_deref(),
                 decode_warning_count,
             ));
             {
@@ -9514,20 +9650,12 @@ fn show_visual_html_with_image_policy(
 
 fn render_visual_html_for_message(
     options: &LaunchOptions,
-    state: &SharedState,
     message: &notm_notmuch::MessageSummary,
     image_policy: ImagePolicy,
-) -> anyhow::Result<(String, String, bool, Option<String>, usize)> {
-    let sender = message_sender_email(message);
-    if matches!(image_policy, ImagePolicy::TrustSender) {
-        let sender = sender
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("selected message sender could not be parsed"))?;
-        trust_image_sender(options, state, &sender)?;
-    }
+) -> anyhow::Result<(String, String, bool, usize)> {
     let allow_remote_images = match image_policy {
-        ImagePolicy::Config => message_allows_images(options, state, message),
-        ImagePolicy::Once | ImagePolicy::TrustSender => true,
+        ImagePolicy::Config => settings::remote_images(&options.runtime_settings),
+        ImagePolicy::Once => true,
     };
     let filename = message_filename(message)?;
     let parsed = parse_file(filename)?;
@@ -9537,10 +9665,9 @@ fn render_visual_html_for_message(
         .ok_or_else(|| anyhow::anyhow!("selected message has no HTML body"))?;
     let sanitized = sanitize_html_for_visual(&html, allow_remote_images);
     Ok((
-        visual_html_document(&sanitized),
+        visual_html_document(&sanitized, allow_remote_images),
         html,
         allow_remote_images,
-        sender,
         decode_warning_count,
     ))
 }
@@ -9554,24 +9681,16 @@ fn set_html_image_loading(view: &webkit6::WebView, allow_remote_images: bool) {
 fn html_status_text(
     policy: ImagePolicy,
     allow_remote_images: bool,
-    sender: Option<&str>,
     decode_warning_count: usize,
 ) -> String {
     let status = match policy {
         ImagePolicy::Once if allow_remote_images => {
-            "Visual HTML rendered; remote images allowed for this view only".to_string()
+            "Visual HTML rendered; remote images loaded once for this message".to_string()
         }
-        ImagePolicy::TrustSender if allow_remote_images => format!(
-            "Visual HTML rendered; remote images always allowed for {}",
-            sender.unwrap_or("this sender")
-        ),
-        ImagePolicy::Config if allow_remote_images => match sender {
-            Some(sender) if !sender.is_empty() => {
-                format!("Visual HTML rendered; remote images allowed by config/trust for {sender}")
-            }
-            _ => "Visual HTML rendered; remote images allowed by config".to_string(),
-        },
-        _ => "Visual HTML rendered; JavaScript and remote images disabled".to_string(),
+        ImagePolicy::Config if allow_remote_images => {
+            "Visual HTML rendered; remote images allowed for all messages by settings".to_string()
+        }
+        _ => "Visual HTML rendered; remote content and message scripts blocked".to_string(),
     };
     if decode_warning_count == 0 {
         status
@@ -9583,31 +9702,12 @@ fn html_status_text(
     }
 }
 
-fn selected_message_allows_images(options: &LaunchOptions, state: &SharedState) -> bool {
-    state
-        .borrow()
-        .selected_message
-        .as_ref()
-        .is_some_and(|message| message_allows_images(options, state, message))
-}
-
 fn selected_sender_email(state: &SharedState) -> Option<String> {
     state
         .borrow()
         .selected_message
         .as_ref()
         .and_then(message_sender_email)
-}
-
-fn message_allows_images(
-    options: &LaunchOptions,
-    state: &SharedState,
-    message: &notm_notmuch::MessageSummary,
-) -> bool {
-    settings::remote_images(&options.runtime_settings)
-        || message_sender_email(message)
-            .as_deref()
-            .is_some_and(|sender| image_sender_is_trusted(state, sender))
 }
 
 fn message_sender_email(message: &notm_notmuch::MessageSummary) -> Option<String> {
@@ -9697,44 +9797,6 @@ fn normalize_sender(sender: &str) -> String {
     sender.trim().to_ascii_lowercase()
 }
 
-fn normalize_sender_list(senders: &[String]) -> Vec<String> {
-    let mut senders = senders
-        .iter()
-        .map(|sender| normalize_sender(sender))
-        .filter(|sender| !sender.is_empty())
-        .collect::<Vec<_>>();
-    senders.sort();
-    senders.dedup();
-    senders
-}
-
-fn image_sender_is_trusted(state: &SharedState, sender: &str) -> bool {
-    let sender = normalize_sender(sender);
-    state
-        .borrow()
-        .trusted_image_senders
-        .iter()
-        .any(|trusted| trusted == &sender)
-}
-
-fn trust_image_sender(
-    options: &LaunchOptions,
-    state: &SharedState,
-    sender: &str,
-) -> anyhow::Result<()> {
-    let sender = normalize_sender(sender);
-    anyhow::ensure!(!sender.is_empty(), "sender is empty");
-    {
-        let mut state = state.borrow_mut();
-        if !state.trusted_image_senders.iter().any(|s| s == &sender) {
-            state.trusted_image_senders.push(sender.clone());
-            state.trusted_image_senders.sort();
-        }
-    }
-    persist_trusted_image_senders(options, &state.borrow().trusted_image_senders)?;
-    Ok(())
-}
-
 fn sanitize_html_for_visual(html: &str, allow_remote_images: bool) -> String {
     let sanitized = sanitize_html(html);
     if allow_remote_images {
@@ -9773,12 +9835,18 @@ fn strip_img_tags(html: &str) -> String {
     out
 }
 
-fn visual_html_document(body: &str) -> String {
+fn visual_html_document(body: &str, allow_remote_images: bool) -> String {
+    let image_sources = if allow_remote_images {
+        "http: https:"
+    } else {
+        "'none'"
+    };
     format!(
         r#"<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src {image_sources}; style-src 'unsafe-inline'; script-src 'none'; connect-src 'none'; frame-src 'none'; font-src 'none'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
 <meta name="color-scheme" content="light">
 <style>
 :root {{
@@ -9860,12 +9928,21 @@ fn html_view_state(
             Err(err) => (false, 0, 0, Some(err.to_string())),
         };
     let sender_email = selected_sender_email(state);
-    let sender_trusted = sender_email
-        .as_deref()
-        .is_some_and(|sender| image_sender_is_trusted(state, sender));
+    let global_remote_images_allowed = settings::remote_images(&options.runtime_settings);
     let image_loading_allowed = WebViewExt::settings(&widgets.html_view)
         .map(|settings| settings.is_auto_load_images())
         .unwrap_or(false);
+    let image_permission = if global_remote_images_allowed {
+        "all_messages"
+    } else if visible_child == "html" && image_loading_allowed {
+        "message_once"
+    } else {
+        "blocked"
+    };
+    let network_session_ephemeral = widgets
+        .html_view
+        .network_session()
+        .is_some_and(|session| session.is_ephemeral());
     json!({
         "ok": error.is_none(),
         "visible_child": visible_child,
@@ -9874,12 +9951,20 @@ fn html_view_state(
         "html_bytes": html_len,
         "decode_warning_count": decode_warning_count,
         "status_text": widgets.status_label.text().to_string(),
-        "global_remote_images_allowed": settings::remote_images(&options.runtime_settings),
+        "loading": widgets.html_view.is_loading(),
+        "load_generation": widgets.html_load_generation.get(),
+        "completed_load_generation": widgets.html_completed_load_generation.get(),
+        "global_remote_images_allowed": global_remote_images_allowed,
         "sender_email": sender_email,
-        "sender_trusted": sender_trusted,
-        "policy_allows_images": selected_message_allows_images(options, state),
+        "sender_identity_authenticated": false,
+        "image_permission": image_permission,
         "image_loading_allowed": image_loading_allowed,
         "remote_images_allowed": image_loading_allowed,
+        "network_session_ephemeral": network_session_ephemeral,
+        "default_content_security_policy": widgets
+            .html_view
+            .default_content_security_policy()
+            .map(|policy| policy.to_string()),
         "error": error,
     })
 }
@@ -11504,7 +11589,6 @@ fn open_standalone_message_window(
         StandalonePolicySnapshot {
             collapse_quotes: policy_quote_collapse.get(),
             remote_images: settings::remote_images(&policy_options.runtime_settings),
-            trusted_image_senders: state.trusted_image_senders.clone(),
             show_keybind_hints: state.show_keybind_hints,
             normal_input_mode: state.input_mode == InputMode::Normal,
             response_sensitive: !state.send_in_progress && !tag_path_actions_blocked(&state),
@@ -11513,26 +11597,20 @@ fn open_standalone_message_window(
     let message_has_html: StandaloneMessageHasHtml = Rc::new(message_has_html);
     let render_text: StandaloneTextRenderer = Rc::new(render_message_text);
     let render_options = options.clone();
-    let render_state = state.clone();
     let render_html: StandaloneHtmlRenderer = Rc::new(move |message, policy| {
         let policy = match policy {
             StandaloneImagePolicy::Config => ImagePolicy::Config,
             StandaloneImagePolicy::Once => ImagePolicy::Once,
-            StandaloneImagePolicy::TrustSender => ImagePolicy::TrustSender,
         };
-        let (document, _, allow_remote_images, sender, decode_warning_count) =
-            render_visual_html_for_message(&render_options, &render_state, message, policy)?;
+        let (document, _, allow_remote_images, decode_warning_count) =
+            render_visual_html_for_message(&render_options, message, policy)?;
         Ok(StandaloneHtmlRender {
             document,
             allow_remote_images,
-            status: html_status_text(
-                policy,
-                allow_remote_images,
-                sender.as_deref(),
-                decode_warning_count,
-            ),
+            status: html_status_text(policy, allow_remote_images, decode_warning_count),
         })
     });
+    let create_html_view: StandaloneHtmlViewFactory = Rc::new(new_privacy_html_webview);
     let initialize_html_view: StandaloneHtmlViewInitializer =
         Rc::new(move |view, status_label, allow_remote_images| {
             configure_html_webview(view, allow_remote_images);
@@ -11601,6 +11679,7 @@ fn open_standalone_message_window(
         message_has_html,
         render_text,
         render_html,
+        create_html_view,
         initialize_html_view,
         scroll_html,
         open_link,
@@ -16299,7 +16378,6 @@ fn handle_automation_request(
             json!({
                 "ok": state.borrow().last_error.is_none(),
                 "html_view": html_view_state(options, widgets, state),
-                "trusted_image_senders": state.borrow().trusted_image_senders,
                 "last_error": state.borrow().last_error,
             })
         }
@@ -16312,16 +16390,15 @@ fn handle_automation_request(
             })
         }
         "trust_sender_images" | "always_load_sender_images" => {
-            show_visual_html_with_image_policy(options, widgets, state, ImagePolicy::TrustSender);
-            json!({
-                "ok": state.borrow().last_error.is_none(),
-                "html_view": html_view_state(options, widgets, state),
-                "trusted_image_senders": state.borrow().trusted_image_senders,
-                "last_error": state.borrow().last_error,
-            })
+            reject_persistent_sender_image_trust(options, widgets, state)
         }
         "trusted_image_senders" => {
-            json!({"ok": true, "trusted_image_senders": state.borrow().trusted_image_senders})
+            json!({
+                "ok": true,
+                "trusted_image_senders": [],
+                "retired": true,
+                "reason": "raw From headers are not authenticated",
+            })
         }
         "html_view_state" => html_view_state(options, widgets, state),
         "view_preference_state" => view_preference_state_json(widgets, state),
@@ -16835,6 +16912,7 @@ fn settings_test_state_json(
         "dialog": widgets.settings.test_dialog_state(),
         "theme": theme_state,
         "preview": rendered_thread_preview_json(widgets, state),
+        "remote_images": settings::remote_images(&options.runtime_settings),
         "app_config_path": options.app_config_path,
         "status_text": widgets.status_label.text().to_string(),
     })
@@ -17350,7 +17428,6 @@ fn run_named_command(
             json!({
                 "ok": state.borrow().last_error.is_none(),
                 "html_view": html_view_state(options, widgets, state),
-                "trusted_image_senders": state.borrow().trusted_image_senders,
                 "last_error": state.borrow().last_error,
             })
         }
@@ -17363,13 +17440,7 @@ fn run_named_command(
             })
         }
         "trust_sender_images" | "always_load_sender_images" => {
-            show_visual_html_with_image_policy(options, widgets, state, ImagePolicy::TrustSender);
-            json!({
-                "ok": state.borrow().last_error.is_none(),
-                "html_view": html_view_state(options, widgets, state),
-                "trusted_image_senders": state.borrow().trusted_image_senders,
-                "last_error": state.borrow().last_error,
-            })
+            reject_persistent_sender_image_trust(options, widgets, state)
         }
         "toggle_quote_collapse" | "collapse_quotes" => {
             toggle_quote_collapse(options, widgets, state);
@@ -17641,7 +17712,6 @@ fn command_name_candidates() -> &'static [&'static str] {
         "link_hints",
         "image_policy",
         "load_images_once",
-        "trust_sender_images",
         "collapse_quotes",
         "nu",
         "nonu",
@@ -18239,7 +18309,7 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
         HelpEntry {
             section: "Message actions",
             key: "I",
-            description: "Load or trust remote images for the current HTML message.",
+            description: "Load remote images once for the current HTML message.",
         },
         HelpEntry {
             section: "Message actions",
@@ -18444,17 +18514,12 @@ fn command_help_entries() -> &'static [HelpEntry] {
         HelpEntry {
             section: "Message view commands",
             key: ":image_policy",
-            description: "Open the remote-image policy action for the current HTML message.",
+            description: "Load remote images once for the current HTML message.",
         },
         HelpEntry {
             section: "Message view commands",
             key: ":load_images_once",
             description: "Load remote images once for the current HTML message.",
-        },
-        HelpEntry {
-            section: "Message view commands",
-            key: ":trust_sender_images",
-            description: "Always load remote images from this sender.",
         },
         HelpEntry {
             section: "Message view commands",
@@ -18550,6 +18615,13 @@ fn command_help_entries() -> &'static [HelpEntry] {
 }
 
 fn show_settings(widgets: &Widgets, state: &SharedState, options: &LaunchOptions) {
+    let block_reason = settings_application_block_reason(&state.borrow());
+    if let Some(reason) = block_reason {
+        widgets.status_label.set_text(reason);
+        state.borrow_mut().last_operation = Some(reason.to_string());
+        update_debug(widgets, state);
+        return;
+    }
     let seed = settings_dialog_seed(options, widgets, state);
     let opts = options.clone();
     let w = widgets.clone();
@@ -18590,7 +18662,6 @@ fn settings_dialog_seed(
         prefer_html_view: state.prefer_html_view,
         start_maximized: options.start_maximized,
         show_debug_panel: widgets.debug_view.is_visible(),
-        trusted_image_senders: state.trusted_image_senders.clone(),
         hidden_tag_searches: widgets
             .hidden_tag_searches
             .borrow()
@@ -18633,6 +18704,9 @@ fn apply_settings_application(
     state: &SharedState,
     application: SettingsApplication,
 ) -> anyhow::Result<SettingsApplicationOutcome> {
+    if let Some(reason) = settings_application_block_reason(&state.borrow()) {
+        anyhow::bail!(reason);
+    }
     let previous_runtime = settings::snapshot(&options.runtime_settings);
     let next_runtime = application.runtime;
     let next_page_size = next_runtime.page_size;
@@ -18640,6 +18714,7 @@ fn apply_settings_application(
     let next_thread_preview_lines = next_runtime.thread_preview_lines;
     let next_layout_preference = next_runtime.layout_preference;
     let next_excluded_tags = next_runtime.excluded_tags.clone();
+    let next_remote_images = next_runtime.remote_images;
     settings::update(&options.runtime_settings, next_runtime);
 
     {
@@ -18654,7 +18729,6 @@ fn apply_settings_application(
         state.show_keybind_hints = application.show_keybind_hints;
         state.layout_preference = next_layout_preference;
         state.prefer_html_view = application.prefer_html_view;
-        state.trusted_image_senders = normalize_sender_list(&application.trusted_image_senders);
     }
     theme::apply_theme_preference(&widgets.gtk_settings, &widgets.css_provider, next_theme);
     widgets.theme_background_probe.queue_draw();
@@ -18676,6 +18750,9 @@ fn apply_settings_application(
     update_thread_result_label(widgets, state);
     update_button_binding_labels(widgets, state);
     update_message_action_buttons(options, widgets, state);
+    widgets
+        .standalone_messages
+        .refresh_remote_image_policy(previous_runtime.remote_images, next_remote_images);
     if html_view_is_visible(widgets) {
         let scroll = current_message_scroll_fraction(widgets);
         show_visual_html_selected_message(options, widgets, state);
@@ -18986,6 +19063,32 @@ mod tests {
             history.pop().expect("unselected history").label,
             "unselected"
         );
+    }
+
+    #[test]
+    fn html_load_completion_ignores_replaced_generations() {
+        let mut lifecycle = HtmlLoadLifecycle::default();
+
+        lifecycle.load_changed(webkit6::LoadEvent::Started, 0);
+        assert_eq!(lifecycle.bind_main_resource(), Some(0));
+        assert_eq!(lifecycle.finish_main_resource(0, 1), None);
+
+        lifecycle.load_changed(webkit6::LoadEvent::Started, 1);
+        assert_eq!(lifecycle.bind_main_resource(), Some(1));
+        lifecycle.load_changed(webkit6::LoadEvent::Started, 2);
+        assert_eq!(lifecycle.bind_main_resource(), Some(2));
+
+        // Concrete replacement race: Started(g1), request g2, Started(g2),
+        // then the old resource and WebView emit their stale Finished events.
+        assert_eq!(lifecycle.finish_main_resource(1, 2), None);
+        let before_stale_finish = lifecycle.clone();
+        lifecycle.load_changed(webkit6::LoadEvent::Finished, 2);
+        assert_eq!(lifecycle, before_stale_finish);
+
+        assert_eq!(lifecycle.finish_main_resource(2, 2), Some(2));
+        let after_current_resource = lifecycle.clone();
+        lifecycle.load_changed(webkit6::LoadEvent::Finished, 2);
+        assert_eq!(lifecycle, after_current_resource);
     }
 
     #[test]
@@ -19820,12 +19923,87 @@ mod tests {
 
     #[test]
     fn visual_html_document_uses_light_default_canvas() {
-        let document = visual_html_document("<p>Hello</p>");
+        let document = visual_html_document("<p>Hello</p>", false);
 
         assert!(document.contains(r#"<meta name="color-scheme" content="light">"#));
+        assert!(document.contains("default-src 'none'; img-src 'none'"));
         assert!(document.contains("background: #ffffff;"));
         assert!(document.contains("color: #111111;"));
         assert!(!document.contains("CanvasText"));
+    }
+
+    #[test]
+    fn visual_html_document_only_opens_http_images_for_explicit_image_loading() {
+        let blocked = visual_html_document("<p>Blocked</p>", false);
+        let allowed = visual_html_document("<p>Allowed once</p>", true);
+
+        assert!(blocked.contains("img-src 'none'"));
+        assert!(!blocked.contains("img-src http: https:"));
+        assert!(allowed.contains("img-src http: https:"));
+        for document in [&blocked, &allowed] {
+            assert!(document.contains("script-src 'none'"));
+            assert!(document.contains("connect-src 'none'"));
+            assert!(document.contains("frame-src 'none'"));
+            assert!(document.contains("object-src 'none'"));
+            assert!(document.contains("base-uri 'none'"));
+            assert!(document.contains("form-action 'none'"));
+        }
+    }
+
+    #[test]
+    fn blocked_visual_html_removes_direct_and_alternate_remote_resource_markup() {
+        let html = r#"
+            <IMG SRC="https://tracker.test/direct" SRCSET="https://tracker.test/srcset 2x">
+            <div style="background:url(https://tracker.test/css-inline)">inline</div>
+            <style>@import url(https://tracker.test/css-import)</style>
+            <picture><source srcset="https://tracker.test/source"><img src="https://tracker.test/nested-img"></picture>
+            <iframe src="https://tracker.test/frame" srcdoc="<img src='https://tracker.test/srcdoc'>"></iframe>
+            <object data="https://tracker.test/object"></object>
+            <embed src="https://tracker.test/embed">
+            <link rel="stylesheet" href="https://tracker.test/stylesheet">
+            <meta http-equiv="refresh" content="0;url=https://tracker.test/refresh">
+            <svg><image href="https://tracker.test/svg"></image></svg>
+        "#;
+
+        let sanitized = sanitize_html_for_visual(html, false);
+
+        assert_eq!(sanitized.matches("[image blocked]").count(), 2);
+        for forbidden in [
+            "tracker.test/direct",
+            "tracker.test/srcset",
+            "tracker.test/css-inline",
+            "tracker.test/css-import",
+            "tracker.test/source",
+            "tracker.test/nested-img",
+            "tracker.test/frame",
+            "tracker.test/srcdoc",
+            "tracker.test/object",
+            "tracker.test/embed",
+            "tracker.test/stylesheet",
+            "tracker.test/refresh",
+            "tracker.test/svg",
+        ] {
+            assert!(
+                !sanitized.contains(forbidden),
+                "blocked HTML retained remote resource URL {forbidden}: {sanitized}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_shot_visual_html_keeps_only_sanitized_direct_image_sources() {
+        let html = r#"
+            <img src="https://tracker.test/direct" srcset="https://tracker.test/srcset 2x">
+            <div style="background-image:url(https://tracker.test/css)">body</div>
+            <iframe src="https://tracker.test/frame"></iframe>
+        "#;
+
+        let sanitized = sanitize_html_for_visual(html, true);
+
+        assert!(sanitized.contains("https://tracker.test/direct"));
+        assert!(!sanitized.contains("tracker.test/srcset"));
+        assert!(!sanitized.contains("tracker.test/css"));
+        assert!(!sanitized.contains("tracker.test/frame"));
     }
 
     #[test]
@@ -20210,6 +20388,32 @@ mod tests {
                 "tag mutation did not block {operation:?}"
             );
         }
+    }
+
+    #[test]
+    fn settings_application_waits_for_tag_path_reconciliation() {
+        let mut state = UiState::default();
+        assert_eq!(settings_application_block_reason(&state), None);
+
+        state.tag_in_progress = true;
+        assert!(
+            settings_application_block_reason(&state)
+                .is_some_and(|reason| reason.contains("tags are changing"))
+        );
+
+        state.tag_in_progress = false;
+        state.tag_warning = Some("partial tag result".to_string());
+        assert!(
+            settings_application_block_reason(&state)
+                .is_some_and(|reason| reason.contains("reconciled"))
+        );
+
+        state.tag_warning = None;
+        state.tag_paths_uncertain = true;
+        assert!(
+            settings_application_block_reason(&state)
+                .is_some_and(|reason| reason.contains("reconciled"))
+        );
     }
 
     #[test]
