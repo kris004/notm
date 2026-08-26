@@ -770,12 +770,13 @@ pub(crate) fn ensure_private_directory(path: &Path) -> anyhow::Result<()> {
 
 pub(crate) fn save_named_draft_fields(
     dir: &Path,
+    legacy_dir: Option<&Path>,
     fields: &ComposeFields,
     replacement: Option<&Path>,
 ) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(fields_has_content(fields), "draft has no content");
     let bytes = serde_json::to_vec_pretty(fields)?;
-    ensure_named_draft_save_fits(dir, replacement, bytes.len())?;
+    ensure_named_draft_save_fits(dir, legacy_dir, replacement, bytes.len())?;
     ensure_private_directory(dir)?;
     let path = if let Some(replacement) = replacement {
         replacement.to_path_buf()
@@ -2853,7 +2854,7 @@ mod tests {
             body: "saved body".to_string(),
             ..ComposeFields::default()
         };
-        let valid_path = save_named_draft_fields(&drafts_directory, &valid, None)
+        let valid_path = save_named_draft_fields(&drafts_directory, None, &valid, None)
             .expect("seed valid named draft");
         let valid_bytes = std::fs::read(&valid_path).expect("read valid named draft");
 
@@ -2861,7 +2862,7 @@ mod tests {
             body: "x".repeat(MAX_NAMED_DRAFT_BYTES),
             ..ComposeFields::default()
         };
-        let error = save_named_draft_fields(&drafts_directory, &oversized, None)
+        let error = save_named_draft_fields(&drafts_directory, None, &oversized, None)
             .expect_err("oversized named draft must be rejected");
 
         let message = error.to_string();
@@ -2904,6 +2905,7 @@ mod tests {
 
         let error = save_named_draft_fields(
             &drafts_directory,
+            None,
             &ComposeFields {
                 body: "new draft".to_string(),
                 ..ComposeFields::default()
@@ -2929,9 +2931,13 @@ mod tests {
             body: "replacement body".to_string(),
             ..ComposeFields::default()
         };
-        let returned =
-            save_named_draft_fields(&drafts_directory, &updated, Some(replacement.as_path()))
-                .expect("replace named draft at the file-count limit");
+        let returned = save_named_draft_fields(
+            &drafts_directory,
+            None,
+            &updated,
+            Some(replacement.as_path()),
+        )
+        .expect("replace named draft at the file-count limit");
         assert_eq!(returned, replacement);
         assert_eq!(
             serde_json::from_slice::<ComposeFields>(
@@ -2953,6 +2959,7 @@ mod tests {
 
         let error = save_named_draft_fields(
             &drafts_directory,
+            None,
             &ComposeFields {
                 body: "replacement body".to_string(),
                 ..ComposeFields::default()
@@ -3010,6 +3017,7 @@ mod tests {
 
         let error = save_named_draft_fields(
             &drafts_directory,
+            None,
             &ComposeFields {
                 body: "another draft".to_string(),
                 ..ComposeFields::default()
@@ -3032,6 +3040,7 @@ mod tests {
         let larger_replacement = fields_with_serialized_len(replacement_len + 1);
         let error = save_named_draft_fields(
             &drafts_directory,
+            None,
             &larger_replacement,
             Some(replacement.as_path()),
         )
@@ -3060,8 +3069,8 @@ mod tests {
             ..ComposeFields::default()
         };
 
-        let path =
-            save_named_draft_fields(&drafts_directory, &fields, None).expect("save named draft");
+        let path = save_named_draft_fields(&drafts_directory, None, &fields, None)
+            .expect("save named draft");
 
         assert_eq!(
             std::fs::metadata(&drafts_directory)

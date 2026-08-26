@@ -520,8 +520,26 @@ fn scan_named_drafts_with_reader(
 
 pub(crate) fn ensure_named_draft_save_fits(
     dir: &Path,
+    legacy_dir: Option<&Path>,
     replacement: Option<&Path>,
     serialized_bytes: usize,
+) -> anyhow::Result<()> {
+    let mut reader_factory = open_named_draft_reader;
+    ensure_named_draft_save_fits_with_reader(
+        dir,
+        legacy_dir,
+        replacement,
+        serialized_bytes,
+        &mut reader_factory,
+    )
+}
+
+fn ensure_named_draft_save_fits_with_reader(
+    dir: &Path,
+    legacy_dir: Option<&Path>,
+    replacement: Option<&Path>,
+    serialized_bytes: usize,
+    reader_factory: &mut NamedDraftReaderFactory<'_>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         serialized_bytes <= MAX_NAMED_DRAFT_BYTES,
@@ -529,7 +547,15 @@ pub(crate) fn ensure_named_draft_save_fits(
     );
 
     let paths = json_entries(dir)?;
-    ensure_count(paths.len())?;
+    let legacy_paths = match legacy_dir {
+        Some(legacy_dir) if legacy_dir != dir => json_entries(legacy_dir)?,
+        _ => Vec::new(),
+    };
+    let existing_count = paths
+        .len()
+        .checked_add(legacy_paths.len())
+        .context("named draft count overflowed")?;
+    ensure_count(existing_count)?;
     let replacement = replacement
         .map(|path| {
             anyhow::ensure!(
@@ -556,8 +582,7 @@ pub(crate) fn ensure_named_draft_save_fits(
         })
         .transpose()?;
 
-    let projected_count = paths
-        .len()
+    let projected_count = existing_count
         .checked_add(usize::from(replacement.is_none()))
         .context("named draft count overflowed")?;
     anyhow::ensure!(
@@ -568,9 +593,19 @@ pub(crate) fn ensure_named_draft_save_fits(
     let mut total_bytes = 0;
     let mut replaced_bytes = 0;
     for path in &paths {
-        let bytes = read_bounded(path, &mut total_bytes)?;
+        let bytes = read_bounded(path, &mut total_bytes, reader_factory)?;
         if replacement == Some(path.as_path()) {
             replaced_bytes = bytes.len();
+        }
+    }
+    for path in &legacy_paths {
+        // Legacy entries rejected by migration remain visible to the startup
+        // scan and still occupy the shared physical count and byte budgets.
+        // Keep per-entry read failures recoverable, as the scan does, and do
+        // not charge any bytes from a failed partial read. Successfully read
+        // malformed and oversized entries are charged before they are skipped.
+        if let Ok(bytes) = read_named_draft(path, reader_factory) {
+            charge_named_draft_bytes(&mut total_bytes, bytes.len())?;
         }
     }
     let projected_bytes = total_bytes
@@ -676,27 +711,19 @@ fn charge_named_draft_bytes(total_bytes: &mut usize, bytes: usize) -> anyhow::Re
     Ok(())
 }
 
-fn read_bounded(path: &Path, total_bytes: &mut usize) -> anyhow::Result<Vec<u8>> {
-    let file =
-        fs::File::open(path).with_context(|| format!("opening named draft {}", path.display()))?;
-    let mut bytes = Vec::new();
-    file.take((MAX_NAMED_DRAFT_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("reading named draft {}", path.display()))?;
+fn read_bounded(
+    path: &Path,
+    total_bytes: &mut usize,
+    reader_factory: &mut NamedDraftReaderFactory<'_>,
+) -> anyhow::Result<Vec<u8>> {
+    let bytes = read_named_draft(path, reader_factory)?;
     anyhow::ensure!(
         bytes.len() <= MAX_NAMED_DRAFT_BYTES,
         "named draft {} exceeds the {}-byte limit",
         path.display(),
         MAX_NAMED_DRAFT_BYTES
     );
-    *total_bytes = total_bytes
-        .checked_add(bytes.len())
-        .context("named draft byte count overflowed")?;
-    anyhow::ensure!(
-        *total_bytes <= MAX_NAMED_DRAFT_TOTAL_BYTES,
-        "named draft store exceeds the {}-byte total limit",
-        MAX_NAMED_DRAFT_TOTAL_BYTES
-    );
+    charge_named_draft_bytes(total_bytes, bytes.len())?;
     Ok(bytes)
 }
 
@@ -786,6 +813,52 @@ mod tests {
                 }
             };
             Ok(reader)
+        }
+    }
+
+    #[derive(Clone)]
+    enum SyntheticLegacyRead {
+        Bytes(usize),
+        PartialError {
+            bytes: usize,
+            emitted: Rc<Cell<usize>>,
+        },
+    }
+
+    fn create_named_draft_placeholders(dir: &Path, count: usize) {
+        for index in 0..count {
+            fs::write(dir.join(format!("current-{index:02}.json")), b"fixture")
+                .expect("write current draft placeholder");
+        }
+    }
+
+    fn save_preflight_budget_reader(
+        current_dir: PathBuf,
+        current_bytes: usize,
+        legacy_path: PathBuf,
+        legacy_read: SyntheticLegacyRead,
+    ) -> impl FnMut(&Path) -> io::Result<NamedDraftReader> {
+        move |path| {
+            if path.parent() == Some(current_dir.as_path()) {
+                return Ok(Box::new(io::repeat(b'x').take(current_bytes as u64)));
+            }
+            if path != legacy_path {
+                return Err(io::Error::other(format!(
+                    "unexpected synthetic entry {}",
+                    path.display()
+                )));
+            }
+            match &legacy_read {
+                SyntheticLegacyRead::Bytes(bytes) => {
+                    Ok(Box::new(io::repeat(b'x').take(*bytes as u64)))
+                }
+                SyntheticLegacyRead::PartialError { bytes, emitted } => {
+                    Ok(Box::new(PartialThenError {
+                        remaining: *bytes,
+                        emitted: Rc::clone(emitted),
+                    }))
+                }
+            }
         }
     }
 
@@ -945,6 +1018,219 @@ mod tests {
         .expect("parse migrated valid draft");
         assert_eq!(migrated_fields.subject, "valid-after-partial-error");
         assert!(legacy.join("partial.json").exists());
+    }
+
+    #[test]
+    fn save_preflight_counts_malformed_legacy_entry_retained_after_migration() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let current = root.path().join("current");
+        let legacy = root.path().join("legacy");
+        fs::create_dir_all(&current).expect("current dir");
+        fs::create_dir_all(&legacy).expect("legacy dir");
+        let valid = serde_json::to_vec(&fields("current")).expect("serialize current draft");
+        for index in 0..(MAX_NAMED_DRAFTS - 1) {
+            fs::write(current.join(format!("current-{index:03}.json")), &valid)
+                .expect("write current draft");
+        }
+        let malformed_path = legacy.join("retained-malformed.json");
+        fs::write(&malformed_path, b"{truncated").expect("write malformed legacy draft");
+
+        let loaded = load_named_drafts(&NamedDraftLoadRequest {
+            generation: 1,
+            current_dir: current.clone(),
+            legacy_dir: Some(legacy.clone()),
+            migrate_legacy: true,
+            fixture_delay: Duration::ZERO,
+        })
+        .expect("load current drafts while retaining malformed legacy entry");
+        assert_eq!(loaded.migrated, 0);
+        assert_eq!(loaded.drafts.len(), MAX_NAMED_DRAFTS - 1);
+        let warning = loaded.warning.expect("malformed legacy warning");
+        assert!(warning.contains("retained-malformed.json"), "{warning}");
+
+        let error = ensure_named_draft_save_fits(&current, Some(&legacy), None, valid.len())
+            .expect_err("retained legacy entry must count against a new save");
+        assert!(error.to_string().contains("would contain 257"), "{error:#}");
+        assert!(malformed_path.is_file());
+        assert_eq!(json_entries(&current).expect("list current").len(), 255);
+    }
+
+    #[test]
+    fn save_preflight_counts_unreadable_legacy_entry_and_allows_current_replacement() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let current = root.path().join("current");
+        let legacy = root.path().join("legacy");
+        fs::create_dir_all(&current).expect("current dir");
+        fs::create_dir_all(&legacy).expect("legacy dir");
+        let valid = serde_json::to_vec(&fields("current")).expect("serialize current draft");
+        for index in 0..(MAX_NAMED_DRAFTS - 1) {
+            fs::write(current.join(format!("current-{index:03}.json")), &valid)
+                .expect("write current draft");
+        }
+        let unreadable_path = legacy.join("retained-unreadable.json");
+        fs::create_dir(&unreadable_path).expect("create deterministic unreadable entry");
+
+        let loaded = load_named_drafts(&NamedDraftLoadRequest {
+            generation: 1,
+            current_dir: current.clone(),
+            legacy_dir: Some(legacy.clone()),
+            migrate_legacy: true,
+            fixture_delay: Duration::ZERO,
+        })
+        .expect("load current drafts while retaining unreadable legacy entry");
+        assert_eq!(loaded.migrated, 0);
+        assert_eq!(loaded.drafts.len(), MAX_NAMED_DRAFTS - 1);
+        let warning = loaded.warning.expect("unreadable legacy warning");
+        assert!(warning.contains("retained-unreadable.json"), "{warning}");
+
+        let error = ensure_named_draft_save_fits(&current, Some(&legacy), None, valid.len())
+            .expect_err("retained unreadable entry must count against a new save");
+        assert!(error.to_string().contains("would contain 257"), "{error:#}");
+
+        let replacement = current.join("current-000.json");
+        ensure_named_draft_save_fits(&current, Some(&legacy), Some(&replacement), valid.len())
+            .expect("replacement should remain allowed at the combined physical count cap");
+        assert!(unreadable_path.is_dir());
+    }
+
+    #[test]
+    fn save_preflight_charges_malformed_legacy_bytes_retained_after_migration() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let current = root.path().join("current");
+        let legacy = root.path().join("legacy");
+        fs::create_dir_all(&current).expect("current dir");
+        fs::create_dir_all(&legacy).expect("legacy dir");
+        let current_count = MAX_NAMED_DRAFT_TOTAL_BYTES / MAX_NAMED_DRAFT_BYTES - 1;
+        create_named_draft_placeholders(&current, current_count);
+        let legacy_path = legacy.join("retained-malformed.json");
+        fs::write(&legacy_path, b"fixture").expect("write legacy draft placeholder");
+
+        let legacy_read = SyntheticLegacyRead::Bytes(MAX_NAMED_DRAFT_BYTES);
+        let mut migration_reader = save_preflight_budget_reader(
+            current.clone(),
+            MAX_NAMED_DRAFT_BYTES,
+            legacy_path.clone(),
+            legacy_read.clone(),
+        );
+        let migrated =
+            migrate_legacy_named_drafts_with_reader(&current, &legacy, &mut migration_reader)
+                .expect("malformed entry should remain within the migration budget");
+        assert_eq!(migrated, 0);
+        assert!(legacy_path.is_file());
+
+        let mut save_reader = save_preflight_budget_reader(
+            current.clone(),
+            MAX_NAMED_DRAFT_BYTES,
+            legacy_path,
+            legacy_read,
+        );
+        let error = ensure_named_draft_save_fits_with_reader(
+            &current,
+            Some(&legacy),
+            None,
+            1,
+            &mut save_reader,
+        )
+        .expect_err("retained malformed bytes must count against a new save");
+        assert!(
+            error.to_string().contains("would use 33554433 bytes"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn save_preflight_charges_oversized_legacy_bytes_retained_after_migration() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let current = root.path().join("current");
+        let legacy = root.path().join("legacy");
+        fs::create_dir_all(&current).expect("current dir");
+        fs::create_dir_all(&legacy).expect("legacy dir");
+        let current_count = MAX_NAMED_DRAFT_TOTAL_BYTES / MAX_NAMED_DRAFT_BYTES - 2;
+        create_named_draft_placeholders(&current, current_count);
+        let legacy_path = legacy.join("retained-oversized.json");
+        fs::write(&legacy_path, b"fixture").expect("write legacy draft placeholder");
+
+        let legacy_read = SyntheticLegacyRead::Bytes(MAX_NAMED_DRAFT_BYTES + 1);
+        let mut migration_reader = save_preflight_budget_reader(
+            current.clone(),
+            MAX_NAMED_DRAFT_BYTES,
+            legacy_path.clone(),
+            legacy_read.clone(),
+        );
+        let migrated =
+            migrate_legacy_named_drafts_with_reader(&current, &legacy, &mut migration_reader)
+                .expect("oversized entry should remain within the migration budget");
+        assert_eq!(migrated, 0);
+        assert!(legacy_path.is_file());
+
+        let mut save_reader = save_preflight_budget_reader(
+            current.clone(),
+            MAX_NAMED_DRAFT_BYTES,
+            legacy_path,
+            legacy_read,
+        );
+        let error = ensure_named_draft_save_fits_with_reader(
+            &current,
+            Some(&legacy),
+            None,
+            MAX_NAMED_DRAFT_BYTES,
+            &mut save_reader,
+        )
+        .expect_err("retained oversized bytes must count against a new save");
+        assert!(
+            error.to_string().contains("would use 33554433 bytes"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn save_preflight_does_not_charge_partial_legacy_read_errors() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let current = root.path().join("current");
+        let legacy = root.path().join("legacy");
+        fs::create_dir_all(&current).expect("current dir");
+        fs::create_dir_all(&legacy).expect("legacy dir");
+        let current_count = MAX_NAMED_DRAFT_TOTAL_BYTES / MAX_NAMED_DRAFT_BYTES - 1;
+        create_named_draft_placeholders(&current, current_count);
+        let legacy_path = legacy.join("retained-partial-error.json");
+        fs::write(&legacy_path, b"fixture").expect("write legacy draft placeholder");
+
+        let migration_emitted = Rc::new(Cell::new(0));
+        let mut migration_reader = save_preflight_budget_reader(
+            current.clone(),
+            MAX_NAMED_DRAFT_BYTES,
+            legacy_path.clone(),
+            SyntheticLegacyRead::PartialError {
+                bytes: MAX_NAMED_DRAFT_BYTES,
+                emitted: Rc::clone(&migration_emitted),
+            },
+        );
+        let migrated =
+            migrate_legacy_named_drafts_with_reader(&current, &legacy, &mut migration_reader)
+                .expect("partial read error must not consume the migration budget");
+        assert_eq!(migrated, 0);
+        assert!(migration_emitted.get() > 0);
+        assert!(legacy_path.is_file());
+
+        let save_emitted = Rc::new(Cell::new(0));
+        let mut save_reader = save_preflight_budget_reader(
+            current.clone(),
+            MAX_NAMED_DRAFT_BYTES,
+            legacy_path,
+            SyntheticLegacyRead::PartialError {
+                bytes: MAX_NAMED_DRAFT_BYTES,
+                emitted: Rc::clone(&save_emitted),
+            },
+        );
+        ensure_named_draft_save_fits_with_reader(
+            &current,
+            Some(&legacy),
+            None,
+            MAX_NAMED_DRAFT_BYTES,
+            &mut save_reader,
+        )
+        .expect("partial legacy read bytes must not consume the save budget");
+        assert!(save_emitted.get() > 0);
     }
 
     #[test]

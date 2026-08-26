@@ -8466,12 +8466,23 @@ fn launch_draft_save_worker(pending: PendingDraftSave) {
     let fields = pending.fields.clone();
     let previous = pending.previous_draft.clone();
     let drafts_dir = pending.widgets.composer.drafts_dir().to_path_buf();
+    let legacy_drafts_dir = pending
+        .widgets
+        .composer
+        .legacy_drafts_dir()
+        .map(Path::to_path_buf);
     let delay = pending.widgets.draft_io_delay.get();
     let response = draft_io::spawn_worker("notm-draft-save", generation, move || {
         if !delay.is_zero() {
             thread::sleep(delay.min(draft_io::MAX_FIXTURE_DELAY));
         }
-        perform_captured_draft_save(&options, &drafts_dir, fields, previous)
+        perform_captured_draft_save(
+            &options,
+            &drafts_dir,
+            legacy_drafts_dir.as_deref(),
+            fields,
+            previous,
+        )
     });
     pending.widgets.status_label.set_text("Saving draft…");
     let mut pending = Some(pending);
@@ -8515,6 +8526,7 @@ fn launch_draft_save_worker(pending: PendingDraftSave) {
 fn perform_captured_draft_save(
     options: &LaunchOptions,
     drafts_dir: &Path,
+    legacy_drafts_dir: Option<&Path>,
     fields: ComposeFields,
     previous_draft: Option<ActiveDraft>,
 ) -> anyhow::Result<DraftSaveWorkerResult> {
@@ -8535,6 +8547,7 @@ fn perform_captured_draft_save(
             .map(|draft| draft.path.as_path());
         Some(composer::save_named_draft_fields(
             drafts_dir,
+            legacy_drafts_dir,
             &fields,
             replacement_path,
         )?)
@@ -19962,6 +19975,7 @@ fn apply_pane_visibility_values(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn mailto_requests_map_to_editable_composer_fields() {
@@ -20017,6 +20031,50 @@ mod tests {
                 .to_string()
                 .contains("cannot be combined")
         );
+    }
+
+    #[test]
+    fn captured_named_draft_save_counts_retained_legacy_entries() {
+        let root = tempfile::tempdir().expect("temporary named-draft root");
+        let current = root.path().join("current");
+        let legacy = root.path().join("legacy");
+        fs::create_dir_all(&current).expect("create current named-draft directory");
+        fs::create_dir_all(&legacy).expect("create legacy named-draft directory");
+        for index in 0..(draft_io::MAX_NAMED_DRAFTS - 1) {
+            fs::write(current.join(format!("current-{index:03}.json")), b"{}")
+                .expect("write current named draft");
+        }
+        let retained = legacy.join("retained-malformed.json");
+        fs::write(&retained, b"{truncated").expect("write retained malformed legacy draft");
+        let options = LaunchOptions {
+            save_drafts_to_maildir: false,
+            index_draft_after_save: false,
+            ..LaunchOptions::default()
+        };
+
+        let error = match perform_captured_draft_save(
+            &options,
+            &current,
+            Some(&legacy),
+            ComposeFields {
+                subject: "Must not become the 257th draft".to_string(),
+                body: "combined current and legacy limits apply".to_string(),
+                ..ComposeFields::default()
+            },
+            None,
+        ) {
+            Ok(_) => panic!("captured save ignored retained legacy entries"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("would contain 257"), "{error:#}");
+        assert_eq!(
+            fs::read_dir(&current)
+                .expect("list current named drafts")
+                .count(),
+            draft_io::MAX_NAMED_DRAFTS - 1
+        );
+        assert!(retained.is_file());
     }
 
     #[test]

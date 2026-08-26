@@ -585,6 +585,33 @@ impl Drop for FixtureApp {
     }
 }
 
+fn wait_for_search_generation_loading(
+    driver: &mut UiDriver,
+    generation: u64,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = driver.command("search_status", json!({}))?;
+        ensure!(status["ok"] == true, "search status failed: {status}");
+        let current_generation = status["generation"]
+            .as_u64()
+            .with_context(|| format!("search status had no generation: {status}"))?;
+        ensure!(
+            current_generation <= generation,
+            "search generation {generation} was superseded before its loading state was observed: {status}"
+        );
+        if current_generation == generation && status["loading"] == true {
+            return Ok(status);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "search generation {generation} did not report loading within {timeout:?}: {status}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
 #[test]
 fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
@@ -619,6 +646,7 @@ fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
         health["state"], "running",
         "unhealthy fixture app: {health}"
     );
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
 
     let delayed_search = driver.command(
         "run_search",
@@ -632,16 +660,19 @@ fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
         delayed_search["scheduled"], true,
         "fixture search response did not report async scheduling: {delayed_search}"
     );
-    assert_eq!(
-        delayed_search["state"]["search_loading"], true,
-        "fixture search completed synchronously instead of returning control: {delayed_search}"
-    );
+    let delayed_generation = delayed_search["generation"]
+        .as_u64()
+        .context("delayed search response had no generation")?;
+    let outstanding = wait_for_search_generation_loading(
+        &mut driver,
+        delayed_generation,
+        Duration::from_secs(2),
+    )?;
     let responsive_health = driver.command("health", json!({}))?;
     assert_eq!(
         responsive_health["ok"], true,
         "harness stopped responding while a search was outstanding: {responsive_health}"
     );
-    let outstanding = driver.command("search_status", json!({}))?;
     assert_eq!(
         outstanding["loading"], true,
         "delayed fixture search was not outstanding during the responsiveness check: {outstanding}"
@@ -656,9 +687,6 @@ fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
         current_search["loading"], true,
         "debounced query edit did not reserve background search work: {current_search}"
     );
-    let delayed_generation = delayed_search["generation"]
-        .as_u64()
-        .context("delayed search response had no generation")?;
     let current_generation = current_search["generation"]
         .as_u64()
         .context("debounced search status had no generation")?;
@@ -2149,6 +2177,41 @@ fn write_recovery_fields(path: &Path, subject: &str, body: &str) -> anyhow::Resu
     Ok(())
 }
 
+fn wait_for_recovery_health_heartbeat(
+    driver: &mut UiDriver,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let first = driver.command("health", json!({}))?;
+    ensure!(first["ok"] == true, "fixture health failed: {first}");
+    ensure!(
+        first["recovery_load"]["busy"] == true,
+        "startup recovery completed before the responsiveness warmup: {first}"
+    );
+    let first_heartbeat = first["gtk_heartbeat"]
+        .as_u64()
+        .with_context(|| format!("health response had no GTK heartbeat: {first}"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        thread::sleep(STARTUP_POLL_INTERVAL);
+        let health = driver.command("health", json!({}))?;
+        ensure!(health["ok"] == true, "fixture health failed: {health}");
+        ensure!(
+            health["recovery_load"]["busy"] == true,
+            "startup recovery completed before the timed responsiveness samples: {health}"
+        );
+        let heartbeat = health["gtk_heartbeat"]
+            .as_u64()
+            .with_context(|| format!("health response had no GTK heartbeat: {health}"))?;
+        if heartbeat > first_heartbeat {
+            return Ok(health);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "GTK heartbeat did not settle during startup recovery within {timeout:?}: first={first}, current={health}"
+        );
+    }
+}
+
 #[test]
 fn fixture_slow_startup_recovery_is_responsive_and_stale_completion_is_safe() -> anyhow::Result<()>
 {
@@ -2188,6 +2251,13 @@ fn fixture_slow_startup_recovery_is_responsive_and_stale_completion_is_safe() ->
             .map(PathBuf::from)
             .with_context(|| format!("recovery status had no path: {loading}"))?;
         assert_eq!(reported_recovery_path, recovery_path, "{loading}");
+
+        let warmed_health =
+            wait_for_recovery_health_heartbeat(&mut driver, Duration::from_secs(2))?;
+        assert_eq!(
+            warmed_health["recovery_load"]["busy"], true,
+            "recovery gate opened during health warmup: {warmed_health}"
+        );
 
         let first_started = Instant::now();
         let first_health = driver.command("health", json!({}))?;
@@ -7226,6 +7296,26 @@ fn fixture_standalone_html_replacements_and_scroll_are_generation_safe() -> anyh
     Ok(())
 }
 
+fn wait_for_active_resolved_view(
+    driver: &mut UiDriver,
+    expected: &str,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let state = driver.command("view_preference_state", json!({}))?;
+        ensure!(state["ok"] == true, "view preference state failed: {state}");
+        if state["resolved_view"] == expected && state["active_view"] == state["resolved_view"] {
+            return Ok(state);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "message view did not render resolved view {expected:?} within {timeout:?}: {state}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
 #[test]
 fn fixture_message_and_sender_views_persist_with_message_precedence() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
@@ -7356,7 +7446,8 @@ fn fixture_message_and_sender_views_persist_with_message_precedence() -> anyhow:
         selected["selected_message"]["message_id"], "thread-reply1-three-message@fixture.test",
         "{selected}"
     );
-    let sender_restored = driver.command("view_preference_state", json!({}))?;
+    let sender_restored =
+        wait_for_active_resolved_view(&mut driver, "raw_source", STARTUP_TIMEOUT)?;
     assert_eq!(
         sender_restored["active_view"], "raw_source",
         "{sender_restored}"
@@ -7384,7 +7475,8 @@ fn fixture_message_and_sender_views_persist_with_message_precedence() -> anyhow:
     select_first_thread(&mut driver, "id:unicode@fixture.test")?;
     select_first_thread(&mut driver, "id:thread-reply1-three-message@fixture.test")?;
     driver.command("select_message_by_index", json!({"index": 1}))?;
-    let message_override = driver.command("view_preference_state", json!({}))?;
+    let message_override =
+        wait_for_active_resolved_view(&mut driver, "full_headers", STARTUP_TIMEOUT)?;
     assert_eq!(
         message_override["active_view"], "full_headers",
         "{message_override}"
