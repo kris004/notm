@@ -301,12 +301,11 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_executable_script(path: &Path, contents: &str) {
-        use std::{fs, os::unix::fs::PermissionsExt};
-
-        fs::write(path, contents).expect("write send helper");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-            .expect("make send helper executable");
+    fn write_shell_script(path: &Path, contents: &str) {
+        // Keep freshly written helpers non-executable and pass them to /bin/sh.
+        // Direct exec can race with parallel test forks that briefly inherit a
+        // writer for the same inode, causing a test-only ETXTBSY failure.
+        std::fs::write(path, contents).expect("write send helper");
     }
 
     #[cfg(unix)]
@@ -403,13 +402,13 @@ mod tests {
     async fn preserves_output_and_status_from_completed_command() {
         let temp = tempfile::tempdir().expect("create temp directory");
         let helper = temp.path().join("send-helper");
-        write_executable_script(
+        write_shell_script(
             &helper,
             "#!/bin/sh\ncat >/dev/null\nprintf 'helper stdout'\nprintf 'helper stderr' >&2\nexit 7\n",
         );
         let transport = ExternalCommandTransport {
-            command: helper,
-            args: Vec::new(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec![helper.display().to_string()],
             mode: TransportMode::StdinRfc5322,
             working_dir: None,
             env: BTreeMap::new(),
@@ -435,13 +434,14 @@ mod tests {
         let helper = temp.path().join("send-helper");
         let observed_path = temp.path().join("observed-path");
         let copied_message = temp.path().join("copied-message.eml");
-        write_executable_script(
+        write_shell_script(
             &helper,
             "#!/bin/sh\nprintf '%s' \"$3\" > \"$1\"\ncat \"$3\" > \"$2\"\nprintf 'file helper stdout'\n",
         );
         let transport = ExternalCommandTransport {
-            command: helper,
+            command: PathBuf::from("/bin/sh"),
             args: vec![
+                helper.display().to_string(),
                 observed_path.display().to_string(),
                 copied_message.display().to_string(),
             ],
@@ -481,13 +481,14 @@ mod tests {
         let helper = temp.path().join("send-helper");
         let observed_path = temp.path().join("observed-path");
         let copied_message = temp.path().join("copied-message.eml");
-        write_executable_script(
+        write_shell_script(
             &helper,
             "#!/bin/sh\nprintf '%s' \"$1\" > \"$2\"\ncat \"$1\" > \"$3\"\nprintf 'template helper stdout'\n",
         );
         let transport = ExternalCommandTransport {
-            command: helper,
+            command: PathBuf::from("/bin/sh"),
             args: vec![
+                helper.display().to_string(),
                 "{file}".to_string(),
                 observed_path.display().to_string(),
                 copied_message.display().to_string(),
@@ -529,13 +530,13 @@ mod tests {
         let temp = tempfile::tempdir().expect("create temp directory");
         let helper = temp.path().join("send-helper");
         let pid_path = temp.path().join("helper.pid");
-        write_executable_script(
+        write_shell_script(
             &helper,
             "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$1\"\nsleep 30\n",
         );
         let transport = ExternalCommandTransport {
-            command: helper,
-            args: vec![pid_path.display().to_string()],
+            command: PathBuf::from("/bin/sh"),
+            args: vec![helper.display().to_string(), pid_path.display().to_string()],
             mode: TransportMode::StdinRfc5322,
             working_dir: None,
             env: BTreeMap::new(),
@@ -566,13 +567,14 @@ mod tests {
         let helper = temp.path().join("send-helper");
         let pid_path = temp.path().join("helper.pid");
         let survived_path = temp.path().join("descendant-survived");
-        write_executable_script(
+        write_shell_script(
             &helper,
             "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$1\"\n(\n  sleep 2\n  printf 'survived\\n' > \"$2\"\n) &\nwait\n",
         );
         let transport = ExternalCommandTransport {
-            command: helper,
+            command: PathBuf::from("/bin/sh"),
             args: vec![
+                helper.display().to_string(),
                 pid_path.display().to_string(),
                 survived_path.display().to_string(),
             ],
