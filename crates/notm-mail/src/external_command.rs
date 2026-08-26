@@ -190,12 +190,11 @@ mod tests {
     use std::path::Path;
 
     #[cfg(unix)]
-    fn write_executable_script(path: &Path, contents: &str) {
-        use std::{fs, os::unix::fs::PermissionsExt};
-
-        fs::write(path, contents).expect("write command helper");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-            .expect("make command helper executable");
+    fn write_shell_script(path: &Path, contents: &str) {
+        // Keep freshly written helpers non-executable and pass them to /bin/sh.
+        // Direct exec can race with parallel test forks that briefly inherit a
+        // writer for the same inode, causing a test-only ETXTBSY failure.
+        std::fs::write(path, contents).expect("write command helper");
     }
 
     #[cfg(unix)]
@@ -220,22 +219,36 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn preserves_output_and_nonzero_status_from_completed_command() {
-        let temp = tempfile::tempdir().expect("create temp directory");
-        let helper = temp.path().join("command-helper");
-        write_executable_script(
-            &helper,
-            "#!/bin/sh\nprintf 'normal stdout'\nprintf 'normal stderr' >&2\nexit 7\n",
-        );
-
+    async fn runs_stable_direct_executable() {
         let output = run_external_command(
             "receive",
-            Command::new(helper),
+            Command::new("/bin/true"),
             None,
             Duration::from_secs(3),
         )
         .await
-        .expect("completed command should return output");
+        .expect("stable direct executable should run");
+
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preserves_output_and_nonzero_status_from_completed_command() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let helper = temp.path().join("command-helper");
+        write_shell_script(
+            &helper,
+            "#!/bin/sh\nprintf 'normal stdout'\nprintf 'normal stderr' >&2\nexit 7\n",
+        );
+        let mut command = Command::new("/bin/sh");
+        command.arg(&helper);
+
+        let output = run_external_command("receive", command, None, Duration::from_secs(3))
+            .await
+            .expect("completed command should return output");
 
         assert_eq!(output.status.code(), Some(7));
         assert_eq!(output.stdout, b"normal stdout");
@@ -269,11 +282,12 @@ mod tests {
         let helper = temp.path().join("command-helper");
         let pid_path = temp.path().join("helper.pid");
         let survived_path = temp.path().join("descendant-survived");
-        write_executable_script(
+        write_shell_script(
             &helper,
             "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$1\"\n(\n  sleep 2\n  printf 'survived\\n' > \"$2\"\n) &\nwait\n",
         );
-        let mut command = Command::new(helper);
+        let mut command = Command::new("/bin/sh");
+        command.arg(&helper);
         command.arg(&pid_path).arg(&survived_path);
 
         let err = run_external_command("receive", command, None, Duration::from_secs(1))

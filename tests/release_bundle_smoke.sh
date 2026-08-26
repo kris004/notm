@@ -11,7 +11,8 @@ PROJECT_ROOT=$(
 )
 readonly PROJECT_ROOT
 WORK_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/notm-release-smoke.XXXXXX")
-readonly WORK_ROOT
+DETERMINISTIC_EPOCH=1700000000
+readonly WORK_ROOT DETERMINISTIC_EPOCH
 FAKE_BINARY="$WORK_ROOT/notm"
 BUILD_INFO="$WORK_ROOT/build-info.txt"
 DIST_DIR="$WORK_ROOT/dist"
@@ -80,7 +81,7 @@ Target: $TARGET
 Build image: release-smoke-fixture
 EOF
 
-SOURCE_DATE_EPOCH=0 \
+SOURCE_DATE_EPOCH=$DETERMINISTIC_EPOCH \
   SOURCE_REF="$SOURCE_COMMIT" \
   "$SOURCE_ROOT/packaging/build-linux-release.sh" \
     "$SOURCE_ROOT" \
@@ -89,7 +90,10 @@ SOURCE_DATE_EPOCH=0 \
     "$FAKE_BINARY" \
     "$BUILD_INFO" \
     "$DIST_DIR" > /dev/null
-SOURCE_DATE_EPOCH=0 \
+# Ensure the two tar invocations cannot inherit the same wall-clock second.
+# The archive-mode PAX global header must still follow SOURCE_DATE_EPOCH.
+sleep 2
+SOURCE_DATE_EPOCH=$DETERMINISTIC_EPOCH \
   SOURCE_REF="$SOURCE_COMMIT" \
   "$SOURCE_ROOT/packaging/build-linux-release.sh" \
     "$SOURCE_ROOT" \
@@ -146,7 +150,10 @@ test "$(stat -c '%a' "$bundle/bin/notm")" = 755
 test "$(stat -c '%a' "$bundle/LICENSE")" = 644
 test "$("$bundle/bin/notm" --version)" = "notm $VERSION"
 gzip -dc "$source_archive" > "$WORK_ROOT/source.tar"
+gzip -dc "$second_source_archive" > "$WORK_ROOT/source-second.tar"
 test "$(git get-tar-commit-id < "$WORK_ROOT/source.tar")" = "$SOURCE_COMMIT"
+test "$(git get-tar-commit-id < "$WORK_ROOT/source-second.tar")" = \
+  "$SOURCE_COMMIT"
 "$source_bundle/packaging/verify-release-metadata.py" \
   --expected-version "$VERSION" \
   --expected-source-commit "$SOURCE_COMMIT" \
