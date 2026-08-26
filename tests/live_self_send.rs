@@ -10,7 +10,15 @@ fn live_self_send_runs_real_command() {
 
     let status = Command::new(env!("CARGO"))
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .args(["run", "--quiet", "-p", "notm-app", "--", "live-self-send"])
+        .args([
+            "run",
+            "--locked",
+            "--quiet",
+            "-p",
+            "notm-app",
+            "--",
+            "live-self-send",
+        ])
         .status()
         .expect("failed to start Cargo for the live self-send smoke");
 

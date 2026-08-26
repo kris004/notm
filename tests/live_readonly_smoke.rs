@@ -12,6 +12,7 @@ fn live_readonly_smoke_runs_real_command() {
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .args([
             "run",
+            "--locked",
             "--quiet",
             "-p",
             "notm-app",

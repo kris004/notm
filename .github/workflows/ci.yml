@@ -15,6 +15,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+  ACTIONLINT_VERSION: 1.7.12
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
@@ -29,6 +31,14 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Record committed Cargo.lock
+        id: cargo-lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'sha256=%s\n' "$(sha256sum Cargo.lock | cut -d ' ' -f 1)" \
+            >>"$GITHUB_OUTPUT"
+
       - name: Install native dependencies
         shell: bash
         run: |
@@ -38,14 +48,19 @@ jobs:
             appstream \
             build-essential \
             clang \
+            curl \
             dbus-daemon \
             desktop-file-utils \
+            gnupg \
             libclang-dev \
             libgtk-4-dev \
             libgtksourceview-5-dev \
             libnotmuch-dev \
             libwebkitgtk-6.0-dev \
+            mandoc \
             pkg-config \
+            python3 \
+            shellcheck \
             weston \
             xauth \
             xvfb
@@ -54,24 +69,49 @@ jobs:
             appstream
             build-essential
             clang
+            curl
             dbus-daemon
             desktop-file-utils
+            gnupg
             libclang-dev
             libgtk-4-dev
             libgtksourceview-5-dev
             libnotmuch-dev
             libwebkitgtk-6.0-dev
+            mandoc
             pkg-config
+            python3
+            shellcheck
             weston
             xauth
             xvfb
           )
           dpkg-query --show --showformat='${binary:Package}\t${Version}\n' "${packages[@]}"
-          for executable in Xvfb cc clang dbus-run-session pkg-config weston xauth xvfb-run; do
+          for executable in Xvfb cc clang curl dbus-run-session gpg mandoc \
+            pkg-config python3 shellcheck weston xauth xvfb-run
+          do
             command -v "$executable"
           done
           pkg-config --modversion gtk4 gtksourceview-5 webkitgtk-6.0
           test -r /usr/include/notmuch.h
+
+      - name: Validate release policy and metadata
+        run: make check-policy
+
+      - name: Install pinned actionlint
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test "$(uname -m)" = x86_64
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${archive}"
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/$archive" "$url"
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$RUNNER_TEMP/$archive" |
+            sha256sum --check
+          mkdir "$RUNNER_TEMP/actionlint"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/actionlint" actionlint
+          "$RUNNER_TEMP/actionlint/actionlint" -version
+          printf '%s\n' "$RUNNER_TEMP/actionlint" >>"$GITHUB_PATH"
 
       - name: Select the stable Rust toolchain
         shell: bash
@@ -98,13 +138,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Run workspace tests
-        run: cargo test --workspace --all-targets --all-features
+        run: cargo test --locked --workspace --all-targets --all-features
 
       - name: Run fixture smoke
-        run: cargo run -p notm-app -- fixture-smoke
+        run: cargo run --locked -p notm-app -- fixture-smoke
 
       - name: Probe a disposable send transport
         shell: bash
@@ -118,10 +158,28 @@ jobs:
           command = "/usr/bin/true"
           mode = "stdin_rfc5322"
           EOF
-          cargo run -p notm-app -- --config "$probe_config" probe-send
+          cargo run --locked -p notm-app -- --config "$probe_config" probe-send
+
+      - name: Validate workflows, shell, man pages, and desktop metadata
+        shell: bash
+        run: |
+          set -euxo pipefail
+          actionlint
+          shellcheck packaging/*.sh tests/*.sh
+          mandoc -Tlint \
+            docs/man/notm.1 \
+            docs/man/notm-config.5 \
+            docs/man/notm-test-harness.7 \
+            docs/man/notm-automation.7
+          desktop-file-validate packaging/io.github.kris004.notm.desktop
+          appstreamcli validate --strict --pedantic --no-net \
+            packaging/io.github.kris004.notm.metainfo.xml
 
       - name: Validate install and release packaging
         run: make check-packaging
+
+      - name: Build and test a clean source archive
+        run: ./tests/source_archive_smoke.sh
 
       - name: Run the complete Wayland GTK smoke with a required display
         # GitHub-hosted runners block the user namespace required by WebKitGTK's
@@ -133,7 +191,7 @@ jobs:
           set -euxo pipefail
           tests/run_with_headless_weston.sh \
             dbus-run-session -- \
-            cargo test -p notm-app --test desktop_ui_smoke -- \
+            cargo test --locked -p notm-app --test desktop_ui_smoke -- \
               --nocapture --test-threads=1
 
       - name: Run a WebKit GTK smoke on X11
@@ -149,6 +207,15 @@ jobs:
             NOTM_REQUIRE_GTK_DISPLAY=1 \
             dbus-run-session -- \
             xvfb-run -a \
-            cargo test -p notm-app --test desktop_ui_smoke \
+            cargo test --locked -p notm-app --test desktop_ui_smoke \
               fixture_html_link_hints_label_visible_links_and_cancel -- \
               --exact --nocapture --test-threads=1
+
+      - name: Verify Cargo.lock is unchanged
+        if: always()
+        env:
+          EXPECTED_SHA256: ${{ steps.cargo-lock.outputs.sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          packaging/verify-cargo-lock.sh Cargo.lock "$EXPECTED_SHA256"
