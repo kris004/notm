@@ -104,8 +104,17 @@ pub(crate) struct StandaloneWindowSnapshot {
     pub(crate) selected_message: Option<MessageSummary>,
     pub(crate) message_ids: Vec<String>,
     pub(crate) view: &'static str,
+    pub(crate) html_visible: bool,
+    pub(crate) loading: bool,
     pub(crate) collapse_quotes: bool,
     pub(crate) image_policy: String,
+    pub(crate) global_remote_images_allowed: bool,
+    pub(crate) image_loading_allowed: bool,
+    pub(crate) image_permission: &'static str,
+    pub(crate) html_policy_text: String,
+    pub(crate) image_policy_button_label: String,
+    pub(crate) image_policy_button_sensitive: bool,
+    pub(crate) network_session_ephemeral: bool,
     pub(crate) title: Option<String>,
     pub(crate) status: String,
     pub(crate) link_hints: LinkHintSnapshot,
@@ -397,6 +406,30 @@ impl StandaloneMessageController {
         }
     }
 
+    pub(crate) fn refresh_remote_image_policy(&self, previous: bool, current: bool) {
+        if previous == current {
+            return;
+        }
+
+        let windows = self.windows.borrow().clone();
+        for standalone in windows {
+            standalone.state.borrow_mut().image_policy = StandaloneImagePolicy::Config;
+            let html_visible = standalone.state.borrow().view == MessageViewKind::Html;
+
+            if html_visible || !current {
+                standalone.link_hints.cancel_silent();
+                standalone.html_view.stop_loading();
+                set_html_image_loading(&standalone.html_view, false);
+            }
+
+            if html_visible {
+                show_message_view(&standalone, MessageViewKind::Html);
+            } else if let Some(message) = current_message(&standalone) {
+                update_message_buttons(&standalone, &message);
+            }
+        }
+    }
+
     pub(crate) fn snapshots(&self) -> Vec<StandaloneWindowSnapshot> {
         self.windows
             .borrow()
@@ -523,6 +556,15 @@ struct StandaloneMessageWindow {
 impl StandaloneMessageWindow {
     fn snapshot(&self) -> StandaloneWindowSnapshot {
         let state = self.state.borrow();
+        let global_remote_images_allowed = (self.policy)().remote_images;
+        let image_loading_allowed = webkit_view_images_allowed(&self.html_view);
+        let image_permission = if global_remote_images_allowed {
+            "all_messages"
+        } else if state.view == MessageViewKind::Html && image_loading_allowed {
+            "message_once"
+        } else {
+            "blocked"
+        };
         StandaloneWindowSnapshot {
             id: self.id,
             selected_index: state.selected_index,
@@ -539,8 +581,24 @@ impl StandaloneMessageWindow {
                 MessageViewKind::Headers => "headers",
                 MessageViewKind::Raw => "raw",
             },
+            html_visible: state.view == MessageViewKind::Html,
+            loading: self.html_view.is_loading(),
             collapse_quotes: state.collapse_quotes,
             image_policy: format!("{:?}", state.image_policy).to_ascii_lowercase(),
+            global_remote_images_allowed,
+            image_loading_allowed,
+            image_permission,
+            html_policy_text: self.html_policy_label.text().to_string(),
+            image_policy_button_label: self
+                .image_policy_button
+                .label()
+                .map(|label| strip_binding_suffix(&label))
+                .unwrap_or_default(),
+            image_policy_button_sensitive: self.image_policy_button.is_sensitive(),
+            network_session_ephemeral: self
+                .html_view
+                .network_session()
+                .is_some_and(|session| session.is_ephemeral()),
             title: self.window.title().map(|title| title.to_string()),
             status: self.status_label.text().to_string(),
             link_hints: self.link_hints.snapshot(),
@@ -1332,6 +1390,7 @@ fn show_html_message(standalone: &StandaloneMessageWindow, message: &MessageSumm
     let image_policy = take_image_policy_for_render(&standalone.state);
     match (standalone.render_html)(message, image_policy) {
         Ok(rendered) => {
+            standalone.html_view.stop_loading();
             set_html_image_loading(&standalone.html_view, rendered.allow_remote_images);
             standalone
                 .html_view

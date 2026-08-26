@@ -3825,6 +3825,196 @@ fn indexed_remote_images_are_blocked_except_for_one_selected_message_load() -> a
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn standalone_remote_images_are_revoked_when_settings_disable_them() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP standalone_remote_images_are_revoked_when_settings_disable_them: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running standalone remote-image revocation UI smoke with {display}");
+
+    let tracker = LocalHttpTracker::start()?;
+    let run_id = unique_run_id()?;
+    let test_root = tempfile::Builder::new()
+        .prefix("notm-standalone-remote-policy-ui-")
+        .tempdir()?;
+    let work_dir = test_root.path().join("app");
+    fs::create_dir_all(&work_dir)?;
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        "[ui]\nremote_images = true\nhtml_mode = \"visual_html_preferred\"\nshow_message_view = false\n",
+    )?;
+
+    let token = format!("notm-standalone-remote-policy-ui-{run_id}");
+    let mut app = FixtureApp::spawn_fixture_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+
+    let initial_settings = driver.command("settings_test_state", json!({}))?;
+    assert_eq!(
+        initial_settings["remote_images"], true,
+        "isolated fixture did not start with global remote images enabled: {initial_settings}"
+    );
+    let fixture_config_path = initial_settings["app_config_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("fixture did not expose its config path: {initial_settings}"))?;
+    let fixture_database_path = fixture_config_path
+        .parent()
+        .context("fixture config path had no database parent")?;
+    let fixture_notmuch_config = fixture_database_path
+        .parent()
+        .context("fixture database path had no temporary parent")?
+        .join("notmuch-config");
+    index_standalone_remote_policy_thread(
+        fixture_database_path,
+        &fixture_notmuch_config,
+        &tracker,
+    )?;
+
+    let visibility = driver.command("pane_visibility", json!({}))?;
+    assert_eq!(
+        visibility["message_view"], false,
+        "isolated fixture did not hide the inline message pane: {visibility}"
+    );
+    select_first_thread(&mut driver, "id:standalone-policy-html-root@fixture.test")?;
+    tracker.ensure_stable(&[], Duration::from_millis(250))?;
+
+    let opened = driver.command("open_selected_thread", json!({}))?;
+    assert_eq!(
+        opened["ok"], true,
+        "remote-image fixture thread did not open standalone: {opened}"
+    );
+    let standalone = driver.command("standalone_message_windows", json!({}))?;
+    let windows = json_array_at(&standalone, &["windows"])?;
+    ensure!(
+        windows.len() == 1,
+        "expected one standalone fixture window: {standalone}"
+    );
+    assert_eq!(windows[0]["message_count"], 2, "{standalone}");
+    assert_eq!(
+        windows[0]["selected_message"]["message_id"], "standalone-policy-text-reply@fixture.test",
+        "standalone fixture did not start on its request-free text reply: {standalone}"
+    );
+    assert_eq!(windows[0]["view"], "text", "{standalone}");
+    tracker.ensure_stable(&[], Duration::from_millis(250))?;
+
+    let opened_second = driver.command("open_selected_thread", json!({}))?;
+    assert_eq!(
+        opened_second["ok"], true,
+        "second standalone fixture window did not open: {opened_second}"
+    );
+    let two_windows = driver.command("standalone_message_windows", json!({}))?;
+    ensure!(
+        json_array_at(&two_windows, &["windows"])?.len() == 2,
+        "expected two simultaneously live standalone windows: {two_windows}"
+    );
+
+    for window_index in 0..2 {
+        let selected = driver.command(
+            "standalone_select_message",
+            json!({"window_index": window_index, "message_index": 0}),
+        )?;
+        assert_eq!(
+            selected["ok"], true,
+            "standalone window {window_index} could not select the HTML root: {selected}"
+        );
+    }
+    let expected_requests = ["/standalone-policy", "/standalone-policy"];
+    tracker.wait_for_requests(&expected_requests, STARTUP_TIMEOUT)?;
+    let allowed = wait_for_standalone_remote_policy(&mut driver, true, 2)?;
+    for (window_index, window) in allowed.iter().enumerate() {
+        assert_eq!(
+            window["image_permission"], "all_messages",
+            "window {window_index}: {window}"
+        );
+        assert_eq!(
+            window["image_policy_button_label"], "Images allowed for all messages",
+            "standalone window {window_index} exposed an ambiguous all-messages permission: {window}"
+        );
+        assert_eq!(
+            window["image_policy_button_sensitive"], false,
+            "global policy unexpectedly exposed a one-shot action in window {window_index}: {window}"
+        );
+        ensure!(
+            window["html_policy_text"].as_str().is_some_and(|text| text
+                .to_ascii_lowercase()
+                .contains("allowed for all messages")),
+            "window {window_index} did not explain the global permission: {window}"
+        );
+    }
+    tracker.ensure_stable(&expected_requests, Duration::from_millis(250))?;
+
+    let opened_settings = driver.command("open_settings", json!({}))?;
+    assert_eq!(
+        opened_settings["ok"], true,
+        "Settings dialog did not open: {opened_settings}"
+    );
+    let settings = driver.command("settings_test_state", json!({}))?;
+    assert_eq!(settings["dialog"]["visible"], true, "{settings}");
+    assert_eq!(settings["dialog"]["remote_images"], true, "{settings}");
+    let applied = driver.command(
+        "respond_settings",
+        json!({"response": "apply", "remote_images": false}),
+    )?;
+    assert_eq!(
+        applied["ok"], true,
+        "disabling remote images through Settings failed: {applied}"
+    );
+    assert_eq!(
+        applied["state"]["remote_images"], false,
+        "Settings Apply did not update the runtime image policy: {applied}"
+    );
+
+    let blocked = wait_for_standalone_remote_policy(&mut driver, false, 2)?;
+    for (window_index, window) in blocked.iter().enumerate() {
+        assert_eq!(
+            window["image_permission"], "blocked",
+            "window {window_index}: {window}"
+        );
+        assert_eq!(
+            window["image_policy_button_label"], "Load remote images once",
+            "revoked window {window_index} did not expose a scoped recovery action: {window}"
+        );
+        assert_eq!(
+            window["image_policy_button_sensitive"], true,
+            "revoked one-shot action was unavailable in window {window_index}: {window}"
+        );
+        ensure!(
+            window["html_policy_text"]
+                .as_str()
+                .is_some_and(|text| text.to_ascii_lowercase().contains("remote content blocked")),
+            "revoked policy was not explained in window {window_index}: {window}"
+        );
+    }
+    tracker.ensure_stable(&expected_requests, Duration::from_millis(500))?;
+
+    for window_index in 0..2 {
+        let rerendered = driver.command(
+            "standalone_select_message",
+            json!({"window_index": window_index, "message_index": 0}),
+        )?;
+        assert_eq!(
+            rerendered["ok"], true,
+            "window {window_index} could not re-render its selected message: {rerendered}"
+        );
+    }
+    let rerendered = wait_for_standalone_remote_policy(&mut driver, false, 2)?;
+    ensure!(
+        rerendered
+            .iter()
+            .all(|window| window["image_permission"] == "blocked"),
+        "same-message re-render did not stay blocked in every window: {rerendered:?}"
+    );
+    tracker.ensure_stable(&expected_requests, Duration::from_millis(500))?;
+
+    Ok(())
+}
+
 #[test]
 fn fixture_html_link_hints_label_visible_links_and_cancel() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
@@ -5803,6 +5993,47 @@ fn index_remote_html_message(
 }
 
 #[cfg(unix)]
+fn index_standalone_remote_policy_thread(
+    database_path: &Path,
+    notmuch_config_path: &Path,
+    tracker: &LocalHttpTracker,
+) -> anyhow::Result<()> {
+    let maildir = database_path.join("account.fixture/cur");
+    let root_path = maildir.join(format!("standalone-policy-root-{}:2,S", unique_run_id()?));
+    let reply_path = maildir.join(format!("standalone-policy-reply-{}:2,S", unique_run_id()?));
+    fs::write(
+        &root_path,
+        format!(
+            "From: Policy Sender <policy@example.test>\r\nTo: fixture@example.test\r\n\
+             Subject: Standalone remote policy\r\nDate: Tue, 25 Aug 2026 12:00:00 -0600\r\n\
+             Message-ID: <standalone-policy-html-root@fixture.test>\r\nMIME-Version: 1.0\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\r\n\
+             <html><body><p>Standalone HTML root.</p><img src=\"{}\" alt=\"tracked\"></body></html>",
+            tracker.url("/standalone-policy")
+        ),
+    )?;
+    fs::write(
+        &reply_path,
+        "From: Policy Sender <policy@example.test>\r\nTo: fixture@example.test\r\n\
+         Subject: Re: Standalone remote policy\r\nDate: Tue, 25 Aug 2026 12:01:00 -0600\r\n\
+         Message-ID: <standalone-policy-text-reply@fixture.test>\r\n\
+         In-Reply-To: <standalone-policy-html-root@fixture.test>\r\n\
+         References: <standalone-policy-html-root@fixture.test>\r\nMIME-Version: 1.0\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\r\nRequest-free text reply.",
+    )?;
+
+    let open = notm_notmuch::OpenConfig {
+        database_path: Some(database_path.to_path_buf()),
+        config_path: Some(notmuch_config_path.to_path_buf()),
+        profile: None,
+    };
+    let database = notm_notmuch::Database::open(&open, notm_notmuch::DatabaseMode::ReadWrite)?;
+    database.index_file_with_tags(&root_path, &["inbox"])?;
+    database.index_file_with_tags(&reply_path, &["inbox"])?;
+    Ok(())
+}
+
+#[cfg(unix)]
 fn remote_image_adversarial_html(tracker: &LocalHttpTracker) -> String {
     format!(
         r#"<!doctype html>
@@ -5945,6 +6176,49 @@ fn assert_remote_images_once(view: &Value) -> anyhow::Result<()> {
         "one-shot HTML view did not explain its selected-message-only scope: {view}"
     );
     Ok(())
+}
+
+#[cfg(unix)]
+fn wait_for_standalone_remote_policy(
+    driver: &mut UiDriver,
+    images_allowed: bool,
+    expected_windows: usize,
+) -> anyhow::Result<Vec<Value>> {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let state = driver.command("standalone_message_windows", json!({}))?;
+        let windows = json_array_at(&state, &["windows"])?;
+        ensure!(
+            windows.len() == expected_windows,
+            "expected {expected_windows} standalone windows while waiting for image policy: {state}"
+        );
+        for window in windows {
+            ensure!(
+                window["view"] == "html" && window["html_visible"] == true,
+                "standalone HTML message was not visible: {state}"
+            );
+            assert_eq!(
+                window["global_remote_images_allowed"], images_allowed,
+                "standalone runtime image policy did not match Settings: {state}"
+            );
+            assert_eq!(
+                window["image_loading_allowed"], images_allowed,
+                "standalone WebKit image loading did not match Settings: {state}"
+            );
+            assert_eq!(
+                window["network_session_ephemeral"], true,
+                "standalone HTML did not use an ephemeral WebKit network session: {state}"
+            );
+        }
+        if windows.iter().all(|window| window["loading"] == false) {
+            return Ok(windows.to_vec());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "standalone HTML load did not complete under its expected image policy: {state}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
 }
 
 #[cfg(unix)]

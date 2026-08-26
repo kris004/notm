@@ -210,6 +210,7 @@ pub struct SettingsDialogTestState {
     pub theme: String,
     pub thread_preview_lines: String,
     pub show_thread_preview: bool,
+    pub remote_images: bool,
 }
 
 struct PendingSettingsDialog {
@@ -218,6 +219,7 @@ struct PendingSettingsDialog {
     theme: gtk::ComboBoxText,
     thread_preview_lines: gtk::Entry,
     show_thread_preview: gtk::CheckButton,
+    remote_images: gtk::CheckButton,
 }
 
 struct SettingsControllerInner {
@@ -751,6 +753,7 @@ impl SettingsController {
             theme: theme.clone(),
             thread_preview_lines: thread_preview_lines.clone(),
             show_thread_preview: show_thread_preview.clone(),
+            remote_images: remote_images.clone(),
         });
         let app_config_path = seed.app_config_path.clone();
         let pending_for_response = Rc::downgrade(&self.inner);
@@ -915,11 +918,12 @@ impl SettingsController {
                 theme: combo_active_id(&pending.theme),
                 thread_preview_lines: pending.thread_preview_lines.text().to_string(),
                 show_thread_preview: pending.show_thread_preview.is_active(),
+                remote_images: pending.remote_images.is_active(),
             })
     }
 
     pub fn respond_test(&self, args: &serde_json::Value) -> anyhow::Result<u64> {
-        let (dialog_id, dialog, theme_combo, preview_entry, preview_check) = {
+        let (dialog_id, dialog, theme_combo, preview_entry, preview_check, remote_images) = {
             let pending = self.inner.pending.borrow();
             let pending = pending
                 .as_ref()
@@ -942,6 +946,7 @@ impl SettingsController {
                 pending.theme.clone(),
                 pending.thread_preview_lines.clone(),
                 pending.show_thread_preview.clone(),
+                pending.remote_images.clone(),
             )
         };
 
@@ -964,6 +969,12 @@ impl SettingsController {
             .and_then(serde_json::Value::as_bool)
         {
             preview_check.set_active(visible);
+        }
+        if let Some(enabled) = args
+            .get("remote_images")
+            .and_then(serde_json::Value::as_bool)
+        {
+            remote_images.set_active(enabled);
         }
 
         let response_name = args

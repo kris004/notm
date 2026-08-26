@@ -1346,10 +1346,12 @@ fn build_ui(
     html_view.set_hexpand(true);
     html_view.set_vexpand(true);
     let html_load_generation = Rc::new(Cell::new(0));
+    let html_load_lifecycle = Rc::new(RefCell::new(HtmlLoadLifecycle::default()));
     let html_completed_load_generation = Rc::new(Cell::new(0));
     connect_html_load_completion(
         &html_view,
         &html_load_generation,
+        &html_load_lifecycle,
         &html_completed_load_generation,
     );
     configure_html_webview(
@@ -1437,7 +1439,13 @@ fn build_ui(
     window.set_child(Some(&overlay));
     connect_html_navigation_policy(&html_view, &status_label);
     connect_html_hover_status(&html_view, &status_label);
-    connect_html_scroll_restore(&html_view, &status_label, &pending_html_scroll_fraction);
+    connect_html_scroll_restore(
+        &html_view,
+        &status_label,
+        &pending_html_scroll_fraction,
+        &html_load_generation,
+        &html_completed_load_generation,
+    );
     let link_opener: LinkHintOpener = Rc::new(open_html_link_externally);
     let link_hints = LinkHintController::new(&html_view, &status_label, link_opener);
 
@@ -4879,11 +4887,15 @@ fn connect_html_scroll_restore(
     view: &webkit6::WebView,
     status_label: &gtk::Label,
     pending_fraction: &Rc<Cell<Option<f64>>>,
+    requested_generation: &Rc<Cell<u64>>,
+    completed_generation: &Rc<Cell<u64>>,
 ) {
     let pending_fraction = pending_fraction.clone();
+    let requested_generation = requested_generation.clone();
+    let completed_generation = completed_generation.clone();
     let status = status_label.clone();
-    view.connect_load_changed(move |view, event| {
-        if event != webkit6::LoadEvent::Finished {
+    view.connect_is_loading_notify(move |view| {
+        if view.is_loading() || completed_generation.get() != requested_generation.get() {
             return;
         }
         let Some(fraction) = pending_fraction.take() else {
@@ -4905,15 +4917,79 @@ fn connect_html_scroll_restore(
 fn connect_html_load_completion(
     view: &webkit6::WebView,
     requested_generation: &Rc<Cell<u64>>,
+    lifecycle: &Rc<RefCell<HtmlLoadLifecycle>>,
     completed_generation: &Rc<Cell<u64>>,
 ) {
-    let requested_generation = requested_generation.clone();
-    let completed_generation = completed_generation.clone();
+    let requested_generation_for_load = requested_generation.clone();
+    let requested_generation_for_resource = requested_generation.clone();
+    let lifecycle_for_load = lifecycle.clone();
     view.connect_load_changed(move |_, event| {
-        if event == webkit6::LoadEvent::Finished {
-            completed_generation.set(requested_generation.get());
-        }
+        lifecycle_for_load
+            .borrow_mut()
+            .load_changed(event, requested_generation_for_load.get());
     });
+
+    let lifecycle_for_resource = lifecycle.clone();
+    let completed_generation = completed_generation.clone();
+    view.connect_resource_load_started(move |view, resource, _| {
+        let is_main_resource = view
+            .main_resource()
+            .is_some_and(|main_resource| main_resource == resource.clone());
+        if !is_main_resource {
+            return;
+        }
+
+        let Some(generation) = lifecycle_for_resource.borrow_mut().bind_main_resource() else {
+            return;
+        };
+        let lifecycle = lifecycle_for_resource.clone();
+        let requested_generation = requested_generation_for_resource.clone();
+        let completed_generation = completed_generation.clone();
+        // WebView Finished events have no load identity. The main WebResource
+        // object does, so only its captured generation may advance completion;
+        // callers additionally require WebView::is_loading() to be false.
+        resource.connect_finished(move |_| {
+            if let Some(generation) = lifecycle
+                .borrow_mut()
+                .finish_main_resource(generation, requested_generation.get())
+            {
+                completed_generation.set(generation);
+            }
+        });
+    });
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HtmlLoadLifecycle {
+    active_generation: Option<u64>,
+    awaiting_main_resource_generation: Option<u64>,
+}
+
+impl HtmlLoadLifecycle {
+    fn load_changed(&mut self, event: webkit6::LoadEvent, requested_generation: u64) {
+        if event == webkit6::LoadEvent::Started {
+            self.start(requested_generation);
+        }
+    }
+
+    fn start(&mut self, generation: u64) {
+        self.active_generation = Some(generation);
+        self.awaiting_main_resource_generation = Some(generation);
+    }
+
+    fn bind_main_resource(&mut self) -> Option<u64> {
+        let generation = self.awaiting_main_resource_generation.take()?;
+        (self.active_generation == Some(generation)).then_some(generation)
+    }
+
+    fn finish_main_resource(&mut self, generation: u64, requested_generation: u64) -> Option<u64> {
+        if self.active_generation != Some(generation) || generation != requested_generation {
+            return None;
+        }
+        self.active_generation = None;
+        self.awaiting_main_resource_generation = None;
+        Some(generation)
+    }
 }
 
 fn evaluate_web_view_scroll_script(
@@ -9337,6 +9413,7 @@ fn show_visual_html_with_image_policy(
     };
     match result {
         Ok((document, original_html, allow_remote_images, decode_warning_count)) => {
+            widgets.html_view.stop_loading();
             set_html_image_loading(&widgets.html_view, allow_remote_images);
             widgets
                 .html_load_generation
@@ -15669,6 +15746,7 @@ fn settings_test_state_json(
         "dialog": widgets.settings.test_dialog_state(),
         "theme": theme_state,
         "preview": rendered_thread_preview_json(widgets, state),
+        "remote_images": settings::remote_images(&options.runtime_settings),
         "app_config_path": options.app_config_path,
         "status_text": widgets.status_label.text().to_string(),
     })
@@ -17460,6 +17538,7 @@ fn apply_settings_application(
     let next_thread_preview_lines = next_runtime.thread_preview_lines;
     let next_layout_preference = next_runtime.layout_preference;
     let next_excluded_tags = next_runtime.excluded_tags.clone();
+    let next_remote_images = next_runtime.remote_images;
     settings::update(&options.runtime_settings, next_runtime);
 
     {
@@ -17495,6 +17574,9 @@ fn apply_settings_application(
     update_thread_result_label(widgets, state);
     update_button_binding_labels(widgets, state);
     update_message_action_buttons(options, widgets, state);
+    widgets
+        .standalone_messages
+        .refresh_remote_image_policy(previous_runtime.remote_images, next_remote_images);
     if html_view_is_visible(widgets) {
         let scroll = current_message_scroll_fraction(widgets);
         show_visual_html_selected_message(options, widgets, state);
@@ -17542,6 +17624,32 @@ fn apply_pane_visibility_values(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_load_completion_ignores_replaced_generations() {
+        let mut lifecycle = HtmlLoadLifecycle::default();
+
+        lifecycle.load_changed(webkit6::LoadEvent::Started, 0);
+        assert_eq!(lifecycle.bind_main_resource(), Some(0));
+        assert_eq!(lifecycle.finish_main_resource(0, 1), None);
+
+        lifecycle.load_changed(webkit6::LoadEvent::Started, 1);
+        assert_eq!(lifecycle.bind_main_resource(), Some(1));
+        lifecycle.load_changed(webkit6::LoadEvent::Started, 2);
+        assert_eq!(lifecycle.bind_main_resource(), Some(2));
+
+        // Concrete replacement race: Started(g1), request g2, Started(g2),
+        // then the old resource and WebView emit their stale Finished events.
+        assert_eq!(lifecycle.finish_main_resource(1, 2), None);
+        let before_stale_finish = lifecycle.clone();
+        lifecycle.load_changed(webkit6::LoadEvent::Finished, 2);
+        assert_eq!(lifecycle, before_stale_finish);
+
+        assert_eq!(lifecycle.finish_main_resource(2, 2), Some(2));
+        let after_current_resource = lifecycle.clone();
+        lifecycle.load_changed(webkit6::LoadEvent::Finished, 2);
+        assert_eq!(lifecycle, after_current_resource);
+    }
 
     #[test]
     fn mailto_requests_map_to_editable_composer_fields() {

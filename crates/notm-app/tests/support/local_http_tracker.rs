@@ -199,7 +199,7 @@ fn handle_request(
         const PIXEL: &[u8] = b"GIF89a\x01\0\x01\0\x80\0\0\0\0\0\xff\xff\xff!\xf9\x04\x01\0\0\0\0,\0\0\0\0\x01\0\x01\0\0\x02\x02D\x01\0;";
         write!(
             stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: image/gif\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: image/gif\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             PIXEL.len()
         )?;
         stream.write_all(PIXEL)?;

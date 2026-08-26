@@ -304,6 +304,20 @@ WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 \
   -- --exact --nocapture --test-threads=1
 ```
 
+A second loopback-only smoke opens Visual HTML in two simultaneously live
+standalone message windows while the global override is enabled, disables it
+through the real Settings dialog, and verifies that both existing WebViews are
+immediately re-rendered with remote content blocked and no additional tracker
+requests:
+
+```sh
+WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 \
+  tests/run_with_headless_weston.sh dbus-run-session -- \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
+  standalone_remote_images_are_revoked_when_settings_disable_them \
+  -- --exact --nocapture --test-threads=1
+```
+
 Desktop `mailto` handling has cold-start and existing-instance GTK smokes. The
 first verifies RFC 6068 fields remain visible while the startup search loads;
 the second verifies D-Bus routing and the dirty-composer replacement prompt:
