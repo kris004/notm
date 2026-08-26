@@ -3660,6 +3660,11 @@ fn isolated_message_io_mime_survives_missing_copy_limits_and_restart() -> anyhow
     const MESSAGE_COUNT: usize = 1_001;
     const NESTING_DEPTH: usize = 80;
 
+    const _: () = {
+        assert!(notm_ui::model::MAX_THREAD_DETAIL_MESSAGES < MESSAGE_COUNT);
+        assert!(MESSAGE_COUNT <= notm_ui::model::MAX_LOADED_THREAD_MESSAGES);
+    };
+
     let fixture = notm_test_support::FixtureDatabase::create()?;
     let run_id = unique_run_id()?;
     let work_dir = std::env::temp_dir().join(format!("notm-message-io-ui-{run_id}"));
@@ -3784,6 +3789,30 @@ fn isolated_message_io_mime_survives_missing_copy_limits_and_restart() -> anyhow
         &root_message_id,
         &malformed_message_id,
     )?;
+    let thread_id = first_state["state"]["selected_thread"]["thread_id"]
+        .as_str()
+        .with_context(|| format!("selected message-I/O thread has no ID: {first_state}"))?;
+    let details = driver.command("thread_ui_details", json!({}))?;
+    let detail = &details["thread_details"][thread_id];
+    let warning = detail["load_warning"]
+        .as_str()
+        .with_context(|| format!("large thread has no explicit detail warning: {details}"))?;
+    ensure!(
+        warning.contains(&format!("contains {MESSAGE_COUNT} message(s)"))
+            && warning.contains(&format!(
+                "safety limit of {}",
+                notm_ui::model::MAX_THREAD_DETAIL_MESSAGES
+            ))
+            && warning.contains("no partial thread was loaded"),
+        "large thread detail warning was incomplete: {warning}"
+    );
+    ensure!(
+        detail["preview"] == ""
+            && detail["has_attachment"] == false
+            && detail["has_encrypted"] == false
+            && detail["has_signed"] == false,
+        "large thread published partial row details despite its warning: {detail}"
+    );
 
     select_loaded_message(&mut driver, &malformed_message_id)?;
     let malformed_raw = driver.command("show_raw_source", json!({}))?;

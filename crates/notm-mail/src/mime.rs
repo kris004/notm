@@ -732,7 +732,8 @@ fn preflight_part(
         return Ok(());
     };
     let content_type = mailparse::parse_content_type(&content_type);
-    if !content_type.mimetype.starts_with("multipart/") || raw.len() <= body_start {
+    let mimetype = content_type.mimetype.to_ascii_lowercase();
+    if !mimetype.starts_with("multipart/") || raw.len() <= body_start {
         return Ok(());
     }
     let Some(boundary) = content_type.params.get("boundary") else {
@@ -1073,9 +1074,9 @@ fn collect_attachment_data(
     next_part_index: &mut usize,
     report: &mut AttachmentExtractionReport,
 ) -> anyhow::Result<()> {
+    let mimetype = part.ctype.mimetype.to_ascii_lowercase();
     if !part.subparts.is_empty() {
-        let child_named_body_allowed =
-            named_body_allowed || part.ctype.mimetype == "multipart/alternative";
+        let child_named_body_allowed = named_body_allowed || mimetype == "multipart/alternative";
         for subpart in &part.subparts {
             collect_attachment_data(
                 subpart,
@@ -1089,7 +1090,6 @@ fn collect_attachment_data(
         return Ok(());
     }
 
-    let mimetype = part.ctype.mimetype.to_lowercase();
     let filename = part_filename(part);
     let explicitly_attached =
         part_is_explicit_attachment(part, filename.as_deref(), named_body_allowed);
@@ -1392,28 +1392,37 @@ mod tests {
 
     #[test]
     fn named_plain_and_html_alternatives_remain_body_representations() {
-        let raw = b"MIME-Version: 1.0\r\n\
-                    Content-Type: multipart/alternative; boundary=alt\r\n\r\n\
-                    --alt\r\n\
-                    Content-Type: text/plain; charset=utf-8; name=body.txt\r\n\
-                    Content-Disposition: inline; filename=body.txt\r\n\r\n\
-                    Named plain body\r\n\
-                    --alt\r\n\
-                    Content-Type: text/html; charset=utf-8; name=body.html\r\n\r\n\
-                    <p>Named HTML body</p>\r\n\
-                    --alt--\r\n";
+        for media_type in ["multipart/alternative", "MULTIPART/ALTERNATIVE"] {
+            let raw = format!(
+                "MIME-Version: 1.0\r\n\
+                 Content-Type: {media_type}; boundary=alt\r\n\r\n\
+                 --alt\r\n\
+                 Content-Type: text/plain; charset=utf-8; name=body.txt\r\n\
+                 Content-Disposition: inline; filename=body.txt\r\n\r\n\
+                 Named plain body\r\n\
+                 --alt\r\n\
+                 Content-Type: text/html; charset=utf-8; name=body.html\r\n\r\n\
+                 <p>Named HTML body</p>\r\n\
+                 --alt--\r\n"
+            );
 
-        let parsed = parse_rfc5322(raw).expect("parse named alternatives");
+            let parsed = parse_rfc5322(raw.as_bytes()).expect("parse named alternatives");
 
-        assert_eq!(parsed.text_body, "Named plain body");
-        assert_eq!(parsed.safe_body, "Named plain body");
-        assert_eq!(parsed.html_body.as_deref(), Some("<p>Named HTML body</p>"));
-        assert!(parsed.attachments.is_empty());
-        assert!(
-            extract_attachments(raw)
-                .expect("extract named alternatives")
-                .is_empty()
-        );
+            assert_eq!(parsed.text_body, "Named plain body", "{media_type}");
+            assert_eq!(parsed.safe_body, "Named plain body", "{media_type}");
+            assert_eq!(
+                parsed.html_body.as_deref(),
+                Some("<p>Named HTML body</p>"),
+                "{media_type}"
+            );
+            assert!(parsed.attachments.is_empty(), "{media_type}");
+            assert!(
+                extract_attachments(raw.as_bytes())
+                    .expect("extract named alternatives")
+                    .is_empty(),
+                "{media_type}"
+            );
+        }
     }
 
     #[test]
@@ -1633,26 +1642,45 @@ mod tests {
                 limit: 2
             }
         );
+
+        let uppercase = String::from_utf8(nested_multipart(3))
+            .expect("nested MIME is ASCII")
+            .replace("multipart/mixed", "MULTIPART/MIXED");
+        let uppercase_error = parse_rfc5322_with_limits(uppercase.as_bytes(), limits)
+            .expect_err("uppercase multipart depth over limit");
+        assert_eq!(
+            uppercase_error.downcast_ref::<MimeLimitError>(),
+            Some(&MimeLimitError::Depth {
+                actual: 3,
+                limit: 2
+            })
+        );
     }
 
     #[test]
     fn mime_part_count_is_bounded() {
-        let raw = b"MIME-Version: 1.0\r\n\
-                    Content-Type: multipart/mixed; boundary=x\r\n\r\n\
-                    --x\r\nContent-Type: text/plain\r\n\r\none\r\n\
-                    --x\r\nContent-Type: text/plain\r\n\r\ntwo\r\n\
-                    --x--\r\n";
         let limits = MimeLimits {
             max_parts: 2,
             ..MimeLimits::default()
         };
 
-        let error = parse_rfc5322_with_limits(raw, limits).expect_err("too many parts");
+        for media_type in ["multipart/mixed", "MULTIPART/MIXED"] {
+            let raw = format!(
+                "MIME-Version: 1.0\r\n\
+                 Content-Type: {media_type}; boundary=x\r\n\r\n\
+                 --x\r\nContent-Type: text/plain\r\n\r\none\r\n\
+                 --x\r\nContent-Type: text/plain\r\n\r\ntwo\r\n\
+                 --x--\r\n"
+            );
+            let error =
+                parse_rfc5322_with_limits(raw.as_bytes(), limits).expect_err("too many parts");
 
-        assert_eq!(
-            error.downcast_ref::<MimeLimitError>(),
-            Some(&MimeLimitError::Parts { limit: 2 })
-        );
+            assert_eq!(
+                error.downcast_ref::<MimeLimitError>(),
+                Some(&MimeLimitError::Parts { limit: 2 }),
+                "{media_type}"
+            );
+        }
     }
 
     #[test]

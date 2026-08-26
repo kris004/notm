@@ -19,7 +19,7 @@ use serde_json::json;
 
 use crate::{
     cache::{BoundedLruCache, SEARCH_PAGE_CACHE_CAPACITY, THREAD_DETAIL_CACHE_CAPACITY},
-    model::{MAX_LOADED_THREAD_MESSAGES, ThreadUiDetails},
+    model::{MAX_THREAD_DETAIL_MESSAGES, ThreadUiDetails},
 };
 
 use super::search_bar::{self, SearchWorkerRequest};
@@ -1380,7 +1380,7 @@ fn thread_details_for_threads(
             out.insert(thread.thread_id.clone(), detail);
             continue;
         }
-        let detail = match db.thread_messages_bounded(&thread.thread_id, MAX_LOADED_THREAD_MESSAGES)
+        let detail = match db.thread_messages_bounded(&thread.thread_id, MAX_THREAD_DETAIL_MESSAGES)
         {
             Ok(messages) => compute_thread_detail(db, &messages),
             Err(error) => unavailable_thread_detail(&error),
@@ -1651,13 +1651,14 @@ mod tests {
     fn oversized_thread_detail_failure_is_visible_and_explicitly_non_partial() {
         let error = notm_notmuch::Error::ThreadMessageLimitExceeded {
             thread_id: "large-thread".to_string(),
-            total: MAX_LOADED_THREAD_MESSAGES + 1,
-            limit: MAX_LOADED_THREAD_MESSAGES,
+            total: MAX_THREAD_DETAIL_MESSAGES + 1,
+            limit: MAX_THREAD_DETAIL_MESSAGES,
         };
         let detail = unavailable_thread_detail(&error);
         let warning = detail.load_warning.as_deref().expect("visible warning");
 
-        assert!(warning.contains(&(MAX_LOADED_THREAD_MESSAGES + 1).to_string()));
+        assert!(warning.contains(&(MAX_THREAD_DETAIL_MESSAGES + 1).to_string()));
+        assert!(warning.contains(&format!("safety limit of {MAX_THREAD_DETAIL_MESSAGES}")));
         assert!(warning.contains("no partial thread was loaded"));
         assert!(thread_title_text(&test_thread("large-thread"), &detail).contains("⚠ "));
     }

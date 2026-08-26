@@ -22,6 +22,16 @@ pub const MAX_THREAD_PREVIEW_LINES: usize = 20;
 /// their exact count instead of displaying a partial prefix.
 pub const MAX_LOADED_THREAD_MESSAGES: usize = 4_096;
 
+/// Maximum number of messages inspected to derive thread-list row details.
+///
+/// Deriving attachment, crypto, and preview metadata opens and parses every
+/// message in the thread. Keep that background work below a smaller explicit
+/// ceiling so unusually large threads cannot stall search-result publication.
+/// Threads over this limit receive an explicit warning instead of details
+/// computed from a partial prefix; interactive navigation retains its separate
+/// [`MAX_LOADED_THREAD_MESSAGES`] limit.
+pub const MAX_THREAD_DETAIL_MESSAGES: usize = 256;
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemePreference {
