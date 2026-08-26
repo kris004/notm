@@ -1447,19 +1447,19 @@ where
         let mut marker = Vec::with_capacity(boundary.len().saturating_add(2));
         marker.extend_from_slice(b"--");
         marker.extend_from_slice(boundary.as_bytes());
-        if let Some(first_boundary) = find_line_prefix(bytes, body_start, &marker) {
+        if let Some(first_boundary) = find_mime_boundary_line(bytes, body_start, &marker) {
             let child_is_digest = content_type.mimetype == "multipart/digest";
-            let mut boundary_end = first_boundary.saturating_add(marker.len());
+            let mut boundary_line = first_boundary;
             let mut found_child = false;
-            while let Some(part_start) =
-                find_bytes(bytes, boundary_end, b"\n").and_then(|newline| newline.checked_add(1))
+            while !boundary_line.closing
+                && let Some(part_start) = boundary_line.next_line_start
             {
                 if cancelled() {
                     return Err(MimePreflightFailure::Cancelled);
                 }
-                let next_boundary = find_line_prefix(bytes, part_start, &marker);
+                let next_boundary = find_mime_boundary_line(bytes, part_start, &marker);
                 let part_end = next_boundary
-                    .map(|index| strip_trailing_crlf(bytes, part_start, index))
+                    .map(|line| strip_trailing_crlf(bytes, part_start, line.start))
                     .unwrap_or(bytes.len());
                 found_child = true;
                 preflight_mime_part(
@@ -1470,14 +1470,10 @@ where
                     state,
                     cancelled,
                 )?;
-                boundary_end = next_boundary
-                    .map(|index| index.saturating_add(marker.len()))
-                    .unwrap_or(bytes.len());
-                if boundary_end.saturating_add(2) > bytes.len()
-                    || bytes[boundary_end..boundary_end + 2] == *b"--"
-                {
+                let Some(next_boundary) = next_boundary else {
                     break;
-                }
+                };
+                boundary_line = next_boundary;
             }
             if found_child {
                 return Ok(());
@@ -1538,15 +1534,57 @@ fn find_bytes(bytes: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
     (start..=end).find(|&index| bytes[index..].starts_with(needle))
 }
 
-fn find_line_prefix(bytes: &[u8], start: usize, prefix: &[u8]) -> Option<usize> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MimeBoundaryLine {
+    start: usize,
+    next_line_start: Option<usize>,
+    closing: bool,
+}
+
+fn find_mime_boundary_line(bytes: &[u8], start: usize, marker: &[u8]) -> Option<MimeBoundaryLine> {
     let mut search_start = start;
-    while let Some(index) = find_bytes(bytes, search_start, prefix) {
-        if index == start || bytes[index.saturating_sub(1)] == b'\n' {
-            return Some(index);
+    while let Some(index) = find_bytes(bytes, search_start, marker) {
+        if (index == start || bytes[index.saturating_sub(1)] == b'\n')
+            && let Some(line) = parse_mime_boundary_line(bytes, index, marker.len())
+        {
+            return Some(line);
         }
         search_start = index.saturating_add(1);
     }
     None
+}
+
+fn parse_mime_boundary_line(
+    bytes: &[u8],
+    start: usize,
+    marker_len: usize,
+) -> Option<MimeBoundaryLine> {
+    let mut cursor = start.checked_add(marker_len)?;
+    let closing = bytes
+        .get(cursor..cursor.saturating_add(2))
+        .is_some_and(|suffix| suffix == b"--");
+    if closing {
+        cursor = cursor.saturating_add(2);
+    }
+    while bytes
+        .get(cursor)
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        cursor = cursor.saturating_add(1);
+    }
+    let next_line_start = match bytes.get(cursor) {
+        None => None,
+        Some(b'\n') => Some(cursor.saturating_add(1)),
+        Some(b'\r') if bytes.get(cursor.saturating_add(1)) == Some(&b'\n') => {
+            Some(cursor.saturating_add(2))
+        }
+        Some(_) => return None,
+    };
+    Some(MimeBoundaryLine {
+        start,
+        next_line_start,
+        closing,
+    })
 }
 
 fn strip_trailing_crlf(bytes: &[u8], start: usize, mut end: usize) -> usize {
@@ -1875,11 +1913,11 @@ mod tests {
     use notm_notmuch::{Database, MessageSummary, OpenConfig};
 
     use super::{
-        DEFAULT_PREPARATION_LIMITS, MAX_CANDIDATE_THREAD_IDS, MessageSource, PreparationLimits,
-        TargetMessageNotFound, ThreadLoadCoordinator, ThreadLoadRequest, ThreadLoaderService,
-        load_thread, load_thread_with_reader, prepare_message_with_parser, prepare_thread,
-        prepare_thread_with_cancel, prepare_thread_with_limits, prepare_thread_with_resolution,
-        read_bounded,
+        DEFAULT_PREPARATION_LIMITS, MAX_CANDIDATE_THREAD_IDS, MessageSource, MimePreflightLimits,
+        PreparationLimits, TargetMessageNotFound, ThreadLoadCoordinator, ThreadLoadRequest,
+        ThreadLoaderService, load_thread, load_thread_with_reader, preflight_mime,
+        prepare_message_with_parser, prepare_thread, prepare_thread_with_cancel,
+        prepare_thread_with_limits, prepare_thread_with_resolution, read_bounded,
     };
 
     fn notmuch_fixture_config(temp: &tempfile::TempDir) -> (OpenConfig, PathBuf) {
@@ -1930,6 +1968,20 @@ mod tests {
             .expect("write attachment fixture");
         }
         source.push_str("--x--\r\n");
+        source.into_bytes()
+    }
+
+    fn message_with_tiny_padded_attachments(count: usize) -> Vec<u8> {
+        let mut source =
+            String::from("MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n");
+        for index in 0..count {
+            write!(
+                source,
+                "--x \t\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename={index}.bin\r\nContent-Transfer-Encoding: base64\r\n\r\neA==\r\n"
+            )
+            .expect("write padded attachment fixture");
+        }
+        source.push_str("--x-- \t");
         source.into_bytes()
     }
 
@@ -2460,6 +2512,82 @@ Content-Type: multipart/mixed; boundary=x\r\n\r\n\
     }
 
     #[test]
+    fn mime_boundary_marker_prefix_remains_body_content() {
+        let source = b"MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=x\r\n\r\n\
+--x\r\nContent-Type: text/plain\r\n\r\n\
+body before marker prefix\r\n\
+--x-with-extra-text\r\n\
+Content-Type: application/octet-stream\r\n\
+Content-Disposition: attachment; filename=not-a-part.bin\r\n\r\n\
+still part of the text body\r\n\
+--x--\r\n";
+        let preflight = preflight_mime(
+            source,
+            MimePreflightLimits {
+                attachment_count: 0,
+                part_count: 2,
+            },
+            &mut || false,
+        )
+        .expect("boundary marker prefix must not split the text part");
+
+        assert!(preflight.parse_error.is_none());
+        assert_eq!(preflight.part_count, 2);
+        assert_eq!(preflight.attachment_like_count, 0);
+    }
+
+    #[test]
+    fn mime_closing_boundary_prefix_does_not_end_the_multipart() {
+        let source = b"MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=x\r\n\r\n\
+--x\r\nContent-Type: text/plain\r\n\r\n\
+body before closing prefix\r\n\
+--x--with-extra-text\r\n\
+still part of the text body\r\n\
+--x\r\nContent-Type: application/octet-stream\r\n\
+Content-Disposition: attachment; filename=real.bin\r\n\r\n\
+eA==\r\n\
+--x--\r\n";
+        let preflight = preflight_mime(
+            source,
+            MimePreflightLimits {
+                attachment_count: 1,
+                part_count: 3,
+            },
+            &mut || false,
+        )
+        .expect("closing marker prefix must remain in the first part body");
+
+        assert!(preflight.parse_error.is_none());
+        assert_eq!(preflight.part_count, 3);
+        assert_eq!(preflight.attachment_like_count, 1);
+    }
+
+    #[test]
+    fn mime_boundary_lines_allow_linear_padding_and_eof() {
+        let source = b"MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=x\r\n\r\n\
+--x \t\r\nContent-Type: text/plain\r\n\r\ntext\r\n\
+--x\t \nContent-Type: application/octet-stream\n\
+Content-Disposition: attachment; filename=padded.bin\n\nattachment\n\
+--x-- \t";
+        let preflight = preflight_mime(
+            source,
+            MimePreflightLimits {
+                attachment_count: 1,
+                part_count: 3,
+            },
+            &mut || false,
+        )
+        .expect("valid padded boundary lines must delimit both parts");
+
+        assert!(preflight.parse_error.is_none());
+        assert_eq!(preflight.part_count, 3);
+        assert_eq!(preflight.attachment_like_count, 1);
+    }
+
+    #[test]
     fn many_tiny_attachments_are_rejected_before_full_parse_or_decode() {
         const ATTACHMENT_COUNT: usize = 4_096;
         let source = message_with_tiny_attachments(ATTACHMENT_COUNT);
@@ -2485,6 +2613,45 @@ Content-Type: multipart/mixed; boundary=x\r\n\r\n\
             &mut parse,
         )
         .expect_err("attachment preflight must reject before decoding");
+
+        assert_eq!(parser_calls, 0, "full MIME parse would decode every part");
+        let error = error.to_string();
+        assert!(
+            error.contains("at least 2049 attachment-like MIME parts"),
+            "{error}"
+        );
+        assert!(
+            error.contains("after visiting 2050 MIME parts"),
+            "preflight must stop at the first excess attachment: {error}"
+        );
+        assert!(error.contains("attachment-count limit is 2048"), "{error}");
+    }
+
+    #[test]
+    fn many_tiny_attachments_with_padded_boundaries_are_rejected_early() {
+        const ATTACHMENT_COUNT: usize = 2_049;
+        let source = message_with_tiny_padded_attachments(ATTACHMENT_COUNT);
+        assert!(source.len() <= DEFAULT_PREPARATION_LIMITS.source_bytes);
+
+        let mut parser_calls = 0_usize;
+        let mut parse = |_: &[u8]| {
+            parser_calls = parser_calls.saturating_add(1);
+            anyhow::bail!("full MIME parser must not run after preflight rejection")
+        };
+        let mut read = move |_: &Path, max_bytes: usize| {
+            assert!(source.len() <= max_bytes);
+            Ok(source.clone())
+        };
+        let error = prepare_message_with_parser(
+            Path::new("/fixture/many-padded-attachments"),
+            &mut read,
+            DEFAULT_PREPARATION_LIMITS,
+            DEFAULT_PREPARATION_LIMITS.attachment_count,
+            DEFAULT_PREPARATION_LIMITS.mime_part_count,
+            &mut || false,
+            &mut parse,
+        )
+        .expect_err("padded attachment delimiters must preserve pre-decode limits");
 
         assert_eq!(parser_calls, 0, "full MIME parse would decode every part");
         let error = error.to_string();

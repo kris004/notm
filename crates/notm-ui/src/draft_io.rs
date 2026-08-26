@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -137,32 +137,98 @@ fn load_named_drafts(request: &NamedDraftLoadRequest) -> anyhow::Result<NamedDra
 }
 
 fn migrate_legacy_named_drafts(dir: &Path, legacy_dir: &Path) -> anyhow::Result<usize> {
-    let entries = json_entries(legacy_dir)?;
-    ensure_count(entries.len())?;
-    let mut migrated = 0;
-    let mut total_bytes = 0;
-    for legacy_path in entries {
-        let bytes = read_bounded(&legacy_path, &mut total_bytes)?;
-        composer::ensure_private_directory(dir)?;
-        let filename = legacy_path
+    struct LegacyMigration {
+        source: PathBuf,
+        destination: Option<PathBuf>,
+        bytes: Vec<u8>,
+    }
+
+    let current_entries = json_entries(dir)?;
+    ensure_count(current_entries.len())?;
+    let mut current_total_bytes = 0;
+    let mut current_by_name = BTreeMap::new();
+    let mut occupied_destinations = BTreeSet::new();
+    for path in current_entries {
+        let filename = path
             .file_name()
-            .context("legacy draft has no filename")?;
-        let mut destination = dir.join(filename);
-        if destination.try_exists()? {
-            let existing = read_bounded(&destination, &mut total_bytes)?;
-            if existing == bytes {
-                remove_file_if_present(&legacy_path)?;
-                continue;
-            }
-            destination = dir.join(format!(
-                "legacy-{}-{}",
-                uuid::Uuid::new_v4(),
-                filename.to_string_lossy()
-            ));
+            .context("current draft has no filename")?
+            .to_os_string();
+        let bytes = read_bounded(&path, &mut current_total_bytes)?;
+        occupied_destinations.insert(path);
+        current_by_name.insert(filename, bytes);
+    }
+
+    let legacy_entries = json_entries(legacy_dir)?;
+    ensure_count(legacy_entries.len())?;
+    let mut legacy_total_bytes = 0;
+    let mut migrated_bytes = 0usize;
+    let mut migrations = Vec::with_capacity(legacy_entries.len());
+    for source in legacy_entries {
+        let bytes = read_bounded(&source, &mut legacy_total_bytes)?;
+        let filename = source
+            .file_name()
+            .context("legacy draft has no filename")?
+            .to_os_string();
+        let destination = if current_by_name.get(&filename) == Some(&bytes) {
+            None
+        } else if current_by_name.contains_key(&filename) {
+            let destination = loop {
+                let candidate = dir.join(format!(
+                    "legacy-{}-{}",
+                    uuid::Uuid::new_v4(),
+                    filename.to_string_lossy()
+                ));
+                if !occupied_destinations.contains(&candidate) {
+                    break candidate;
+                }
+            };
+            occupied_destinations.insert(destination.clone());
+            Some(destination)
+        } else {
+            let destination = dir.join(&filename);
+            occupied_destinations.insert(destination.clone());
+            Some(destination)
+        };
+        if destination.is_some() {
+            migrated_bytes = migrated_bytes
+                .checked_add(bytes.len())
+                .context("named draft migration byte count overflowed")?;
         }
-        atomic_write_durable(&destination, &bytes)?;
-        remove_file_if_present(&legacy_path)?;
-        migrated += 1;
+        migrations.push(LegacyMigration {
+            source,
+            destination,
+            bytes,
+        });
+    }
+
+    let migrated = migrations
+        .iter()
+        .filter(|migration| migration.destination.is_some())
+        .count();
+    let projected_count = current_by_name
+        .len()
+        .checked_add(migrated)
+        .context("named draft migration count overflowed")?;
+    anyhow::ensure!(
+        projected_count <= MAX_NAMED_DRAFTS,
+        "named draft migration would contain {projected_count} JSON files; limit is {MAX_NAMED_DRAFTS}"
+    );
+    let projected_bytes = current_total_bytes
+        .checked_add(migrated_bytes)
+        .context("named draft migration projected byte count overflowed")?;
+    anyhow::ensure!(
+        projected_bytes <= MAX_NAMED_DRAFT_TOTAL_BYTES,
+        "named draft migration would use {projected_bytes} bytes; limit is {MAX_NAMED_DRAFT_TOTAL_BYTES}"
+    );
+
+    if migrated > 0 {
+        composer::ensure_private_directory(dir)?;
+    }
+    for migration in migrations {
+        if let Some(destination) = migration.destination {
+            atomic_write_durable(&destination, &migration.bytes)?;
+        }
+        remove_file_if_present(&migration.source)?;
     }
     Ok(migrated)
 }
@@ -377,5 +443,86 @@ mod tests {
         assert!(!coordinator.finish(old));
         assert!(coordinator.finish(current));
         assert_eq!(coordinator.completed_generation(), Some(current));
+    }
+
+    #[test]
+    fn legacy_migration_rejects_combined_count_without_mutating_either_store() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let current = root.path().join("current");
+        let legacy = root.path().join("legacy");
+        fs::create_dir_all(&current).expect("current dir");
+        fs::create_dir_all(&legacy).expect("legacy dir");
+        let existing = serde_json::to_vec(&fields("existing")).expect("serialize existing");
+        for index in 0..MAX_NAMED_DRAFTS {
+            fs::write(current.join(format!("draft-{index:03}.json")), &existing)
+                .expect("write current draft");
+        }
+        fs::write(legacy.join("draft-000.json"), &existing).expect("write duplicate legacy draft");
+        let newcomer = serde_json::to_vec(&fields("newcomer")).expect("serialize newcomer");
+        fs::write(legacy.join("newcomer.json"), &newcomer)
+            .expect("write nonduplicate legacy draft");
+
+        let error = migrate_legacy_named_drafts(&current, &legacy)
+            .expect_err("combined count must reject migration");
+        assert!(error.to_string().contains("would contain 257"), "{error:#}");
+        assert_eq!(json_entries(&current).expect("list current").len(), 256);
+        assert_eq!(
+            fs::read(legacy.join("draft-000.json")).expect("read duplicate after rejection"),
+            existing
+        );
+        assert_eq!(
+            fs::read(legacy.join("newcomer.json")).expect("read newcomer after rejection"),
+            newcomer
+        );
+        assert_eq!(
+            scan_named_drafts(&current, None)
+                .expect("last good current store remains readable")
+                .len(),
+            MAX_NAMED_DRAFTS
+        );
+    }
+
+    #[test]
+    fn legacy_migration_rejects_combined_bytes_without_mutating_either_store() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let current = root.path().join("current");
+        let legacy = root.path().join("legacy");
+        fs::create_dir_all(&current).expect("current dir");
+        fs::create_dir_all(&legacy).expect("legacy dir");
+
+        let mut full_sized_fields = fields("capacity");
+        full_sized_fields.body.clear();
+        let empty_size = serde_json::to_vec(&full_sized_fields)
+            .expect("serialize empty draft")
+            .len();
+        full_sized_fields.body = "x".repeat(MAX_NAMED_DRAFT_BYTES - empty_size);
+        let full_sized = serde_json::to_vec(&full_sized_fields).expect("serialize full draft");
+        assert_eq!(full_sized.len(), MAX_NAMED_DRAFT_BYTES);
+        let full_draft_count = MAX_NAMED_DRAFT_TOTAL_BYTES / MAX_NAMED_DRAFT_BYTES;
+        for index in 0..full_draft_count {
+            fs::write(current.join(format!("draft-{index:03}.json")), &full_sized)
+                .expect("write current draft");
+        }
+        let newcomer = serde_json::to_vec(&fields("newcomer")).expect("serialize newcomer");
+        fs::write(legacy.join("newcomer.json"), &newcomer)
+            .expect("write nonduplicate legacy draft");
+
+        let error = migrate_legacy_named_drafts(&current, &legacy)
+            .expect_err("combined bytes must reject migration");
+        assert!(error.to_string().contains("would use"), "{error:#}");
+        assert_eq!(
+            json_entries(&current).expect("list current").len(),
+            full_draft_count
+        );
+        assert_eq!(
+            fs::read(legacy.join("newcomer.json")).expect("read newcomer after rejection"),
+            newcomer
+        );
+        assert_eq!(
+            scan_named_drafts(&current, None)
+                .expect("last good current store remains readable")
+                .len(),
+            full_draft_count
+        );
     }
 }
