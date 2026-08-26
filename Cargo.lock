@@ -1236,6 +1236,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "gtk4",
+ "mailparse",
  "notm-mail",
  "notm-notmuch",
  "parking_lot",
@@ -1256,6 +1257,7 @@ name = "notm-workspace"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "mailparse",
  "notm-mail",
  "notm-notmuch",
  "notm-test-support",

@@ -21,7 +21,7 @@ use notm_mail::{
     html_sanitize::sanitize_html,
     message_io::{BoundedText, read_header_text, read_raw_text},
     mime::parse_reader,
-    parse_mailto_uri,
+    parse_mailto_uri, send_timeout_duration, validate_send_timeout_seconds,
 };
 use notm_notmuch::{
     Database, DatabaseMode, MessageTagMutation, OpenConfig, QueryOptions, SortOrder, TagMutation,
@@ -302,6 +302,7 @@ pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
 
 fn validate_launch_options(options: &LaunchOptions) -> anyhow::Result<()> {
     settings::validate_thread_preview_lines(options.thread_preview_lines)?;
+    validate_send_timeout_seconds(options.send_timeout_seconds)?;
     anyhow::ensure!(
         options.open_message_id.is_none() || options.mailto_uri.is_none(),
         "message-id and mailto launch targets cannot be combined"
@@ -15016,7 +15017,7 @@ fn send_message_with_config(
             mode: options.send_mode.clone(),
             working_dir: options.send_working_dir.clone(),
             env: options.send_env.clone(),
-            timeout: Duration::from_secs(options.send_timeout_seconds),
+            timeout: send_timeout_duration(options.send_timeout_seconds)?,
         };
         return rt.block_on(transport.send(message));
     }
@@ -15131,7 +15132,8 @@ fn save_rfc5322_to_maildir(
         Uuid::new_v4()
     );
     let tmp_path = tmp.join(&unique);
-    write_private_new_file(&tmp_path, message.to_rfc5322().as_bytes())?;
+    let rendered = message.to_rfc5322()?;
+    write_private_new_file(&tmp_path, &rendered)?;
     let final_path = cur.join(format!("{unique}:2,{flags}"));
     std::fs::rename(&tmp_path, &final_path)?;
     Ok(final_path)
@@ -16954,6 +16956,7 @@ fn settings_test_state_json(
         "theme": theme_state,
         "preview": rendered_thread_preview_json(widgets, state),
         "remote_images": settings::remote_images(&options.runtime_settings),
+        "configured_send_timeout_seconds": options.send_timeout_seconds,
         "app_config_path": options.app_config_path,
         "status_text": widgets.status_label.text().to_string(),
     })
@@ -20182,6 +20185,27 @@ mod tests {
                 "unexpected error: {error:#}"
             );
         }
+    }
+
+    #[test]
+    fn launch_rejects_unsupported_send_timeouts_before_gtk_startup() {
+        for send_timeout_seconds in [0, notm_mail::MAX_SEND_TIMEOUT_SECONDS + 1, i64::MAX as u64] {
+            let options = LaunchOptions {
+                send_timeout_seconds,
+                ..LaunchOptions::default()
+            };
+            let error = launch(options).expect_err("invalid send timeout must fail");
+            assert!(
+                error.to_string().contains("send.timeout_seconds"),
+                "unexpected error: {error:#}"
+            );
+        }
+
+        let options = LaunchOptions {
+            send_timeout_seconds: notm_mail::MAX_SEND_TIMEOUT_SECONDS,
+            ..LaunchOptions::default()
+        };
+        validate_launch_options(&options).expect("maximum supported timeout must be valid");
     }
 
     #[test]
