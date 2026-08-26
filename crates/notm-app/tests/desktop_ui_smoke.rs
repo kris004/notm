@@ -18,6 +18,7 @@ use gui_test_display::{GuiTestDisplay, gtk_display_environment};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const LARGE_THREAD_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_HARNESS_APPLICATION_ID_ENV: &str = "NOTM_TEST_HARNESS_APPLICATION_ID";
 
 struct FixtureApp {
@@ -3672,6 +3673,10 @@ fn isolated_message_io_mime_survives_missing_copy_limits_and_restart() -> anyhow
     const _: () = {
         assert!(notm_ui::model::MAX_THREAD_DETAIL_MESSAGES < MESSAGE_COUNT);
         assert!(MESSAGE_COUNT <= notm_ui::model::MAX_LOADED_THREAD_MESSAGES);
+        assert!(
+            LARGE_THREAD_COMMAND_TIMEOUT.as_secs()
+                < notm_ui::automation::TEST_HARNESS_RESPONSE_TIMEOUT.as_secs()
+        );
     };
 
     let fixture = notm_test_support::FixtureDatabase::create()?;
@@ -3792,7 +3797,7 @@ fn isolated_message_io_mime_survives_missing_copy_limits_and_restart() -> anyhow
     // 1,001-message thread. Keep the ordinary 10-second responsiveness
     // deadline for every other smoke, but allow this correctness-only flow to
     // complete on slower CI runners.
-    let mut driver = app.connect_with_command_timeout(&token, STARTUP_TIMEOUT)?;
+    let mut driver = app.connect_with_command_timeout(&token, LARGE_THREAD_COMMAND_TIMEOUT)?;
     select_first_thread(&mut driver, &format!("id:{root_message_id}"))?;
     let first_state = driver.command("app_state", json!({}))?;
     assert_complete_message_io_thread(
@@ -3967,7 +3972,7 @@ fn isolated_message_io_mime_survives_missing_copy_limits_and_restart() -> anyhow
     let restart_token = format!("notm-message-io-restart-{run_id}");
     let mut restarted = FixtureApp::spawn_with_config(work_dir, &restart_token, &config_path)?;
     let mut restarted_driver =
-        restarted.connect_with_command_timeout(&restart_token, STARTUP_TIMEOUT)?;
+        restarted.connect_with_command_timeout(&restart_token, LARGE_THREAD_COMMAND_TIMEOUT)?;
     select_first_thread(&mut restarted_driver, &format!("id:{root_message_id}"))?;
     let restart_state = restarted_driver.command("app_state", json!({}))?;
     assert_complete_message_io_thread(
