@@ -35,6 +35,10 @@ RUST_COMMAND_ARGUMENT = re.compile(
     rf'"(?P<command>{"|".join(LOCKED_COMMANDS)})"'
 )
 COMMAND_SEPARATOR = re.compile(r"&&|\|\||[;|]")
+SOURCE_ARCHIVE_TEST_COMMAND = (
+    "cargo test --locked --workspace --all-targets --all-features -- "
+    "--test-threads=1"
+)
 
 
 @dataclass(frozen=True)
@@ -87,6 +91,17 @@ def unlocked_rust_commands(path: Path, text: str) -> list[Violation]:
     return violations
 
 
+def source_archive_test_commands(text: str) -> list[str]:
+    """Return normalized Cargo test commands from the archive smoke."""
+
+    logical_text = re.sub(r"\\\n[ \t]*", " ", text)
+    return [
+        " ".join(line.split())
+        for line in logical_text.splitlines()
+        if re.match(r"^[ \t]*cargo test\b", line)
+    ]
+
+
 def run_parser_regressions() -> None:
     """Prove the scanner catches the unlocked-first-command regression."""
 
@@ -129,6 +144,19 @@ let status = Command::new(env!("CARGO"))
     if actual != [(1, "run")]:
         raise AssertionError(f"unlocked nested Rust command escaped: {actual}")
 
+    parallel_archive_test = (
+        "cargo test --locked --workspace --all-targets --all-features"
+    )
+    if source_archive_test_commands(parallel_archive_test) == [
+        SOURCE_ARCHIVE_TEST_COMMAND
+    ]:
+        raise AssertionError("parallel source-archive test command was accepted")
+
+    if source_archive_test_commands(SOURCE_ARCHIVE_TEST_COMMAND) != [
+        SOURCE_ARCHIVE_TEST_COMMAND
+    ]:
+        raise AssertionError("serialized source-archive test command was rejected")
+
 
 def policy_paths() -> list[Path]:
     paths = [PROJECT_ROOT / "Makefile", PROJECT_ROOT / "README.md"]
@@ -144,6 +172,19 @@ def policy_paths() -> list[Path]:
 
 def main() -> int:
     run_parser_regressions()
+
+    source_archive_path = PROJECT_ROOT / "tests" / "source_archive_smoke.sh"
+    archive_test_commands = source_archive_test_commands(
+        source_archive_path.read_text(encoding="utf-8")
+    )
+    if archive_test_commands != [SOURCE_ARCHIVE_TEST_COMMAND]:
+        print(
+            "source archive smoke must run the complete locked workspace test "
+            "exactly once with --test-threads=1",
+            file=sys.stderr,
+        )
+        print(f"  found: {archive_test_commands}", file=sys.stderr)
+        return 1
 
     paths = policy_paths()
     missing = [path for path in paths if not path.is_file()]

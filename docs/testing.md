@@ -91,7 +91,9 @@ appstreamcli validate --strict --pedantic --no-net \
 `tests/source_archive_smoke.sh` creates the exact source-archive form, confirms
 that it has no `.git`, verifies embedded commit and version provenance, and
 runs a clean locked release build, workspace test, fixture smoke, and packaging
-suite from the extraction. The packaging suite includes the deliberate
+suite from the extraction. The full workspace/all-target/all-feature test run
+uses the standard Rust harness with `--test-threads=1` so GUI-capable tests keep
+deterministic compositor isolation. The packaging suite includes the deliberate
 Cargo.lock-mutation negative test and the standalone release-bundle verifier.
 
 ## Live smoke commands
