@@ -270,6 +270,14 @@ impl FixtureApp {
     }
 
     fn connect(&mut self, token: &str) -> anyhow::Result<UiDriver> {
+        self.connect_with_command_timeout(token, Duration::from_secs(10))
+    }
+
+    fn connect_with_command_timeout(
+        &mut self,
+        token: &str,
+        command_timeout: Duration,
+    ) -> anyhow::Result<UiDriver> {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         loop {
             if let Some(status) = self.child.try_wait()? {
@@ -280,7 +288,8 @@ impl FixtureApp {
             }
 
             if self.socket_path.exists()
-                && let Ok(driver) = UiDriver::connect(&self.socket_path, token)
+                && let Ok(driver) =
+                    UiDriver::connect_with_timeout(&self.socket_path, token, command_timeout)
             {
                 return Ok(driver);
             }
@@ -3779,7 +3788,11 @@ fn isolated_message_io_mime_survives_missing_copy_limits_and_restart() -> anyhow
 
     let token = format!("notm-message-io-first-{run_id}");
     let mut app = FixtureApp::spawn_with_config(work_dir.clone(), &token, &config_path)?;
-    let mut driver = app.connect(&token)?;
+    // This scenario validates correctness while intentionally materializing a
+    // 1,001-message thread. Keep the ordinary 10-second responsiveness
+    // deadline for every other smoke, but allow this correctness-only flow to
+    // complete on slower CI runners.
+    let mut driver = app.connect_with_command_timeout(&token, STARTUP_TIMEOUT)?;
     select_first_thread(&mut driver, &format!("id:{root_message_id}"))?;
     let first_state = driver.command("app_state", json!({}))?;
     assert_complete_message_io_thread(
@@ -3953,7 +3966,8 @@ fn isolated_message_io_mime_survives_missing_copy_limits_and_restart() -> anyhow
 
     let restart_token = format!("notm-message-io-restart-{run_id}");
     let mut restarted = FixtureApp::spawn_with_config(work_dir, &restart_token, &config_path)?;
-    let mut restarted_driver = restarted.connect(&restart_token)?;
+    let mut restarted_driver =
+        restarted.connect_with_command_timeout(&restart_token, STARTUP_TIMEOUT)?;
     select_first_thread(&mut restarted_driver, &format!("id:{root_message_id}"))?;
     let restart_state = restarted_driver.command("app_state", json!({}))?;
     assert_complete_message_io_thread(

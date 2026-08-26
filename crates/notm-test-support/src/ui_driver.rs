@@ -15,9 +15,17 @@ pub struct UiDriver {
 
 impl UiDriver {
     pub fn connect(path: impl AsRef<Path>, token: impl Into<String>) -> anyhow::Result<Self> {
+        Self::connect_with_timeout(path, token, Duration::from_secs(10))
+    }
+
+    pub fn connect_with_timeout(
+        path: impl AsRef<Path>,
+        token: impl Into<String>,
+        command_timeout: Duration,
+    ) -> anyhow::Result<Self> {
         let stream = UnixStream::connect(path)?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+        stream.set_read_timeout(Some(command_timeout))?;
+        stream.set_write_timeout(Some(command_timeout))?;
         Ok(Self {
             stream,
             token: token.into(),
@@ -98,8 +106,42 @@ fn search_snapshots_are_settled(status: &Value, state: &Value) -> anyhow::Result
 
 #[cfg(test)]
 mod tests {
-    use super::search_snapshots_are_settled;
+    use super::{UiDriver, search_snapshots_are_settled};
     use serde_json::json;
+    use std::{os::unix::net::UnixListener, time::Duration};
+
+    #[test]
+    fn command_timeouts_are_applied() {
+        let temp = tempfile::tempdir().expect("create socket directory");
+        let default_path = temp.path().join("ui-driver-default.sock");
+        let listener = UnixListener::bind(&default_path).expect("bind default UI-driver socket");
+        let accept = std::thread::spawn(move || listener.accept().expect("accept UI driver"));
+
+        let default_timeout = Duration::from_secs(10);
+        let driver =
+            UiDriver::connect(&default_path, "token").expect("connect with default timeout");
+        assert_eq!(driver.stream.read_timeout().unwrap(), Some(default_timeout));
+        assert_eq!(
+            driver.stream.write_timeout().unwrap(),
+            Some(default_timeout)
+        );
+
+        drop(driver);
+        drop(accept.join().expect("join listener").0);
+
+        let custom_path = temp.path().join("ui-driver-custom.sock");
+        let listener = UnixListener::bind(&custom_path).expect("bind custom UI-driver socket");
+        let accept = std::thread::spawn(move || listener.accept().expect("accept UI driver"));
+
+        let timeout = Duration::from_secs(30);
+        let driver = UiDriver::connect_with_timeout(&custom_path, "token", timeout)
+            .expect("connect with custom timeout");
+        assert_eq!(driver.stream.read_timeout().unwrap(), Some(timeout));
+        assert_eq!(driver.stream.write_timeout().unwrap(), Some(timeout));
+
+        drop(driver);
+        drop(accept.join().expect("join listener").0);
+    }
 
     #[test]
     fn search_wait_rejects_startup_and_between_snapshot_races() {
