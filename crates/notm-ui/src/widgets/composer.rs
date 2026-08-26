@@ -2,7 +2,7 @@ use std::{
     cell::{Cell, RefCell},
     ffi::OsStr,
     fs::OpenOptions,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     rc::Rc,
     time::Duration,
@@ -18,7 +18,8 @@ use notm_mail::{
     build_reply,
     compose::{AttachmentInput, Identity},
     forward::{build_attachment_forward, build_inline_forward},
-    mime::parse_file,
+    message_io::read_message_bytes,
+    mime::{parse_reader, parse_rfc5322},
 };
 use serde::{Deserialize, Serialize};
 use sourceview5::{Buffer as SourceBuffer, View as SourceView, VimIMContext};
@@ -310,12 +311,19 @@ fn checked_recipient_field(label: &str, value: &str) -> anyhow::Result<Vec<Strin
         .map_err(|err| anyhow::anyhow!("invalid {label} recipients: {err}"))
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_draft_fields_from_message_file(
     path: impl AsRef<Path>,
 ) -> anyhow::Result<(ComposeFields, Vec<AttachmentInput>)> {
-    let path = path.as_ref();
-    let parsed = parse_file(path)?;
-    let attachment_inputs = attachments::attachment_inputs_from_file(path)?;
+    prepare_draft_fields_from_message_reader(std::fs::File::open(path)?)
+}
+
+pub(crate) fn prepare_draft_fields_from_message_reader(
+    reader: impl Read,
+) -> anyhow::Result<(ComposeFields, Vec<AttachmentInput>)> {
+    let raw = read_message_bytes(reader)?;
+    let parsed = parse_rfc5322(&raw)?;
+    let attachment_inputs = attachments::attachment_inputs_from_bytes(&raw)?;
     let body = if parsed.text_body.trim().is_empty() {
         parsed.safe_body
     } else {
@@ -339,27 +347,32 @@ pub(crate) fn prepare_draft_fields_from_message_file(
     ))
 }
 
-pub(crate) fn composed_reply_from_file(
-    path: impl AsRef<Path>,
+pub(crate) fn composed_reply_from_reader(
+    reader: impl Read,
     identity: &Identity,
     own_emails: &[String],
     kind: ReplyKind,
 ) -> anyhow::Result<ComposedMessage> {
-    Ok(build_reply(&parse_file(path)?, identity, own_emails, kind))
+    Ok(build_reply(
+        &parse_reader(reader)?,
+        identity,
+        own_emails,
+        kind,
+    ))
 }
 
-pub(crate) fn composed_inline_forward_from_file(
-    path: impl AsRef<Path>,
+pub(crate) fn composed_inline_forward_from_reader(
+    reader: impl Read,
     identity: &Identity,
 ) -> anyhow::Result<ComposedMessage> {
-    Ok(build_inline_forward(&parse_file(path)?, identity))
+    Ok(build_inline_forward(&parse_reader(reader)?, identity))
 }
 
-pub(crate) fn composed_attachment_forward_from_file(
-    path: impl AsRef<Path>,
+pub(crate) fn composed_attachment_forward_from_reader(
+    reader: impl Read,
     identity: &Identity,
 ) -> anyhow::Result<ComposedMessage> {
-    let raw = std::fs::read(path)?;
+    let raw = read_message_bytes(reader)?;
     let parsed = notm_mail::mime::parse_rfc5322(&raw)?;
     Ok(build_attachment_forward(&parsed, identity, raw))
 }

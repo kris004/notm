@@ -20,6 +20,26 @@ pub enum Error {
     Nul(#[from] NulError),
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    #[error("message `{0}` was not found in the Notmuch database")]
+    MessageNotFound(String),
+    #[error("message `{message_id}` has no readable indexed file{detail}")]
+    MessageFileUnavailable { message_id: String, detail: String },
+    #[error(
+        "thread `{thread_id}` changed or returned inconsistent paging results: expected {expected} message(s), loaded {loaded}"
+    )]
+    InconsistentThreadMessages {
+        thread_id: String,
+        expected: usize,
+        loaded: usize,
+    },
+    #[error(
+        "thread `{thread_id}` contains {total} message(s), exceeding the requested safety limit of {limit}; no partial thread was loaded"
+    )]
+    ThreadMessageLimitExceeded {
+        thread_id: String,
+        total: usize,
+        limit: usize,
+    },
     #[error("invalid notmuch tag `{0}`")]
     InvalidTag(String),
 }

@@ -224,18 +224,18 @@ desktop-file-validate \
 appstreamcli validate --strict --pedantic --no-net \
   "$BUNDLE_ROOT/share/metainfo/io.github.kris004.notm.metainfo.xml"
 
+archive_epoch=${SOURCE_DATE_EPOCH:-0}
+case "$archive_epoch" in
+  *[!0-9]*)
+    printf 'SOURCE_DATE_EPOCH must be a non-negative integer\n' >&2
+    exit 2
+    ;;
+esac
 if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
-  case "$SOURCE_DATE_EPOCH" in
-    *[!0-9]*)
-      printf 'SOURCE_DATE_EPOCH must be a non-negative integer\n' >&2
-      exit 2
-      ;;
-  esac
   find "$BUNDLE_ROOT" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
-  archive_mtime="@$SOURCE_DATE_EPOCH"
-else
-  archive_mtime='@0'
 fi
+archive_mtime="@$archive_epoch"
+readonly archive_epoch archive_mtime
 
 (
   cd -- "$WORK_ROOT"
@@ -266,7 +266,8 @@ else
       --group=0 \
       --numeric-owner \
       --mtime="$archive_mtime" \
-      --pax-option="comment=$source_commit,delete=atime,delete=ctime" \
+      --pax-option="globexthdr.mtime=$archive_epoch,\
+comment=$source_commit,delete=atime,delete=ctime" \
       --exclude-vcs-ignores \
       --transform="s|^\\./|$SOURCE_NAME/|" \
       --transform="s|^\\.$|$SOURCE_NAME/|" \

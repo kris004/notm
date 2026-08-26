@@ -16,9 +16,9 @@ use notm_mail::{
         save_attachment_without_overwrite,
     },
     compose::AttachmentInput,
-    mime::{extract_attachments_from_file, extract_attachments_from_file_detailed},
+    mime::{extract_attachments, extract_attachments_from_reader_detailed},
 };
-use notm_notmuch::MessageSummary;
+use notm_notmuch::{Database, DatabaseMode, MessageSummary, OpenConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -140,6 +140,7 @@ pub(crate) struct AttachmentController {
     list: gtk::ListBox,
     items: Rc<RefCell<Vec<ThreadAttachmentItem>>>,
     messages: Rc<RefCell<Vec<MessageSummary>>>,
+    open_config: OpenConfig,
     open_dir: PathBuf,
     pending_save: Rc<RefCell<Option<PendingAttachmentSave>>>,
     next_save_id: Rc<Cell<u64>>,
@@ -152,6 +153,7 @@ impl AttachmentController {
         window: &gtk::ApplicationWindow,
         open_dir: PathBuf,
         fixture_mode: bool,
+        open_config: OpenConfig,
     ) -> Self {
         let title = gtk::Label::new(Some("Attachments in thread"));
         title.set_xalign(0.0);
@@ -176,6 +178,7 @@ impl AttachmentController {
             list,
             items: Rc::new(RefCell::new(Vec::new())),
             messages: Rc::new(RefCell::new(Vec::new())),
+            open_config,
             open_dir,
             pending_save: Rc::new(RefCell::new(None)),
             next_save_id: Rc::new(Cell::new(1)),
@@ -227,12 +230,16 @@ impl AttachmentController {
         }
         self.items.borrow_mut().clear();
         self.messages.replace(messages.to_vec());
+        let database = Database::open(&self.open_config, DatabaseMode::ReadOnly).ok();
 
         for (message_index, message) in messages.iter().enumerate() {
-            let Some(filename) = message.filenames.first() else {
+            let Some(database) = database.as_ref() else {
                 continue;
             };
-            let Ok(report) = extract_attachments_from_file_detailed(filename) else {
+            let Ok(source) = database.open_message_file(message) else {
+                continue;
+            };
+            let Ok(report) = extract_attachments_from_reader_detailed(source) else {
                 continue;
             };
             for attachment in report.attachments {
@@ -321,7 +328,7 @@ impl AttachmentController {
         );
         match self.items.borrow().get(index).cloned() {
             Some(item) => self.thread_payload(&item),
-            None => selected_attachment_payload(selected_message, index),
+            None => selected_attachment_payload(&self.open_config, selected_message, index),
         }
     }
 
@@ -335,7 +342,7 @@ impl AttachmentController {
         );
         match self.selected_thread_attachment() {
             Some(item) => self.thread_payload(&item),
-            None => selected_attachment_payload(selected_message, 0),
+            None => selected_attachment_payload(&self.open_config, selected_message, 0),
         }
     }
 
@@ -565,11 +572,9 @@ impl AttachmentController {
             .get(item.message_index)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("attachment message index not found"))?;
-        let filename = message
-            .filenames
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("attachment message has no file"))?;
-        let report = extract_attachments_from_file_detailed(filename)?;
+        let database = Database::open(&self.open_config, DatabaseMode::ReadOnly)?;
+        let source = database.open_message_file(&message)?;
+        let report = extract_attachments_from_reader_detailed(source)?;
         let attachment = report
             .attachments
             .into_iter()
@@ -649,15 +654,14 @@ fn emit_result(
 }
 
 fn selected_attachment_payload(
+    open_config: &OpenConfig,
     selected_message: Option<MessageSummary>,
     index: usize,
 ) -> anyhow::Result<AttachmentPayload> {
     let message = selected_message.ok_or_else(|| anyhow::anyhow!("no selected message"))?;
-    let filename = message
-        .filenames
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("selected message has no file"))?;
-    let report = extract_attachments_from_file_detailed(filename)?;
+    let database = Database::open(open_config, DatabaseMode::ReadOnly)?;
+    let source = database.open_message_file(&message)?;
+    let report = extract_attachments_from_reader_detailed(source)?;
     let attachment = report
         .attachments
         .get(index)
@@ -726,8 +730,8 @@ pub(crate) fn load_compose_attachments(
         .collect()
 }
 
-pub(crate) fn attachment_inputs_from_file(path: &Path) -> anyhow::Result<Vec<AttachmentInput>> {
-    Ok(extract_attachments_from_file(path)?
+pub(crate) fn attachment_inputs_from_bytes(bytes: &[u8]) -> anyhow::Result<Vec<AttachmentInput>> {
+    Ok(extract_attachments(bytes)?
         .into_iter()
         .map(|attachment| AttachmentInput {
             filename: attachment.filename,

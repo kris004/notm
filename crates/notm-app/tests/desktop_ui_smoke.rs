@@ -21,6 +21,7 @@ use local_http_tracker::LocalHttpTracker;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const LARGE_THREAD_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_HARNESS_APPLICATION_ID_ENV: &str = "NOTM_TEST_HARNESS_APPLICATION_ID";
 
 struct FixtureApp {
@@ -275,6 +276,14 @@ impl FixtureApp {
     }
 
     fn connect(&mut self, token: &str) -> anyhow::Result<UiDriver> {
+        self.connect_with_command_timeout(token, Duration::from_secs(10))
+    }
+
+    fn connect_with_command_timeout(
+        &mut self,
+        token: &str,
+        command_timeout: Duration,
+    ) -> anyhow::Result<UiDriver> {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         loop {
             if let Some(status) = self.child.try_wait()? {
@@ -285,7 +294,8 @@ impl FixtureApp {
             }
 
             if self.socket_path.exists()
-                && let Ok(driver) = UiDriver::connect(&self.socket_path, token)
+                && let Ok(driver) =
+                    UiDriver::connect_with_timeout(&self.socket_path, token, command_timeout)
             {
                 return Ok(driver);
             }
@@ -4015,6 +4025,554 @@ fn standalone_remote_images_are_revoked_when_settings_disable_them() -> anyhow::
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn oversized_thread_rejection_restores_selection_before_tagging() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP oversized_thread_rejection_restores_selection_before_tagging: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running oversized-thread selection rollback smoke with {display}");
+
+    const OVERSIZED_MESSAGE_COUNT: usize = notm_ui::model::MAX_LOADED_THREAD_MESSAGES + 1;
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-oversized-select-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+
+    let query_tag = format!("oversized-select-{run_id}");
+    let mutation_tag = format!("after-rejected-selection-{run_id}");
+    let safe_message_id = format!("oversized-safe-{run_id}@fixture.test");
+    let oversized_root_id = format!("oversized-root-{run_id}@fixture.test");
+    let oversized_subject = "Oversized selection rejection";
+    {
+        let db = fixture.open_readwrite()?;
+        let safe_path = fixture
+            .maildir
+            .join("cur")
+            .join(format!("oversized-safe-{run_id}:2,S"));
+        fs::write(
+            &safe_path,
+            format!(
+                "From: Safe Sender <safe@example.test>\r\n\
+                 To: Fixture User <fixture@example.test>\r\n\
+                 Subject: Safe selection target\r\n\
+                 Date: Tue, 25 Aug 2030 13:00:00 -0600\r\n\
+                 Message-ID: <{safe_message_id}>\r\n\
+                 MIME-Version: 1.0\r\n\
+                 Content-Type: text/plain; charset=utf-8\r\n\r\n\
+                 Safe selection body.\r\n"
+            ),
+        )?;
+        db.index_file_with_tags(&safe_path, &["inbox", &query_tag])?;
+
+        for index in 0..OVERSIZED_MESSAGE_COUNT {
+            let message_id = if index == 0 {
+                oversized_root_id.clone()
+            } else {
+                format!("oversized-reply-{index}-{run_id}@fixture.test")
+            };
+            let reply_headers = if index == 0 {
+                String::new()
+            } else {
+                format!(
+                    "In-Reply-To: <{oversized_root_id}>\r\n\
+                     References: <{oversized_root_id}>\r\n"
+                )
+            };
+            let path = fixture
+                .maildir
+                .join("cur")
+                .join(format!("oversized-{run_id}-{index:04}:2,S"));
+            fs::write(
+                &path,
+                format!(
+                    "From: Oversized Sender <oversized@example.test>\r\n\
+                     To: Fixture User <fixture@example.test>\r\n\
+                     Subject: {}{oversized_subject}\r\n\
+                     Date: Tue, 25 Aug 2026 12:00:00 -0600\r\n\
+                     Message-ID: <{message_id}>\r\n\
+                     {reply_headers}\
+                     MIME-Version: 1.0\r\n\
+                     Content-Type: text/plain; charset=utf-8\r\n\r\n\
+                     Oversized message {index}.\r\n",
+                    if index == 0 { "" } else { "Re: " },
+                ),
+            )?;
+            db.index_file_with_tags(&path, &["inbox", &query_tag])?;
+        }
+    }
+
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = {}\nexcluded_tags = []\n\
+             \n[identity]\nname = \"Fixture User\"\nprimary_email = \"fixture@example.test\"\n\
+             \n[send]\nenabled = false\n\
+             \n[sync]\nenabled = false\n\
+             \n[automation]\nallow_live_tag_test = true\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+            toml::Value::String(format!("tag:{query_tag}")),
+        ),
+    )?;
+
+    let token = format!("notm-oversized-select-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect_with_command_timeout(&token, LARGE_THREAD_COMMAND_TIMEOUT)?;
+    let search = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let rows = json_array_at(&search, &["state", "thread_list_items"])?;
+    ensure!(
+        rows.len() == 2,
+        "expected safe and oversized threads: {search}"
+    );
+    let safe_index = rows
+        .iter()
+        .position(|thread| thread["subject"] == "Safe selection target")
+        .with_context(|| format!("safe thread was not present: {search}"))?;
+    let safe_thread_id = rows[safe_index]["thread_id"]
+        .as_str()
+        .with_context(|| format!("safe thread had no ID: {search}"))?
+        .to_string();
+    let oversized_index = rows
+        .iter()
+        .position(|thread| thread["subject"] == oversized_subject)
+        .with_context(|| format!("oversized thread was not present: {search}"))?;
+
+    let selected = driver.command("select_thread_by_index", json!({"index": safe_index}))?;
+    assert_eq!(
+        selected["selected_thread"]["thread_id"], safe_thread_id,
+        "safe thread was not selected before rejection: {selected}"
+    );
+
+    let rejected = driver.command("select_thread_by_index", json!({"index": oversized_index}))?;
+    assert_eq!(
+        rejected["selected_thread_index"], safe_index,
+        "rejected oversized row remained selected: {rejected}"
+    );
+    assert_eq!(
+        rejected["selected_thread"]["thread_id"], safe_thread_id,
+        "rejected oversized selection changed the state target: {rejected}"
+    );
+    let selection = driver.command("thread_selection_view_state", json!({}))?;
+    assert_eq!(
+        selection["selected_local"], safe_index,
+        "GTK selection did not roll back with state: {selection}"
+    );
+    let rejected_state = driver.command("app_state", json!({}))?;
+    ensure!(
+        rejected_state["state"]["last_error"]
+            .as_str()
+            .is_some_and(|error| {
+                error.contains(&format!("contains {OVERSIZED_MESSAGE_COUNT} message(s)"))
+                    && error.contains(&format!(
+                        "safety limit of {}",
+                        notm_ui::model::MAX_LOADED_THREAD_MESSAGES
+                    ))
+                    && error.contains("no partial thread was loaded")
+            }),
+        "oversized rejection was not surfaced: {rejected_state}"
+    );
+
+    let tagged = driver.command("tag_selected", json!({"add": [&mutation_tag]}))?;
+    assert_eq!(
+        tagged["ok"], true,
+        "tag action after oversized rejection failed: {tagged}"
+    );
+    assert_eq!(
+        tagged["state"]["selected_thread"]["thread_id"], safe_thread_id,
+        "post-rejection tag action no longer targeted the restored row: {tagged}"
+    );
+
+    let db = fixture.open_readonly()?;
+    let query_options = notm_notmuch::QueryOptions {
+        excluded_tags: Vec::new(),
+        ..notm_notmuch::QueryOptions::default()
+    };
+    assert_eq!(
+        db.count_messages(&format!("tag:{mutation_tag}"), &query_options)?,
+        1,
+        "post-rejection tag leaked onto the oversized thread"
+    );
+    assert_eq!(
+        db.count_messages(
+            &format!("id:{safe_message_id} and tag:{mutation_tag}"),
+            &query_options,
+        )?,
+        1,
+        "restored safe thread did not receive the tag"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn isolated_message_io_mime_survives_missing_copy_limits_and_restart() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP isolated_message_io_mime_survives_missing_copy_limits_and_restart: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running isolated message-I/O and MIME restart smoke with {display}");
+
+    const MESSAGE_COUNT: usize = 1_001;
+    const NESTING_DEPTH: usize = 80;
+
+    const _: () = {
+        assert!(notm_ui::model::MAX_THREAD_DETAIL_MESSAGES < MESSAGE_COUNT);
+        assert!(MESSAGE_COUNT <= notm_ui::model::MAX_LOADED_THREAD_MESSAGES);
+        assert!(
+            LARGE_THREAD_COMMAND_TIMEOUT.as_secs()
+                < notm_ui::automation::TEST_HARNESS_RESPONSE_TIMEOUT.as_secs()
+        );
+    };
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-message-io-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+
+    let root_message_id = format!("message-io-root-{run_id}@fixture.test");
+    let malformed_message_id = format!("message-io-malformed-{run_id}@fixture.test");
+    let newest_message_id = format!("message-io-reply-1000-{run_id}@fixture.test");
+    let subject = "Message I/O robustness thread";
+    let root_bytes = message_io_attachment_message(&root_message_id, subject);
+    let first_copy = fixture
+        .maildir
+        .join("cur")
+        .join(format!("message-io-{run_id}-a:2,"));
+    let second_copy = fixture
+        .maildir
+        .join("cur")
+        .join(format!("message-io-{run_id}-b:2,"));
+    fs::write(&first_copy, &root_bytes)?;
+    fs::hard_link(&first_copy, &second_copy)?;
+
+    let base_date = chrono::DateTime::parse_from_rfc3339("2026-06-18T20:00:00-06:00")?;
+    {
+        let db = fixture.open_readwrite()?;
+        db.index_file_with_tags(&first_copy, &["inbox", "message-io-e2e"])?;
+        db.index_file_with_tags(&second_copy, &["inbox", "message-io-e2e"])?;
+
+        let malformed_path = fixture
+            .maildir
+            .join("cur")
+            .join(format!("message-io-{run_id}-malformed:2,"));
+        fs::write(
+            &malformed_path,
+            message_io_malformed_nested_message(
+                &malformed_message_id,
+                &root_message_id,
+                subject,
+                &(base_date + chrono::Duration::seconds(1)).to_rfc2822(),
+                NESTING_DEPTH,
+            ),
+        )?;
+        db.index_file_with_tags(&malformed_path, &["inbox", "message-io-e2e"])?;
+
+        for index in 2..MESSAGE_COUNT {
+            let message_id = format!("message-io-reply-{index}-{run_id}@fixture.test");
+            let reply_path = fixture
+                .maildir
+                .join("cur")
+                .join(format!("message-io-{run_id}-{index:04}:2,"));
+            fs::write(
+                &reply_path,
+                message_io_thread_reply(
+                    &message_id,
+                    &root_message_id,
+                    subject,
+                    &(base_date + chrono::Duration::seconds(index as i64)).to_rfc2822(),
+                    index,
+                ),
+            )?;
+            db.index_file_with_tags(&reply_path, &["inbox", "message-io-e2e"])?;
+        }
+    }
+
+    let query_options = notm_notmuch::QueryOptions {
+        limit: 2,
+        excluded_tags: Vec::new(),
+        ..notm_notmuch::QueryOptions::default()
+    };
+    let root_summary = fixture
+        .open_readonly()?
+        .search_messages(&format!("id:{root_message_id}"), &query_options)?
+        .into_iter()
+        .next()
+        .context("indexed message-I/O root was not found")?;
+    ensure!(
+        root_summary.filenames.len() >= 2,
+        "duplicate root did not retain both indexed filenames: {root_summary:?}"
+    );
+    let missing_first = PathBuf::from(&root_summary.filenames[0]);
+    let valid_later = root_summary
+        .filenames
+        .iter()
+        .skip(1)
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+        .with_context(|| format!("root has no valid later filename: {root_summary:?}"))?;
+    fs::remove_file(&missing_first)
+        .with_context(|| format!("removing first indexed copy {}", missing_first.display()))?;
+    ensure!(
+        !missing_first.exists() && valid_later.is_file(),
+        "missing-first setup failed: missing={}, later={}",
+        missing_first.display(),
+        valid_later.display()
+    );
+
+    let opener_marker = work_dir.join("fake-opener.log");
+    install_isolated_text_opener(&work_dir, &opener_marker)?;
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = {}\nexcluded_tags = []\n\
+             \n[identity]\nname = \"Fixture User\"\nprimary_email = \"fixture@example.test\"\n\
+             \n[send]\nenabled = false\n\
+             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n\
+             \n[sync]\nenabled = false\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+            toml::Value::String(format!("id:{root_message_id}")),
+        ),
+    )?;
+
+    let token = format!("notm-message-io-first-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir.clone(), &token, &config_path)?;
+    // This scenario validates correctness while intentionally materializing a
+    // 1,001-message thread. Keep the ordinary 10-second responsiveness
+    // deadline for every other smoke, but allow this correctness-only flow to
+    // complete on slower CI runners.
+    let mut driver = app.connect_with_command_timeout(&token, LARGE_THREAD_COMMAND_TIMEOUT)?;
+    select_first_thread(&mut driver, &format!("id:{root_message_id}"))?;
+    let first_state = driver.command("app_state", json!({}))?;
+    assert_complete_message_io_thread(
+        &first_state,
+        MESSAGE_COUNT,
+        &newest_message_id,
+        &root_message_id,
+        &malformed_message_id,
+    )?;
+    let thread_id = first_state["state"]["selected_thread"]["thread_id"]
+        .as_str()
+        .with_context(|| format!("selected message-I/O thread has no ID: {first_state}"))?;
+    let details = driver.command("thread_ui_details", json!({}))?;
+    let detail = &details["thread_details"][thread_id];
+    let warning = detail["load_warning"]
+        .as_str()
+        .with_context(|| format!("large thread has no explicit detail warning: {details}"))?;
+    ensure!(
+        warning.contains(&format!("contains {MESSAGE_COUNT} message(s)"))
+            && warning.contains(&format!(
+                "safety limit of {}",
+                notm_ui::model::MAX_THREAD_DETAIL_MESSAGES
+            ))
+            && warning.contains("no partial thread was loaded"),
+        "large thread detail warning was incomplete: {warning}"
+    );
+    ensure!(
+        detail["preview"] == ""
+            && detail["has_attachment"] == false
+            && detail["has_encrypted"] == false
+            && detail["has_signed"] == false,
+        "large thread published partial row details despite its warning: {detail}"
+    );
+
+    select_loaded_message(&mut driver, &malformed_message_id)?;
+    let malformed_raw = driver.command("show_raw_source", json!({}))?;
+    assert_eq!(
+        malformed_raw["ok"], true,
+        "binary-tolerant raw view failed for malformed nested MIME: {malformed_raw}"
+    );
+    let malformed_raw_text = driver.command("message_view_text", json!({}))?;
+    let malformed_raw_text = malformed_raw_text["text"]
+        .as_str()
+        .with_context(|| format!("malformed raw view returned no text: {malformed_raw_text}"))?;
+    ensure!(
+        malformed_raw_text.contains("X-Malformed: before-")
+            && malformed_raw_text.contains("-after")
+            && malformed_raw_text.contains("malformed UTF-8 body before")
+            && malformed_raw_text.contains("after invalid bytes"),
+        "binary-tolerant raw view lost the malformed message markers: {malformed_raw_text:?}"
+    );
+
+    let malformed = driver.command("show_text_thread", json!({}))?;
+    assert_eq!(
+        malformed["ok"], true,
+        "bounded MIME failure did not remain recoverable: {malformed}"
+    );
+    let malformed_text = driver.command("message_view_text", json!({}))?;
+    let malformed_text = malformed_text["text"]
+        .as_str()
+        .with_context(|| format!("malformed MIME view returned no text: {malformed_text}"))?;
+    ensure!(
+        malformed_text.contains("Could not parse body:")
+            && malformed_text
+                .to_ascii_lowercase()
+                .contains("nesting depth")
+            && malformed_text.to_ascii_lowercase().contains("limit"),
+        "over-deep MIME did not expose its bounded, recoverable parse failure: {malformed_text:?}"
+    );
+    assert_eq!(driver.command("health", json!({}))?["ok"], true);
+
+    select_loaded_message(&mut driver, &root_message_id)?;
+    let raw = driver.command("show_raw_source", json!({}))?;
+    assert_eq!(raw["ok"], true, "raw source failed via later copy: {raw}");
+    let raw_text = driver.command("message_view_text", json!({}))?;
+    let raw_text = raw_text["text"]
+        .as_str()
+        .with_context(|| format!("raw source returned no text: {raw_text}"))?;
+    ensure!(
+        raw_text.contains(&format!("Message-ID: <{root_message_id}>"))
+            && raw_text.contains("Content-Disposition: attachment; filename=note.txt"),
+        "raw source did not come from the valid later indexed copy: {raw_text:?}"
+    );
+
+    select_loaded_message(&mut driver, &root_message_id)?;
+    let opened_path = open_message_io_attachment(
+        &mut driver,
+        &root_message_id,
+        &opener_marker,
+        "later indexed copy",
+    )?;
+
+    let persisted: toml::Value = fs::read_to_string(&config_path)?.parse()?;
+    assert_eq!(
+        persisted
+            .get("ui")
+            .and_then(|ui| ui.get("message_view_preferences"))
+            .and_then(|preferences| preferences.get(root_message_id.as_str()))
+            .and_then(toml::Value::as_str),
+        Some("raw_source"),
+        "raw per-message preference was not persisted: {persisted}"
+    );
+
+    let closed = driver.command("close_main_window", json!({}))?;
+    assert_eq!(closed["ok"], true, "first process did not close: {closed}");
+    drop(driver);
+    let status = app.wait_for_exit(STARTUP_TIMEOUT)?;
+    ensure!(
+        status.success(),
+        "first message-I/O process exited with {status}\n{}",
+        app.logs()
+    );
+    ensure!(
+        !opened_path.parent().is_some_and(Path::exists),
+        "normal exit retained the private attachment Open directory: {}",
+        opened_path.display()
+    );
+
+    drop(app.display.take());
+    for path in [&app.socket_path, &app.log_path] {
+        if path.exists() {
+            fs::remove_file(path)
+                .with_context(|| format!("removing first-run artifact {}", path.display()))?;
+        }
+    }
+    let display_dir = work_dir.join("gui-display");
+    if display_dir.exists() {
+        fs::remove_dir_all(&display_dir)
+            .with_context(|| format!("removing first-run display {}", display_dir.display()))?;
+    }
+
+    let moved_copy = fixture
+        .maildir
+        .join("cur")
+        .join(format!("message-io-{run_id}-moved:2,S"));
+    fs::rename(&valid_later, &moved_copy).with_context(|| {
+        format!(
+            "moving current indexed copy {} to {}",
+            valid_later.display(),
+            moved_copy.display()
+        )
+    })?;
+    {
+        let db = fixture.open_readwrite()?;
+        db.remove_message_file(&valid_later)?;
+        db.index_file_with_tags(&moved_copy, &["inbox", "message-io-e2e"])?;
+    }
+    let moved_summary = fixture
+        .open_readonly()?
+        .search_messages(&format!("id:{root_message_id}"), &query_options)?
+        .into_iter()
+        .next()
+        .context("moved message-I/O root was not found after reindex")?;
+    ensure!(
+        !valid_later.exists()
+            && moved_copy.is_file()
+            && moved_summary
+                .filenames
+                .iter()
+                .any(|path| Path::new(path) == moved_copy)
+            && !moved_summary
+                .filenames
+                .iter()
+                .any(|path| Path::new(path) == valid_later),
+        "Maildir move/reindex did not replace the old indexed path: old={}, moved={}, filenames={:?}",
+        valid_later.display(),
+        moved_copy.display(),
+        moved_summary.filenames
+    );
+    fs::remove_file(&opener_marker).context("clearing first-run isolated opener marker")?;
+
+    let restart_token = format!("notm-message-io-restart-{run_id}");
+    let mut restarted = FixtureApp::spawn_with_config(work_dir, &restart_token, &config_path)?;
+    let mut restarted_driver =
+        restarted.connect_with_command_timeout(&restart_token, LARGE_THREAD_COMMAND_TIMEOUT)?;
+    select_first_thread(&mut restarted_driver, &format!("id:{root_message_id}"))?;
+    let restart_state = restarted_driver.command("app_state", json!({}))?;
+    assert_complete_message_io_thread(
+        &restart_state,
+        MESSAGE_COUNT,
+        &newest_message_id,
+        &root_message_id,
+        &malformed_message_id,
+    )?;
+    select_loaded_message(&mut restarted_driver, &root_message_id)?;
+    let restored_raw = restarted_driver.command("message_view_text", json!({}))?;
+    let restored_raw_text = restored_raw["text"]
+        .as_str()
+        .with_context(|| format!("restored raw view returned no text: {restored_raw}"))?;
+    ensure!(
+        restored_raw_text.contains(&format!("Message-ID: <{root_message_id}>"))
+            && restored_raw_text.contains("Content-Disposition: attachment; filename=note.txt"),
+        "restart did not restore the raw per-message view: {restored_raw}"
+    );
+
+    select_loaded_message(&mut restarted_driver, &root_message_id)?;
+    open_message_io_attachment(
+        &mut restarted_driver,
+        &root_message_id,
+        &opener_marker,
+        "moved and reindexed copy after restart",
+    )?;
+
+    select_loaded_message(&mut restarted_driver, &root_message_id)?;
+    let reply = restarted_driver.command("reply_selected", json!({}))?;
+    assert_eq!(reply["ok"], true, "reply via moved copy failed: {reply}");
+    assert_eq!(
+        reply["compose_fields"]["in_reply_to"],
+        format!("<{root_message_id}>")
+    );
+    assert_eq!(reply["compose_fields"]["subject"], format!("Re: {subject}"));
+    ensure!(
+        reply["compose_fields"]["body"]
+            .as_str()
+            .is_some_and(|body| body.contains("> Valid attachment-bearing root body.")),
+        "reply did not quote the selected valid root: {reply}"
+    );
+
+    Ok(())
+}
+
 #[test]
 fn fixture_html_link_hints_label_visible_links_and_cancel() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
@@ -7027,6 +7585,275 @@ fn message_tags(state: &Value) -> anyhow::Result<BTreeMap<String, BTreeSet<Strin
             Ok((message_id, tags))
         })
         .collect()
+}
+
+#[cfg(unix)]
+fn message_io_attachment_message(message_id: &str, subject: &str) -> Vec<u8> {
+    format!(
+        "From: Message I/O Sender <sender@example.test>\r\n\
+         To: Fixture User <fixture@example.test>\r\n\
+         Subject: {subject}\r\n\
+         Date: Thu, 18 Jun 2026 20:00:00 -0600\r\n\
+         Message-ID: <{message_id}>\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: multipart/mixed; boundary=message-io-root\r\n\r\n\
+         --message-io-root\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\r\n\
+         Valid attachment-bearing root body.\r\n\
+         --message-io-root\r\n\
+         Content-Type: text/plain; name=note.txt\r\n\
+         Content-Disposition: attachment; filename=note.txt\r\n\
+         Content-Transfer-Encoding: base64\r\n\r\n\
+         bWVzc2FnZS1JL08gYXR0YWNobWVudA0K\r\n\
+         --message-io-root--\r\n"
+    )
+    .into_bytes()
+}
+
+#[cfg(unix)]
+fn message_io_malformed_nested_message(
+    message_id: &str,
+    root_message_id: &str,
+    subject: &str,
+    date: &str,
+    depth: usize,
+) -> Vec<u8> {
+    let mut raw = format!(
+        "From: Broken MIME <broken@example.test>\r\n\
+         To: Fixture User <fixture@example.test>\r\n\
+         Subject: Re: {subject}\r\n\
+         Date: {date}\r\n\
+         Message-ID: <{message_id}>\r\n\
+         In-Reply-To: <{root_message_id}>\r\n\
+         References: <{root_message_id}>\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: multipart/mixed; boundary=message-io-malformed\r\n\
+         X-Malformed: before-"
+    )
+    .into_bytes();
+    raw.extend_from_slice(&[0xff, 0xfe]);
+    raw.extend_from_slice(
+        b"-after\r\n\r\n\
+          --message-io-malformed\r\n\
+          Content-Type: text/plain; charset=utf-8\r\n\r\n\
+          malformed UTF-8 body before ",
+    );
+    raw.extend_from_slice(&[0xff, 0xfe]);
+    raw.extend_from_slice(b" after invalid bytes\r\n--message-io-malformed\r\n");
+    append_message_io_nested_multipart(&mut raw, depth);
+    raw.extend_from_slice(b"\r\n--message-io-malformed--\r\n");
+    raw
+}
+
+#[cfg(unix)]
+fn append_message_io_nested_multipart(raw: &mut Vec<u8>, depth: usize) {
+    if depth == 0 {
+        raw.extend_from_slice(
+            b"Content-Type: text/plain; charset=utf-8\r\n\r\ndeep MIME leaf marker",
+        );
+        return;
+    }
+
+    let boundary = format!("message-io-depth-{depth}");
+    raw.extend_from_slice(
+        format!("Content-Type: multipart/mixed; boundary={boundary}\r\n\r\n--{boundary}\r\n")
+            .as_bytes(),
+    );
+    append_message_io_nested_multipart(raw, depth - 1);
+    raw.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+}
+
+#[cfg(unix)]
+fn message_io_thread_reply(
+    message_id: &str,
+    root_message_id: &str,
+    subject: &str,
+    date: &str,
+    index: usize,
+) -> Vec<u8> {
+    format!(
+        "From: Reply {index} <reply-{index}@example.test>\r\n\
+         To: Fixture User <fixture@example.test>\r\n\
+         Subject: Re: {subject}\r\n\
+         Date: {date}\r\n\
+         Message-ID: <{message_id}>\r\n\
+         In-Reply-To: <{root_message_id}>\r\n\
+         References: <{root_message_id}>\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\r\n\
+         Message-I/O thread reply {index}.\r\n"
+    )
+    .into_bytes()
+}
+
+#[cfg(unix)]
+fn open_message_io_attachment(
+    driver: &mut UiDriver,
+    root_message_id: &str,
+    opener_marker: &Path,
+    source_description: &str,
+) -> anyhow::Result<PathBuf> {
+    let listed = driver.command("attachment_list_items", json!({}))?;
+    let attachments = json_array_at(&listed, &["attachments"])?;
+    let attachment_index = attachments
+        .iter()
+        .position(|attachment| {
+            attachment["message_id"] == root_message_id && attachment["filename"] == "note.txt"
+        })
+        .with_context(|| {
+            format!("root attachment was not listed via {source_description}: {listed}")
+        })?;
+    let opened = driver.command("open_attachment", json!({"index": attachment_index}))?;
+    ensure!(
+        opened["ok"] == true,
+        "root attachment could not be opened via {source_description}: {opened}"
+    );
+    let opened_path = opened["path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("attachment Open returned no path: {opened}"))?;
+    ensure!(
+        fs::read(&opened_path)? == b"message-I/O attachment\r\n",
+        "attachment bytes changed when opened via {source_description}"
+    );
+    let opener_call = wait_for_file_text(opener_marker, STARTUP_TIMEOUT)?;
+    ensure!(
+        opener_call.contains(&opened_path.display().to_string()),
+        "isolated opener did not receive {} via {source_description}: {opener_call:?}",
+        opened_path.display()
+    );
+    Ok(opened_path)
+}
+
+#[cfg(unix)]
+fn install_isolated_text_opener(work_dir: &Path, marker: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let applications = work_dir.join("data/applications");
+    let config_home = work_dir.join("config");
+    fs::create_dir_all(&applications)?;
+    fs::create_dir_all(&config_home)?;
+    let opener = work_dir.join("fake-open");
+    fs::write(
+        &opener,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" > {}\n",
+            shell_single_quote(marker)
+        ),
+    )?;
+    fs::set_permissions(&opener, fs::Permissions::from_mode(0o755))?;
+
+    let desktop_id = "notm-message-io-test-opener.desktop";
+    fs::write(
+        applications.join(desktop_id),
+        format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=notm message-I/O test opener\n\
+             Exec={} %u\n\
+             MimeType=text/plain;application/octet-stream;\n\
+             NoDisplay=true\n",
+            opener.display()
+        ),
+    )?;
+    fs::write(
+        applications.join("mimeinfo.cache"),
+        format!("[MIME Cache]\ntext/plain={desktop_id};\napplication/octet-stream={desktop_id};\n"),
+    )?;
+    fs::write(
+        config_home.join("mimeapps.list"),
+        format!(
+            "[Default Applications]\ntext/plain={desktop_id}\napplication/octet-stream={desktop_id}\n\
+             [Added Associations]\ntext/plain={desktop_id};\napplication/octet-stream={desktop_id};\n"
+        ),
+    )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn shell_single_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+#[cfg(unix)]
+fn wait_for_file_text(path: &Path, timeout: Duration) -> anyhow::Result<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match fs::read_to_string(path) {
+            Ok(value) if !value.trim().is_empty() => return Ok(value),
+            Ok(_) | Err(_) if Instant::now() < deadline => {
+                thread::sleep(STARTUP_POLL_INTERVAL);
+            }
+            Ok(_) => anyhow::bail!("{} stayed empty for {timeout:?}", path.display()),
+            Err(error) => anyhow::bail!(
+                "{} was not written within {timeout:?}: {error}",
+                path.display()
+            ),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn assert_complete_message_io_thread(
+    state: &Value,
+    expected_count: usize,
+    newest_message_id: &str,
+    root_message_id: &str,
+    malformed_message_id: &str,
+) -> anyhow::Result<()> {
+    let messages = json_array_at(state, &["state", "messages"])?;
+    let reported_total = state["state"]["selected_thread"]["total_messages"]
+        .as_u64()
+        .unwrap_or_default();
+    ensure!(
+        messages.len() == expected_count,
+        "message-I/O thread was silently truncated: loaded {}, expected {}, thread reported {}",
+        messages.len(),
+        expected_count,
+        reported_total
+    );
+    ensure!(
+        reported_total == expected_count as u64,
+        "message-I/O thread summary reported {reported_total}, expected {expected_count}"
+    );
+    let actual_newest = messages
+        .last()
+        .and_then(|message| message["message_id"].as_str());
+    ensure!(
+        actual_newest == Some(newest_message_id),
+        "message-I/O thread did not load its actual newest message: got {actual_newest:?}, expected {newest_message_id}"
+    );
+    for message_id in [root_message_id, malformed_message_id, newest_message_id] {
+        ensure!(
+            messages
+                .iter()
+                .any(|message| message["message_id"] == message_id),
+            "message-I/O thread omitted {message_id} from {} loaded messages",
+            messages.len()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn select_loaded_message(driver: &mut UiDriver, message_id: &str) -> anyhow::Result<Value> {
+    let state = driver.command("app_state", json!({}))?;
+    let messages = json_array_at(&state, &["state", "messages"])?;
+    let index = messages
+        .iter()
+        .position(|message| message["message_id"] == message_id)
+        .with_context(|| {
+            format!(
+                "loaded thread has no message {message_id} among {} messages",
+                messages.len()
+            )
+        })?;
+    let selected = driver.command("select_message_by_index", json!({"index": index}))?;
+    ensure!(
+        selected["ok"] == true && selected["selected_message"]["message_id"] == message_id,
+        "could not select message {message_id}: {selected}"
+    );
+    Ok(selected)
 }
 
 #[cfg(unix)]

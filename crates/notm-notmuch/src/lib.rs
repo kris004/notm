@@ -12,7 +12,9 @@ pub mod tags;
 pub mod thread;
 
 pub use config::{ConfigProfile, LoadedIdentity};
-pub use database::{Database, DatabaseMode, OpenConfig, Revision};
+pub use database::{
+    Database, DatabaseMode, OpenConfig, ResolvedMessageFile, Revision, ThreadMessagePage,
+};
 pub use error::{Error, Result};
 pub use message::{
     AppliedTagChange, MaildirFilenameChange, MaildirFlagSyncFailure, MessageSummary,

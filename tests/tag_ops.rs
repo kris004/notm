@@ -145,7 +145,7 @@ fn exact_thread_ids_remain_targets_after_search_reorders() -> anyhow::Result<()>
         .collect::<Vec<_>>();
     let expected_message_ids = selected_thread_ids
         .iter()
-        .map(|thread_id| db.thread_messages(thread_id))
+        .map(|thread_id| db.thread_messages_bounded(thread_id, 4_096))
         .collect::<notm_notmuch::Result<Vec<_>>>()?
         .into_iter()
         .flatten()
@@ -415,17 +415,16 @@ fn removes_indexed_message_file_from_database() -> anyhow::Result<()> {
     let options = query_options(SortOrder::NewestFirst);
     let db = fixture.open_readwrite()?;
     let messages = db.search_messages("subject:\"Draft like message\"", &options)?;
-    let filename = messages
-        .first()
-        .and_then(|message| message.filenames.first())
-        .expect("fixture draft filename")
-        .clone();
+    let filename = db
+        .open_message_file(messages.first().expect("fixture draft message"))?
+        .path()
+        .to_path_buf();
 
-    db.remove_message_file(Path::new(&filename))?;
+    db.remove_message_file(&filename)?;
     let count = db.count_messages("subject:\"Draft like message\"", &options)?;
 
     assert_eq!(count, 0);
-    assert!(Path::new(&filename).exists());
+    assert!(filename.exists());
     db.close()?;
     Ok(())
 }

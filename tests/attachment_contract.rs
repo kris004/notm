@@ -8,7 +8,8 @@ fn extracts_attachment_bytes_from_fixture_message() -> anyhow::Result<()> {
             &notm_notmuch::QueryOptions::default(),
         )?
         .remove(0);
-    let attachments = notm_mail::mime::extract_attachments_from_file(&msg.filenames[0])?;
+    let attachments =
+        notm_mail::mime::extract_attachments_from_reader(db.open_message_file(&msg)?)?;
     assert_eq!(attachments.len(), 1);
     assert_eq!(attachments[0].filename, "note.txt");
     assert!(String::from_utf8_lossy(&attachments[0].bytes).contains("attached text"));
@@ -25,7 +26,8 @@ fn saves_fixture_attachment_without_replacing_existing_file() -> anyhow::Result<
             &notm_notmuch::QueryOptions::default(),
         )?
         .remove(0);
-    let attachments = notm_mail::mime::extract_attachments_from_file(&message.filenames[0])?;
+    let attachments =
+        notm_mail::mime::extract_attachments_from_reader(db.open_message_file(&message)?)?;
     let attachment = attachments.first().expect("fixture attachment");
     let downloads = tempfile::tempdir()?;
     let original_path = downloads.path().join("note.txt");

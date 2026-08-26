@@ -33,7 +33,7 @@ fn searches_fixture_thread_by_message_id() -> anyhow::Result<()> {
 
     let threads = db.search_threads("id:html-message@fixture.test", &options)?;
     assert_eq!(threads.len(), 1);
-    let messages = db.thread_messages(&threads[0].thread_id)?;
+    let messages = db.thread_messages_bounded(&threads[0].thread_id, 4_096)?;
     assert!(
         messages
             .iter()

@@ -12,6 +12,13 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+/// Bounded server-side fail-safe for authenticated test-harness commands.
+///
+/// Ordinary drivers impose a shorter 10-second responsiveness deadline. This
+/// stays slightly above the 30-second opt-in deadline used by correctness-only
+/// scenarios so the server does not preempt the client that owns the timeout.
+pub const TEST_HARNESS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(35);
+
 #[derive(Debug)]
 pub struct AutomationRequest {
     pub command: String,
@@ -206,7 +213,7 @@ fn handle_client(
             );
             continue;
         }
-        match resp_rx.recv_timeout(Duration::from_secs(15)) {
+        match resp_rx.recv_timeout(TEST_HARNESS_RESPONSE_TIMEOUT) {
             Ok(value) => {
                 let _ = writeln!(writer, "{}", value);
                 let _ = writer.flush();
