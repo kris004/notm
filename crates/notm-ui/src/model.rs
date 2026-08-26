@@ -117,7 +117,6 @@ pub struct UiState {
     pub messages: Vec<MessageSummary>,
     pub visible_tags: Vec<String>,
     pub address_suggestions: Vec<String>,
-    pub trusted_image_senders: Vec<String>,
     pub pending_open_message_id: Option<String>,
     pub compose_fields: ComposeFields,
     #[serde(default)]
@@ -194,7 +193,6 @@ impl Default for UiState {
             messages: Vec::new(),
             visible_tags: Vec::new(),
             address_suggestions: Vec::new(),
-            trusted_image_senders: Vec::new(),
             pending_open_message_id: None,
             compose_fields: ComposeFields::default(),
             compose_generation: 0,

@@ -148,7 +148,6 @@ pub struct SettingsDialogSeed {
     pub prefer_html_view: bool,
     pub start_maximized: bool,
     pub show_debug_panel: bool,
-    pub trusted_image_senders: Vec<String>,
     pub hidden_tag_searches: Vec<String>,
     pub send_enabled: bool,
     pub send_command: Option<PathBuf>,
@@ -192,7 +191,6 @@ pub struct SettingsApplication {
     pub show_message_view: bool,
     pub prefer_html_view: bool,
     pub show_debug_panel: bool,
-    pub trusted_image_senders: Vec<String>,
     pub hidden_tag_searches: BTreeSet<String>,
 }
 
@@ -212,6 +210,7 @@ pub struct SettingsDialogTestState {
     pub theme: String,
     pub thread_preview_lines: String,
     pub show_thread_preview: bool,
+    pub remote_images: bool,
 }
 
 struct PendingSettingsDialog {
@@ -220,6 +219,7 @@ struct PendingSettingsDialog {
     theme: gtk::ComboBoxText,
     thread_preview_lines: gtk::Entry,
     show_thread_preview: gtk::CheckButton,
+    remote_images: gtk::CheckButton,
 }
 
 struct SettingsControllerInner {
@@ -283,7 +283,13 @@ impl SettingsController {
         search.set_placeholder_text(Some("Search settings"));
         area.append(&search);
 
-        let existing = read_settings_toml(seed.app_config_path.as_deref());
+        let existing = match read_settings_toml(seed.app_config_path.as_deref()) {
+            Ok(existing) => existing,
+            Err(error) => {
+                (status)(format!("Settings config read failed: {error}"));
+                toml::Value::Table(Default::default())
+            }
+        };
         let scrolled = gtk::ScrolledWindow::builder()
             .hexpand(true)
             .vexpand(true)
@@ -496,15 +502,9 @@ impl SettingsController {
         );
         let remote_images = settings_check_row(
             &form,
-            "Load remote images",
+            "Always load remote images in all messages",
             seed.runtime.remote_images,
-            "If off, HTML mail starts with remote images blocked unless the sender is trusted.",
-        );
-        let trusted_image_senders = settings_entry_row(
-            &form,
-            "Trusted image senders",
-            &join_string_list(&seed.trusted_image_senders),
-            "Senders whose remote images may load by default, comma separated.",
+            "Global privacy override. If enabled, every Visual HTML message may contact remote servers automatically. Keep this off to block remote content by default and use Load remote images once per message.",
         );
         let hidden_tag_searches = settings_entry_row(
             &form,
@@ -753,6 +753,7 @@ impl SettingsController {
             theme: theme.clone(),
             thread_preview_lines: thread_preview_lines.clone(),
             show_thread_preview: show_thread_preview.clone(),
+            remote_images: remote_images.clone(),
         });
         let app_config_path = seed.app_config_path.clone();
         let pending_for_response = Rc::downgrade(&self.inner);
@@ -815,7 +816,6 @@ impl SettingsController {
                     start_maximized: start_maximized.is_active(),
                     show_debug_panel: show_debug_panel.is_active(),
                     remote_images: remote_images.is_active(),
-                    trusted_image_senders: trusted_image_senders.text().to_string(),
                     hidden_tag_searches: hidden_tag_searches.text().to_string(),
                     send_enabled: send_enabled.is_active(),
                     send_transport: combo_active_id(&send_transport),
@@ -918,11 +918,12 @@ impl SettingsController {
                 theme: combo_active_id(&pending.theme),
                 thread_preview_lines: pending.thread_preview_lines.text().to_string(),
                 show_thread_preview: pending.show_thread_preview.is_active(),
+                remote_images: pending.remote_images.is_active(),
             })
     }
 
     pub fn respond_test(&self, args: &serde_json::Value) -> anyhow::Result<u64> {
-        let (dialog_id, dialog, theme_combo, preview_entry, preview_check) = {
+        let (dialog_id, dialog, theme_combo, preview_entry, preview_check, remote_images) = {
             let pending = self.inner.pending.borrow();
             let pending = pending
                 .as_ref()
@@ -945,6 +946,7 @@ impl SettingsController {
                 pending.theme.clone(),
                 pending.thread_preview_lines.clone(),
                 pending.show_thread_preview.clone(),
+                pending.remote_images.clone(),
             )
         };
 
@@ -967,6 +969,12 @@ impl SettingsController {
             .and_then(serde_json::Value::as_bool)
         {
             preview_check.set_active(visible);
+        }
+        if let Some(enabled) = args
+            .get("remote_images")
+            .and_then(serde_json::Value::as_bool)
+        {
+            remote_images.set_active(enabled);
         }
 
         let response_name = args
@@ -1020,7 +1028,6 @@ struct SettingsValues {
     start_maximized: bool,
     show_debug_panel: bool,
     remote_images: bool,
-    trusted_image_senders: String,
     hidden_tag_searches: String,
     send_enabled: bool,
     send_transport: String,
@@ -1077,7 +1084,6 @@ fn apply_settings_values(values: &SettingsValues) -> anyhow::Result<SettingsAppl
         show_message_view: values.show_message_view,
         prefer_html_view: values.html_mode == "visual_html_preferred",
         show_debug_panel: values.show_debug_panel,
-        trusted_image_senders: parse_string_list(&values.trusted_image_senders),
         hidden_tag_searches: parse_string_list(&values.hidden_tag_searches)
             .into_iter()
             .collect(),
@@ -1405,10 +1411,11 @@ fn settings_readonly_row(container: &gtk::Box, label_text: &str, value: &str, to
     container.append(&row);
 }
 
-fn read_settings_toml(path: Option<&Path>) -> toml::Value {
-    path.and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| text.parse::<toml::Value>().ok())
-        .unwrap_or_else(|| toml::Value::Table(Default::default()))
+fn read_settings_toml(path: Option<&Path>) -> anyhow::Result<toml::Value> {
+    match path {
+        Some(path) => read_settings_toml_for_update(path),
+        None => Ok(toml::Value::Table(Default::default())),
+    }
 }
 
 fn read_settings_toml_for_update(path: &Path) -> anyhow::Result<toml::Value> {
@@ -1632,12 +1639,10 @@ fn persist_settings_values(path: Option<&Path>, values: &SettingsValues) -> anyh
     set_bool(root, "ui", "start_maximized", values.start_maximized);
     set_bool(root, "ui", "show_debug_panel", values.show_debug_panel);
     set_bool(root, "ui", "remote_images", values.remote_images);
-    set_string_array(
-        root,
-        "ui",
-        "trusted_image_senders",
-        parse_string_list(&values.trusted_image_senders),
-    );
+    // Sender addresses in raw mail headers are unauthenticated. Drop the
+    // retired allow-list on the next successful all-settings save rather than
+    // carrying an unsafe permission forward.
+    table_entry(root, "ui").remove("trusted_image_senders");
     set_string_array(
         root,
         "ui",
@@ -1844,7 +1849,9 @@ pub fn persist_basic_settings(
         toml::Value::String(default_query.to_string()),
     );
     persist_read_only_notmuch_invariant(root);
-    table_entry(root, "ui").insert(
+    let ui = table_entry(root, "ui");
+    ui.remove("trusted_image_senders");
+    ui.insert(
         "page_size".to_string(),
         toml::Value::Integer(page_size as i64),
     );
@@ -1867,8 +1874,9 @@ pub fn persist_ui_value(
         return Ok(());
     };
     let mut value = read_settings_toml_for_update(path)?;
-    table_entry(value.as_table_mut().expect("value is table"), "ui")
-        .insert(key.to_string(), setting);
+    let ui = table_entry(value.as_table_mut().expect("value is table"), "ui");
+    ui.remove("trusted_image_senders");
+    ui.insert(key.to_string(), setting);
     persist_private_settings_toml(path, &value)
 }
 
@@ -1878,6 +1886,15 @@ fn persist_private_settings_toml(path: &Path, value: &toml::Value) -> anyhow::Re
 }
 
 fn atomic_write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    atomic_write_private_with_rename(path, bytes, |source, destination| {
+        std::fs::rename(source, destination)
+    })
+}
+
+fn atomic_write_private_with_rename<F>(path: &Path, bytes: &[u8], rename: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
     let configured_parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
@@ -1901,7 +1918,7 @@ fn atomic_write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         temporary.write_all(bytes)?;
         temporary.sync_all()?;
         drop(temporary);
-        std::fs::rename(&temporary_path, path)?;
+        rename(&temporary_path, path)?;
         Ok(())
     })();
     if write_result.is_err() {
@@ -2046,7 +2063,8 @@ mod tests {
         let path = config_directory.join("config.toml");
         std::fs::write(
             &path,
-            "[unrelated]\nkeep = \"yes\"\n\n[ui]\nshow_sidebar = true\n",
+            "[unrelated]\nkeep = \"yes\"\n\n[ui]\nshow_sidebar = true\n\
+             trusted_image_senders = [\"spoofable@example.test\"]\n",
         )
         .expect("seed settings");
         #[cfg(unix)]
@@ -2071,6 +2089,10 @@ mod tests {
         assert_eq!(value["unrelated"]["keep"].as_str(), Some("yes"));
         assert_eq!(value["ui"]["show_sidebar"].as_bool(), Some(true));
         assert_eq!(value["ui"]["hidden_tag_searches"][0].as_str(), Some("sent"));
+        assert!(
+            value["ui"].get("trusted_image_senders").is_none(),
+            "a successful atomic UI save must retire the unsafe legacy sender allow-list"
+        );
         #[cfg(unix)]
         {
             assert_eq!(
@@ -2161,6 +2183,35 @@ mod tests {
         )
         .expect_err("non-table settings must be rejected");
         assert!(error.to_string().contains("must contain a TOML table"));
+    }
+
+    #[test]
+    fn failed_atomic_settings_rename_preserves_original_policy_and_cleans_temporary_file() {
+        let directory = tempfile::tempdir().expect("temporary settings directory");
+        let path = directory.path().join("config.toml");
+        let original = b"[ui]\nremote_images = false\n";
+        std::fs::write(&path, original).expect("seed remote-image policy");
+
+        let result =
+            atomic_write_private_with_rename(&path, b"[ui]\nremote_images = true\n", |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "simulated atomic rename failure",
+                ))
+            });
+
+        let error = result.expect_err("failed rename must reject policy save");
+        assert!(error.to_string().contains("writing app config"), "{error}");
+        assert_eq!(
+            std::fs::read(&path).expect("read preserved config"),
+            original,
+            "failed persistence must not broaden the stored remote-image policy"
+        );
+        let entries = std::fs::read_dir(directory.path())
+            .expect("list config directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read config entries");
+        assert_eq!(entries.len(), 1, "failed write left a temporary file");
     }
 
     #[test]

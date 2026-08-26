@@ -1,4 +1,4 @@
-.TH NOTM-TEST-HARNESS 7 "2026-08-19" "notm 0.1.1" "Miscellaneous"
+.TH NOTM-TEST-HARNESS 7 "2026-08-25" "notm 0.1.1" "Miscellaneous"
 .SH NAME
 notm-test-harness \- developer test harness for notm
 .SH DESCRIPTION
@@ -158,7 +158,6 @@ It targets the selected message ID only and ignores thread multi-selection.
 .BR show_visual_html ,
 .BR image_policy ,
 .BR load_images_once ,
-.BR trust_sender_images ,
 .BR view_preference_state ,
 .BR click_sender_view_preference ,
 .BR start_link_hints ,
@@ -174,6 +173,11 @@ It targets the selected message ID only and ignores thread multi-selection.
 .BR open_attachment ,
 .BR attachment_test_state ,
 .BR respond_attachment_save .
+.PP
+.B load_images_once
+reloads Visual HTML with remote images enabled only for the current message
+view.  It creates no durable sender permission and resets on navigation or
+application restart.
 .SS UI and debugging
 .BR open_command_palette ,
 .BR command_completion ,

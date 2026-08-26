@@ -202,8 +202,11 @@ pub struct UiConfig {
     pub show_keybind_hints: bool,
     #[serde(default)]
     pub remote_images: bool,
-    #[serde(default)]
-    pub trusted_image_senders: Vec<String>,
+    // Raw From headers are not authenticated by Notmuch. Keep accepting the
+    // former sender allow-list so existing configs still load, but never expose
+    // or serialize it as an effective permission.
+    #[serde(default, rename = "trusted_image_senders", skip_serializing)]
+    _legacy_trusted_image_senders: Vec<String>,
     #[serde(default = "default_html_mode")]
     pub html_mode: String,
     #[serde(default)]
@@ -248,7 +251,7 @@ impl Default for UiConfig {
             show_thread_preview: true,
             show_keybind_hints: true,
             remote_images: false,
-            trusted_image_senders: Vec::new(),
+            _legacy_trusted_image_senders: Vec::new(),
             html_mode: "sanitize_then_render_text_fallback".to_string(),
             message_view_preferences: BTreeMap::new(),
             sender_view_preferences: BTreeMap::new(),
@@ -860,6 +863,7 @@ mod tests {
     fn legacy_keys_and_arbitrary_send_environment_are_accepted_but_not_serialized() {
         let config = parse_validated(
             "[ui]\nconfirm_destructive_tag_actions = false\n\
+             trusted_image_senders = [\"SPOOFED@EXAMPLE.TEST\", \"not an address\"]\n\
              \n[send]\none_live_self_test_per_run = true\n\
              \n[send.env]\nNOTM_CUSTOM_VARIABLE = \"value\"\n\
              \n[sync]\nshow_manual_sync_button = true\n",
@@ -874,9 +878,14 @@ mod tests {
                 .map(String::as_str),
             Some("value")
         );
+        assert!(
+            !config.ui.remote_images,
+            "ignored legacy sender entries must not broaden the global image policy"
+        );
         let serialized = toml::to_string(&config).expect("serialize configuration");
         for legacy_key in [
             "confirm_destructive_tag_actions",
+            "trusted_image_senders",
             "one_live_self_test_per_run",
             "show_manual_sync_button",
         ] {
