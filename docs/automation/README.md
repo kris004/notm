@@ -40,20 +40,33 @@ Example request:
 the new generation. `select_saved_search` and `load_more_threads` use the same
 background-search state. Poll `search_status` until `loading` is false before
 inspecting final rows; a non-null `error` means the current generation failed.
-Fixture harnesses may add `test_delay_ms` (up to 5000) when testing that the UI
-and harness remain responsive during an outstanding search. The delay option is
-rejected for non-fixture runs.
+Tag commands likewise return `pending: true` after scheduling. Poll
+`tag_status` until `in_progress` is false for writer completion. A tag result
+may then start an authoritative reconciliation search; if `search_status`
+reports `loading: true`, poll it until `loading` is false before inspecting
+final rows, current filenames, undo history, or path-based message actions.
+Fixture harnesses may add `test_delay_ms` (up to 5000) to `run_search` or
+`tag_selected` when testing responsiveness. A disposable non-fixture tag-race
+harness may use the delay only with `automation.allow_live_tag_test = true`;
+other non-fixture runs reject it.
+If `tag_status.paths_uncertain` is true, retained message and draft paths are
+intentionally disabled and the process must be restarted before driving any
+path, tag, send, or sync action. A reported partial result with known paths
+instead remains blocked only through its automatic reconciliation search.
 
 Thread/message and message-derived composer preparation plus recovery-draft
 persistence have equivalent fixture-only controls. `set_fixture_thread_delay`,
 `set_fixture_composer_preparation_delay`, `set_fixture_draft_delay`, and
 `set_fixture_attachment_delay` inject at most 5000 milliseconds of worker-side
-I/O delay; `fail_next_draft_write` injects one persistence failure.
+I/O delay. `fail_next_draft_write` and `fail_next_attachment_write` inject one
+recovery-draft or attachment write failure, respectively. These latency and
+failure-injection controls are fixture-only; the status commands remain
+read-only and available in any test-harness run.
 `thread_load_status`, `composer_preparation_status`, `draft_autosave_status`,
-`draft_io_status`, `recovery_load_status`, and `attachment_io_status` report the current
-generation, activity, and last completion/error. The attachment status also
-reports asynchronous composer attachment caching. Poll those status commands
-rather than waiting inside GTK.
+`draft_io_status`, `recovery_load_status`, and `attachment_io_status` report
+the current generation, activity, and last completion/error. The attachment
+status also reports asynchronous composer attachment caching. Poll those
+status commands rather than waiting inside GTK.
 The `health` response includes those activities plus a monotonically increasing
 `gtk_heartbeat`, so a responsiveness smoke can prove that timers and harness
 input continue to run while slow work is outstanding.
@@ -106,9 +119,9 @@ composer/recovery state is retained.
 
 Implemented test-harness commands include:
 
-- health/state: `health`, `app_state`, `search_status`, `thread_load_status`,
-  `composer_preparation_status`, `draft_autosave_status`,
-  `recovery_load_status`, `get_logs`, `screenshot`
+- health/state: `health`, `app_state`, `search_status`, `tag_status`,
+  `thread_load_status`, `composer_preparation_status`,
+  `draft_autosave_status`, `recovery_load_status`, `get_logs`, `screenshot`
 - search/navigation: `focus_search`, `set_search_query`, `run_search`,
   `load_more_threads`, `scroll_thread_list_to_bottom`, `thread_page_info`,
   `thread_selection_view_state`, `thread_row_layout`, `thread_list_rows`,
@@ -134,12 +147,13 @@ Implemented test-harness commands include:
   `list_drafts`, `select_draft_by_index`, `load_selected_draft`,
   `delete_selected_draft`, `delete_active_draft`, `delete_local_draft`,
   `load_draft`, `clear_draft`, `draft_list_state`, `draft_io_status`,
-  `set_fixture_draft_delay`, `fail_next_draft_write`,
+  `refresh_named_drafts`, `set_fixture_draft_delay`, `fail_next_draft_write`,
   `activate_draft_by_index`, `click_delete_selected_draft`,
   `pending_confirmation`, `respond_confirmation`,
   `save_selected_attachment`, `save_attachment`, `open_selected_attachment`,
   `open_attachment`, `attachment_test_state`, `attachment_io_status`,
-  `set_fixture_attachment_delay`, `respond_attachment_save`
+  `set_fixture_attachment_delay`, `fail_next_attachment_write`,
+  `respond_attachment_save`
 - message actions: `show_raw_source`, `open_raw_source`, `show_full_headers`,
   `full_headers`, `show_text_thread`, `show_rendered_thread`,
   `toggle_text_visual`, `show_visual_html`, `show_html_visual`, `image_policy`,
@@ -151,6 +165,9 @@ Implemented test-harness commands include:
   `start_link_hints`, `link_hint_state`, `input_link_hint`,
   `cancel_link_hints`, `toggle_quote_collapse`, `message_view_text`,
   `copy_message_id`, `copy_thread_id`
+- standalone windows: `standalone_message_windows`,
+  `close_standalone_message_windows`, `standalone_select_message`,
+  `standalone_respond`
 - UI/debug: `send_key`, `open_command_palette`, `command_completion`,
   `open_shortcuts`, `show_shortcuts`, `help_search`, `run_command`,
   `run_manual_sync`, `open_settings`, `settings_test_state`,
@@ -212,6 +229,9 @@ Named-draft migration, bounded directory scanning, file reads, JSON parsing,
 explicit save/index/replacement, and deletion run on workers. The rendered list
 uses the last completed snapshot (at most 256 drafts, 2 MiB per file, and
 32 MiB total), so a failed refresh leaves the last good list visible.
+The fixture-only `refresh_named_drafts` command schedules that refresh and
+returns its generation; poll `draft_io_status.list_busy` until it is false.
+Its optional `migrate_legacy: true` path exercises the same bounded migration.
 `set_fixture_draft_delay` also delays these explicit draft operations.
 
 ### Confirmation dialog seam
@@ -315,9 +335,16 @@ before checking `last_send_report`, `last_error`, or send-related file changes.
 If the primary window closes while a send is pending, the application remains
 alive until send finalization completes.
 
-`close_main_window` closes only the primary window after returning its response,
-unless dirty compose state first defers it behind a confirmation. Standalone
-message windows, if any, are left open.
+`close_main_window` schedules closure of only the primary window after returning
+its response. Dirty compose state can first defer it behind a confirmation.
+Outstanding send, sync, or tag work, a tag-warning reconciliation search, or an
+active draft save instead hides the window and defers closure until that work
+settles; the latest recovery-draft state is then flushed asynchronously before
+the window closes. A failed reconciliation or recovery-draft flush re-presents
+the window and reports the error. Standalone message windows, if any, are left
+open. Attachment workers hold the application independently: the primary window
+may close while a save finishes, but the process remains alive until the worker
+publishes the complete file or reports failure.
 
 `set_layout` accepts `auto`, `columns` (with `three_pane` kept as a
 compatibility spelling), and `stacked`. `toggle_layout` cycles through columns,

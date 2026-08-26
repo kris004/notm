@@ -211,6 +211,7 @@ pub(crate) struct AttachmentController {
     next_save_id: Rc<Cell<u64>>,
     render_generation: Rc<Cell<u64>>,
     io: AttachmentIoLauncher,
+    actions_sensitive: Rc<Cell<bool>>,
 }
 
 impl AttachmentController {
@@ -261,6 +262,7 @@ impl AttachmentController {
                     AttachmentOpener::System
                 },
             },
+            actions_sensitive: Rc::new(Cell::new(true)),
         }
     }
 
@@ -284,6 +286,16 @@ impl AttachmentController {
         self.title.set_visible(false);
         self.scrolled.set_visible(false);
     }
+
+    pub(crate) fn set_actions_sensitive(&self, sensitive: bool) {
+        self.actions_sensitive.set(sensitive);
+        self.list.set_sensitive(sensitive);
+    }
+
+    /// Prepared attachment metadata and MIME-part ordering do not change when
+    /// tags change. Lazy payload sources resolve stale cached paths by
+    /// Message-ID when read, so no retained summary needs replacement here.
+    pub(crate) fn apply_authoritative_messages(&self, _messages: &[notm_notmuch::MessageSummary]) {}
 
     pub(crate) fn refresh_prepared(
         &self,
@@ -428,6 +440,10 @@ impl AttachmentController {
     }
 
     pub(crate) fn payload_at_index(&self, index: usize) -> anyhow::Result<AttachmentPayload> {
+        anyhow::ensure!(
+            self.actions_sensitive.get(),
+            "attachment actions are unavailable while tags are changing"
+        );
         match self.items.borrow().get(index).cloned() {
             Some(item) => self.thread_payload(&item),
             None => anyhow::bail!("attachment index {index} is not prepared"),
@@ -435,6 +451,10 @@ impl AttachmentController {
     }
 
     pub(crate) fn active_payload(&self) -> anyhow::Result<AttachmentPayload> {
+        anyhow::ensure!(
+            self.actions_sensitive.get(),
+            "attachment actions are unavailable while tags are changing"
+        );
         match self.selected_thread_attachment() {
             Some(item) => self.thread_payload(&item),
             None => anyhow::bail!("no prepared attachment is selected"),
@@ -732,6 +752,10 @@ impl AttachmentController {
     }
 
     fn thread_payload(&self, item: &ThreadAttachmentItem) -> anyhow::Result<AttachmentPayload> {
+        anyhow::ensure!(
+            self.actions_sensitive.get(),
+            "attachment actions are unavailable while tags are changing"
+        );
         let source = self
             .payloads
             .borrow()

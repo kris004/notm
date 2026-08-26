@@ -203,10 +203,29 @@ means the composed snapshot was queued, not that sending finished. Poll
 `app_state.state.send_in_progress` until it becomes false before checking
 `last_send_report`, `last_error`, or send-related file changes.
 
+Tag commands are also asynchronous. A successful scheduling response includes
+`pending: true`; poll `tag_status` until `in_progress` is false for writer
+completion. The result may then start an authoritative reconciliation search;
+if `search_status.loading` is true, poll it until false before checking final
+rows, filenames, undo history, or path-based message actions. An incomplete
+batch forces this search reconciliation and remains unavailable for another
+tag mutation until that refresh succeeds. `tag_status.paths_uncertain = true`
+means the worker could not prove retained message or draft filenames safe (for
+example, after a close/commit failure); verify the warning and restart the
+isolated app before attempting another path, draft, tag, send, or sync action.
+Thread tag targets are captured as exact message IDs from one database
+UUID/revision, using count-first ID-only pages with a 4,096-message ceiling per
+thread. An oversized or otherwise isolated rejected thread is reported without
+mutating that thread; revision drift rejects the whole captured selection
+before mutation. Both outcomes force an authoritative search reconciliation
+instead of restoring retained message detail optimistically.
+
 For a narrowly scoped responsiveness check, fixture harness requests may pass
-`test_delay_ms` to `run_search` (maximum 5000). The delay runs on the search
-worker, so `health` and `search_status` must remain responsive while the search
-is outstanding. This argument is rejected outside fixture harness mode.
+`test_delay_ms` to `run_search` or `tag_selected` (maximum 5000). The delay runs
+on the corresponding worker, so `health`, `search_status`, and `tag_status`
+must remain responsive while work is outstanding. A disposable non-fixture
+tag-race harness may use the same delay only when
+`automation.allow_live_tag_test = true`; other non-fixture runs reject it.
 
 Thread/message preparation, message-derived reply/forward/draft preparation,
 and draft persistence expose the same kind of fixture-only latency seam through
@@ -220,7 +239,13 @@ respectively. Poll `thread_load_status`, `composer_preparation_status`,
 completion. Compare the
 `gtk_heartbeat` values returned by two `health` requests while work is pending
 to assert that the GTK loop is still processing requests and timers. These
-controls are rejected outside fixture mode.
+delay and failure-injection controls are rejected outside fixture mode; the
+read-only status commands remain available to a non-fixture harness.
+
+The fixture-only `refresh_named_drafts` command schedules an explicit bounded
+list refresh (and, with `migrate_legacy: true`, legacy migration) and returns a
+generation. Poll `draft_io_status.list_busy` until it is false. Do not use an
+older list snapshot as proof that a scheduled refresh completed.
 
 `thread_load_status` also reports the prepared message/attachment counts,
 estimated retained bytes, and active/peak preparation workers. The peak must
@@ -239,6 +264,13 @@ threaded messages tagged `search-stress`; the required-display
 `fixture_rapid_searches_coalesce_and_apply_large_pages_incrementally` smoke uses
 144 of them to exercise both a 100-row replacement and a 44-row append while
 rapid delayed searches are cancelled/coalesced and the GTK heartbeat advances.
+
+`fixture_closing_last_window_waits_for_atomic_attachment_save` verifies that
+closing the primary window does not release an outstanding attachment worker's
+application hold. The process must remain alive until the worker atomically
+publishes the complete file, without replacing an existing destination or
+leaving a temporary artifact. It runs as part of the complete required-Weston
+desktop UI suite above.
 
 `NOTM_FIXTURE_TEST_HUGE_BODY_BYTES=<bytes>` adds one opt-in HTML message whose
 body is capped just below the 4 MiB responsive rendering limit. The
@@ -374,6 +406,22 @@ NOTM_REQUIRE_GTK_DISPLAY=1 \
   fixture_current_message_navigation_and_tagging_are_explicit \
   -- --exact --nocapture --test-threads=1
 ```
+
+Exact multi-selection, refresh races, Maildir filename propagation, and restart
+persistence have a standard-user regression backed by a disposable Maildir,
+Notmuch database, XDG tree, Wayland display, and D-Bus session:
+
+```sh
+tests/run_with_headless_weston.sh dbus-run-session -- \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
+  indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after_restart \
+  -- --exact --nocapture --test-threads=1
+```
+
+The test is required-display and fails rather than skips when its isolated GUI
+environment is unavailable. It verifies exact thread IDs after a reorder,
+multi-file rename propagation into raw/attachment/reply/standalone paths,
+conflicting-action rejection, and persistence after a clean restart.
 
 Visual-HTML link hints have a fixture-backed GTK smoke that verifies visible
 links receive distinct labels and that cancelling clears the mode:

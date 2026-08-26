@@ -6538,6 +6538,11 @@ fn oversized_thread_rejection_restores_selection_before_tagging() -> anyhow::Res
         "tag action after oversized rejection failed: {tagged}"
     );
     assert_eq!(
+        tagged["pending"], true,
+        "tag action after oversized rejection was not scheduled asynchronously: {tagged}"
+    );
+    let tagged = wait_for_tag(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
         tagged["state"]["selected_thread"]["thread_id"], safe_thread_id,
         "post-rejection tag action no longer targeted the restored row: {tagged}"
     );
@@ -8601,6 +8606,735 @@ fn fixture_standalone_message_window_keeps_its_thread_snapshot() -> anyhow::Resu
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after_restart()
+-> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after_restart: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running indexed Maildir tag-race UI E2E with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let query_options = notm_notmuch::QueryOptions {
+        limit: 1_000,
+        excluded_tags: Vec::new(),
+        ..notm_notmuch::QueryOptions::default()
+    };
+    let attachment_message_id = "attachment-message@fixture.test";
+
+    // Give the attachment message two indexed files so the UI must ingest every
+    // authoritative filename returned by Maildir flag synchronization.
+    let readonly = fixture.open_readonly()?;
+    let mut attachment_matches =
+        readonly.search_messages(&format!("id:{attachment_message_id}"), &query_options)?;
+    ensure!(
+        attachment_matches.len() == 1,
+        "attachment fixture lookup was not unique: {attachment_matches:?}"
+    );
+    let attachment_before_duplicate = attachment_matches.remove(0);
+    ensure!(
+        attachment_before_duplicate.filenames.len() == 1,
+        "attachment fixture unexpectedly started with multiple files: {attachment_before_duplicate:?}"
+    );
+    readonly.close()?;
+    let duplicate_path = fixture.maildir.join("new/tag-race-duplicate.fixture");
+    fs::copy(&attachment_before_duplicate.filenames[0], &duplicate_path)?;
+    let writable = fixture.open_readwrite()?;
+    let duplicate_id = writable.index_file_with_tags(&duplicate_path, &["inbox"])?;
+    assert_eq!(duplicate_id, attachment_message_id);
+    writable.close()?;
+
+    let readonly = fixture.open_readonly()?;
+    let attachment_with_duplicate =
+        readonly.search_messages(&format!("id:{attachment_message_id}"), &query_options)?;
+    ensure!(
+        attachment_with_duplicate.len() == 1 && attachment_with_duplicate[0].filenames.len() == 2,
+        "duplicate attachment file was not indexed as a second filename: {attachment_with_duplicate:?}"
+    );
+    readonly.close()?;
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-indexed-tag-race-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let config_home = work_dir.join("config");
+    let data_applications = work_dir.join("data/applications");
+    fs::create_dir_all(&config_home)?;
+    fs::create_dir_all(&data_applications)?;
+
+    // A private text/plain handler makes the standard-user attachment Open action
+    // deterministic without involving any application or settings outside this E2E.
+    let opener_marker = work_dir.join("attachment-opener-call");
+    let opener = work_dir.join("attachment-opener");
+    fs::write(
+        &opener,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" > {}\n",
+            opener_marker.display()
+        ),
+    )?;
+    fs::set_permissions(&opener, fs::Permissions::from_mode(0o755))?;
+    fs::write(
+        data_applications.join("notm-tag-race-opener.desktop"),
+        format!(
+            "[Desktop Entry]\nType=Application\nName=notm tag race opener\nExec={} %u\nMimeType=text/plain;\nNoDisplay=true\nTerminal=false\n",
+            opener.display()
+        ),
+    )?;
+    fs::write(
+        config_home.join("mimeapps.list"),
+        "[Default Applications]\ntext/plain=notm-tag-race-opener.desktop;\n",
+    )?;
+
+    let initial_query = "subject:\"Attachment message\" or subject:\"Unread inbox message\"";
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = {}\nexcluded_tags = []\nsync_maildir_flags_after_tag_change = true\n\
+             \n[identity]\nname = \"Fixture User\"\nprimary_email = \"fixture@example.test\"\n\
+             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n\
+             \n[automation]\nallow_live_tag_test = true\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+            toml::Value::String(initial_query.to_string()),
+        ),
+    )?;
+
+    let token = format!("notm-indexed-tag-race-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir.clone(), &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    let startup = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let startup_rows = json_array_at(&startup, &["state", "thread_list_items"])?;
+    ensure!(
+        startup_rows.len() == 2,
+        "tag-race query did not produce exactly two target threads: {startup}"
+    );
+    let target_thread_ids = startup_rows
+        .iter()
+        .map(|row| {
+            row["thread_id"]
+                .as_str()
+                .map(ToOwned::to_owned)
+                .with_context(|| format!("thread row had no ID: {row}"))
+        })
+        .collect::<anyhow::Result<BTreeSet<_>>>()?;
+    let attachment_index = startup_rows
+        .iter()
+        .position(|row| row["subject"] == "Attachment message")
+        .context("tag-race search did not include the attachment thread")?;
+    let other_index = startup_rows
+        .iter()
+        .position(|row| row["subject"] == "Unread inbox message")
+        .context("tag-race search did not include the unread thread")?;
+
+    let attachment_selected =
+        driver.command("select_thread_by_index", json!({"index": attachment_index}))?;
+    assert_eq!(
+        attachment_selected["ok"], true,
+        "could not schedule attachment-thread selection: {attachment_selected}"
+    );
+    wait_for_thread_load_idle(&mut driver, LARGE_THREAD_COMMAND_TIMEOUT)?;
+    let attachment_selected = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        attachment_selected["state"]["selected_thread"]["subject"], "Attachment message",
+        "attachment thread did not settle as selected: {attachment_selected}"
+    );
+    let raw_preference = driver.command("show_raw_source", json!({}))?;
+    assert_eq!(
+        raw_preference["ok"], true,
+        "could not seed raw view before opening the standalone window: {raw_preference}"
+    );
+    let hidden = driver.command(
+        "set_pane_visibility",
+        json!({"pane": "message", "visible": false}),
+    )?;
+    assert_eq!(hidden["ok"], true, "could not hide message pane: {hidden}");
+    let opened = driver.command("open_selected_thread", json!({}))?;
+    assert_eq!(
+        opened["ok"], true,
+        "could not open the pre-mutation standalone message window: {opened}"
+    );
+    let standalone_before = driver.command("standalone_message_windows", json!({}))?;
+    let standalone_before_windows = json_array_at(&standalone_before, &["windows"])?;
+    ensure!(
+        standalone_before_windows.len() == 1
+            && standalone_before_windows[0]["selected_message"]["message_id"]
+                == attachment_message_id
+            && standalone_before_windows[0]["view"] == "raw",
+        "pre-mutation standalone attachment snapshot was not ready: {standalone_before}"
+    );
+
+    // Select both immutable thread snapshots, leaving the attachment thread active
+    // so both its main-pane and standalone caches are live when filenames change.
+    let first_multi =
+        driver.command("toggle_multi_select_thread", json!({"index": other_index}))?;
+    assert_eq!(
+        first_multi["ok"], true,
+        "first multi-select failed: {first_multi}"
+    );
+    let second_multi = driver.command(
+        "toggle_multi_select_thread",
+        json!({"index": attachment_index}),
+    )?;
+    assert_eq!(
+        second_multi["ok"], true,
+        "second multi-select failed: {second_multi}"
+    );
+    wait_for_thread_load_idle(&mut driver, LARGE_THREAD_COMMAND_TIMEOUT)?;
+    let selected_ids = second_multi["multi_selected_threads"]
+        .as_array()
+        .with_context(|| format!("multi-selection did not return thread IDs: {second_multi}"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .with_context(|| format!("multi-selected ID was not a string: {value}"))
+        })
+        .collect::<anyhow::Result<BTreeSet<_>>>()?;
+    assert_eq!(selected_ids, target_thread_ids);
+
+    let readonly = fixture.open_readonly()?;
+    let before_target_messages = readonly
+        .search_messages("*", &query_options)?
+        .into_iter()
+        .filter(|message| target_thread_ids.contains(&message.thread_id))
+        .collect::<Vec<_>>();
+    readonly.close()?;
+    ensure!(
+        before_target_messages.len() == 2,
+        "selected target threads did not map to two fixture messages: {before_target_messages:?}"
+    );
+    ensure!(
+        before_target_messages.iter().all(|message| {
+            !message.tags.iter().any(|tag| tag == "flagged")
+                && message
+                    .filenames
+                    .iter()
+                    .all(|filename| Path::new(filename).is_file())
+        }),
+        "selected targets were not in a clean pre-mutation state: {before_target_messages:?}"
+    );
+    let old_filenames = before_target_messages
+        .iter()
+        .map(|message| {
+            (
+                message.message_id.clone(),
+                message
+                    .filenames
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect::<BTreeSet<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        old_filenames.get(attachment_message_id).map(BTreeSet::len),
+        Some(2),
+        "the selected attachment message lost its second file before mutation"
+    );
+
+    // Change the database after selection so a refreshed `*` result has a new row
+    // at the front. The tag worker must still use the two captured thread IDs.
+    let interloper_path = fixture.maildir.join("cur/tag-race-interloper.fixture:2,");
+    fs::write(
+        &interloper_path,
+        "From: interloper@example.test\r\nTo: fixture@example.test\r\nSubject: Tag race interloper\r\nDate: Thu, 18 Jun 2037 20:00:00 -0600\r\nMessage-ID: <tag-race-interloper@fixture.test>\r\n\r\nnewest row\r\n",
+    )?;
+    let writable = fixture.open_readwrite()?;
+    let interloper_id = writable.index_file_with_tags(&interloper_path, &["inbox", "unread"])?;
+    assert_eq!(interloper_id, "tag-race-interloper@fixture.test");
+    writable.close()?;
+
+    let race_tag = format!("notm/tag-race-{run_id}");
+    let rejected_tag = format!("notm/rejected-race-{run_id}");
+    let refresh = driver.command("run_search", json!({"query": "*", "test_delay_ms": 1_200}))?;
+    assert_eq!(
+        refresh["scheduled"], true,
+        "delayed refresh was not scheduled: {refresh}"
+    );
+    let tagged = driver.command(
+        "tag_selected",
+        json!({
+            "add": [race_tag.clone(), "flagged"],
+            "test_delay_ms": 600,
+        }),
+    )?;
+    assert_eq!(tagged["ok"], true, "tag mutation was rejected: {tagged}");
+    assert_eq!(
+        tagged["pending"], true,
+        "tag mutation did not remain asynchronous: {tagged}"
+    );
+    assert_eq!(
+        driver.command("health", json!({}))?["ok"],
+        true,
+        "GTK stopped responding while the delayed tag worker was active"
+    );
+    let repeated = driver.command("tag_selected", json!({"add": [rejected_tag.clone()]}))?;
+    assert_eq!(
+        repeated["ok"], false,
+        "rapid conflicting tag action was accepted: {repeated}"
+    );
+    ensure!(
+        repeated["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("tag change is already in progress")),
+        "rapid action rejection did not explain the conflict: {repeated}"
+    );
+    let selected_before_navigation =
+        driver.command("app_state", json!({}))?["state"]["selected_thread"]["thread_id"].clone();
+    let navigation = driver.command("select_thread_by_index", json!({"index": other_index}))?;
+    assert_eq!(
+        navigation["ok"], false,
+        "thread navigation changed the visible selection during a tag write: {navigation}"
+    );
+    let selected_after_navigation = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        selected_after_navigation["state"]["selected_thread"]["thread_id"],
+        selected_before_navigation,
+        "rejected navigation desynchronized the visible and model selections: {selected_after_navigation}"
+    );
+    let message_navigation = driver.command("select_message_by_index", json!({"index": 0}))?;
+    assert_eq!(
+        message_navigation["ok"], false,
+        "message navigation was accepted while Maildir paths could be changing: {message_navigation}"
+    );
+
+    let completed = wait_for_tag(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        completed["state"]["last_error"],
+        Value::Null,
+        "tag mutation did not complete cleanly: {completed}\n{}",
+        app.logs()
+    );
+    let settled = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    assert_eq!(
+        settled["state"]["current_query"], "*",
+        "the refresh raced by the tag operation was not reconciled: {settled}"
+    );
+    let settled_rows = json_array_at(&settled, &["state", "thread_list_items"])?;
+    ensure!(
+        settled_rows
+            .first()
+            .is_some_and(|row| row["subject"] == "Tag race interloper"),
+        "the post-selection database change did not reorder refreshed results: {settled}"
+    );
+
+    let readonly = fixture.open_readonly()?;
+    let all_messages = readonly.search_messages("*", &query_options)?;
+    readonly.close()?;
+    let after_by_id = all_messages
+        .iter()
+        .cloned()
+        .map(|message| (message.message_id.clone(), message))
+        .collect::<BTreeMap<_, _>>();
+    for message in &all_messages {
+        let was_selected = target_thread_ids.contains(&message.thread_id);
+        assert_eq!(
+            message.tags.iter().any(|tag| tag == &race_tag),
+            was_selected,
+            "exact target tag membership was wrong for {} in thread {}",
+            message.message_id,
+            message.thread_id
+        );
+        ensure!(
+            !message.tags.iter().any(|tag| tag == &rejected_tag),
+            "rejected rapid tag action changed {}",
+            message.message_id
+        );
+        if was_selected {
+            ensure!(
+                message.tags.iter().any(|tag| tag == "flagged"),
+                "selected message was not flagged: {message:?}"
+            );
+            let current_paths = message
+                .filenames
+                .iter()
+                .map(PathBuf::from)
+                .collect::<BTreeSet<_>>();
+            ensure!(
+                current_paths.iter().all(|path| path.is_file()),
+                "database reported a non-current filename for {}: {current_paths:?}",
+                message.message_id
+            );
+            let old_paths = old_filenames
+                .get(&message.message_id)
+                .with_context(|| format!("missing old filenames for {}", message.message_id))?;
+            ensure!(
+                old_paths.iter().all(|path| !path.exists()),
+                "a pre-mutation filename still exists for {}: old={old_paths:?}, current={current_paths:?}",
+                message.message_id
+            );
+            ensure!(
+                current_paths.is_disjoint(old_paths),
+                "Maildir flag sync did not rename every file for {}: old={old_paths:?}, current={current_paths:?}",
+                message.message_id
+            );
+        }
+    }
+    let attachment_after = after_by_id
+        .get(attachment_message_id)
+        .context("attachment message disappeared after tag mutation")?;
+    assert_eq!(
+        attachment_after.filenames.len(),
+        2,
+        "Maildir sync did not preserve both indexed attachment files: {attachment_after:?}"
+    );
+    ensure!(
+        after_by_id
+            .get(&interloper_id)
+            .is_some_and(|message| !message.tags.iter().any(|tag| tag == &race_tag)),
+        "the newly front-positioned thread was tagged instead of an immutable target"
+    );
+
+    let verify_ui_thread = |driver: &mut UiDriver, thread_id: &str| -> anyhow::Result<Value> {
+        select_first_thread(driver, &format!("thread:{thread_id}"))?;
+        wait_for_thread_load_idle(driver, LARGE_THREAD_COMMAND_TIMEOUT)?;
+        let state = driver.command("app_state", json!({}))?;
+        let ui_messages = json_array_at(&state, &["state", "messages"])?;
+        ensure!(
+            !ui_messages.is_empty(),
+            "UI loaded no messages for exact thread {thread_id}: {state}"
+        );
+        for ui_message in ui_messages {
+            let message_id = ui_message["message_id"]
+                .as_str()
+                .with_context(|| format!("UI message had no ID: {ui_message}"))?;
+            let authoritative = after_by_id.get(message_id).with_context(|| {
+                format!("UI loaded unknown database message {message_id}: {ui_message}")
+            })?;
+            let ui_filenames = ui_message["filenames"]
+                .as_array()
+                .with_context(|| format!("UI message had no filenames: {ui_message}"))?
+                .iter()
+                .map(|filename| {
+                    filename
+                        .as_str()
+                        .map(PathBuf::from)
+                        .with_context(|| format!("UI filename was not a string: {filename}"))
+                })
+                .collect::<anyhow::Result<BTreeSet<_>>>()?;
+            let authoritative_filenames = authoritative
+                .filenames
+                .iter()
+                .map(PathBuf::from)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                ui_filenames, authoritative_filenames,
+                "UI retained stale filenames for {message_id}: {state}"
+            );
+            ensure!(
+                ui_filenames.iter().all(|path| path.is_file()),
+                "UI exposed a missing filename for {message_id}: {ui_filenames:?}"
+            );
+        }
+        Ok(state)
+    };
+    for thread_id in &target_thread_ids {
+        verify_ui_thread(&mut driver, thread_id)?;
+    }
+
+    let standalone_after = driver.command("standalone_message_windows", json!({}))?;
+    let standalone_after_windows = json_array_at(&standalone_after, &["windows"])?;
+    ensure!(
+        standalone_after_windows.len() == 1,
+        "tag completion lost or duplicated the pre-existing standalone window: {standalone_after}"
+    );
+    let standalone_message = &standalone_after_windows[0]["selected_message"];
+    assert_eq!(standalone_message["message_id"], attachment_message_id);
+    assert_eq!(
+        standalone_after_windows[0]["view"], "raw",
+        "standalone raw view changed during filename reconciliation: {standalone_after}"
+    );
+    let standalone_filenames = standalone_message["filenames"]
+        .as_array()
+        .with_context(|| {
+            format!("standalone message had no filenames after rename: {standalone_after}")
+        })?
+        .iter()
+        .map(|filename| {
+            filename
+                .as_str()
+                .map(PathBuf::from)
+                .with_context(|| format!("standalone filename was not a string: {filename}"))
+        })
+        .collect::<anyhow::Result<BTreeSet<_>>>()?;
+    assert_eq!(
+        standalone_filenames,
+        attachment_after
+            .filenames
+            .iter()
+            .map(PathBuf::from)
+            .collect::<BTreeSet<_>>(),
+        "standalone snapshot retained pre-rename paths: {standalone_after}"
+    );
+    let standalone_rerender = driver.command(
+        "standalone_select_message",
+        json!({"window_index": 0, "message_index": 0}),
+    )?;
+    assert_eq!(
+        standalone_rerender["ok"], true,
+        "standalone raw view could not read the renamed message: {standalone_rerender}"
+    );
+    assert_eq!(standalone_rerender["window"]["view"], "raw");
+
+    let visible = driver.command(
+        "set_pane_visibility",
+        json!({"pane": "message", "visible": true}),
+    )?;
+    assert_eq!(
+        visible["ok"], true,
+        "could not restore message pane: {visible}"
+    );
+    let attachment_thread_id = attachment_after.thread_id.clone();
+    verify_ui_thread(&mut driver, &attachment_thread_id)?;
+    let raw = driver.command("show_raw_source", json!({}))?;
+    assert_eq!(
+        raw["ok"], true,
+        "raw view could not open the renamed message: {raw}"
+    );
+    let listed = driver.command("attachment_list_items", json!({}))?;
+    ensure!(
+        json_array_at(&listed, &["attachments"])?
+            .iter()
+            .any(|attachment| attachment["filename"] == "note.txt"),
+        "attachment cache was not rebuilt from renamed files: {listed}"
+    );
+    let attachment_opened = driver.command("open_attachment", json!({"index": 0}))?;
+    assert_eq!(
+        attachment_opened["ok"], true,
+        "attachment Open used a stale message path: {attachment_opened}"
+    );
+    assert_eq!(
+        attachment_opened["pending"], true,
+        "attachment Open was not asynchronous: {attachment_opened}"
+    );
+    let attachment_completion = wait_for_attachment_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        attachment_completion["last_completion"]["request_id"], attachment_opened["request_id"],
+        "attachment Open completed a different request: started={attachment_opened}, completion={attachment_completion}"
+    );
+    assert_eq!(
+        attachment_completion["last_completion"]["applied"], true,
+        "attachment Open completion was stale: {attachment_completion}"
+    );
+    ensure!(
+        attachment_completion["last_completion"]["error"].is_null(),
+        "attachment Open failed: {attachment_completion}"
+    );
+    let opened_attachment_path = attachment_completion["last_completion"]["path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("attachment Open returned no path: {attachment_completion}"))?;
+    ensure!(
+        String::from_utf8_lossy(&fs::read(&opened_attachment_path)?).contains("attached text"),
+        "attachment Open did not extract the expected bytes"
+    );
+    let opener_deadline = Instant::now() + Duration::from_secs(5);
+    while !opener_marker.is_file() {
+        ensure!(
+            Instant::now() < opener_deadline,
+            "private standard-user attachment handler was not invoked: {attachment_opened}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+    ensure!(
+        fs::read_to_string(&opener_marker)?.contains("note.txt"),
+        "private attachment handler received the wrong target"
+    );
+
+    let main_reply = driver.command("reply_selected", json!({}))?;
+    assert_eq!(
+        main_reply["ok"], true,
+        "main reply could not parse the renamed message: {main_reply}"
+    );
+    assert_eq!(
+        main_reply["pending"], true,
+        "main reply was not prepared asynchronously: {main_reply}"
+    );
+    let main_preparation = wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        main_preparation["outcome"], "prepared",
+        "main reply did not finish preparing: {main_preparation}"
+    );
+    let main_reply = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        main_reply["state"]["compose_fields"]["in_reply_to"],
+        "<attachment-message@fixture.test>"
+    );
+    for command in [
+        "compose_set_to",
+        "compose_set_cc",
+        "compose_set_bcc",
+        "compose_set_subject",
+        "compose_set_body",
+    ] {
+        let cleared = driver.command(command, json!({"value": ""}))?;
+        assert_eq!(cleared["ok"], true, "could not clear main reply: {cleared}");
+    }
+    let clear_main_reply = driver.command("clear_draft", json!({}))?;
+    assert_eq!(
+        clear_main_reply["ok"], true,
+        "could not close cleared main reply: {clear_main_reply}"
+    );
+    assert_eq!(clear_main_reply["pending_confirmation"], false);
+
+    let standalone_reply = driver.command(
+        "standalone_respond",
+        json!({"window_index": 0, "action": "reply"}),
+    )?;
+    assert_eq!(
+        standalone_reply["ok"], true,
+        "pre-existing standalone window could not reply after rename: {standalone_reply}"
+    );
+    assert_eq!(
+        standalone_reply["pending"], true,
+        "standalone reply was not prepared asynchronously: {standalone_reply}"
+    );
+    let standalone_preparation = wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        standalone_preparation["outcome"], "prepared",
+        "standalone reply did not finish preparing: {standalone_preparation}"
+    );
+    let standalone_reply = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        standalone_reply["state"]["compose_fields"]["in_reply_to"],
+        "<attachment-message@fixture.test>"
+    );
+    for command in [
+        "compose_set_to",
+        "compose_set_cc",
+        "compose_set_bcc",
+        "compose_set_subject",
+        "compose_set_body",
+    ] {
+        let cleared = driver.command(command, json!({"value": ""}))?;
+        assert_eq!(
+            cleared["ok"], true,
+            "could not clear standalone reply: {cleared}"
+        );
+    }
+    let clear_standalone_reply = driver.command("clear_draft", json!({}))?;
+    assert_eq!(
+        clear_standalone_reply["ok"], true,
+        "could not close cleared standalone reply: {clear_standalone_reply}"
+    );
+    assert_eq!(clear_standalone_reply["pending_confirmation"], false);
+
+    let standalone_closed = driver.command("close_standalone_message_windows", json!({}))?;
+    assert_eq!(
+        standalone_closed["closed"], 1,
+        "could not close the exercised standalone window: {standalone_closed}"
+    );
+    let closed = driver.command("close_main_window", json!({}))?;
+    assert_eq!(closed["ok"], true, "first app close failed: {closed}");
+    drop(driver);
+    let status = app.wait_for_exit(Duration::from_secs(5))?;
+    ensure!(
+        status.success(),
+        "first app did not exit normally: {status}\n{}",
+        app.logs()
+    );
+
+    // Preserve the clean XDG state and Notmuch database while replacing only the
+    // first process's private display and harness artifacts.
+    drop(app.display.take());
+    for path in [&app.socket_path, &app.log_path] {
+        if path.exists() {
+            fs::remove_file(path)
+                .with_context(|| format!("removing first-run artifact {}", path.display()))?;
+        }
+    }
+    let display_dir = work_dir.join("gui-display");
+    if display_dir.exists() {
+        fs::remove_dir_all(&display_dir)
+            .with_context(|| format!("removing first-run display {}", display_dir.display()))?;
+    }
+
+    let restart_token = format!("notm-indexed-tag-race-restart-ui-{run_id}");
+    let mut restarted = FixtureApp::spawn_with_config(work_dir, &restart_token, &config_path)?;
+    let mut restarted_driver = restarted.connect(&restart_token)?;
+    restarted_driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let persisted_search = restarted_driver.command(
+        "run_search",
+        json!({"query": format!("tag:\"{race_tag}\"")}),
+    )?;
+    assert_eq!(
+        persisted_search["scheduled"], true,
+        "restart tag query was not scheduled: {persisted_search}"
+    );
+    let persisted = restarted_driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let persisted_thread_ids = json_array_at(&persisted, &["state", "thread_list_items"])?
+        .iter()
+        .map(|row| {
+            row["thread_id"]
+                .as_str()
+                .map(ToOwned::to_owned)
+                .with_context(|| format!("persisted row had no thread ID: {row}"))
+        })
+        .collect::<anyhow::Result<BTreeSet<_>>>()?;
+    assert_eq!(
+        persisted_thread_ids, target_thread_ids,
+        "restart did not preserve the exact target tags: {persisted}"
+    );
+    for thread_id in &target_thread_ids {
+        verify_ui_thread(&mut restarted_driver, thread_id)?;
+    }
+
+    let reopened = fixture.open_readonly()?;
+    let persisted_messages = reopened.search_messages("*", &query_options)?;
+    reopened.close()?;
+    for message in persisted_messages {
+        let was_selected = target_thread_ids.contains(&message.thread_id);
+        assert_eq!(
+            message.tags.iter().any(|tag| tag == &race_tag),
+            was_selected,
+            "restart changed exact tag membership for {}",
+            message.message_id
+        );
+        if was_selected {
+            let prior = after_by_id
+                .get(&message.message_id)
+                .with_context(|| format!("missing post-tag message {}", message.message_id))?;
+            assert_eq!(
+                message.filenames, prior.filenames,
+                "restart changed authoritative filenames for {}",
+                message.message_id
+            );
+            ensure!(
+                message
+                    .filenames
+                    .iter()
+                    .all(|filename| Path::new(filename).is_file()),
+                "restart exposed a missing filename for {}: {:?}",
+                message.message_id,
+                message.filenames
+            );
+        }
+    }
+
+    let restart_close = restarted_driver.command("close_main_window", json!({}))?;
+    assert_eq!(
+        restart_close["ok"], true,
+        "restarted app close failed: {restart_close}"
+    );
+    drop(restarted_driver);
+    let restart_status = restarted.wait_for_exit(Duration::from_secs(5))?;
+    ensure!(
+        restart_status.success(),
+        "restarted app did not exit normally: {restart_status}\n{}",
+        restarted.logs()
+    );
+
+    Ok(())
+}
+
 #[test]
 fn fixture_current_message_navigation_and_tagging_are_explicit() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
@@ -8738,6 +9472,11 @@ fn fixture_current_message_navigation_and_tagging_are_explicit() -> anyhow::Resu
         tagged["ok"], true,
         "current-message tag action failed: {tagged}"
     );
+    assert_eq!(
+        tagged["pending"], true,
+        "tag did not run asynchronously: {tagged}"
+    );
+    let tagged = wait_for_tag(&mut driver, STARTUP_TIMEOUT)?;
     let after = message_tags(&tagged)?;
     for (message_id, tags) in &after {
         assert_eq!(
@@ -8793,9 +9532,11 @@ fn fixture_current_message_navigation_and_tagging_are_explicit() -> anyhow::Resu
 
     let undone = driver.command("undo_last_tag", json!({}))?;
     assert_eq!(undone["ok"], true, "message-only undo failed: {undone}");
-    driver.wait_for_search(STARTUP_TIMEOUT)?;
-    select_first_thread(&mut driver, query)?;
-    let restored = message_tags(&driver.command("app_state", json!({}))?)?;
+    assert_eq!(
+        undone["pending"], true,
+        "undo did not run asynchronously: {undone}"
+    );
+    let restored = message_tags(&wait_for_tag(&mut driver, STARTUP_TIMEOUT)?)?;
     assert_eq!(
         restored, before,
         "message-only undo did not restore exact tags"
@@ -8846,6 +9587,11 @@ fn fixture_tag_undo_restores_each_messages_original_tags() -> anyhow::Result<()>
         json!({"add": ["inbox"], "remove": ["unread"]}),
     )?;
     assert_eq!(
+        tagged["pending"], true,
+        "tag did not run asynchronously: {tagged}"
+    );
+    let tagged = wait_for_tag(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
         tagged["state"]["last_error"],
         Value::Null,
         "tag operation failed: {tagged}"
@@ -8869,22 +9615,21 @@ fn fixture_tag_undo_restores_each_messages_original_tags() -> anyhow::Result<()>
 
     let undone = driver.command("undo_last_tag", json!({}))?;
     assert_eq!(
+        undone["pending"], true,
+        "undo did not run asynchronously: {undone}"
+    );
+    let undone = wait_for_tag(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
         undone["state"]["last_error"],
         Value::Null,
         "undo operation failed: {undone}"
     );
-    assert_eq!(
-        undone["state"]["search_loading"], true,
-        "tag undo did not schedule a result refresh: {undone}"
-    );
-    driver.wait_for_search(STARTUP_TIMEOUT)?;
     let actions = driver.command("undo_tag_actions", json!({}))?;
     ensure!(
         json_array_at(&actions, &["actions"])?.is_empty(),
         "undo history was not consumed: {actions}"
     );
 
-    select_first_thread(&mut driver, query)?;
     let restored = message_tags(&driver.command("app_state", json!({}))?)?;
     assert_eq!(restored, before);
 
@@ -10650,6 +11395,257 @@ fn fixture_near_limit_html_preparation_and_rendering_keep_gtk_responsive() -> an
 }
 
 #[test]
+fn fixture_fast_tag_cancels_delayed_thread_load_without_switching_visible_state()
+-> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_fast_tag_cancels_delayed_thread_load_without_switching_visible_state: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running thread-load/tag cancellation UI regression with {display}");
+
+    const DELAYED_LOAD_MS: u64 = 1_200;
+    const STALE_COMPLETION_WINDOW: Duration = Duration::from_millis(1_400);
+    const UI_RESPONSE_LIMIT: Duration = Duration::from_millis(500);
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-thread-tag-race-ui-{run_id}"));
+    let token = format!("notm-thread-tag-race-ui-{run_id}");
+    let mutation_tag = format!("thread-load-race-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+
+    let query = "subject:\"Read inbox message\" or subject:\"Unread inbox message\"";
+    let scheduled = driver.command("run_search", json!({"query": query}))?;
+    assert_eq!(
+        scheduled["scheduled"], true,
+        "thread-load/tag fixture search was not scheduled: {scheduled}"
+    );
+    let search = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let rows = json_array_at(&search, &["state", "thread_list_items"])?;
+    ensure!(
+        rows.len() == 2,
+        "thread-load/tag fixture query did not return two rows: {search}"
+    );
+    let initial_index = rows
+        .iter()
+        .position(|row| row["subject"] == "Read inbox message")
+        .with_context(|| format!("initial thread was missing: {search}"))?;
+    let delayed_index = rows
+        .iter()
+        .position(|row| row["subject"] == "Unread inbox message")
+        .with_context(|| format!("delayed thread was missing: {search}"))?;
+    let initial_thread_id = rows[initial_index]["thread_id"]
+        .as_str()
+        .with_context(|| format!("initial row had no thread ID: {}", rows[initial_index]))?
+        .to_string();
+    let delayed_thread_id = rows[delayed_index]["thread_id"]
+        .as_str()
+        .with_context(|| format!("delayed row had no thread ID: {}", rows[delayed_index]))?
+        .to_string();
+
+    let selected = driver.command("select_thread_by_index", json!({"index": initial_index}))?;
+    assert_eq!(
+        selected["ok"], true,
+        "initial thread selection was not scheduled: {selected}"
+    );
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let selected_message = driver.command("select_message_by_index", json!({"index": 0}))?;
+    assert_eq!(
+        selected_message["ok"], true,
+        "initial message could not be selected: {selected_message}"
+    );
+    let before_state = driver.command("app_state", json!({}))?;
+    let before_view = driver.command("message_view_text", json!({}))?;
+    let before_selection = driver.command("thread_selection_view_state", json!({}))?;
+    assert_eq!(
+        before_state["state"]["selected_thread"]["thread_id"], initial_thread_id,
+        "initial thread did not settle before the race: {before_state}"
+    );
+    let initial_message_id = before_state["state"]["selected_message"]["message_id"]
+        .as_str()
+        .with_context(|| format!("initial state had no selected message: {before_state}"))?
+        .to_string();
+    let before_message_ids = json_array_at(&before_state, &["state", "messages"])?
+        .iter()
+        .map(|message| {
+            message["message_id"]
+                .as_str()
+                .map(ToOwned::to_owned)
+                .with_context(|| format!("loaded message had no ID: {message}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    ensure!(
+        !before_message_ids.is_empty(),
+        "initial thread had no prepared messages: {before_state}"
+    );
+    ensure!(
+        before_view["text"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty()),
+        "initial message had no visible prepared text: {before_view}"
+    );
+    assert_eq!(
+        before_selection["selected_local"].as_u64(),
+        Some(initial_index as u64),
+        "GTK did not settle on the initial row: {before_selection}"
+    );
+    let loader_before = driver.command("thread_load_status", json!({}))?;
+    let cancelled_before = loader_before["cancelled"].as_u64().unwrap_or(0);
+
+    let delayed = driver.command(
+        "set_fixture_thread_delay",
+        json!({"milliseconds": DELAYED_LOAD_MS}),
+    )?;
+    assert_eq!(
+        delayed["ok"], true,
+        "could not delay thread load: {delayed}"
+    );
+    let delayed_selection =
+        driver.command("select_thread_by_index", json!({"index": delayed_index}))?;
+    assert_eq!(
+        delayed_selection["ok"], true,
+        "delayed target selection was not scheduled: {delayed_selection}"
+    );
+    let delayed_status = driver.command("thread_load_status", json!({}))?;
+    assert_eq!(
+        delayed_status["busy"], true,
+        "delayed target loader was not active: {delayed_status}"
+    );
+    let delayed_generation = delayed_status["generation"]
+        .as_u64()
+        .with_context(|| format!("delayed loader had no generation: {delayed_status}"))?;
+    let retained = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        retained["state"]["selected_thread"]["thread_id"], initial_thread_id,
+        "delayed selection replaced retained state before preparation: {retained}"
+    );
+    assert_eq!(
+        retained["state"]["selected_message"]["message_id"], initial_message_id,
+        "delayed selection replaced the retained message before preparation: {retained}"
+    );
+    driver.command("set_fixture_thread_delay", json!({"milliseconds": 0}))?;
+
+    let health_started = Instant::now();
+    let health_before = driver.command("health", json!({}))?;
+    let health_elapsed = health_started.elapsed();
+    ensure!(
+        health_elapsed < UI_RESPONSE_LIMIT,
+        "health blocked behind delayed thread load for {health_elapsed:?}: {health_before}"
+    );
+    assert_eq!(
+        health_before["thread_load"]["generation"], delayed_generation,
+        "health did not report the delayed loader generation: {health_before}"
+    );
+
+    let tag_started = Instant::now();
+    let tagged = driver.command("tag_selected", json!({"add": [&mutation_tag]}))?;
+    let tag_elapsed = tag_started.elapsed();
+    ensure!(
+        tag_elapsed < UI_RESPONSE_LIMIT,
+        "fast tag scheduling blocked for {tag_elapsed:?}: {tagged}"
+    );
+    assert_eq!(tagged["ok"], true, "fast tag was rejected: {tagged}");
+    assert_eq!(
+        tagged["pending"], true,
+        "fast tag did not run asynchronously: {tagged}"
+    );
+    let tag_completion = wait_for_tag(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        tag_completion["state"]["last_error"],
+        Value::Null,
+        "fast tag did not complete cleanly: {tag_completion}\n{}",
+        app.logs()
+    );
+
+    // The pre-fix worker ignores the tag refresh and publishes after its full
+    // fixture delay. Keep one explicit bounded stale-completion window so that
+    // ordering bug cannot hide behind an early assertion.
+    thread::sleep(STALE_COMPLETION_WINDOW);
+
+    let final_health_started = Instant::now();
+    let final_health = driver.command("health", json!({}))?;
+    let final_health_elapsed = final_health_started.elapsed();
+    ensure!(
+        final_health_elapsed < UI_RESPONSE_LIMIT,
+        "health blocked after tag/load cancellation for {final_health_elapsed:?}: {final_health}"
+    );
+    ensure!(
+        final_health["gtk_heartbeat"].as_u64().unwrap_or(0)
+            > health_before["gtk_heartbeat"].as_u64().unwrap_or(0),
+        "GTK heartbeat did not advance through the tag/load race: before={health_before}, after={final_health}"
+    );
+    let final_loader = driver.command("thread_load_status", json!({}))?;
+    assert_eq!(
+        final_loader["busy"], false,
+        "thread loader remained active after the stale-completion window: {final_loader}"
+    );
+    ensure!(
+        final_loader["cancelled"].as_u64().unwrap_or(0) > cancelled_before,
+        "tag mutation did not cancel the delayed loader: before={loader_before}, after={final_loader}"
+    );
+
+    let final_state = driver.command("app_state", json!({}))?;
+    let final_view = driver.command("message_view_text", json!({}))?;
+    let final_selection = driver.command("thread_selection_view_state", json!({}))?;
+    assert_eq!(
+        final_state["state"]["selected_thread"]["thread_id"], initial_thread_id,
+        "stale delayed load replaced the retained tagged thread: {final_state}"
+    );
+    assert_eq!(
+        final_state["state"]["selected_message"]["message_id"], initial_message_id,
+        "stale delayed load replaced the retained tagged message: {final_state}"
+    );
+    let final_message_ids = json_array_at(&final_state, &["state", "messages"])?
+        .iter()
+        .map(|message| {
+            message["message_id"]
+                .as_str()
+                .map(ToOwned::to_owned)
+                .with_context(|| format!("final loaded message had no ID: {message}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    assert_eq!(
+        final_message_ids, before_message_ids,
+        "stale delayed load replaced the visible prepared message set: {final_state}"
+    );
+    assert_eq!(
+        final_view["text"], before_view["text"],
+        "stale delayed load replaced the visible prepared text: before={before_view}, after={final_view}"
+    );
+    assert_eq!(
+        final_selection["selected_local"].as_u64(),
+        Some(initial_index as u64),
+        "GTK selection did not return to the retained tagged row: {final_selection}"
+    );
+
+    let final_rows = json_array_at(&final_state, &["state", "thread_list_items"])?;
+    let row_has_tag = |thread_id: &str| -> anyhow::Result<bool> {
+        let row = final_rows
+            .iter()
+            .find(|row| row["thread_id"].as_str() == Some(thread_id))
+            .with_context(|| format!("final result omitted thread {thread_id}: {final_state}"))?;
+        Ok(row["tags"]
+            .as_array()
+            .is_some_and(|tags| tags.iter().any(|tag| tag == &mutation_tag)))
+    };
+    assert!(
+        row_has_tag(&initial_thread_id)?,
+        "fast tag missed the retained exact thread: {final_state}"
+    );
+    assert!(
+        !row_has_tag(&delayed_thread_id)?,
+        "fast tag leaked onto the delayed target: {final_state}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn fixture_delayed_thread_loading_is_generation_safe_and_responsive() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
@@ -11204,6 +12200,30 @@ fn select_first_thread(driver: &mut UiDriver, query: &str) -> anyhow::Result<()>
         "could not select fixture thread: {selected}"
     );
     Ok(())
+}
+
+fn wait_for_tag(driver: &mut UiDriver, timeout: Duration) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = driver.command("tag_status", json!({}))?;
+        if status["in_progress"] == false {
+            let state = driver.command("app_state", json!({}))?;
+            if state["state"]["search_loading"] == true {
+                return driver.wait_for_search(timeout);
+            }
+            return Ok(state);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "tag operation did not finish within {timeout:?}: {status}"
+        );
+        let health = driver.command("health", json!({}))?;
+        ensure!(
+            health["ok"] == true,
+            "app became unresponsive during tag: {health}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
 }
 
 #[cfg(unix)]

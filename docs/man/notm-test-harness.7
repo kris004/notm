@@ -58,15 +58,35 @@ is false before inspecting final rows.
 .B select_saved_search
 and
 .B load_more_threads
-use the same background-search state. Fixture harness requests may pass
+use the same background-search state. Tag commands return
+.B pending
+after scheduling; poll
+.B tag_status
+until
+.B in_progress
+is false for writer completion.  A tag result may then start an authoritative
+reconciliation search.  If
+.B search_status.loading
+is true, poll until it is false before inspecting final rows, filenames, undo
+history, or path-based message actions.  If
+.B paths_uncertain
+is true, restart notm before issuing any retained-message, draft, tag, send, or
+sync action. Fixture harness requests may pass
 .B test_delay_ms
-(maximum 5000) to validate responsiveness while worker-side search work is
-outstanding; non-fixture runs reject that test-only argument.
+(maximum 5000) to
+.B run_search
+or
+.B tag_selected
+to validate responsiveness while worker-side work is outstanding. A disposable
+non-fixture tag-race harness may use the delay only with
+.B automation.allow_live_tag_test=true ;
+other non-fixture runs reject it.
 .SH TEST COMMAND GROUPS
 .SS Health and state
 .BR health ,
 .BR app_state ,
 .BR search_status ,
+.BR tag_status ,
 .BR thread_load_status ,
 .BR composer_preparation_status ,
 .BR draft_autosave_status ,
@@ -146,12 +166,28 @@ It targets the selected message ID only and ignores thread multi-selection.
 .BR load_draft ,
 .BR clear_draft ,
 .BR draft_list_state ,
+.BR draft_io_status ,
+.BR refresh_named_drafts ,
 .BR set_fixture_draft_delay ,
 .BR fail_next_draft_write ,
 .BR activate_draft_by_index ,
 .BR click_delete_selected_draft ,
 .BR pending_confirmation ,
 .BR respond_confirmation .
+.PP
+.B draft_io_status
+is a read-only status command available in fixture and non-fixture harnesses.
+The
+.B refresh_named_drafts
+command schedules a bounded list refresh and returns its generation; poll
+.B draft_io_status.list_busy
+until it is false.  With
+.B migrate_legacy=true
+it exercises the same bounded legacy migration.  This refresh command,
+.BR set_fixture_draft_delay ,
+and
+.B fail_next_draft_write
+are fixture-only controls.
 .PP
 Startup recovery begins before a harness command can inject latency.  For a
 fixture test-harness process only,
@@ -205,6 +241,10 @@ outcome instead of being overwritten by late recovery completion.
 .BR cancel_link_hints ,
 .BR toggle_quote_collapse ,
 .BR message_view_text ,
+.BR standalone_message_windows ,
+.BR close_standalone_message_windows ,
+.BR standalone_select_message ,
+.BR standalone_respond ,
 .BR attachment_list_items ,
 .BR save_selected_attachment ,
 .BR save_attachment ,
@@ -213,6 +253,7 @@ outcome instead of being overwritten by late recovery completion.
 .BR attachment_test_state ,
 .BR attachment_io_status ,
 .BR set_fixture_attachment_delay ,
+.BR fail_next_attachment_write ,
 .BR respond_attachment_save .
 .PP
 .B load_images_once
@@ -300,9 +341,16 @@ closes while a send is pending, the application remains alive until send
 finalization completes.
 .PP
 .B close_main_window
-closes only the primary window after returning its response, unless dirty
-compose state first defers the close behind a confirmation.  Standalone message
-windows are left open.
+schedules closure of only the primary window after returning its response.
+Dirty compose state can first defer the close behind a confirmation.  An
+outstanding send, sync, or tag operation, a tag-warning reconciliation search,
+or an active draft save instead hides the window and defers closure until that
+work settles; the latest recovery-draft state is then flushed asynchronously.
+A failed reconciliation or recovery-draft flush re-presents the window and
+reports the error.  Standalone message windows are left open.  Attachment
+workers hold the application independently, so the primary window can close
+while a save finishes but the process remains alive until the complete file is
+published or the failure is reported.
 .PP
 In fixture mode,
 .B draft_list_state
@@ -375,9 +423,12 @@ Confirmation inspection and response are normally fixture-only.  A
 non-fixture harness with
 .B automation.allow_live_send_test=true
 may use them only while the pending action is exactly
-.BR send_composer .
-This narrow exception lets custom-transport tests drive the real saved-draft
-Send modal without exposing other live confirmations.
+.B send_composer
+or
+.BR close_main_window .
+This narrow exception lets disposable custom-transport tests drive the real
+saved-draft Send and close-flush modals without exposing other live
+confirmations.
 .PP
 .B save_selected_attachment
 and its
@@ -415,6 +466,8 @@ reports the resulting path or error and whether the completion was current.
 .B set_fixture_attachment_delay
 adds at most 5000 milliseconds of worker-side delay in fixture mode and also
 applies to composer attachment caching.
+.B fail_next_attachment_write
+injects one attachment write failure and is likewise fixture-only.
 .PP
 Reply, reply-all, inline-forward, forward-as-attachment, and indexed-draft
 message preparation run on a worker and return a pending generation.  Poll

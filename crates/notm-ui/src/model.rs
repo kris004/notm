@@ -20,7 +20,7 @@ pub const MAX_THREAD_PREVIEW_LINES: usize = 20;
 /// explicit ceiling prevents an unexpectedly large thread from growing that
 /// synchronous state without bound. Threads over this limit are rejected with
 /// their exact count instead of displaying a partial prefix.
-pub const MAX_LOADED_THREAD_MESSAGES: usize = 4_096;
+pub const MAX_LOADED_THREAD_MESSAGES: usize = notm_notmuch::MAX_THREAD_TAG_MESSAGES;
 
 /// Maximum number of messages inspected to derive thread-list row details.
 ///
@@ -136,6 +136,14 @@ pub struct UiState {
     pub send_in_progress: bool,
     #[serde(default)]
     pub sync_in_progress: bool,
+    #[serde(default)]
+    pub tag_in_progress: bool,
+    #[serde(default)]
+    pub tag_generation: u64,
+    #[serde(default)]
+    pub tag_warning: Option<String>,
+    #[serde(default)]
+    pub tag_paths_uncertain: bool,
     pub last_error: Option<String>,
     pub last_operation: Option<String>,
     #[serde(default)]
@@ -175,8 +183,14 @@ pub struct UiState {
     pub visual_select_anchor: Option<usize>,
     pub visual_select_cursor: Option<usize>,
     pub visual_selected_threads: BTreeSet<String>,
+    #[serde(default)]
+    pub visual_selected_thread_snapshots: BTreeMap<String, ThreadSummary>,
+    #[serde(default)]
+    pub visual_selection_request_generation: u64,
     pub visual_selection_pending_range: Option<(usize, usize)>,
     pub multi_selected_threads: BTreeSet<String>,
+    #[serde(default)]
+    pub multi_selected_thread_snapshots: BTreeMap<String, ThreadSummary>,
 }
 
 const fn default_thread_preview_lines() -> usize {
@@ -209,6 +223,10 @@ impl Default for UiState {
             last_send_report: None,
             send_in_progress: false,
             sync_in_progress: false,
+            tag_in_progress: false,
+            tag_generation: 0,
+            tag_warning: None,
+            tag_paths_uncertain: false,
             last_error: None,
             last_operation: None,
             search_loading: false,
@@ -238,8 +256,11 @@ impl Default for UiState {
             visual_select_anchor: None,
             visual_select_cursor: None,
             visual_selected_threads: BTreeSet::new(),
+            visual_selected_thread_snapshots: BTreeMap::new(),
+            visual_selection_request_generation: 0,
             visual_selection_pending_range: None,
             multi_selected_threads: BTreeSet::new(),
+            multi_selected_thread_snapshots: BTreeMap::new(),
         }
     }
 }

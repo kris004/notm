@@ -33,6 +33,7 @@ pub(crate) struct SearchWorkerRequest {
 pub(crate) struct SearchHarnessPolicy {
     pub(crate) fixture_mode: bool,
     pub(crate) automation_enabled: bool,
+    pub(crate) allow_live_tag_test: bool,
 }
 
 pub(crate) enum SearchInputEvent {
@@ -547,8 +548,8 @@ pub(crate) fn fixture_search_worker_delay(
         return Ok(Duration::ZERO);
     };
     anyhow::ensure!(
-        policy.fixture_mode && policy.automation_enabled,
-        "test_delay_ms is available only in fixture test-harness mode"
+        policy.automation_enabled && (policy.fixture_mode || policy.allow_live_tag_test),
+        "test_delay_ms requires fixture mode or automation.allow_live_tag_test=true"
     );
     let milliseconds = value
         .as_u64()
@@ -790,10 +791,11 @@ mod tests {
     }
 
     #[test]
-    fn delayed_search_work_is_scoped_to_fixture_harnesses() {
+    fn delayed_search_work_is_scoped_to_explicit_test_harnesses() {
         let fixture = SearchHarnessPolicy {
             fixture_mode: true,
             automation_enabled: true,
+            allow_live_tag_test: false,
         };
         assert_eq!(
             fixture_search_worker_delay(fixture, &serde_json::json!({"test_delay_ms": 250}))
@@ -803,6 +805,7 @@ mod tests {
         let normal = SearchHarnessPolicy {
             fixture_mode: false,
             automation_enabled: false,
+            allow_live_tag_test: false,
         };
         assert_eq!(
             fixture_search_worker_delay(normal, &serde_json::json!({})).expect("no delay"),
@@ -812,7 +815,17 @@ mod tests {
             fixture_search_worker_delay(normal, &serde_json::json!({"test_delay_ms": 1}))
                 .unwrap_err()
                 .to_string()
-                .contains("fixture test-harness mode")
+                .contains("requires fixture mode")
+        );
+        let isolated_live = SearchHarnessPolicy {
+            fixture_mode: false,
+            automation_enabled: true,
+            allow_live_tag_test: true,
+        };
+        assert_eq!(
+            fixture_search_worker_delay(isolated_live, &serde_json::json!({"test_delay_ms": 250}))
+                .expect("explicitly gated live delay"),
+            Duration::from_millis(250)
         );
         assert!(
             fixture_search_worker_delay(fixture, &serde_json::json!({"test_delay_ms": 5001}))

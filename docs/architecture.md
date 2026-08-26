@@ -44,6 +44,25 @@ bounded filesystem reads, and MIME parsing run outside them. Thread previews
 are cached before the configured display-line limit is applied, so that
 presentation setting is not part of either key.
 
+Tag mutations run on a serialized background writer and target exact thread or
+message IDs captured from the displayed result snapshot. Thread targets use a
+count-first, ID-only Notmuch query: each thread is limited to 4,096 messages,
+read in 256-ID pages, and every page plus the final pre-mutation check must
+match one shared database UUID/revision. A revision drift aborts the entire
+snapshot before mutation; safely isolated missing, invalid, or oversized
+threads remain explicit partial results for the other exact targets. Their
+batch reports retain partial failures and authoritative current Maildir
+filenames. Search generations that overlap a write are discarded and
+reconciled before another tag mutation is accepted; retained message, draft,
+and standalone window models receive filename mappings without reparsing MIME
+on the GTK callback. Attachment models keep lazy message sources and resolve a
+stale cached path by Message-ID when the payload is requested. Explicit partial
+reports keep path actions disabled until the reconciliation search completes.
+An unreported result, close/commit failure, or unresolved retained filename
+keeps those actions disabled until restart rather than allowing a stale path to
+escape.
+Durable undo-history writes are serialized on a separate worker.
+
 ## Implementation notes
 
 The UI uses gtk4-rs directly, keeping widget behavior and the dependency
