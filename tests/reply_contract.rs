@@ -112,7 +112,7 @@ fn reply_ignores_encoded_threading_syntax_and_preserves_real_folded_ids() -> any
         "To: Me <me@example.test>\r\n",
         "Subject: Encoded threading phrases\r\n",
         "Message-ID: <current@example.test>\r\n",
-        "References: =?US-ASCII?Q?=3Cfake@example.test=3E?=\r\n",
+        "References: =?X.UNKNOWN?Q?=3Cfake@example.test=3E?=\r\n",
         "\t=?US-ASCII?Q?,_=3Cother@example.test=3E?=\r\n",
         " <root@example.test>\r\n",
         "Content-Type: text/plain; charset=utf-8\r\n",
@@ -123,7 +123,7 @@ fn reply_ignores_encoded_threading_syntax_and_preserves_real_folded_ids() -> any
     let parsed = parse_rfc5322(raw)?;
     assert_eq!(
         parsed.references,
-        "=?US-ASCII?Q?=3Cfake@example.test=3E?=\t\
+        "=?X.UNKNOWN?Q?=3Cfake@example.test=3E?=\t\
          =?US-ASCII?Q?,_=3Cother@example.test=3E?= <root@example.test>"
     );
     let identity = Identity {

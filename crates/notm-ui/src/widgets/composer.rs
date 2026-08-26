@@ -322,17 +322,20 @@ pub(crate) fn prepare_draft_fields_from_message_reader(
     reader: impl Read,
 ) -> anyhow::Result<(ComposeFields, Vec<AttachmentInput>)> {
     let raw = read_message_bytes(reader)?;
-    let wire = mailparse::parse_mail(&raw)?;
+    // Run the bounded MIME preflight before any recursive parser sees a saved
+    // draft. Address restoration needs only the top-level headers, so avoid a
+    // second recursive parse after the bounded message parse succeeds.
     let parsed = parse_rfc5322(&raw)?;
+    let (headers, _) = mailparse::parse_headers(&raw)?;
     let attachment_inputs = attachments::attachment_inputs_from_bytes(&raw)?;
     // Parse each raw address header structurally before decoding RFC 2047.
     // A decoded display name such as `Doe, Zoë` needs its comma re-quoted;
     // reparsing the already-decoded flat string would mistake it for a list
     // delimiter and could change the recipient set on the next send.
-    let from = canonical_draft_address_header(&wire, "From", true)?;
-    let to = canonical_draft_address_header(&wire, "To", false)?;
-    let cc = canonical_draft_address_header(&wire, "Cc", false)?;
-    let bcc = canonical_draft_address_header(&wire, "Bcc", false)?;
+    let from = canonical_draft_address_header(&headers, "From", true)?;
+    let to = canonical_draft_address_header(&headers, "To", false)?;
+    let cc = canonical_draft_address_header(&headers, "Cc", false)?;
+    let bcc = canonical_draft_address_header(&headers, "Bcc", false)?;
     let body = if parsed.text_body.trim().is_empty() {
         parsed.safe_body
     } else {
@@ -357,12 +360,11 @@ pub(crate) fn prepare_draft_fields_from_message_reader(
 }
 
 fn canonical_draft_address_header(
-    message: &mailparse::ParsedMail<'_>,
+    headers: &[mailparse::MailHeader<'_>],
     label: &str,
     require_one: bool,
 ) -> anyhow::Result<String> {
-    let headers = message
-        .headers
+    let headers = headers
         .iter()
         .filter(|header| header.get_key_ref().eq_ignore_ascii_case(label))
         .collect::<Vec<_>>();
@@ -2415,6 +2417,89 @@ mod tests {
                 "unexpected error for {fields:?}: {error:#}"
             );
         }
+    }
+
+    fn nested_multipart_draft(depth: usize) -> Vec<u8> {
+        fn append_part(raw: &mut Vec<u8>, depth: usize) {
+            if depth == 0 {
+                // Deliberately malformed. The bounded preflight must reject
+                // the nesting depth before a recursive parser reaches this
+                // innermost header block.
+                raw.extend_from_slice(b"malformed nested header\r\n\r\nleaf\r\n");
+                return;
+            }
+            let boundary = format!("saved-draft-depth-{depth}");
+            raw.extend_from_slice(
+                format!(
+                    "Content-Type: multipart/mixed; boundary={boundary}\r\n\r\n--{boundary}\r\n"
+                )
+                .as_bytes(),
+            );
+            append_part(raw, depth - 1);
+            raw.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        }
+
+        let mut raw = concat!(
+            "From: sender@example.test\r\n",
+            "To: first@example.test\r\n",
+            "To: second@example.test\r\n",
+            "Subject: Over-deep saved draft\r\n",
+            "MIME-Version: 1.0\r\n",
+        )
+        .as_bytes()
+        .to_vec();
+        append_part(&mut raw, depth);
+        raw
+    }
+
+    fn many_part_multipart_draft(parts: usize) -> Vec<u8> {
+        const BOUNDARY: &str = "saved-draft-parts";
+        let mut raw = concat!(
+            "From: sender@example.test\r\n",
+            "To: first@example.test\r\n",
+            "To: second@example.test\r\n",
+            "Subject: Over-part-count saved draft\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=saved-draft-parts\r\n\r\n",
+        )
+        .as_bytes()
+        .to_vec();
+        for index in 0..parts {
+            raw.extend_from_slice(
+                format!("--{BOUNDARY}\r\nContent-Type: text/plain\r\n\r\npart {index}\r\n")
+                    .as_bytes(),
+            );
+        }
+        raw.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+        raw
+    }
+
+    #[test]
+    fn draft_loading_rejects_overdeep_mime_before_recursive_header_parsing() {
+        let raw = nested_multipart_draft(notm_mail::mime::MIME_DEPTH_LIMIT + 2);
+
+        let error = prepare_draft_fields_from_message_reader(std::io::Cursor::new(raw))
+            .expect_err("over-deep saved draft must be rejected by the MIME preflight");
+        let error = format!("{error:#}");
+
+        assert!(
+            error.contains("MIME nesting depth") && error.contains("exceeding the limit"),
+            "saved draft did not fail at the bounded MIME preflight: {error}"
+        );
+    }
+
+    #[test]
+    fn draft_loading_rejects_too_many_mime_parts_before_recursive_header_parsing() {
+        let raw = many_part_multipart_draft(notm_mail::mime::MIME_PARTS_LIMIT);
+
+        let error = prepare_draft_fields_from_message_reader(std::io::Cursor::new(raw))
+            .expect_err("saved draft with too many MIME parts must be rejected by the preflight");
+        let error = format!("{error:#}");
+
+        assert!(
+            error.contains("more than the allowed") && error.contains("MIME parts"),
+            "saved draft did not fail at the bounded MIME part preflight: {error}"
+        );
     }
 
     #[test]

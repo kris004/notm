@@ -332,7 +332,7 @@ fn parse_obsolete_threading_encoded_word(
         })?;
     let charset = &bytes[index + 2..charset_end];
     ensure!(
-        valid_rfc2047_token(charset),
+        valid_rfc2047_charset_token(charset),
         "{field} contains an invalid RFC 2047 charset near {:?}",
         &value[index..]
     );
@@ -350,7 +350,7 @@ fn parse_obsolete_threading_encoded_word(
         })?;
     let encoding = &bytes[encoding_start..encoding_end];
     ensure!(
-        valid_rfc2047_token(encoding),
+        valid_rfc2047_encoding_token(encoding),
         "{field} contains an invalid RFC 2047 encoding near {:?}",
         &value[index..]
     );
@@ -400,11 +400,27 @@ fn parse_obsolete_threading_encoded_word(
     Ok(end)
 }
 
-fn valid_rfc2047_token(value: &[u8]) -> bool {
+fn valid_rfc2047_charset_token(value: &[u8]) -> bool {
+    // RFC 2047 section 2's strict encoded-word `token` excludes `.`, even
+    // though section 3 permits charset names accepted as MIME charset
+    // parameters and RFC 2045's MIME token grammar permits dots. Legacy mail
+    // consequently exists with dotted private/unknown charset labels. Accept
+    // that one deliberate compatibility extension only while reading ignored
+    // obsolete threading phrases: the word is never decoded or emitted, so
+    // its contents cannot become message-id syntax. All other delimiters and
+    // MIME token specials stay banned, while encoding retains section 2's
+    // strict grammar below.
     !value.is_empty()
         && value
             .iter()
-            .all(|byte| byte.is_ascii_graphic() && !b"()<>@,;:\"/[]?.=".contains(byte))
+            .all(|byte| byte.is_ascii_graphic() && !br#"()<>@,;:\"/[]?="#.contains(byte))
+}
+
+fn valid_rfc2047_encoding_token(value: &[u8]) -> bool {
+    !value.is_empty()
+        && value
+            .iter()
+            .all(|byte| byte.is_ascii_graphic() && !br#"()<>@,;:\"/[]?.="#.contains(byte))
 }
 
 fn parse_obsolete_threading_atom(value: &str, index: usize) -> Option<usize> {
@@ -1838,6 +1854,8 @@ mod tests {
             "=?UTF-8?Q?bad=ZZ?= <real@example.test>",
             "=?UTF-8?B?not-base64!?= <real@example.test>",
             "=?UTF-8?X?value?= <real@example.test>",
+            "=?X.UNKNOWN?Q?label?= <real@example.test>",
+            "=?X.UNKNOWN?Q?=3Cfake=40example=2Etest=3E?= <real@example.test>",
             "=?US-ASCII?Q?=3Cfake@example.test=3E?= <real@example.test>",
             "=?US-ASCII?Q?phrase,with,commas?= <real@example.test>",
         ] {
@@ -1852,7 +1870,11 @@ mod tests {
         }
 
         for invalid in [
-            "=?UTF.8?Q?value?= <real@example.test>",
+            "=?X/UNKNOWN?Q?value?= <real@example.test>",
+            "=?X@UNKNOWN?Q?value?= <real@example.test>",
+            "=?X=UNKNOWN?Q?value?= <real@example.test>",
+            "=?X\\UNKNOWN?Q?value?= <real@example.test>",
+            "=?X.UNKNOWN?Q.value?= <real@example.test>",
             "=?UTF-8?Q??= <real@example.test>",
             "=?UTF-8?Q?unterminated <real@example.test>",
             "=?UTF-8?Q?valid?=adjacent <real@example.test>",
