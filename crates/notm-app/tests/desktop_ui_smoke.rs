@@ -8638,6 +8638,187 @@ fn fixture_standalone_message_window_keeps_its_thread_snapshot() -> anyhow::Resu
     Ok(())
 }
 
+#[test]
+fn fixture_older_draft_clear_does_not_cancel_newer_standalone_forward() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_older_draft_clear_does_not_cancel_newer_standalone_forward: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running composer clear/preparation ordering UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-composer-clear-epoch-ui-{run_id}"));
+    let token = format!("notm-composer-clear-epoch-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+
+    select_first_thread(&mut driver, "subject:\"Three message thread\"")?;
+    let hidden = driver.command(
+        "set_pane_visibility",
+        json!({"pane": "message", "visible": false}),
+    )?;
+    assert_eq!(hidden["ok"], true, "message pane did not hide: {hidden}");
+    let opened = driver.command("open_selected_thread", json!({}))?;
+    assert_eq!(
+        opened["ok"], true,
+        "fixture thread did not open standalone: {opened}"
+    );
+    let standalone_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let standalone = driver.command("standalone_message_windows", json!({}))?;
+        if json_array_at(&standalone, &["windows"])?.len() == 1 {
+            break;
+        }
+        ensure!(
+            Instant::now() < standalone_deadline,
+            "standalone message window did not open: {standalone}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+    let selected = driver.command(
+        "standalone_select_message",
+        json!({"window_index": 0, "message_index": 0}),
+    )?;
+    assert_eq!(
+        selected["ok"], true,
+        "standalone source message could not be selected: {selected}"
+    );
+    let authoritative_path = selected["window"]["selected_message"]["filenames"]
+        .as_array()
+        .and_then(|filenames| filenames.first())
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .with_context(|| format!("standalone source had no filename: {selected}"))?;
+    let authoritative_bytes = fs::read(&authoritative_path)?;
+
+    assert_eq!(
+        driver.command("set_fixture_draft_delay", json!({"milliseconds": 300}))?["ok"],
+        true
+    );
+    assert_eq!(
+        driver.command(
+            "set_fixture_composer_preparation_delay",
+            json!({"milliseconds": 800}),
+        )?["ok"],
+        true
+    );
+    let clear_before = draft_autosave_status(&mut driver)?;
+    let clear_write_count = draft_write_count(&clear_before)?;
+    let compose_generation = clear_before["compose_generation"]
+        .as_u64()
+        .with_context(|| format!("clear status had no compose generation: {clear_before}"))?;
+    let transition_epoch = clear_before["transition_epoch"]
+        .as_u64()
+        .with_context(|| format!("clear status had no transition epoch: {clear_before}"))?;
+    let clear = driver.command("clear_draft", json!({}))?;
+    assert_eq!(clear["ok"], true, "delayed clear did not start: {clear}");
+    assert_eq!(clear["pending_confirmation"], false, "{clear}");
+    let clear_busy = wait_for_draft_worker_after(&mut driver, clear_write_count, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        clear_busy["busy"], true,
+        "delayed clear was not active: {clear_busy}"
+    );
+
+    let cache_before = driver.command("attachment_io_status", json!({}))?;
+    let cache_generation = cache_before["composer_cache"]["latest_generation"]
+        .as_u64()
+        .with_context(|| format!("composer cache had no generation: {cache_before}"))?;
+    let forward = driver.command(
+        "standalone_respond",
+        json!({"window_index": 0, "action": "forward_attachment"}),
+    )?;
+    assert_eq!(forward["ok"], true, "standalone forward failed: {forward}");
+    assert_eq!(
+        forward["pending"], true,
+        "standalone forward was not prepared asynchronously: {forward}"
+    );
+    let preparation_generation = forward["generation"]
+        .as_u64()
+        .with_context(|| format!("standalone forward had no generation: {forward}"))?;
+    assert_eq!(
+        driver.command(
+            "set_fixture_composer_preparation_delay",
+            json!({"milliseconds": 0}),
+        )?["ok"],
+        true
+    );
+    assert_eq!(
+        driver.command("set_fixture_draft_delay", json!({"milliseconds": 0}))?["ok"],
+        true
+    );
+
+    let clear_completed =
+        wait_for_draft_write_after(&mut driver, clear_write_count, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        clear_completed["compose_generation"], compose_generation,
+        "older clear changed the composer after the newer preparation started: before={clear_before}, after={clear_completed}"
+    );
+    assert_eq!(
+        clear_completed["transition_epoch"],
+        transition_epoch.saturating_add(1),
+        "standalone preparation did not advance exactly one transition epoch: before={clear_before}, after={clear_completed}"
+    );
+    assert_eq!(
+        clear_completed["last_error"],
+        Value::Null,
+        "older draft clear failed: {clear_completed}"
+    );
+    let in_flight = driver.command("composer_preparation_status", json!({}))?;
+    assert_eq!(
+        in_flight["busy"], true,
+        "older clear cancelled the newer standalone preparation: {in_flight}"
+    );
+    assert_eq!(
+        in_flight["generation"], preparation_generation,
+        "older clear replaced the newer standalone preparation generation: {in_flight}"
+    );
+    assert_eq!(in_flight["outcome"], "pending", "{in_flight}");
+
+    let prepared = wait_for_composer_preparation_generation(
+        &mut driver,
+        preparation_generation,
+        STARTUP_TIMEOUT,
+    )?;
+    assert_eq!(
+        prepared["outcome"], "prepared",
+        "newer standalone preparation did not finish: {prepared}"
+    );
+    let cached =
+        wait_for_new_composer_attachment_cache(&mut driver, cache_generation, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        cached["composer_cache"]["outcome"], "applied",
+        "standalone message source was not cached: {cached}"
+    );
+    assert_eq!(
+        cached["composer_cache"]["completed_generation"],
+        cached["composer_cache"]["latest_generation"],
+        "standalone cache did not complete its requested generation: {cached}"
+    );
+    let final_state = driver.command("app_state", json!({}))?;
+    ensure!(
+        final_state["state"]["compose_generation"]
+            .as_u64()
+            .is_some_and(|generation| generation > compose_generation),
+        "newer standalone preparation never applied composer fields: {final_state}"
+    );
+    let cached_path = final_state["state"]["compose_fields"]["attachments"]
+        .as_array()
+        .and_then(|attachments| attachments.first())
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .with_context(|| format!("standalone forward cached no attachment: {final_state}"))?;
+    assert_eq!(
+        fs::read(&cached_path)?,
+        authoritative_bytes,
+        "standalone forward cache did not preserve the authoritative source bytes"
+    );
+
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after_restart()
@@ -9287,7 +9468,14 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
         main_reply["pending"], true,
         "main reply was not prepared asynchronously: {main_reply}"
     );
-    let main_preparation = wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let main_preparation_generation = main_reply["generation"]
+        .as_u64()
+        .with_context(|| format!("main reply returned no preparation generation: {main_reply}"))?;
+    let main_preparation = wait_for_composer_preparation_generation(
+        &mut driver,
+        main_preparation_generation,
+        STARTUP_TIMEOUT,
+    )?;
     assert_eq!(
         main_preparation["outcome"], "prepared",
         "main reply did not finish preparing: {main_preparation}"
@@ -9313,12 +9501,32 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
         let cleared = driver.command(command, json!({"value": ""}))?;
         assert_eq!(cleared["ok"], true, "could not clear main reply: {cleared}");
     }
+    let main_clear_before = draft_autosave_status(&mut driver)?;
+    let main_clear_write_count = draft_write_count(&main_clear_before)?;
+    let main_clear_compose_generation = main_clear_before["compose_generation"]
+        .as_u64()
+        .with_context(|| {
+            format!("main clear status had no composer generation: {main_clear_before}")
+        })?;
     let clear_main_reply = driver.command("clear_draft", json!({}))?;
     assert_eq!(
         clear_main_reply["ok"], true,
         "could not close cleared main reply: {clear_main_reply}"
     );
     assert_eq!(clear_main_reply["pending_confirmation"], false);
+    let main_clear_completed =
+        wait_for_draft_write_after(&mut driver, main_clear_write_count, STARTUP_TIMEOUT)?;
+    ensure!(
+        main_clear_completed["compose_generation"]
+            .as_u64()
+            .is_some_and(|generation| generation > main_clear_compose_generation),
+        "main reply clear did not reach its composer boundary: before={main_clear_before}, after={main_clear_completed}"
+    );
+    assert_eq!(
+        main_clear_completed["last_error"],
+        Value::Null,
+        "main reply clear failed: {main_clear_completed}"
+    );
 
     let standalone_reply = driver.command(
         "standalone_respond",
@@ -9332,7 +9540,15 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
         standalone_reply["pending"], true,
         "standalone reply was not prepared asynchronously: {standalone_reply}"
     );
-    let standalone_preparation = wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let standalone_preparation_generation =
+        standalone_reply["generation"].as_u64().with_context(|| {
+            format!("standalone reply returned no preparation generation: {standalone_reply}")
+        })?;
+    let standalone_preparation = wait_for_composer_preparation_generation(
+        &mut driver,
+        standalone_preparation_generation,
+        STARTUP_TIMEOUT,
+    )?;
     assert_eq!(
         standalone_preparation["outcome"], "prepared",
         "standalone reply did not finish preparing: {standalone_preparation}"
@@ -9361,17 +9577,43 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
             "could not clear standalone reply: {cleared}"
         );
     }
+    let standalone_clear_before = draft_autosave_status(&mut driver)?;
+    let standalone_clear_write_count = draft_write_count(&standalone_clear_before)?;
+    let standalone_clear_compose_generation = standalone_clear_before["compose_generation"]
+        .as_u64()
+        .with_context(|| {
+            format!("standalone clear status had no composer generation: {standalone_clear_before}")
+        })?;
     let clear_standalone_reply = driver.command("clear_draft", json!({}))?;
     assert_eq!(
         clear_standalone_reply["ok"], true,
         "could not close cleared standalone reply: {clear_standalone_reply}"
     );
     assert_eq!(clear_standalone_reply["pending_confirmation"], false);
+    let standalone_clear_completed =
+        wait_for_draft_write_after(&mut driver, standalone_clear_write_count, STARTUP_TIMEOUT)?;
+    ensure!(
+        standalone_clear_completed["compose_generation"]
+            .as_u64()
+            .is_some_and(|generation| generation > standalone_clear_compose_generation),
+        "standalone reply clear did not reach its composer boundary: before={standalone_clear_before}, after={standalone_clear_completed}"
+    );
+    assert_eq!(
+        standalone_clear_completed["last_error"],
+        Value::Null,
+        "standalone reply clear failed: {standalone_clear_completed}"
+    );
 
     // Keep the pre-mutation standalone window alive through the fresh main
     // reloads above, then exercise its independently retained lazy source.
     // The resulting dirty forward is closed through the real modal main-window
     // workflow below; that workflow intentionally preserves recovery state.
+    let cache_before_forward = driver.command("attachment_io_status", json!({}))?;
+    let previous_cache_generation = cache_before_forward["composer_cache"]["latest_generation"]
+        .as_u64()
+        .with_context(|| {
+            format!("composer cache had no generation before forward: {cache_before_forward}")
+        })?;
     let retained_standalone_forward = driver.command(
         "standalone_respond",
         json!({"window_index": 0, "action": "forward_attachment"}),
@@ -9380,17 +9622,35 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
         retained_standalone_forward["pending"], true,
         "retained standalone forward did not prepare asynchronously: {retained_standalone_forward}"
     );
-    let retained_standalone_preparation =
-        wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let retained_standalone_generation = retained_standalone_forward["generation"]
+        .as_u64()
+        .with_context(|| {
+            format!(
+                "retained standalone forward returned no preparation generation: {retained_standalone_forward}"
+            )
+        })?;
+    let retained_standalone_preparation = wait_for_composer_preparation_generation(
+        &mut driver,
+        retained_standalone_generation,
+        STARTUP_TIMEOUT,
+    )?;
     assert_eq!(
         retained_standalone_preparation["outcome"], "prepared",
         "retained standalone forward did not finish preparing: {retained_standalone_preparation}"
     );
-    let retained_standalone_cache =
-        wait_for_composer_attachment_cache_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let retained_standalone_cache = wait_for_new_composer_attachment_cache(
+        &mut driver,
+        previous_cache_generation,
+        STARTUP_TIMEOUT,
+    )?;
     assert_eq!(
         retained_standalone_cache["composer_cache"]["outcome"], "applied",
         "retained standalone source was not cached: {retained_standalone_cache}"
+    );
+    assert_eq!(
+        retained_standalone_cache["composer_cache"]["completed_generation"],
+        retained_standalone_cache["composer_cache"]["latest_generation"],
+        "retained standalone cache did not complete its requested generation: {retained_standalone_cache}"
     );
     let retained_forward_state = driver.command("app_state", json!({}))?;
     let retained_forward_paths = json_array_at(
@@ -12364,6 +12624,47 @@ fn wait_for_composer_preparation_idle(
     }
 }
 
+fn wait_for_composer_preparation_generation(
+    driver: &mut UiDriver,
+    requested_generation: u64,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = driver.command("composer_preparation_status", json!({}))?;
+        ensure!(
+            status["ok"] == true,
+            "composer preparation status failed: {status}"
+        );
+        let busy = status["busy"]
+            .as_bool()
+            .with_context(|| format!("composer preparation status had no busy flag: {status}"))?;
+        let active_generation = status["generation"].as_u64();
+        let completed_generation = status["completed_generation"].as_u64();
+        if !busy && completed_generation == Some(requested_generation) {
+            return Ok(status);
+        }
+        ensure!(
+            !active_generation.is_some_and(|generation| generation > requested_generation)
+                && !completed_generation
+                    .is_some_and(|generation| generation > requested_generation),
+            "composer preparation generation {requested_generation} was superseded: {status}"
+        );
+        ensure!(
+            busy || !matches!(
+                status["outcome"].as_str(),
+                Some("cancelled" | "superseded" | "failed" | "rejected")
+            ),
+            "composer preparation generation {requested_generation} became idle without completing: {status}"
+        );
+        ensure!(
+            Instant::now() < deadline,
+            "composer preparation generation {requested_generation} did not complete within {timeout:?}: {status}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
 fn wait_for_attachment_io_idle(driver: &mut UiDriver, timeout: Duration) -> anyhow::Result<Value> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -12400,6 +12701,45 @@ fn wait_for_composer_attachment_cache_idle(
         ensure!(
             Instant::now() < deadline,
             "composer attachment cache did not become idle within {timeout:?}: {status}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
+fn wait_for_new_composer_attachment_cache(
+    driver: &mut UiDriver,
+    previous_generation: u64,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = driver.command("attachment_io_status", json!({}))?;
+        ensure!(
+            status["ok"] == true,
+            "attachment I/O status failed: {status}"
+        );
+        let cache = &status["composer_cache"];
+        let latest_generation = cache["latest_generation"].as_u64().with_context(|| {
+            format!("composer attachment cache had no latest generation: {status}")
+        })?;
+        let completed_generation = cache["completed_generation"].as_u64();
+        let busy = cache["busy"]
+            .as_bool()
+            .with_context(|| format!("composer attachment cache had no busy flag: {status}"))?;
+        if latest_generation > previous_generation
+            && completed_generation == Some(latest_generation)
+            && !busy
+        {
+            return Ok(status);
+        }
+        ensure!(
+            busy || latest_generation == previous_generation
+                || !matches!(cache["outcome"].as_str(), Some("cancelled" | "failed")),
+            "composer attachment cache generation after {previous_generation} became idle without completing: {status}"
+        );
+        ensure!(
+            Instant::now() < deadline,
+            "composer attachment cache did not complete a generation after {previous_generation} within {timeout:?}: {status}"
         );
         thread::sleep(STARTUP_POLL_INTERVAL);
     }

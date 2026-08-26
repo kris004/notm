@@ -534,6 +534,7 @@ struct Widgets {
     composer_preparation_delay: Rc<Cell<Duration>>,
     composer_preparation_completed_generation: Rc<Cell<Option<u64>>>,
     composer_preparation_last_outcome: Rc<RefCell<Option<String>>>,
+    composer_transition_epoch: Rc<Cell<u64>>,
     pending_message_selection: Rc<Cell<Option<usize>>>,
     prepared_threads: Rc<RefCell<BTreeMap<String, Arc<PreparedThread>>>>,
     thread_load_delay: Rc<Cell<Duration>>,
@@ -1690,6 +1691,7 @@ fn build_ui(
         composer_preparation_delay: Rc::new(Cell::new(Duration::ZERO)),
         composer_preparation_completed_generation: Rc::new(Cell::new(None)),
         composer_preparation_last_outcome: Rc::new(RefCell::new(None)),
+        composer_transition_epoch: Rc::new(Cell::new(0)),
         pending_message_selection: Rc::new(Cell::new(None)),
         prepared_threads: Rc::new(RefCell::new(BTreeMap::new())),
         thread_load_delay: Rc::new(Cell::new(Duration::ZERO)),
@@ -7735,10 +7737,13 @@ fn execute_pending_action(
         } => {
             cancel_pending_draft_capture(widgets);
             let fields = compose_fields(widgets, state);
-            let generation = {
+            let (generation, transition_epoch) = {
                 let mut state = state.borrow_mut();
                 state.compose_fields = fields.clone();
-                state.compose_generation
+                (
+                    state.compose_generation,
+                    widgets.composer_transition_epoch.get(),
+                )
             };
             let action = if clear_saved_recovery {
                 RecoveryAction::Clear
@@ -7754,7 +7759,14 @@ fn execute_pending_action(
             widgets
                 .draft_autosave
                 .flush(generation, action, move |result| match result {
-                    Ok(()) if st.borrow().compose_generation != generation => {
+                    Ok(())
+                        if composer_reset_was_superseded(
+                            generation,
+                            transition_epoch,
+                            st.borrow().compose_generation,
+                            w.composer_transition_epoch.get(),
+                        ) =>
+                    {
                         w.status_label
                             .set_text("Composer close superseded by newer changes");
                     }
@@ -8317,6 +8329,12 @@ fn schedule_composer_preparation(
         report_composer_preparation_error(options, widgets, state, intent, &error);
         return false;
     }
+    // Preparation does not edit compose fields until its worker completes.
+    // Advance a separate epoch now so an older asynchronous composer reset
+    // cannot mistake the still-unchanged edit generation for inactivity.
+    widgets
+        .composer_transition_epoch
+        .set(widgets.composer_transition_epoch.get().saturating_add(1));
     cancel_composer_attachment_cache(
         widgets,
         state,
@@ -9538,6 +9556,7 @@ where
 {
     let generation = widgets.draft_recovery_coordinator.borrow_mut().begin();
     let compose_generation = state.borrow().compose_generation;
+    let transition_epoch = widgets.composer_transition_epoch.get();
     widgets
         .draft_recovery_last_outcome
         .replace(Some("loading".to_string()));
@@ -9566,8 +9585,15 @@ where
                 result: Err(anyhow::anyhow!("draft recovery worker disconnected")),
             },
         };
-        if finish_draft_recovery_load(&opts, &w, &st, intent, compose_generation, response)
-            && let Some(on_complete) = on_complete.take()
+        if finish_draft_recovery_load(
+            &opts,
+            &w,
+            &st,
+            intent,
+            compose_generation,
+            transition_epoch,
+            response,
+        ) && let Some(on_complete) = on_complete.take()
         {
             on_complete();
         }
@@ -9582,6 +9608,7 @@ fn finish_draft_recovery_load(
     state: &SharedState,
     intent: DraftRecoveryIntent,
     requested_compose_generation: u64,
+    requested_transition_epoch: u64,
     response: DraftRecoveryResponse,
 ) -> bool {
     if !widgets
@@ -9594,7 +9621,12 @@ fn finish_draft_recovery_load(
     widgets
         .draft_recovery_completed_generation
         .set(Some(response.generation));
-    if state.borrow().compose_generation != requested_compose_generation {
+    if composer_reset_was_superseded(
+        requested_compose_generation,
+        requested_transition_epoch,
+        state.borrow().compose_generation,
+        widgets.composer_transition_epoch.get(),
+    ) {
         widgets
             .draft_recovery_last_outcome
             .replace(Some("superseded".to_string()));
@@ -9732,6 +9764,7 @@ fn clear_current_draft_immediately(
 ) -> bool {
     cancel_pending_draft_capture(widgets);
     let generation = state.borrow().compose_generation;
+    let transition_epoch = widgets.composer_transition_epoch.get();
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
@@ -9740,7 +9773,14 @@ fn clear_current_draft_immediately(
         generation,
         RecoveryAction::Clear,
         move |result| match result {
-            Ok(()) if st.borrow().compose_generation != generation => {
+            Ok(())
+                if composer_reset_was_superseded(
+                    generation,
+                    transition_epoch,
+                    st.borrow().compose_generation,
+                    w.composer_transition_epoch.get(),
+                ) =>
+            {
                 w.status_label
                     .set_text("Draft clear superseded by newer composer changes");
             }
@@ -9757,6 +9797,16 @@ fn clear_current_draft_immediately(
         },
     );
     true
+}
+
+fn composer_reset_was_superseded(
+    requested_compose_generation: u64,
+    requested_transition_epoch: u64,
+    current_compose_generation: u64,
+    current_transition_epoch: u64,
+) -> bool {
+    current_compose_generation != requested_compose_generation
+        || current_transition_epoch != requested_transition_epoch
 }
 
 fn clear_draft_widgets(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -17816,6 +17866,7 @@ fn handle_automation_request(
                 "completed_generation": widgets.composer_preparation_completed_generation.get(),
                 "outcome": widgets.composer_preparation_last_outcome.borrow().clone(),
                 "compose_generation": state.borrow().compose_generation,
+                "transition_epoch": widgets.composer_transition_epoch.get(),
                 "last_error": state.borrow().last_error,
             })
         }
@@ -17844,6 +17895,7 @@ fn handle_automation_request(
                 "completed_generation": draft.completed_generation,
                 "write_count": draft.write_count,
                 "compose_generation": state.borrow().compose_generation,
+                "transition_epoch": widgets.composer_transition_epoch.get(),
                 "last_error": state.borrow().last_error,
             })
         }
@@ -21593,6 +21645,14 @@ fn apply_pane_visibility_values(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn composer_reset_completion_requires_unchanged_generations() {
+        assert!(!composer_reset_was_superseded(7, 11, 7, 11));
+        assert!(composer_reset_was_superseded(7, 11, 8, 11));
+        assert!(composer_reset_was_superseded(7, 11, 7, 12));
+        assert!(composer_reset_was_superseded(7, 11, 8, 12));
+    }
 
     fn indexed_draft_test_options(temp: &tempfile::TempDir) -> (LaunchOptions, PathBuf) {
         let database_path = temp.path().join("mail");
