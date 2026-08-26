@@ -213,7 +213,7 @@ NOTM_REQUIRE_GTK_DISPLAY=1 \
   fixture_theme_modes_follow_both_simulated_system_preferences \
   -- --exact --nocapture --test-threads=1
 NOTM_REQUIRE_GTK_DISPLAY=1 \
-  cargo test -p notm-app --test desktop_ui_smoke \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
   fixture_send_timeout_validation_preserves_last_valid_value_across_restart \
   -- --exact --nocapture --test-threads=1
 ```

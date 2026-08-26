@@ -6341,6 +6341,64 @@ fn fixture_settings_preview_limits_apply_without_partial_persistence() -> anyhow
 
 #[cfg(unix)]
 #[test]
+fn bcc_only_local_smtp_submission_uses_hidden_envelope_recipient() -> anyhow::Result<()> {
+    let work_dir = tempfile::tempdir().context("creating Bcc-only SMTP work directory")?;
+    let smtp = LocalSmtpCapture::start()?;
+    let submit_helper = work_dir.path().join("submit-local-smtp");
+    write_python_submission_helper(&submit_helper, smtp.port())?;
+
+    let mut message = notm_mail::ComposedMessage::new(
+        "Jörg Sender <sender@example.test>".to_string(),
+        Vec::new(),
+        format!("Bcc-only Unicode submission {}", "秘密".repeat(60)),
+        "The sole recipient must remain private.".to_string(),
+    );
+    message.bcc = vec!["Hidden <hidden@example.test>".to_string()];
+    let raw = message.to_rfc5322()?;
+    ensure!(
+        !raw.starts_with(b"To:") && !raw.windows(b"\r\nTo:".len()).any(|line| line == b"\r\nTo:"),
+        "Bcc-only pre-submission message contained an empty To field"
+    );
+
+    let mut child = Command::new(&submit_helper)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting Bcc-only local SMTP helper")?;
+    std::io::Write::write_all(child.stdin.as_mut().context("opening helper stdin")?, &raw)?;
+    let output = child
+        .wait_with_output()
+        .context("waiting for Bcc-only local SMTP helper")?;
+    ensure!(
+        output.status.success(),
+        "Bcc-only local SMTP helper failed with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let captured = smtp
+        .wait_for_messages(1, Duration::from_secs(10))?
+        .pop()
+        .context("Bcc-only SMTP capture was empty")?;
+    assert_eq!(captured.rcpt_to, ["hidden@example.test"]);
+    let parsed = parse_captured_smtp_wire(
+        work_dir.path(),
+        "bcc-only",
+        &captured,
+        "sender@example.test",
+    )?;
+    ensure!(
+        parsed["to"].as_array().is_some_and(|to| to.is_empty())
+            && parsed["cc"].as_array().is_some_and(|cc| cc.is_empty())
+            && parsed["bcc"].as_array().is_some_and(|bcc| bcc.is_empty()),
+        "Bcc-only captured wire exposed a destination field: {parsed}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn clean_xdg_local_smtp_wire_interoperability() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(

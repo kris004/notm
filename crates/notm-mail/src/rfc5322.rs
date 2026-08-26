@@ -54,7 +54,9 @@ pub fn render_message(message: &ComposedMessage) -> anyhow::Result<Vec<u8>> {
     );
     write_token_header(&mut out, "Message-ID", &message_ids)?;
     write_address_header(&mut out, "From", std::slice::from_ref(&message.from), false)?;
-    write_address_header(&mut out, "To", &message.to, true)?;
+    if !message.to.is_empty() {
+        write_address_header(&mut out, "To", &message.to, true)?;
+    }
     if !message.cc.is_empty() {
         write_address_header(&mut out, "Cc", &message.cc, true)?;
     }
@@ -339,14 +341,41 @@ fn canonical_message_id_core(
         value.is_ascii() && value.starts_with('<') && value.ends_with('>'),
         "{field} contains a non-ASCII or unbracketed message identifier: {value:?}"
     );
-    // notm-generated Message-ID values use the current no-internal-CFWS
-    // grammar. Threading values can originate in older mail, for which RFC
-    // 5322 requires readers to honor obsolete local-part/domain CFWS; strip
-    // that semantically empty CFWS before emitting the canonical msg-id.
+    let source_inner = &value.as_bytes()[1..value.len() - 1];
+    let source_separator = message_id_separator(source_inner).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{field} contains a message identifier without one valid @ separator: {value:?}"
+        )
+    })?;
+    let (source_left, source_right_with_at) = source_inner.split_at(source_separator);
+    let source_right = &source_right_with_at[1..];
+
+    // notm-generated Message-ID values use the current RFC 5322 grammar:
+    // dot-atom-text on the left and no internal CFWS. Threading values can
+    // originate in older mail, for which conforming readers must also accept
+    // obs-id-left/local-part and obs-id-right/domain. Validate that obsolete
+    // grammar before removing its semantically empty CFWS so invalid adjacent
+    // words cannot be silently repaired into a different identifier.
     let inner = if allow_obsolete_internal_cfws {
-        strip_obsolete_message_id_cfws(field, &value.as_bytes()[1..value.len() - 1])?
+        ensure!(
+            valid_obs_id_left_with_cfws(field, source_left)?,
+            "{field} contains an invalid obsolete id-left in {value:?}"
+        );
+        ensure!(
+            valid_obs_id_right_with_cfws(field, source_right)?,
+            "{field} contains an invalid obsolete id-right in {value:?}"
+        );
+        strip_obsolete_message_id_cfws(field, source_inner)?
     } else {
-        value.as_bytes()[1..value.len() - 1].to_vec()
+        ensure!(
+            valid_dot_atom(source_left),
+            "{field} contains an invalid id-left in {value:?}"
+        );
+        ensure!(
+            valid_id_right(source_right),
+            "{field} contains an invalid id-right in {value:?}"
+        );
+        source_inner.to_vec()
     };
     let separator = message_id_separator(&inner).ok_or_else(|| {
         anyhow::anyhow!(
@@ -461,8 +490,19 @@ fn message_id_separator(inner: &[u8]) -> Option<usize> {
     let mut quoted = false;
     let mut literal = false;
     let mut escaped = false;
+    let mut comment_depth = 0usize;
     for (index, byte) in inner.iter().copied().enumerate() {
-        if escaped {
+        if comment_depth != 0 {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'(' {
+                comment_depth += 1;
+            } else if byte == b')' {
+                comment_depth -= 1;
+            }
+        } else if escaped {
             escaped = false;
         } else if (quoted || literal) && byte == b'\\' {
             escaped = true;
@@ -472,16 +512,159 @@ fn message_id_separator(inner: &[u8]) -> Option<usize> {
             literal = true;
         } else if literal && byte == b']' {
             literal = false;
+        } else if !quoted && !literal && byte == b'(' {
+            comment_depth = 1;
         } else if !quoted && !literal && byte == b'@' && separator.replace(index).is_some() {
             return None;
         }
     }
-    (!quoted && !literal && !escaped)
+    (!quoted && !literal && !escaped && comment_depth == 0)
         .then_some(separator)
         .flatten()
 }
 
+fn valid_obs_id_left_with_cfws(field: &str, value: &[u8]) -> anyhow::Result<bool> {
+    if value.is_empty() {
+        return Ok(false);
+    }
+    let mut index = 0;
+    loop {
+        let Some(next) = parse_obs_id_left_word(field, value, index)? else {
+            return Ok(false);
+        };
+        index = next;
+        if index == value.len() {
+            return Ok(true);
+        }
+        if value[index] != b'.' {
+            return Ok(false);
+        }
+        index += 1;
+        if index == value.len() {
+            return Ok(false);
+        }
+    }
+}
+
+fn parse_obs_id_left_word(
+    field: &str,
+    value: &[u8],
+    index: usize,
+) -> anyhow::Result<Option<usize>> {
+    let index = skip_obsolete_message_id_cfws(field, value, index)?;
+    let Some(&first) = value.get(index) else {
+        return Ok(None);
+    };
+    let next = if first == b'"' {
+        parse_quoted_id_word(value, index)
+    } else {
+        parse_id_left_atom(value, index)
+    };
+    next.map(|next| skip_obsolete_message_id_cfws(field, value, next))
+        .transpose()
+}
+
+fn parse_id_left_atom(value: &[u8], index: usize) -> Option<usize> {
+    let mut end = index;
+    while value.get(end).is_some_and(|byte| is_atext(*byte)) {
+        end += 1;
+    }
+    (end != index).then_some(end)
+}
+
+fn valid_obs_id_right_with_cfws(field: &str, value: &[u8]) -> anyhow::Result<bool> {
+    if value.is_empty() {
+        return Ok(false);
+    }
+    let start = skip_obsolete_message_id_cfws(field, value, 0)?;
+    if value.get(start) == Some(&b'[') {
+        return valid_obs_domain_literal(field, value, start);
+    }
+
+    let mut index = 0;
+    loop {
+        let Some(next) = parse_obs_domain_atom(field, value, index)? else {
+            return Ok(false);
+        };
+        index = next;
+        if index == value.len() {
+            return Ok(true);
+        }
+        if value[index] != b'.' {
+            return Ok(false);
+        }
+        index += 1;
+        if index == value.len() {
+            return Ok(false);
+        }
+    }
+}
+
+fn parse_obs_domain_atom(field: &str, value: &[u8], index: usize) -> anyhow::Result<Option<usize>> {
+    let index = skip_obsolete_message_id_cfws(field, value, index)?;
+    let Some(next) = parse_id_left_atom(value, index) else {
+        return Ok(None);
+    };
+    Ok(Some(skip_obsolete_message_id_cfws(field, value, next)?))
+}
+
+fn valid_obs_domain_literal(field: &str, value: &[u8], mut index: usize) -> anyhow::Result<bool> {
+    index += 1;
+    let mut has_content = false;
+    while let Some(&byte) = value.get(index) {
+        match byte {
+            b']' => {
+                if !has_content {
+                    return Ok(false);
+                }
+                index = skip_obsolete_message_id_cfws(field, value, index + 1)?;
+                return Ok(index == value.len());
+            }
+            b' ' | b'\t' => index += 1,
+            b'\\' => {
+                let Some(&escaped) = value.get(index + 1) else {
+                    return Ok(false);
+                };
+                if !matches!(escaped, b' ' | b'\t') && !escaped.is_ascii_graphic() {
+                    return Ok(false);
+                }
+                has_content = true;
+                index += 2;
+            }
+            b'!'..=b'Z' | b'^'..=b'~' => {
+                has_content = true;
+                index += 1;
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+
+fn skip_obsolete_message_id_cfws(
+    field: &str,
+    value: &[u8],
+    mut index: usize,
+) -> anyhow::Result<usize> {
+    loop {
+        while value
+            .get(index)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            index += 1;
+        }
+        if value.get(index) != Some(&b'(') {
+            return Ok(index);
+        }
+        index = skip_obsolete_message_id_comment(field, value, index)?;
+    }
+}
+
 fn valid_obs_id_left(value: &[u8]) -> bool {
+    // RFC 5322 obs-id-left -> local-part -> obs-local-part, whose exact
+    // grammar is word *("." word); word is atom / quoted-string. Multiple
+    // quoted or mixed dot-separated words are therefore deliberately legal
+    // when canonicalizing legacy threading identifiers.
     if value.is_empty() {
         return false;
     }
@@ -508,11 +691,7 @@ fn parse_id_left_word(value: &[u8], index: usize) -> Option<usize> {
     if value.get(index) == Some(&b'"') {
         return parse_quoted_id_word(value, index);
     }
-    let mut end = index;
-    while value.get(end).is_some_and(|byte| is_atext(*byte)) {
-        end += 1;
-    }
-    (end != index).then_some(end)
+    parse_id_left_atom(value, index)
 }
 
 fn parse_quoted_id_word(value: &[u8], mut index: usize) -> Option<usize> {
@@ -1199,6 +1378,23 @@ mod tests {
     }
 
     #[test]
+    fn bcc_only_message_omits_invalid_empty_destination_fields() {
+        let mut message = test_message();
+        message.to.clear();
+        message.bcc = vec!["Only Hidden <hidden@example.test>".to_string()];
+
+        let raw = render(&message);
+        let parsed = mailparse::parse_mail(&raw).expect("parse Bcc-only message");
+        assert!(parsed.headers.get_first_header("To").is_none());
+        assert!(parsed.headers.get_first_header("Cc").is_none());
+        assert_eq!(
+            parsed.headers.get_first_value("Bcc").as_deref(),
+            Some("Only Hidden <hidden@example.test>")
+        );
+        assert_wire_limits(&raw);
+    }
+
+    #[test]
     fn long_text_html_and_binary_attachment_lines_are_transfer_encoded() {
         let mut message = test_message();
         let text_body = format!("{}\nUnicode: {}", "x".repeat(4_000), "世界".repeat(1_000));
@@ -1321,6 +1517,85 @@ mod tests {
             83
         );
         assert_wire_limits(&raw);
+    }
+
+    #[test]
+    fn generated_and_legacy_message_id_grammars_are_deliberately_distinct() {
+        assert_eq!(
+            message_id_tokens(
+                "Message-ID",
+                &["(outside) <strict.id@[IPv6:2001:db8::1]> (outside)".to_string()],
+            )
+            .expect("strict identifier with surrounding CFWS"),
+            ["<strict.id@[IPv6:2001:db8::1]>"]
+        );
+
+        for invalid in [
+            "<\"quoted\"@example.test>",
+            "<first.\"quoted\"@example.test>",
+            "<strict(comment)@example.test>",
+            "<strict @ example.test>",
+        ] {
+            assert!(
+                message_id_tokens("Message-ID", &[invalid.to_string()]).is_err(),
+                "strict Message-ID accepted obsolete syntax {invalid:?}"
+            );
+        }
+
+        for (legacy, canonical) in [
+            (
+                "(outside) < (old) \"quoted id\" (left) @ [ IPv6:2001:db8::1 ] > (outside)",
+                "<\"quoted id\"@[IPv6:2001:db8::1]>",
+            ),
+            (
+                "< (left) first (after) . (before) \"second word\" (right) @ \
+                 (domain) example (after) . (before) test (right) >",
+                "<first.\"second word\"@example.test>",
+            ),
+            (
+                "<\"quoted@left\".\"words\"@example.test>",
+                "<\"quoted@left\".\"words\"@example.test>",
+            ),
+            (
+                "<atom(comment@ignored)@example.test>",
+                "<atom@example.test>",
+            ),
+        ] {
+            for field in ["In-Reply-To", "References"] {
+                assert_eq!(
+                    message_id_tokens(field, &[legacy.to_string()])
+                        .unwrap_or_else(|error| panic!("{field} rejected {legacy:?}: {error:#}")),
+                    [canonical],
+                    "unexpected {field} canonicalization for {legacy:?}"
+                );
+            }
+        }
+
+        let sequence = "(lead) <first@example.test> (between) \
+                        < (old) \"second id\" (left) @ example.test > (tail)";
+        assert_eq!(
+            message_id_tokens("References", &[sequence.to_string()])
+                .expect("legacy References list"),
+            ["<first@example.test>", "<\"second id\"@example.test>"]
+        );
+
+        for invalid in [
+            "<a(comment)b@example.test>",
+            "<a b@example.test>",
+            "<a.\"b\" \"c\"@example.test>",
+            "<a@example(comment)test>",
+            "<a@example test>",
+            "<a@\"quoted\".example.test>",
+            "<a@[ ]>",
+            "<a@@example.test>",
+        ] {
+            for field in ["In-Reply-To", "References"] {
+                assert!(
+                    message_id_tokens(field, &[invalid.to_string()]).is_err(),
+                    "{field} accepted invalid obsolete syntax {invalid:?}"
+                );
+            }
+        }
     }
 
     #[test]
