@@ -111,7 +111,8 @@ fi
 (
   cd -- "$ARCHIVE_ROOT"
   cargo build --release --locked -p notm-app
-  cargo test --locked --workspace --all-targets --all-features
+  cargo test --locked --workspace --all-targets --all-features -- \
+    --test-threads=1
   cargo run --locked -p notm-app -- fixture-smoke
   make check-packaging
 )
