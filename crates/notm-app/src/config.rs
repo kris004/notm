@@ -2,7 +2,9 @@ use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use anyhow::Context;
 use notm_mail::validate_send_timeout_seconds;
-use notm_ui::model::{MAX_THREAD_PREVIEW_LINES, MessageViewPreference, ThemePreference};
+use notm_ui::model::{
+    MAX_SEARCH_PAGE_SIZE, MAX_THREAD_PREVIEW_LINES, MessageViewPreference, ThemePreference,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::paths;
@@ -35,8 +37,9 @@ impl AppConfig {
             "notmuch.open_readwrite_only_for_mutations must be true; notm always opens searches and message views read-only"
         );
         anyhow::ensure!(
-            self.ui.page_size > 0,
-            "ui.page_size must be greater than zero"
+            (1..=MAX_SEARCH_PAGE_SIZE).contains(&self.ui.page_size),
+            "ui.page_size must be between 1 and {MAX_SEARCH_PAGE_SIZE}; got {}",
+            self.ui.page_size
         );
         anyhow::ensure!(
             self.ui.theme.parse::<ThemePreference>().is_ok(),
@@ -923,6 +926,7 @@ mod tests {
                 "notmuch.open_readwrite_only_for_mutations",
             ),
             ("zero page size", "[ui]\npage_size = 0\n", "ui.page_size"),
+            ("oversized page", "[ui]\npage_size = 1001\n", "ui.page_size"),
             ("theme", "[ui]\ntheme = \"auto\"\n", "ui.theme"),
             (
                 "zero preview lines",

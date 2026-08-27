@@ -13,14 +13,13 @@ use chrono::Utc;
 use gtk::glib::variant::{StaticVariantType, ToVariant};
 use gtk::prelude::*;
 use gtk4 as gtk;
+#[cfg(test)]
+use notm_mail::html_sanitize::sanitize_html;
 use notm_mail::{
     ComposedMessage, ExternalCommandTransport, FakeSendTransport, MailtoRequest, ReplyKind,
     SendTransport, TransportMode,
     address::{dedupe_addresses, format_address, parse_address_list},
-    compose::{AttachmentInput, Identity},
-    html_sanitize::sanitize_html,
-    message_io::{BoundedText, read_header_text, read_raw_text},
-    mime::parse_reader,
+    compose::Identity,
     parse_mailto_uri, send_timeout_duration, validate_send_timeout_seconds,
 };
 use notm_notmuch::{
@@ -35,15 +34,37 @@ use webkit6::{
 };
 
 use crate::{
+    attachment_io::{
+        ComposerAttachmentCacheRequest, ComposerAttachmentCacheResponse,
+        ComposerAttachmentCacheService, ComposerAttachmentSource,
+    },
     automation::{self, AutomationConfig, AutomationRequest},
+    composer_preparation::{
+        self, ComposerPreparationAction, ComposerPreparationCoordinator, ComposerPreparationOutput,
+        ComposerPreparationRequest, ComposerPreparationResponse,
+    },
+    draft_autosave::{
+        DEFAULT_DEBOUNCE, DraftAutosaveController, DraftAutosaveEvent, RecoveryAction,
+    },
+    draft_io::{
+        self, DraftIoCoordinator, NamedDraftLoadRequest, NamedDraftLoadResult, WorkerResponse,
+    },
+    draft_recovery::{
+        self, DraftRecoveryCoordinator, DraftRecoveryOutcome, DraftRecoveryRequest,
+        DraftRecoveryResponse,
+    },
+    html_view_lifecycle::HtmlViewLifecycle,
     model::{
         ActiveDraft, ActivePane, ComposeFields, ContentLayout, InputMode, LayoutPreference,
-        MAX_LOADED_THREAD_MESSAGES, MessageViewPreference, ThemePreference, UiState,
+        MAX_SEARCH_PAGE_SIZE, MessageViewPreference, ThemePreference, UiState,
     },
     screenshot, theme,
+    thread_loader::{
+        AuthoritativePathMap, PreparedMessage, PreparedThread, TargetMessageNotFound,
+        ThreadLoadCoordinator, ThreadLoadRequest, ThreadLoadResponse,
+    },
     widgets::attachments::{
-        self, AttachmentActionResult, AttachmentController, AttachmentEvent,
-        AttachmentEventHandler, AttachmentOpenStore,
+        self, AttachmentController, AttachmentEvent, AttachmentEventHandler, AttachmentOpenStore,
     },
     widgets::composer::{
         self, ComposerController, ComposerPaths, ComposerReplacementKind, DRAFT_LIST_MAX_HEIGHT,
@@ -61,13 +82,13 @@ use crate::{
         try_parse_layout_preference,
     },
     widgets::standalone_message::{
-        StandaloneHtmlRender, StandaloneHtmlRenderer, StandaloneHtmlScroll,
-        StandaloneHtmlScrollHandler, StandaloneHtmlViewFactory, StandaloneHtmlViewInitializer,
+        STANDALONE_MESSAGE_WINDOW_LIMIT, STANDALONE_PREPARED_BYTES_LIMIT, StandaloneHtmlRender,
+        StandaloneHtmlRenderer, StandaloneHtmlViewFactory, StandaloneHtmlViewInitializer,
         StandaloneImagePolicy, StandaloneMessageController, StandaloneMessageHasHtml,
         StandaloneOpenOptions, StandalonePolicyProvider, StandalonePolicySnapshot,
         StandalonePreferredView, StandaloneRememberView, StandaloneResponseAction,
         StandaloneResponseHandler, StandaloneResponseRequest, StandaloneSenderView,
-        StandaloneSourceReader, StandaloneTextRenderer, StandaloneToggleSenderView,
+        StandaloneSourceRenderer, StandaloneTextRenderer, StandaloneToggleSenderView,
     },
     widgets::thread_list::{
         self, AppendSearchOutcome, LoadMoreDecision, LocatePagePlan, ReplaceSearchOutcome,
@@ -79,6 +100,9 @@ use crate::{
         thread_window_status as thread_window_status_from_parts,
     },
 };
+
+#[cfg(test)]
+use crate::widgets::attachments::AttachmentActionResult;
 
 pub use crate::widgets::settings::{RuntimeSettings, RuntimeSettingsStore};
 
@@ -302,6 +326,7 @@ pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
 }
 
 fn validate_launch_options(options: &LaunchOptions) -> anyhow::Result<()> {
+    settings::validate_page_size(options.page_size)?;
     settings::validate_thread_preview_lines(options.thread_preview_lines)?;
     validate_send_timeout_seconds(options.send_timeout_seconds)?;
     anyhow::ensure!(
@@ -468,7 +493,7 @@ fn sync_runtime_settings_from_launch_options(options: &LaunchOptions) {
     settings::update(
         &options.runtime_settings,
         RuntimeSettings {
-            page_size: options.page_size.max(1),
+            page_size: options.page_size.clamp(1, MAX_SEARCH_PAGE_SIZE),
             theme: options.theme,
             thread_preview_lines: options.thread_preview_lines,
             excluded_tags: options.excluded_tags.clone(),
@@ -499,10 +524,21 @@ struct Widgets {
     save_search_button: gtk::Button,
     custom_tag_entry: gtk::Entry,
     search_bar: SearchBarController,
+    search_page_coordinator: SearchPageCoordinator,
     sync_refresh_generation: Rc<Cell<Option<u64>>>,
     input_mode_generation: Rc<Cell<u64>>,
     hidden_tag_searches: HiddenTagSearchStore,
     thread_list: ThreadListController,
+    thread_load_coordinator: Rc<RefCell<ThreadLoadCoordinator>>,
+    composer_preparation_coordinator: Rc<RefCell<ComposerPreparationCoordinator>>,
+    composer_preparation_delay: Rc<Cell<Duration>>,
+    composer_preparation_completed_generation: Rc<Cell<Option<u64>>>,
+    composer_preparation_last_outcome: Rc<RefCell<Option<String>>>,
+    composer_transition_epoch: Rc<Cell<u64>>,
+    pending_message_selection: Rc<Cell<Option<usize>>>,
+    prepared_threads: Rc<RefCell<BTreeMap<String, Arc<PreparedThread>>>>,
+    thread_load_delay: Rc<Cell<Duration>>,
+    message_menu_generation: Rc<Cell<u64>>,
     manual_sync_button: Option<gtk::Button>,
     compose_button: gtk::Button,
     debug_button: gtk::Button,
@@ -536,8 +572,6 @@ struct Widgets {
     message_view: gtk::TextView,
     message_scrolled: gtk::ScrolledWindow,
     html_view: webkit6::WebView,
-    html_load_generation: Rc<Cell<u64>>,
-    html_completed_load_generation: Rc<Cell<u64>>,
     html_scrolled: gtk::ScrolledWindow,
     link_hints: LinkHintController,
     response_menu_button: gtk::MenuButton,
@@ -566,7 +600,7 @@ struct Widgets {
     view_raw_button: gtk::Button,
     sender_view_preference_button: gtk::Button,
     active_message_view: Rc<Cell<MessageViewKind>>,
-    pending_html_scroll_fraction: Rc<Cell<Option<f64>>>,
+    html_lifecycle: HtmlViewLifecycle,
     image_policy_button: gtk::Button,
     html_policy_row: gtk::Box,
     html_policy_label: gtk::Label,
@@ -582,11 +616,31 @@ struct Widgets {
     copy_subject_button: gtk::Button,
     quote_collapse: Rc<Cell<bool>>,
     attachments: AttachmentController,
+    composer_attachment_cache_service: ComposerAttachmentCacheService,
+    composer_attachment_cache_generation: Rc<Cell<u64>>,
+    composer_attachment_cache_active: Rc<Cell<Option<u64>>>,
+    composer_attachment_cache_poll_source: Rc<RefCell<Option<gtk::glib::SourceId>>>,
+    composer_attachment_cache_source_status: Rc<RefCell<Option<gtk::Label>>>,
+    composer_attachment_cache_completed_generation: Rc<Cell<Option<u64>>>,
+    composer_attachment_cache_last_outcome: Rc<RefCell<Option<String>>>,
     tag_search_box: gtk::Box,
     debug_view: gtk::TextView,
     status_label: gtk::Label,
     composer: ComposerController,
+    draft_autosave: DraftAutosaveController,
+    draft_recovery_coordinator: Rc<RefCell<DraftRecoveryCoordinator>>,
+    draft_recovery_completed_generation: Rc<Cell<Option<u64>>>,
+    draft_recovery_last_outcome: Rc<RefCell<Option<String>>>,
+    named_draft_io_coordinator: Rc<RefCell<DraftIoCoordinator>>,
+    named_draft_io_last_error: Rc<RefCell<Option<String>>>,
+    draft_io_delay: Rc<Cell<Duration>>,
+    draft_save_generation: Rc<Cell<u64>>,
+    draft_save_active: Rc<Cell<Option<u64>>>,
+    draft_save_completed: Rc<Cell<Option<u64>>>,
+    draft_capture_source: Rc<RefCell<Option<gtk::glib::SourceId>>>,
+    gtk_heartbeat: Rc<Cell<u64>>,
     close_when_idle: Rc<Cell<bool>>,
+    close_flush_in_progress: Rc<Cell<bool>>,
     tag_refresh_selected_thread_id: Rc<RefCell<Option<String>>>,
     standalone_messages: StandaloneMessageController,
 }
@@ -808,6 +862,8 @@ struct AddressSuggestionsResponse {
     result: anyhow::Result<Vec<String>>,
 }
 
+type DraftSaveCompletion = Box<dyn FnOnce(Result<DraftSaveReport, String>)>;
+
 enum PendingTransition {
     ClearComposer,
     ReplaceComposer(PreparedComposerReplacement),
@@ -816,6 +872,7 @@ enum PendingTransition {
     SaveDraftReplacement {
         fields: ComposeFields,
         previous: ActiveDraft,
+        completion: Option<DraftSaveCompletion>,
     },
     SendComposer {
         fields: ComposeFields,
@@ -871,13 +928,32 @@ enum ComposerReplacementPayload {
     Empty,
     Fields(Box<ComposeFields>),
     Message(Box<ComposedMessage>),
+    MessageWithAttachments {
+        message: Box<ComposedMessage>,
+        sources: Vec<ComposerAttachmentSource>,
+    },
+    CachedMessage {
+        message: Box<ComposedMessage>,
+        paths: Vec<String>,
+    },
     Draft(Box<PreparedDraftReplacement>),
 }
 
 struct PreparedDraftReplacement {
     fields: ComposeFields,
     active_source: Option<PreparedActiveDraft>,
-    attachment_inputs: Vec<AttachmentInput>,
+    attachment_sources: Vec<ComposerAttachmentSource>,
+}
+
+struct ComposerPreparationIntent {
+    kind: ComposerReplacementKind,
+    selection: Option<MessageSelectionSnapshot>,
+    rejection_restore: Option<MessageSelectionSnapshot>,
+    status: String,
+    source_status: Option<gtk::Label>,
+    present_main_window: bool,
+    show_message_pane: bool,
+    active_pane: ActivePane,
 }
 
 struct PreparedActiveDraft {
@@ -889,6 +965,13 @@ struct PreparedActiveDraft {
 const SIDEBAR_MIN_WIDTH: i32 = 136;
 const THREAD_LIST_MIN_WIDTH: i32 = 320;
 const MAX_SYNC_REFRESH_DELAY: Duration = Duration::from_secs(5);
+const DRAFT_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(15);
+const FIXTURE_STARTUP_RECOVERY_DELAY_ENV: &str = "NOTM_FIXTURE_TEST_STARTUP_RECOVERY_DELAY_MS";
+const FIXTURE_STARTUP_RECOVERY_GATE_ENV: &str = "NOTM_FIXTURE_TEST_STARTUP_RECOVERY_GATE";
+const MESSAGE_MENU_ROWS_PER_UPDATE: usize = 24;
+const COMPOSER_ATTACHMENT_CACHE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const COMPOSER_PREPARATION_POLL_INTERVAL: Duration = Duration::from_millis(15);
+const DRAFT_IO_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_TAG_WORKER_DELAY: Duration = Duration::from_secs(5);
 // GTK measures the message header at unbounded width during compact pane allocation.
 // Reserving multiple lines per metadata row can force the whole message pane taller
@@ -1406,7 +1489,6 @@ fn build_ui(
     sender_view_preference_button.set_visible(false);
     view_menu_box.append(&sender_view_preference_button);
     let active_message_view = Rc::new(Cell::new(MessageViewKind::Text));
-    let pending_html_scroll_fraction = Rc::new(Cell::new(None));
     let image_policy_button = gtk::Button::with_label("Load remote images once");
     image_policy_button.set_widget_name("notm-image-policy-button");
     image_policy_button.set_tooltip_text(Some(
@@ -1446,12 +1528,7 @@ fn build_ui(
     message_actions.append(&copy_menu_button);
     right.append(&message_actions);
 
-    let attachments = AttachmentController::new(
-        &window,
-        attachment_open_dir,
-        options.fixture_mode,
-        open_config(&options),
-    );
+    let attachments = AttachmentController::new(&window, attachment_open_dir, options.fixture_mode);
     right.append(&attachments.title_widget());
     right.append(&attachments.scrolled_widget());
 
@@ -1489,15 +1566,6 @@ fn build_ui(
     html_view.set_widget_name("notm-html-view");
     html_view.set_hexpand(true);
     html_view.set_vexpand(true);
-    let html_load_generation = Rc::new(Cell::new(0));
-    let html_load_lifecycle = Rc::new(RefCell::new(HtmlLoadLifecycle::default()));
-    let html_completed_load_generation = Rc::new(Cell::new(0));
-    connect_html_load_completion(
-        &html_view,
-        &html_load_generation,
-        &html_load_lifecycle,
-        &html_completed_load_generation,
-    );
     configure_html_webview(
         &html_view,
         settings::remote_images(&options.runtime_settings),
@@ -1542,6 +1610,10 @@ fn build_ui(
         drafts: drafts_dir,
         legacy_drafts: legacy_drafts_dir,
     });
+    let draft_autosave = DraftAutosaveController::new(
+        composer.recovery_path().to_path_buf(),
+        composer.legacy_recovery_path().map(Path::to_path_buf),
+    );
     message_stack.add_named(&composer.root(), Some("compose"));
 
     let debug_view = gtk::TextView::new();
@@ -1583,13 +1655,8 @@ fn build_ui(
     window.set_child(Some(&overlay));
     connect_html_navigation_policy(&html_view, &status_label);
     connect_html_hover_status(&html_view, &status_label);
-    connect_html_scroll_restore(
-        &html_view,
-        &status_label,
-        &pending_html_scroll_fraction,
-        &html_load_generation,
-        &html_completed_load_generation,
-    );
+    let html_lifecycle = HtmlViewLifecycle::new(&html_view, &status_label);
+    html_lifecycle.load_html(&empty_visual_html_document(), Some("about:blank"));
     let link_opener: LinkHintOpener = Rc::new(open_html_link_externally);
     let link_hints = LinkHintController::new(&html_view, &status_label, link_opener);
 
@@ -1612,10 +1679,23 @@ fn build_ui(
         save_search_button: save_search_button.clone(),
         custom_tag_entry,
         search_bar,
+        search_page_coordinator: search_page_coordinator(&options),
         sync_refresh_generation,
         input_mode_generation: Rc::new(Cell::new(0)),
         hidden_tag_searches,
         thread_list,
+        thread_load_coordinator: Rc::new(RefCell::new(ThreadLoadCoordinator::default())),
+        composer_preparation_coordinator: Rc::new(RefCell::new(
+            ComposerPreparationCoordinator::default(),
+        )),
+        composer_preparation_delay: Rc::new(Cell::new(Duration::ZERO)),
+        composer_preparation_completed_generation: Rc::new(Cell::new(None)),
+        composer_preparation_last_outcome: Rc::new(RefCell::new(None)),
+        composer_transition_epoch: Rc::new(Cell::new(0)),
+        pending_message_selection: Rc::new(Cell::new(None)),
+        prepared_threads: Rc::new(RefCell::new(BTreeMap::new())),
+        thread_load_delay: Rc::new(Cell::new(Duration::ZERO)),
+        message_menu_generation: Rc::new(Cell::new(0)),
         manual_sync_button: manual_sync_button.clone(),
         compose_button: compose_button.clone(),
         debug_button: debug_button.clone(),
@@ -1649,8 +1729,6 @@ fn build_ui(
         message_view,
         message_scrolled: scrolled_message.clone(),
         html_view,
-        html_load_generation,
-        html_completed_load_generation,
         html_scrolled: scrolled_html.clone(),
         link_hints,
         response_menu_button,
@@ -1679,7 +1757,7 @@ fn build_ui(
         view_raw_button,
         sender_view_preference_button,
         active_message_view,
-        pending_html_scroll_fraction,
+        html_lifecycle,
         image_policy_button,
         html_policy_row,
         html_policy_label,
@@ -1695,11 +1773,31 @@ fn build_ui(
         copy_subject_button,
         quote_collapse,
         attachments,
+        composer_attachment_cache_service: ComposerAttachmentCacheService::default(),
+        composer_attachment_cache_generation: Rc::new(Cell::new(0)),
+        composer_attachment_cache_active: Rc::new(Cell::new(None)),
+        composer_attachment_cache_poll_source: Rc::new(RefCell::new(None)),
+        composer_attachment_cache_source_status: Rc::new(RefCell::new(None)),
+        composer_attachment_cache_completed_generation: Rc::new(Cell::new(None)),
+        composer_attachment_cache_last_outcome: Rc::new(RefCell::new(None)),
         tag_search_box,
         debug_view,
         status_label,
         composer,
+        draft_autosave,
+        draft_recovery_coordinator: Rc::new(RefCell::new(DraftRecoveryCoordinator::default())),
+        draft_recovery_completed_generation: Rc::new(Cell::new(None)),
+        draft_recovery_last_outcome: Rc::new(RefCell::new(None)),
+        named_draft_io_coordinator: Rc::new(RefCell::new(DraftIoCoordinator::default())),
+        named_draft_io_last_error: Rc::new(RefCell::new(None)),
+        draft_io_delay: Rc::new(Cell::new(Duration::ZERO)),
+        draft_save_generation: Rc::new(Cell::new(0)),
+        draft_save_active: Rc::new(Cell::new(None)),
+        draft_save_completed: Rc::new(Cell::new(None)),
+        draft_capture_source: Rc::new(RefCell::new(None)),
+        gtk_heartbeat: Rc::new(Cell::new(0)),
         close_when_idle: Rc::new(Cell::new(false)),
+        close_flush_in_progress: Rc::new(Cell::new(false)),
         tag_refresh_selected_thread_id: Rc::new(RefCell::new(None)),
         standalone_messages: StandaloneMessageController::new(),
     };
@@ -1707,6 +1805,46 @@ fn build_ui(
         widgets.attachments.open_dir().is_dir(),
         "application attachment-open directory must exist while the UI is running"
     );
+    let thread_load_coordinator = widgets.thread_load_coordinator.clone();
+    let search_page_coordinator = widgets.search_page_coordinator.clone();
+    let thread_list = widgets.thread_list.clone();
+    let composer_preparation_coordinator = widgets.composer_preparation_coordinator.clone();
+    let draft_recovery_coordinator = widgets.draft_recovery_coordinator.clone();
+    let named_draft_io_coordinator = widgets.named_draft_io_coordinator.clone();
+    let draft_save_generation = widgets.draft_save_generation.clone();
+    let draft_save_active = widgets.draft_save_active.clone();
+    let pending_message_selection = widgets.pending_message_selection.clone();
+    let message_menu_generation = widgets.message_menu_generation.clone();
+    let composer_attachment_cache_service = widgets.composer_attachment_cache_service.clone();
+    let composer_attachment_cache_generation = widgets.composer_attachment_cache_generation.clone();
+    let composer_attachment_cache_active = widgets.composer_attachment_cache_active.clone();
+    let composer_attachment_cache_poll_source =
+        widgets.composer_attachment_cache_poll_source.clone();
+    let composer_attachment_cache_source_status =
+        widgets.composer_attachment_cache_source_status.clone();
+    widgets.window.connect_destroy(move |_| {
+        search_page_coordinator.cancel();
+        thread_list.cancel_model_update();
+        thread_load_coordinator.borrow_mut().cancel();
+        composer_preparation_coordinator.borrow_mut().cancel();
+        draft_recovery_coordinator.borrow_mut().cancel();
+        named_draft_io_coordinator.borrow_mut().cancel();
+        draft_save_generation.set(draft_save_generation.get().saturating_add(1));
+        draft_save_active.set(None);
+        pending_message_selection.set(None);
+        message_menu_generation.set(message_menu_generation.get().saturating_add(1));
+        composer_attachment_cache_generation
+            .set(composer_attachment_cache_generation.get().saturating_add(1));
+        composer_attachment_cache_active.set(None);
+        if let Some(source) = composer_attachment_cache_poll_source.borrow_mut().take() {
+            source.remove();
+        }
+        if let Some(status) = composer_attachment_cache_source_status.borrow_mut().take() {
+            status.set_text("Attachment cache cancelled because the window closed");
+        }
+        composer_attachment_cache_service.cancel();
+    });
+    connect_draft_autosave_events(&widgets, &state);
     apply_content_layout(&widgets, &state, initial_layout, false);
     apply_initial_pane_visibility(&options, &widgets, &state);
     update_active_pane_visuals(&widgets, &state);
@@ -1777,7 +1915,7 @@ fn build_ui(
     connect_recipient_autocomplete(&widgets.composer.to_entry(), &widgets, &state);
     connect_recipient_autocomplete(&widgets.composer.cc_entry(), &widgets, &state);
     connect_recipient_autocomplete(&widgets.composer.bcc_entry(), &widgets, &state);
-    connect_address_suggestion_list(&widgets, &state);
+    connect_address_suggestion_list(&widgets);
     connect_search_bar(&options, &widgets, &state);
     connect_input_mode_focus(&widgets, &state);
     let shortcut_router =
@@ -1795,9 +1933,11 @@ fn build_ui(
             if w.composer.has_pending_confirmation() {
                 return gtk::glib::Propagation::Stop;
             }
+            cancel_composer_preparation(&w, &st);
             let background_activity = {
                 let state = st.borrow();
                 background_activity_requires_deferred_close(&state)
+                    || w.draft_save_active.get().is_some()
             };
             if background_activity {
                 w.close_when_idle.set(true);
@@ -1807,10 +1947,8 @@ fn build_ui(
                 let fields = compose_fields(&w, &st);
                 let active_draft = st.borrow().active_draft.clone();
                 if !composer_requires_confirmation(&fields, active_draft.as_ref()) {
-                    // Durable undo history is written off the GTK thread during normal
-                    // operation. Only a final close waits for queued writes to finish.
-                    flush_undo_tag_persistence();
-                    return gtk::glib::Propagation::Proceed;
+                    flush_and_close_main_window(&w, &st);
+                    return gtk::glib::Propagation::Stop;
                 }
                 let _ = request_pending_action(&opts, &w, &st, PendingTransition::CloseMainWindow);
                 gtk::glib::Propagation::Stop
@@ -1829,20 +1967,8 @@ fn build_ui(
         );
     }
 
-    let recovered_draft = restore_draft_if_present(&options, &widgets, &state);
-    let preserve_recovered_composer = recovered_draft
-        && composer_requires_confirmation(
-            &compose_fields(&widgets, &state),
-            state.borrow().active_draft.as_ref(),
-        );
-    migrate_legacy_named_drafts_from_ui(&widgets, &state);
-    widgets.composer.refresh_draft_list();
+    schedule_named_draft_refresh(&widgets, &state, true, None);
     window.present();
-    let initial_mailto_opened = options
-        .mailto_uri
-        .as_deref()
-        .is_some_and(|uri| open_mailto_uri_request(&options, &widgets, &state, uri));
-    let preserve_startup_composer = preserve_recovered_composer || initial_mailto_opened;
     {
         let w = widgets.clone();
         let st = state.clone();
@@ -1851,40 +1977,14 @@ fn build_ui(
             sync_pane_button_classes(&w, &st);
         });
     }
-    if !initial_mailto_opened {
-        widgets
-            .status_label
-            .set_text("Starting notm; loading mail…");
-    }
+    widgets
+        .status_label
+        .set_text("Starting notm; checking draft recovery…");
     widgets
         .thread_list
-        .set_result_label("Loading initial search…");
-    show_thread_list_loading(&widgets, "Loading initial search…");
-    {
-        let opts = options.clone();
-        let w = widgets.clone();
-        let st = state.clone();
-        let query = options.default_query.clone();
-        gtk::glib::timeout_add_local_once(Duration::from_millis(0), move || {
-            schedule_search(
-                &opts,
-                &w,
-                &st,
-                &query,
-                !preserve_startup_composer,
-                Duration::ZERO,
-            );
-            refresh_address_suggestions_async(&opts, &w, &st);
-        });
-    }
-    {
-        let opts = options.clone();
-        let w = widgets.clone();
-        let st = state.clone();
-        gtk::glib::timeout_add_local_once(Duration::from_millis(250), move || {
-            run_startup_sync(&opts, &w, &st);
-        });
-    }
+        .set_result_label("Waiting for draft recovery…");
+    show_thread_list_loading(&widgets, "Waiting for draft recovery…");
+    schedule_startup_draft_recovery(&options, &widgets, &state);
     update_debug(&widgets, &state);
     MainWindowHandle {
         window,
@@ -3408,32 +3508,42 @@ fn connect_compose_vim_context(options: &LaunchOptions, widgets: &Widgets, state
     let st = state.clone();
     widgets.composer.connect_vim(
         Rc::new(move |text| status.set_text(&text)),
-        Rc::new(
-            move |path| match request_save_current_draft(&opts, &w, &st) {
-                Ok(Some(report)) => {
-                    w.composer.refresh_draft_list();
-                    let destination = report
-                        .maildir_path
-                        .as_ref()
-                        .or(report.local_path.as_ref())
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| "draft store".to_string());
-                    let suffix = path
-                        .map(|requested| format!("; ignored Vim file path {requested}"))
-                        .unwrap_or_default();
-                    let warning = report
-                        .recovery_cleanup_warning
-                        .as_ref()
-                        .map(|warning| format!("; recovery cleanup failed: {warning}"))
-                        .unwrap_or_default();
-                    w.status_label.set_text(&format!(
-                        "Vim :w saved draft to {destination}{suffix}{warning}"
-                    ));
-                }
-                Ok(None) => {}
-                Err(err) => w.status_label.set_text(&format!("Vim :w failed: {err}")),
-            },
-        ),
+        Rc::new(move |path| {
+            let completion_widgets = w.clone();
+            let completion_state = st.clone();
+            let completion = Box::new(
+                move |result: Result<DraftSaveReport, String>| match result {
+                    Ok(report) => {
+                        let destination = report
+                            .maildir_path
+                            .as_ref()
+                            .or(report.local_path.as_ref())
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "draft store".to_string());
+                        let suffix = path
+                            .as_deref()
+                            .map(|requested| format!("; ignored Vim file path {requested}"))
+                            .unwrap_or_default();
+                        let warning = report
+                            .recovery_cleanup_warning
+                            .as_ref()
+                            .map(|warning| format!("; recovery cleanup failed: {warning}"))
+                            .unwrap_or_default();
+                        completion_widgets.status_label.set_text(&format!(
+                            "Vim :w saved draft to {destination}{suffix}{warning}"
+                        ));
+                    }
+                    Err(error) => completion_widgets
+                        .status_label
+                        .set_text(&format!("Vim :w failed: {error}")),
+                },
+            );
+            if let Err(error) =
+                request_save_current_draft(&opts, &w, &completion_state, Some(completion))
+            {
+                w.status_label.set_text(&format!("Vim :w failed: {error}"));
+            }
+        }),
     );
 }
 
@@ -3452,9 +3562,6 @@ fn connect_compose_helpers(
 ) {
     for entry in [
         widgets.composer.sender_entry().clone(),
-        widgets.composer.to_entry().clone(),
-        widgets.composer.cc_entry().clone(),
-        widgets.composer.bcc_entry().clone(),
         widgets.composer.subject_entry().clone(),
     ] {
         let w = widgets.clone();
@@ -3496,14 +3603,12 @@ fn connect_compose_helpers(
 }
 
 fn save_current_draft_from_ui(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
-    match request_save_current_draft(options, widgets, state) {
-        Ok(Some(_)) => {}
-        Ok(None) => {}
+    match request_save_current_draft(options, widgets, state, None) {
+        Ok(_) => {}
         Err(err) => widgets
             .status_label
             .set_text(&format!("Draft save failed: {err}")),
     }
-    widgets.composer.refresh_draft_list();
 }
 
 #[allow(deprecated)]
@@ -3858,12 +3963,8 @@ fn connect_recipient_autocomplete(entry: &gtk::Entry, widgets: &Widgets, state: 
         .connect_recipient_autocomplete(entry, suggestions, edited);
 }
 
-fn connect_address_suggestion_list(widgets: &Widgets, state: &SharedState) {
-    let w = widgets.clone();
-    let st = state.clone();
-    widgets
-        .composer
-        .connect_address_suggestion_list(Rc::new(move || autosave_draft_from_widgets(&w, &st)));
+fn connect_address_suggestion_list(widgets: &Widgets) {
+    widgets.composer.connect_address_suggestion_list();
 }
 
 fn connect_search_bar(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -3879,6 +3980,8 @@ fn connect_search_bar(options: &LaunchOptions, widgets: &Widgets, state: &Shared
                 update_debug(&w, &st);
                 return;
             }
+            w.search_page_coordinator.cancel();
+            w.thread_list.cancel_model_update();
             let replace_cancelled_search = {
                 let state = st.borrow();
                 state.sync_in_progress && state.search_loading
@@ -3912,6 +4015,8 @@ fn connect_search_bar(options: &LaunchOptions, widgets: &Widgets, state: &Shared
             }
         }
         SearchInputEvent::Reserved { query, generation } => {
+            w.search_page_coordinator.cancel();
+            w.thread_list.cancel_model_update();
             prepare_search_activity(&w, &st, generation, &query);
         }
         SearchInputEvent::Dispatch(request) => start_full_search(&opts, &w, &st, request),
@@ -4856,54 +4961,15 @@ fn vim_scroll_to_edge(widgets: &Widgets, state: &SharedState, bottom: bool) {
 }
 
 fn scroll_html_view_lines(widgets: &Widgets, lines: f64) {
-    scroll_web_view_lines(&widgets.html_view, &widgets.status_label, lines);
+    widgets.html_lifecycle.scroll_lines(lines);
 }
 
 fn scroll_html_view_pages(widgets: &Widgets, pages: f64) {
-    scroll_web_view_pages(&widgets.html_view, &widgets.status_label, pages);
+    widgets.html_lifecycle.scroll_pages(pages);
 }
 
 fn scroll_html_view_to_edge(widgets: &Widgets, bottom: bool) {
-    scroll_web_view_to_edge(&widgets.html_view, &widgets.status_label, bottom);
-}
-
-fn scroll_web_view_lines(view: &webkit6::WebView, status_label: &gtk::Label, lines: f64) {
-    evaluate_web_view_scroll_script(
-        view,
-        status_label,
-        &format!(
-            "const e = document.scrollingElement || document.documentElement || document.body; \
-             e.scrollBy(0, {}); \
-             JSON.stringify({{y:e.scrollTop,h:e.scrollHeight,c:e.clientHeight}});",
-            (lines * 40.0).round()
-        ),
-    );
-}
-
-fn scroll_web_view_pages(view: &webkit6::WebView, status_label: &gtk::Label, pages: f64) {
-    evaluate_web_view_scroll_script(
-        view,
-        status_label,
-        &format!(
-            "const e = document.scrollingElement || document.documentElement || document.body; \
-             e.scrollBy(0, Math.round(window.innerHeight * {})); \
-             JSON.stringify({{y:e.scrollTop,h:e.scrollHeight,c:e.clientHeight}});",
-            pages
-        ),
-    );
-}
-
-fn scroll_web_view_to_edge(view: &webkit6::WebView, status_label: &gtk::Label, bottom: bool) {
-    let target = if bottom { "e.scrollHeight" } else { "0" };
-    evaluate_web_view_scroll_script(
-        view,
-        status_label,
-        &format!(
-            "const e = document.scrollingElement || document.documentElement || document.body; \
-             e.scrollTo(0, {target}); \
-             JSON.stringify({{y:e.scrollTop,h:e.scrollHeight,c:e.clientHeight}});"
-        ),
-    );
+    widgets.html_lifecycle.scroll_to_edge(bottom);
 }
 
 fn current_message_scroll_fraction(widgets: &Widgets) -> Option<f64> {
@@ -4957,183 +5023,11 @@ fn restore_adjustment_scroll_fraction(adjustment: &gtk::Adjustment, fraction: f6
 }
 
 fn html_scroll_fraction(widgets: &Widgets) -> Option<f64> {
-    let value = evaluate_html_javascript_json_sync(
-        widgets,
-        "const e = document.scrollingElement || document.documentElement || document.body; \
-         const max = Math.max(0, e.scrollHeight - e.clientHeight); \
-         JSON.stringify({fraction:max > 0 ? e.scrollTop / max : 0});",
-    )
-    .ok()?;
-    value.get("fraction").and_then(serde_json::Value::as_f64)
+    widgets.html_lifecycle.scroll_fraction()
 }
 
 fn restore_html_scroll_fraction(widgets: &Widgets, fraction: f64) {
-    widgets
-        .pending_html_scroll_fraction
-        .set(Some(fraction.clamp(0.0, 1.0)));
-}
-
-fn connect_html_scroll_restore(
-    view: &webkit6::WebView,
-    status_label: &gtk::Label,
-    pending_fraction: &Rc<Cell<Option<f64>>>,
-    requested_generation: &Rc<Cell<u64>>,
-    completed_generation: &Rc<Cell<u64>>,
-) {
-    let pending_fraction = pending_fraction.clone();
-    let requested_generation = requested_generation.clone();
-    let completed_generation = completed_generation.clone();
-    let status = status_label.clone();
-    view.connect_is_loading_notify(move |view| {
-        if view.is_loading() || completed_generation.get() != requested_generation.get() {
-            return;
-        }
-        let Some(fraction) = pending_fraction.take() else {
-            return;
-        };
-        evaluate_web_view_scroll_script(
-            view,
-            &status,
-            &format!(
-                "const e = document.scrollingElement || document.documentElement || document.body; \
-                 const max = Math.max(0, e.scrollHeight - e.clientHeight); \
-                 e.scrollTo(0, max * {});",
-                fraction.clamp(0.0, 1.0)
-            ),
-        );
-    });
-}
-
-fn connect_html_load_completion(
-    view: &webkit6::WebView,
-    requested_generation: &Rc<Cell<u64>>,
-    lifecycle: &Rc<RefCell<HtmlLoadLifecycle>>,
-    completed_generation: &Rc<Cell<u64>>,
-) {
-    let requested_generation_for_load = requested_generation.clone();
-    let requested_generation_for_resource = requested_generation.clone();
-    let lifecycle_for_load = lifecycle.clone();
-    view.connect_load_changed(move |_, event| {
-        lifecycle_for_load
-            .borrow_mut()
-            .load_changed(event, requested_generation_for_load.get());
-    });
-
-    let lifecycle_for_resource = lifecycle.clone();
-    let completed_generation = completed_generation.clone();
-    view.connect_resource_load_started(move |view, resource, _| {
-        let is_main_resource = view
-            .main_resource()
-            .is_some_and(|main_resource| main_resource == resource.clone());
-        if !is_main_resource {
-            return;
-        }
-
-        let Some(generation) = lifecycle_for_resource.borrow_mut().bind_main_resource() else {
-            return;
-        };
-        let lifecycle = lifecycle_for_resource.clone();
-        let requested_generation = requested_generation_for_resource.clone();
-        let completed_generation = completed_generation.clone();
-        // WebView Finished events have no load identity. The main WebResource
-        // object does, so only its captured generation may advance completion;
-        // callers additionally require WebView::is_loading() to be false.
-        resource.connect_finished(move |_| {
-            if let Some(generation) = lifecycle
-                .borrow_mut()
-                .finish_main_resource(generation, requested_generation.get())
-            {
-                completed_generation.set(generation);
-            }
-        });
-    });
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct HtmlLoadLifecycle {
-    active_generation: Option<u64>,
-    awaiting_main_resource_generation: Option<u64>,
-}
-
-impl HtmlLoadLifecycle {
-    fn load_changed(&mut self, event: webkit6::LoadEvent, requested_generation: u64) {
-        if event == webkit6::LoadEvent::Started {
-            self.start(requested_generation);
-        }
-    }
-
-    fn start(&mut self, generation: u64) {
-        self.active_generation = Some(generation);
-        self.awaiting_main_resource_generation = Some(generation);
-    }
-
-    fn bind_main_resource(&mut self) -> Option<u64> {
-        let generation = self.awaiting_main_resource_generation.take()?;
-        (self.active_generation == Some(generation)).then_some(generation)
-    }
-
-    fn finish_main_resource(&mut self, generation: u64, requested_generation: u64) -> Option<u64> {
-        if self.active_generation != Some(generation) || generation != requested_generation {
-            return None;
-        }
-        self.active_generation = None;
-        self.awaiting_main_resource_generation = None;
-        Some(generation)
-    }
-}
-
-fn evaluate_web_view_scroll_script(
-    view: &webkit6::WebView,
-    status_label: &gtk::Label,
-    script: &str,
-) {
-    let status = status_label.clone();
-    view.evaluate_javascript(
-        script,
-        Some("notm-scroll"),
-        Some("notm://scroll"),
-        None::<&gtk::gio::Cancellable>,
-        move |result| {
-            if let Err(err) = result {
-                status.set_text(&format!("HTML scroll failed: {err}"));
-            }
-        },
-    );
-}
-
-fn evaluate_html_javascript_json_sync(
-    widgets: &Widgets,
-    script: &str,
-) -> anyhow::Result<serde_json::Value> {
-    let slot: Rc<RefCell<Option<anyhow::Result<serde_json::Value>>>> = Rc::new(RefCell::new(None));
-    let slot_for_callback = slot.clone();
-    widgets.html_view.evaluate_javascript(
-        script,
-        Some("notm-automation"),
-        Some("notm://automation"),
-        None::<&gtk::gio::Cancellable>,
-        move |result| {
-            let parsed = match result {
-                Ok(value) => serde_json::from_str::<serde_json::Value>(&value.to_str())
-                    .map_err(anyhow::Error::from),
-                Err(err) => Err(anyhow::anyhow!(err.to_string())),
-            };
-            *slot_for_callback.borrow_mut() = Some(parsed);
-        },
-    );
-    let context = gtk::glib::MainContext::default();
-    let started = Instant::now();
-    while slot.borrow().is_none() && started.elapsed() < Duration::from_secs(2) {
-        while context.pending() {
-            context.iteration(false);
-        }
-        if slot.borrow().is_none() {
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-    slot.borrow_mut()
-        .take()
-        .unwrap_or_else(|| Err(anyhow::anyhow!("HTML JavaScript evaluation timed out")))
+    widgets.html_lifecycle.restore_fraction(fraction);
 }
 
 fn spin_main_context_for(duration: Duration) {
@@ -5148,15 +5042,17 @@ fn spin_main_context_for(duration: Duration) {
 }
 
 fn html_scroll_state(widgets: &Widgets) -> serde_json::Value {
-    match evaluate_html_javascript_json_sync(
-        widgets,
-        "const e = document.scrollingElement || document.documentElement || document.body; \
-         JSON.stringify({y:e.scrollTop,h:e.scrollHeight,c:e.clientHeight, \
-         canScroll:e.scrollHeight > e.clientHeight});",
-    ) {
-        Ok(value) => json!({"ok": true, "scroll": value}),
-        Err(err) => json!({"ok": false, "error": err.to_string()}),
-    }
+    let snapshot = widgets.html_lifecycle.snapshot();
+    json!({
+        "ok": snapshot.ready && snapshot.scroll.is_some(),
+        "generation": snapshot.generation,
+        "completed_generation": snapshot.completed_generation,
+        "ready": snapshot.ready,
+        "pending": snapshot.evaluation_pending,
+        "pending_restore": snapshot.pending_restore,
+        "scroll": snapshot.scroll,
+        "error": snapshot.last_error,
+    })
 }
 
 fn select_thread_edge(
@@ -5316,7 +5212,7 @@ fn load_thread_page_containing_index(
             SearchCachePolicy::Use
         },
     };
-    let coordinator = search_page_coordinator(options);
+    let coordinator = widgets.search_page_coordinator.clone();
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
@@ -5325,6 +5221,7 @@ fn load_thread_page_containing_index(
             return;
         }
         if visual_page_response_is_stale(visual_snapshot.as_ref(), &st.borrow()) {
+            finish_search_activity(&mut st.borrow_mut(), response.generation);
             update_thread_result_label(&w, &st);
             update_debug(&w, &st);
             return;
@@ -5345,48 +5242,73 @@ fn load_thread_page_containing_index(
                         let error = format!(
                             "Visual selection snapshot changed before page navigation; reselect it: {err}"
                         );
+                        finish_search_activity(&mut st.borrow_mut(), response.generation);
                         reject_visual_selection(&w, &st, error);
                         update_thread_result_label(&w, &st);
                         return;
                     }
                 }
                 let outcome = thread_list::reduce_replace_search(data);
-                finish_replaced_search(&opts, &w, &st, outcome, false);
-                if let Some(snapshot) = &visual_snapshot {
-                    let mut state = st.borrow_mut();
-                    state.visual_select_mode = true;
-                    state.visual_select_anchor = snapshot.anchor;
-                    state.visual_select_cursor = snapshot.cursor;
-                    state
-                        .visual_selected_threads
-                        .clone_from(&snapshot.selected_threads);
-                    state
-                        .visual_selected_thread_snapshots
-                        .clone_from(&snapshot.selected_thread_snapshots);
-                }
-                let local_index = plan
-                    .target_index
-                    .saturating_sub(st.borrow().thread_window_offset);
-                select_thread_index_clamped(&opts, &w, &st, local_index);
-                update_thread_result_label(&w, &st);
+                let generation = response.generation;
+                let continue_options = opts.clone();
+                let continue_widgets = w.clone();
+                let continue_state = st.clone();
+                let continue_visual_snapshot = visual_snapshot.clone();
+                finish_replaced_search_then(
+                    &opts,
+                    &w,
+                    &st,
+                    generation,
+                    outcome,
+                    false,
+                    move |applied| {
+                        if !applied {
+                            return;
+                        }
+                        if let Some(snapshot) = &continue_visual_snapshot {
+                            let mut state = continue_state.borrow_mut();
+                            state.visual_select_mode = true;
+                            state.visual_select_anchor = snapshot.anchor;
+                            state.visual_select_cursor = snapshot.cursor;
+                            state
+                                .visual_selected_threads
+                                .clone_from(&snapshot.selected_threads);
+                            state
+                                .visual_selected_thread_snapshots
+                                .clone_from(&snapshot.selected_thread_snapshots);
+                        }
+                        let local_index = plan
+                            .target_index
+                            .saturating_sub(continue_state.borrow().thread_window_offset);
+                        select_thread_index_clamped(
+                            &continue_options,
+                            &continue_widgets,
+                            &continue_state,
+                            local_index,
+                        );
+                        update_thread_result_label(&continue_widgets, &continue_state);
+                    },
+                );
             }
             Err(err) => {
-                if visual_snapshot.is_some() {
-                    reject_visual_selection(
-                        &w,
-                        &st,
-                        format!(
-                            "Visual selection page could not be validated; reselect it: {err}"
-                        ),
-                    );
-                    update_thread_result_label(&w, &st);
-                } else {
-                    let has_threads = !st.borrow().thread_list_items.is_empty();
-                    finish_search_error(
-                        &w,
-                        &st,
-                        thread_list::reduce_search_error(err, has_threads),
-                    );
+                if finish_search_activity(&mut st.borrow_mut(), response.generation) {
+                    if visual_snapshot.is_some() {
+                        reject_visual_selection(
+                            &w,
+                            &st,
+                            format!(
+                                "Visual selection page could not be validated; reselect it: {err}"
+                            ),
+                        );
+                        update_thread_result_label(&w, &st);
+                    } else {
+                        let has_threads = !st.borrow().thread_list_items.is_empty();
+                        finish_search_error(
+                            &w,
+                            &st,
+                            thread_list::reduce_search_error(err, has_threads),
+                        );
+                    }
                 }
             }
         }
@@ -6155,7 +6077,6 @@ fn install_shortcuts(
         }
         if st.borrow().input_mode == InputMode::Insert {
             if key == gtk::gdk::Key::Tab && complete_focused_recipient(&w, &st) {
-                autosave_draft_from_widgets(&w, &st);
                 return gtk::glib::Propagation::Stop;
             }
             if key == gtk::gdk::Key::Escape {
@@ -7330,37 +7251,98 @@ fn autosave_draft_from_widgets(widgets: &Widgets, state: &SharedState) {
     if widgets.composer.autosave_suppressed() {
         return;
     }
-    let fields = compose_fields(widgets, state);
-    record_compose_edit(state, fields.clone());
-    update_attachment_label(widgets, &fields.attachments);
-    persist_recovery_draft_from_ui(widgets, state, &fields);
-    update_draft_action_buttons(widgets, state);
+    cancel_composer_attachment_cache(
+        widgets,
+        state,
+        "Attachment cache cancelled by newer composer changes",
+    );
+    cancel_thread_load_for_composer_activity(widgets);
+    let generation = {
+        let mut state = state.borrow_mut();
+        state.compose_generation = state.compose_generation.saturating_add(1);
+        state.compose_generation
+    };
+    cancel_pending_draft_capture(widgets);
+    let w = widgets.clone();
+    let st = state.clone();
+    let source = gtk::glib::timeout_add_local_once(DEFAULT_DEBOUNCE, move || {
+        w.draft_capture_source.borrow_mut().take();
+        let fields = compose_fields(&w, &st);
+        st.borrow_mut().compose_fields = fields.clone();
+        update_attachment_label(&w, &fields.attachments);
+        w.draft_autosave.schedule(
+            generation,
+            recovery_action_for_fields(&st, &fields),
+            Duration::ZERO,
+        );
+        update_draft_action_buttons(&w, &st);
+    });
+    *widgets.draft_capture_source.borrow_mut() = Some(source);
 }
 
-fn persist_recovery_draft_from_ui(
-    widgets: &Widgets,
-    state: &SharedState,
-    fields: &ComposeFields,
-) -> bool {
-    let clearing_saved_copy = active_draft_matches_fields(state, fields);
-    match reconcile_recovery_draft(widgets, state, fields) {
-        Ok(()) => {
-            let mut state = state.borrow_mut();
-            if composer::clear_transient_autosave_error(&mut state.last_error) {
-                widgets.status_label.set_text("Draft autosave recovered");
-            }
-            true
-        }
-        Err(err) => {
-            let action = if clearing_saved_copy {
-                "Saved draft recovery cleanup failed"
-            } else {
-                "Draft autosave failed"
-            };
-            report_draft_persistence_error(widgets, state, action, &err);
-            false
-        }
+fn cancel_thread_load_for_composer_activity(widgets: &Widgets) {
+    let mut coordinator = widgets.thread_load_coordinator.borrow_mut();
+    if coordinator.active_generation().is_some() {
+        coordinator.cancel();
     }
+    drop(coordinator);
+    widgets.pending_message_selection.set(None);
+}
+
+fn cancel_pending_draft_capture(widgets: &Widgets) {
+    if let Some(source) = widgets.draft_capture_source.borrow_mut().take() {
+        source.remove();
+    }
+}
+
+fn recovery_action_for_fields(state: &SharedState, fields: &ComposeFields) -> RecoveryAction {
+    if !fields_has_content(fields) || active_draft_matches_fields(state, fields) {
+        RecoveryAction::Clear
+    } else {
+        RecoveryAction::Persist(Box::new(fields.clone()))
+    }
+}
+
+fn schedule_recovery_draft_from_ui(widgets: &Widgets, state: &SharedState, fields: &ComposeFields) {
+    cancel_pending_draft_capture(widgets);
+    let generation = state.borrow().compose_generation;
+    widgets.draft_autosave.schedule(
+        generation,
+        recovery_action_for_fields(state, fields),
+        Duration::ZERO,
+    );
+}
+
+fn connect_draft_autosave_events(widgets: &Widgets, state: &SharedState) {
+    let status = widgets.status_label.clone();
+    let debug_view = widgets.debug_view.clone();
+    let state = state.clone();
+    widgets
+        .draft_autosave
+        .connect_events(Rc::new(move |event: DraftAutosaveEvent| {
+            if !event.is_latest {
+                return;
+            }
+            match event.result {
+                Ok(()) => {
+                    let mut state = state.borrow_mut();
+                    if composer::clear_transient_autosave_error(&mut state.last_error) {
+                        status.set_text("Draft autosave recovered");
+                    }
+                }
+                Err(error) => {
+                    let message = format!("Draft autosave failed: {error}");
+                    let mut state = state.borrow_mut();
+                    state.last_error = Some(message.clone());
+                    state.last_operation = Some(format!(
+                        "draft autosave generation {} failed",
+                        event.generation
+                    ));
+                    status.set_text(&message);
+                }
+            }
+            update_debug_view(&debug_view, &state);
+        }));
 }
 
 fn active_draft_matches_fields(state: &SharedState, fields: &ComposeFields) -> bool {
@@ -7369,25 +7351,6 @@ fn active_draft_matches_fields(state: &SharedState, fields: &ComposeFields) -> b
         .active_draft
         .as_ref()
         .is_some_and(|active| active.saved_fields == *fields)
-}
-
-fn reconcile_recovery_draft(
-    widgets: &Widgets,
-    state: &SharedState,
-    fields: &ComposeFields,
-) -> anyhow::Result<()> {
-    if active_draft_matches_fields(state, fields) {
-        composer::clear_recovery_draft_files(
-            widgets.composer.recovery_path(),
-            widgets.composer.legacy_recovery_path(),
-        )
-    } else {
-        composer::persist_recovery_draft(
-            widgets.composer.recovery_path(),
-            widgets.composer.legacy_recovery_path(),
-            fields,
-        )
-    }
 }
 
 fn report_draft_persistence_error(
@@ -7403,13 +7366,25 @@ fn report_draft_persistence_error(
 }
 
 fn update_draft_action_buttons(widgets: &Widgets, state: &SharedState) {
-    let (active_draft, background_activity, response_io_in_progress) = {
+    let (
+        active_draft,
+        background_activity,
+        attachment_cache_pending,
+        named_draft_migration_pending,
+    ) = {
         let state = state.borrow();
         let tag_paths_blocked = tag_path_actions_blocked(&state);
         (
             state.active_draft.clone(),
-            state.sync_in_progress || state.send_in_progress || tag_paths_blocked,
-            state.send_in_progress || tag_paths_blocked,
+            state.sync_in_progress
+                || state.send_in_progress
+                || widgets.draft_save_active.get().is_some()
+                || tag_paths_blocked,
+            widgets.composer_attachment_cache_active.get().is_some(),
+            widgets
+                .named_draft_io_coordinator
+                .borrow()
+                .migration_in_progress(),
         )
     };
     if let Some(active_draft) = active_draft {
@@ -7439,28 +7414,29 @@ fn update_draft_action_buttons(widgets: &Widgets, state: &SharedState) {
             .delete_local_draft_button()
             .set_visible(false);
     }
-    widgets
-        .composer
-        .save_draft_button()
-        .set_sensitive(!background_activity);
+    widgets.composer.save_draft_button().set_sensitive(
+        !background_activity && !attachment_cache_pending && !named_draft_migration_pending,
+    );
     widgets
         .composer
         .clear_draft_button()
-        .set_sensitive(!response_io_in_progress);
-    widgets
-        .composer
-        .delete_local_draft_button()
         .set_sensitive(!background_activity);
+    widgets.composer.delete_local_draft_button().set_sensitive(
+        !background_activity && !attachment_cache_pending && !named_draft_migration_pending,
+    );
     widgets
         .composer
         .delete_selected_draft_button()
         .set_sensitive(
-            !background_activity && widgets.composer.draft_list().selected_row().is_some(),
+            !background_activity
+                && !attachment_cache_pending
+                && !named_draft_migration_pending
+                && widgets.composer.draft_list().selected_row().is_some(),
         );
     widgets
         .composer
         .draft_list()
-        .set_sensitive(!response_io_in_progress);
+        .set_sensitive(!background_activity);
     update_button_binding_labels(widgets, state);
 }
 
@@ -7574,6 +7550,15 @@ fn request_pending_action(
     state: &SharedState,
     action: PendingTransition,
 ) -> bool {
+    if matches!(
+        &action,
+        PendingTransition::ClearComposer
+            | PendingTransition::ReplaceComposer(_)
+            | PendingTransition::ShowSelectedMessage { .. }
+            | PendingTransition::CloseMainWindow
+    ) {
+        cancel_composer_preparation(widgets, state);
+    }
     if let Err(err) = ensure_user_operation_allowed(widgets, state, action.operation()) {
         action.rollback_preparation(options, widgets, state);
         widgets.status_label.set_text(&err.to_string());
@@ -7708,17 +7693,26 @@ fn execute_pending_action(
             delete_captured_active_draft(options, widgets, state, draft)
         }
         PendingTransition::DeleteNamedDraft(path) => {
-            delete_captured_named_draft(widgets, state, path)
+            delete_captured_named_draft(options, widgets, state, path)
         }
-        PendingTransition::SaveDraftReplacement { fields, previous } => {
-            match finish_captured_draft_save(options, widgets, state, fields, Some(previous)) {
-                Ok(_) => true,
-                Err(err) => {
-                    report_draft_persistence_error(widgets, state, "Draft save failed", &err);
-                    false
-                }
+        PendingTransition::SaveDraftReplacement {
+            fields,
+            previous,
+            completion,
+        } => match start_captured_draft_save(
+            options,
+            widgets,
+            state,
+            fields,
+            Some(previous),
+            completion,
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                report_draft_persistence_error(widgets, state, "Draft save failed", &error);
+                false
             }
-        }
+        },
         PendingTransition::SendComposer {
             fields,
             active,
@@ -7741,32 +7735,66 @@ fn execute_pending_action(
             clear_saved_recovery,
             ..
         } => {
-            apply_message_selection_snapshot(options, widgets, state, selection);
-            let recovery_error = if clear_saved_recovery {
-                composer::clear_recovery_draft_files(
-                    widgets.composer.recovery_path(),
-                    widgets.composer.legacy_recovery_path(),
+            cancel_pending_draft_capture(widgets);
+            let fields = compose_fields(widgets, state);
+            let (generation, transition_epoch) = {
+                let mut state = state.borrow_mut();
+                state.compose_fields = fields.clone();
+                (
+                    state.compose_generation,
+                    widgets.composer_transition_epoch.get(),
                 )
-                .err()
-            } else {
-                None
             };
-            reset_composer_fields(widgets, state);
-            show_preferred_selected_message_view(options, widgets, state);
-            state.borrow_mut().active_pane = active_pane;
-            focus_active_pane(widgets, state);
-            if let Some(err) = recovery_error {
-                let message = format!("{status}; saved-draft recovery cleanup failed: {err}");
-                state.borrow_mut().last_error = Some(message.clone());
-                widgets.status_label.set_text(&message);
+            let action = if clear_saved_recovery {
+                RecoveryAction::Clear
             } else {
-                widgets.status_label.set_text(&status);
-            }
+                recovery_action_for_fields(state, &fields)
+            };
+            let opts = options.clone();
+            let w = widgets.clone();
+            let st = state.clone();
+            widgets
+                .status_label
+                .set_text("Saving draft before closing composer…");
+            widgets
+                .draft_autosave
+                .flush(generation, action, move |result| match result {
+                    Ok(())
+                        if composer_reset_was_superseded(
+                            generation,
+                            transition_epoch,
+                            st.borrow().compose_generation,
+                            w.composer_transition_epoch.get(),
+                        ) =>
+                    {
+                        w.status_label
+                            .set_text("Composer close superseded by newer changes");
+                    }
+                    Ok(()) => {
+                        apply_message_selection_snapshot(&opts, &w, &st, selection);
+                        reset_composer_fields(&w, &st);
+                        show_preferred_selected_message_view(&opts, &w, &st);
+                        st.borrow_mut().active_pane = active_pane;
+                        focus_active_pane(&w, &st);
+                        w.status_label.set_text(&status);
+                    }
+                    Err(error) => {
+                        let message =
+                            format!("Draft autosave failed before closing composer: {error}");
+                        {
+                            let mut state = st.borrow_mut();
+                            state.last_error = Some(message.clone());
+                            state.last_operation =
+                                Some("composer close draft flush failed".to_string());
+                        }
+                        w.status_label.set_text(&message);
+                        update_debug(&w, &st);
+                    }
+                });
             true
         }
         PendingTransition::CloseMainWindow => {
-            widgets.composer.allow_close_once();
-            widgets.window.close();
+            flush_and_close_main_window(widgets, state);
             true
         }
     }
@@ -7861,8 +7889,24 @@ fn apply_prepared_composer_replacement(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
-    replacement: PreparedComposerReplacement,
+    mut replacement: PreparedComposerReplacement,
 ) -> bool {
+    // An accepted composer transition is newer than any thread preview that
+    // was queued before it. In particular, the initial search can finish its
+    // bounded model update just before automation or the user opens a new
+    // composer; allowing that preview to complete would immediately close or
+    // replace the new composer.
+    cancel_thread_load_for_composer_activity(widgets);
+    let attachment_sources = take_composer_attachment_sources(&mut replacement.payload);
+    if !attachment_sources.is_empty() {
+        return schedule_composer_attachment_cache(
+            options,
+            widgets,
+            state,
+            replacement,
+            attachment_sources,
+        );
+    }
     state.borrow_mut().last_error = None;
     if let Some(selection) = replacement.selection {
         apply_message_selection_snapshot(options, widgets, state, selection);
@@ -7875,35 +7919,33 @@ fn apply_prepared_composer_replacement(
             };
             apply_compose_fields(widgets, state, fields);
             set_active_draft(widgets, state, None);
+            let fields = compose_fields(widgets, state);
+            schedule_recovery_draft_from_ui(widgets, state, &fields);
             show_compose_view(widgets);
         }
         ComposerReplacementPayload::Fields(fields) => {
             apply_compose_fields(widgets, state, *fields);
             set_active_draft(widgets, state, None);
+            let fields = compose_fields(widgets, state);
+            schedule_recovery_draft_from_ui(widgets, state, &fields);
             show_compose_view(widgets);
         }
-        ComposerReplacementPayload::Message(message) => fill_composer(widgets, state, *message),
+        ComposerReplacementPayload::Message(message) => {
+            fill_composer(widgets, state, *message, Vec::new())
+        }
+        ComposerReplacementPayload::MessageWithAttachments { .. } => {
+            unreachable!("composer attachments must be cached before applying a replacement")
+        }
+        ComposerReplacementPayload::CachedMessage { message, paths } => {
+            fill_composer(widgets, state, *message, paths)
+        }
         ComposerReplacementPayload::Draft(draft) => {
             let PreparedDraftReplacement {
-                mut fields,
+                fields,
                 active_source,
-                attachment_inputs,
+                attachment_sources,
             } = *draft;
-            if !attachment_inputs.is_empty() {
-                let attachments = match cache_composer_attachments(&attachment_inputs) {
-                    Ok(attachments) => attachments,
-                    Err(err) => {
-                        report_draft_persistence_error(
-                            widgets,
-                            state,
-                            "Draft attachment load failed",
-                            &err,
-                        );
-                        return false;
-                    }
-                };
-                fields.attachments = attachments;
-            }
+            debug_assert!(attachment_sources.is_empty());
             let active_draft = active_source.map(|source| ActiveDraft {
                 path: source.path,
                 message_id: source.message_id,
@@ -7913,7 +7955,7 @@ fn apply_prepared_composer_replacement(
             apply_compose_fields(widgets, state, fields);
             set_active_draft(widgets, state, active_draft);
             let fields = compose_fields(widgets, state);
-            persist_recovery_draft_from_ui(widgets, state, &fields);
+            schedule_recovery_draft_from_ui(widgets, state, &fields);
             show_compose_view(widgets);
         }
     }
@@ -7941,55 +7983,792 @@ fn apply_prepared_composer_replacement(
     true
 }
 
+fn take_composer_attachment_sources(
+    payload: &mut ComposerReplacementPayload,
+) -> Vec<ComposerAttachmentSource> {
+    match payload {
+        ComposerReplacementPayload::Message(message) => std::mem::take(&mut message.attachments)
+            .into_iter()
+            .map(ComposerAttachmentSource::from_input)
+            .collect(),
+        ComposerReplacementPayload::MessageWithAttachments { message, sources } => {
+            let mut result = std::mem::take(sources);
+            result.extend(
+                std::mem::take(&mut message.attachments)
+                    .into_iter()
+                    .map(ComposerAttachmentSource::from_input),
+            );
+            result
+        }
+        ComposerReplacementPayload::Draft(draft) => std::mem::take(&mut draft.attachment_sources),
+        ComposerReplacementPayload::Empty
+        | ComposerReplacementPayload::Fields(_)
+        | ComposerReplacementPayload::CachedMessage { .. } => Vec::new(),
+    }
+}
+
+fn install_cached_composer_attachment_paths(
+    replacement: &mut PreparedComposerReplacement,
+    paths: Vec<String>,
+) -> anyhow::Result<()> {
+    match &mut replacement.payload {
+        ComposerReplacementPayload::Draft(draft) => {
+            draft.fields.attachments = paths;
+            Ok(())
+        }
+        ComposerReplacementPayload::Message(_)
+        | ComposerReplacementPayload::MessageWithAttachments { .. } => {
+            let payload =
+                std::mem::replace(&mut replacement.payload, ComposerReplacementPayload::Empty);
+            let message = match payload {
+                ComposerReplacementPayload::Message(message)
+                | ComposerReplacementPayload::MessageWithAttachments { message, .. } => message,
+                _ => unreachable!("matched composer message payload changed during replacement"),
+            };
+            replacement.payload = ComposerReplacementPayload::CachedMessage { message, paths };
+            Ok(())
+        }
+        ComposerReplacementPayload::Empty
+        | ComposerReplacementPayload::Fields(_)
+        | ComposerReplacementPayload::CachedMessage { .. } => {
+            anyhow::bail!("cached attachment paths have no composer payload destination")
+        }
+    }
+}
+
+fn composer_cache_selection(state: &SharedState) -> (Option<String>, Option<String>, u64) {
+    let state = state.borrow();
+    (
+        state
+            .selected_thread
+            .as_ref()
+            .map(|thread| thread.thread_id.clone()),
+        state
+            .selected_message
+            .as_ref()
+            .map(|message| message.message_id.clone()),
+        state.search_generation,
+    )
+}
+
+fn update_composer_attachment_cache_controls(widgets: &Widgets, state: &SharedState) {
+    let cache_pending = widgets.composer_attachment_cache_active.get().is_some();
+    let named_draft_migration_pending = widgets
+        .named_draft_io_coordinator
+        .borrow()
+        .migration_in_progress();
+    let (manual_sync_sensitive, send_sensitive) = {
+        let state = state.borrow();
+        background_control_sensitivity(
+            &state,
+            widgets.draft_save_active.get().is_some(),
+            cache_pending,
+            named_draft_migration_pending,
+        )
+    };
+    if let Some(button) = &widgets.manual_sync_button {
+        button.set_sensitive(manual_sync_sensitive);
+    }
+    widgets.composer.send_button().set_sensitive(send_sensitive);
+    update_draft_action_buttons(widgets, state);
+}
+
+fn background_control_sensitivity(
+    state: &UiState,
+    draft_save_pending: bool,
+    attachment_cache_pending: bool,
+    named_draft_migration_pending: bool,
+) -> (bool, bool) {
+    let background_activity = state.sync_in_progress
+        || state.send_in_progress
+        || draft_save_pending
+        || tag_path_actions_blocked(state);
+    let manual_sync_sensitive = !background_activity && !attachment_cache_pending;
+    let send_sensitive = manual_sync_sensitive && !named_draft_migration_pending;
+    (manual_sync_sensitive, send_sensitive)
+}
+
+fn cancel_composer_attachment_cache(
+    widgets: &Widgets,
+    state: &SharedState,
+    source_status: &str,
+) -> bool {
+    let logical_pending = widgets.composer_attachment_cache_active.replace(None);
+    let worker = widgets.composer_attachment_cache_service.snapshot();
+    let had_work = logical_pending.is_some()
+        || worker.active_generation.is_some()
+        || worker.pending_requests > 0
+        || worker.active_preparations > 0;
+    if logical_pending.is_some() {
+        widgets.composer_attachment_cache_generation.set(
+            widgets
+                .composer_attachment_cache_generation
+                .get()
+                .saturating_add(1),
+        );
+    }
+    if let Some(source) = widgets
+        .composer_attachment_cache_poll_source
+        .borrow_mut()
+        .take()
+    {
+        source.remove();
+    }
+    if let Some(status) = widgets
+        .composer_attachment_cache_source_status
+        .borrow_mut()
+        .take()
+    {
+        status.set_text(source_status);
+    }
+    widgets.composer_attachment_cache_service.cancel();
+    if logical_pending.is_some() {
+        *widgets.composer_attachment_cache_last_outcome.borrow_mut() =
+            Some("cancelled".to_string());
+    }
+    update_composer_attachment_cache_controls(widgets, state);
+    if had_work {
+        update_debug(widgets, state);
+    }
+    had_work
+}
+
+fn schedule_composer_attachment_cache(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    replacement: PreparedComposerReplacement,
+    attachment_sources: Vec<ComposerAttachmentSource>,
+) -> bool {
+    cancel_composer_attachment_cache(
+        widgets,
+        state,
+        "Attachment cache superseded by newer activity",
+    );
+    let generation = widgets
+        .composer_attachment_cache_generation
+        .get()
+        .saturating_add(1);
+    widgets.composer_attachment_cache_generation.set(generation);
+    widgets
+        .composer_attachment_cache_active
+        .set(Some(generation));
+    let compose_generation = state.borrow().compose_generation;
+    let selection = composer_cache_selection(state);
+    let response = widgets.composer_attachment_cache_service.submit(
+        ComposerAttachmentCacheRequest::new(
+            generation,
+            attachment_sources,
+            composer::default_attachment_cache_dir(),
+        )
+        .with_fixture_delay(widgets.attachments.fixture_io_delay()),
+    );
+    widgets
+        .status_label
+        .set_text("Caching composer attachments…");
+    if let Some(source_status) = replacement.source_status.as_ref() {
+        source_status.set_text("Caching composer attachments…");
+    }
+    *widgets.composer_attachment_cache_source_status.borrow_mut() =
+        replacement.source_status.clone();
+    *widgets.composer_attachment_cache_last_outcome.borrow_mut() = Some("pending".to_string());
+    update_composer_attachment_cache_controls(widgets, state);
+    update_debug(widgets, state);
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let mut replacement = Some(replacement);
+    let poll_source =
+        gtk::glib::timeout_add_local(COMPOSER_ATTACHMENT_CACHE_POLL_INTERVAL, move || {
+            let response = match response.try_recv() {
+                Ok(response) => response,
+                Err(mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => ComposerAttachmentCacheResponse {
+                    generation,
+                    result: Err(anyhow::anyhow!(
+                        "composer attachment cache worker disconnected"
+                    )),
+                },
+            };
+            if w.composer_attachment_cache_generation.get() != response.generation
+                || w.composer_attachment_cache_active.get() != Some(response.generation)
+            {
+                return gtk::glib::ControlFlow::Break;
+            }
+            w.composer_attachment_cache_poll_source.borrow_mut().take();
+            w.composer_attachment_cache_source_status
+                .borrow_mut()
+                .take();
+            w.composer_attachment_cache_active.set(None);
+            w.composer_attachment_cache_completed_generation
+                .set(Some(response.generation));
+            update_composer_attachment_cache_controls(&w, &st);
+            if st.borrow().compose_generation != compose_generation
+                || composer_cache_selection(&st) != selection
+            {
+                *w.composer_attachment_cache_last_outcome.borrow_mut() =
+                    Some("superseded".to_string());
+                if let Some(replacement) = replacement.as_ref()
+                    && let Some(status) = replacement.source_status.as_ref()
+                {
+                    status.set_text("Attachment cache superseded by newer activity");
+                }
+                update_debug(&w, &st);
+                return gtk::glib::ControlFlow::Break;
+            }
+            let mut replacement = replacement
+                .take()
+                .expect("composer cache replacement is consumed only on completion");
+            match response.result {
+                Ok(lease) => {
+                    let paths = lease.paths().to_vec();
+                    if let Err(error) =
+                        install_cached_composer_attachment_paths(&mut replacement, paths)
+                    {
+                        *w.composer_attachment_cache_last_outcome.borrow_mut() =
+                            Some("failed".to_string());
+                        report_composer_attachment_cache_error(&w, &st, &replacement, &error);
+                    } else if apply_prepared_composer_replacement(&opts, &w, &st, replacement) {
+                        let _ = lease.commit();
+                        *w.composer_attachment_cache_last_outcome.borrow_mut() =
+                            Some("applied".to_string());
+                    } else {
+                        *w.composer_attachment_cache_last_outcome.borrow_mut() =
+                            Some("rejected".to_string());
+                    }
+                }
+                Err(error) => {
+                    *w.composer_attachment_cache_last_outcome.borrow_mut() =
+                        Some("failed".to_string());
+                    report_composer_attachment_cache_error(&w, &st, &replacement, &error);
+                }
+            }
+            update_debug(&w, &st);
+            gtk::glib::ControlFlow::Break
+        });
+    *widgets.composer_attachment_cache_poll_source.borrow_mut() = Some(poll_source);
+    true
+}
+
+fn report_composer_attachment_cache_error(
+    widgets: &Widgets,
+    state: &SharedState,
+    replacement: &PreparedComposerReplacement,
+    error: &anyhow::Error,
+) {
+    let action = match replacement.kind {
+        ComposerReplacementKind::NamedDraft
+        | ComposerReplacementKind::RecoveryDraft
+        | ComposerReplacementKind::IndexedDraft => "Draft attachment load failed",
+        _ => "Attachment cache failed",
+    };
+    let message = format!("{action}: {error}");
+    {
+        let mut state = state.borrow_mut();
+        state.last_error = Some(message.clone());
+        state.last_operation = Some(message.clone());
+    }
+    widgets.status_label.set_text(&message);
+    if let Some(source_status) = replacement.source_status.as_ref() {
+        source_status.set_text(&message);
+    }
+    update_debug(widgets, state);
+}
+
+fn composer_preparation_selection(state: &SharedState) -> (Option<String>, Option<String>, u64) {
+    let state = state.borrow();
+    (
+        state
+            .selected_thread
+            .as_ref()
+            .map(|thread| thread.thread_id.clone()),
+        state
+            .selected_message
+            .as_ref()
+            .map(|message| message.message_id.clone()),
+        state.search_generation,
+    )
+}
+
+fn cancel_composer_preparation(widgets: &Widgets, state: &SharedState) {
+    let was_active = widgets
+        .composer_preparation_coordinator
+        .borrow()
+        .active_generation()
+        .is_some();
+    widgets
+        .composer_preparation_coordinator
+        .borrow_mut()
+        .cancel();
+    if was_active {
+        *widgets.composer_preparation_last_outcome.borrow_mut() = Some("cancelled".to_string());
+    }
+    cancel_composer_attachment_cache(
+        widgets,
+        state,
+        "Attachment cache superseded by newer activity",
+    );
+}
+
+fn schedule_composer_preparation(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    prepared_thread: Arc<PreparedThread>,
+    message_id: String,
+    action: ComposerPreparationAction,
+    intent: ComposerPreparationIntent,
+) -> bool {
+    let operation = if intent.kind == ComposerReplacementKind::IndexedDraft {
+        UserOperation::DraftLoad
+    } else {
+        UserOperation::ComposeReplace
+    };
+    if let Err(error) = ensure_user_operation_allowed(widgets, state, operation) {
+        report_composer_preparation_error(options, widgets, state, intent, &error);
+        return false;
+    }
+    // Preparation does not edit compose fields until its worker completes.
+    // Advance a separate epoch now so an older asynchronous composer reset
+    // cannot mistake the still-unchanged edit generation for inactivity.
+    widgets
+        .composer_transition_epoch
+        .set(widgets.composer_transition_epoch.get().saturating_add(1));
+    cancel_composer_attachment_cache(
+        widgets,
+        state,
+        "Attachment cache superseded by a newer composer request",
+    );
+
+    let token = widgets
+        .composer_preparation_coordinator
+        .borrow_mut()
+        .begin();
+    let generation = token.generation();
+    let compose_generation = state.borrow().compose_generation;
+    let selection = composer_preparation_selection(state);
+    let response = composer_preparation::spawn(
+        ComposerPreparationRequest::new(token, prepared_thread, message_id, action)
+            .with_fixture_delay(widgets.composer_preparation_delay.get()),
+    );
+    widgets.status_label.set_text("Preparing composer…");
+    if let Some(source_status) = intent.source_status.as_ref() {
+        source_status.set_text("Preparing composer…");
+    }
+    *widgets.composer_preparation_last_outcome.borrow_mut() = Some("pending".to_string());
+    update_debug(widgets, state);
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let mut intent = Some(intent);
+    gtk::glib::timeout_add_local(COMPOSER_PREPARATION_POLL_INTERVAL, move || {
+        let response = match response.try_recv() {
+            Ok(response) => response,
+            Err(mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => ComposerPreparationResponse {
+                generation,
+                result: Err(anyhow::anyhow!("composer preparation worker disconnected")),
+            },
+        };
+        if !w
+            .composer_preparation_coordinator
+            .borrow_mut()
+            .finish(response.generation)
+        {
+            return gtk::glib::ControlFlow::Break;
+        }
+        w.composer_preparation_completed_generation
+            .set(Some(response.generation));
+        let mut intent = intent
+            .take()
+            .expect("composer preparation intent is consumed only on completion");
+        if st.borrow().compose_generation != compose_generation
+            || composer_preparation_selection(&st) != selection
+        {
+            *w.composer_preparation_last_outcome.borrow_mut() = Some("superseded".to_string());
+            if let Some(restore) = intent.rejection_restore.take() {
+                apply_message_selection_snapshot(&opts, &w, &st, restore);
+            }
+            if let Some(source_status) = intent.source_status.as_ref() {
+                source_status.set_text("Response cancelled by newer activity");
+            }
+            update_debug(&w, &st);
+            return gtk::glib::ControlFlow::Break;
+        }
+        match response.result {
+            Ok(output) => match prepared_composer_replacement_from_output(intent, output) {
+                Ok(replacement) => {
+                    *w.composer_preparation_last_outcome.borrow_mut() =
+                        Some("prepared".to_string());
+                    let requested = request_pending_action(
+                        &opts,
+                        &w,
+                        &st,
+                        PendingTransition::ReplaceComposer(replacement),
+                    );
+                    if !requested {
+                        *w.composer_preparation_last_outcome.borrow_mut() =
+                            Some("rejected".to_string());
+                    }
+                }
+                Err(error) => {
+                    let (intent, error) = *error;
+                    *w.composer_preparation_last_outcome.borrow_mut() = Some("failed".to_string());
+                    report_composer_preparation_error(&opts, &w, &st, intent, &error);
+                }
+            },
+            Err(error) => {
+                *w.composer_preparation_last_outcome.borrow_mut() = Some("failed".to_string());
+                report_composer_preparation_error(&opts, &w, &st, intent, &error);
+            }
+        }
+        gtk::glib::ControlFlow::Break
+    });
+    true
+}
+
+fn prepared_composer_replacement_from_output(
+    intent: ComposerPreparationIntent,
+    output: ComposerPreparationOutput,
+) -> Result<PreparedComposerReplacement, Box<(ComposerPreparationIntent, anyhow::Error)>> {
+    let matching_output = matches!(
+        (&output, intent.kind),
+        (
+            ComposerPreparationOutput::IndexedDraft { .. },
+            ComposerReplacementKind::IndexedDraft
+        ) | (
+            ComposerPreparationOutput::Message(_)
+                | ComposerPreparationOutput::MessageWithAttachments { .. },
+            ComposerReplacementKind::Reply
+                | ComposerReplacementKind::ReplyAll
+                | ComposerReplacementKind::Forward
+                | ComposerReplacementKind::ForwardAttachment
+                | ComposerReplacementKind::StandaloneReply
+                | ComposerReplacementKind::StandaloneReplyAll
+                | ComposerReplacementKind::StandaloneForward
+                | ComposerReplacementKind::StandaloneForwardAttachment
+        )
+    );
+    if !matching_output {
+        return Err(Box::new((
+            intent,
+            anyhow::anyhow!("composer preparation returned the wrong response kind"),
+        )));
+    }
+    let payload = match output {
+        ComposerPreparationOutput::Message(message) => {
+            ComposerReplacementPayload::Message(Box::new(message))
+        }
+        ComposerPreparationOutput::MessageWithAttachments { message, sources } => {
+            ComposerReplacementPayload::MessageWithAttachments {
+                message: Box::new(message),
+                sources,
+            }
+        }
+        ComposerPreparationOutput::IndexedDraft {
+            fields,
+            sources,
+            source_path,
+            message_id,
+        } => ComposerReplacementPayload::Draft(Box::new(PreparedDraftReplacement {
+            fields,
+            active_source: Some(PreparedActiveDraft {
+                path: source_path,
+                message_id: Some(message_id),
+                indexed: true,
+            }),
+            attachment_sources: sources,
+        })),
+    };
+    Ok(PreparedComposerReplacement {
+        kind: intent.kind,
+        payload,
+        selection: intent.selection,
+        rejection_restore: intent.rejection_restore,
+        status: intent.status,
+        source_status: intent.source_status,
+        present_main_window: intent.present_main_window,
+        show_message_pane: intent.show_message_pane,
+        active_pane: intent.active_pane,
+    })
+}
+
+fn report_composer_preparation_error(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    mut intent: ComposerPreparationIntent,
+    error: &anyhow::Error,
+) {
+    let label = if intent.kind == ComposerReplacementKind::IndexedDraft {
+        "Draft preparation failed"
+    } else {
+        "Composer preparation failed"
+    };
+    let message = format!("{label}: {error}");
+    if let Some(restore) = intent.rejection_restore.take() {
+        apply_message_selection_snapshot(options, widgets, state, restore);
+    }
+    {
+        let mut state = state.borrow_mut();
+        state.last_error = Some(message.clone());
+        state.last_operation = Some(message.clone());
+    }
+    widgets.status_label.set_text(&message);
+    if let Some(source_status) = intent.source_status.as_ref() {
+        source_status.set_text(&message);
+    }
+    update_debug(widgets, state);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DraftSaveDisposition {
+    Started,
+    ConfirmationPending,
+}
+
+struct PendingDraftSave {
+    options: LaunchOptions,
+    widgets: Widgets,
+    state: SharedState,
+    fields: ComposeFields,
+    previous_draft: Option<ActiveDraft>,
+    operation_generation: u64,
+    completion: Option<DraftSaveCompletion>,
+    application_hold: gtk::gio::ApplicationHoldGuard,
+}
+
+struct DraftSaveWorkerResult {
+    report: DraftSaveReport,
+    active_draft: ActiveDraft,
+}
+
 fn request_save_current_draft(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
-) -> anyhow::Result<Option<DraftSaveReport>> {
+    completion: Option<DraftSaveCompletion>,
+) -> anyhow::Result<DraftSaveDisposition> {
     ensure_user_operation_allowed(widgets, state, UserOperation::DraftSave)?;
+    anyhow::ensure!(
+        widgets.draft_save_active.get().is_none(),
+        "draft saving is already in progress"
+    );
     let fields = compose_fields(widgets, state);
     anyhow::ensure!(fields_has_content(&fields), "draft has no content");
+    cancel_pending_draft_capture(widgets);
+    // Saving is an explicit persistence boundary. Keep the model snapshot in
+    // step with the exact widget values even when the outer edit debounce has
+    // not fired yet; otherwise the durable draft can be current while
+    // `active_draft.saved_fields` is compared with an older in-memory model.
+    state.borrow_mut().compose_fields = fields.clone();
     let previous_draft = state.borrow().active_draft.clone();
     if let Some(previous) = previous_draft.as_ref()
         && fields == previous.saved_fields
     {
-        let recovery_cleanup_warning = reconcile_recovery_draft(widgets, state, &fields)
-            .err()
-            .map(|err| err.to_string());
         let report = DraftSaveReport {
             local_path: (!previous.indexed).then(|| previous.path.clone()),
             maildir_path: previous.indexed.then(|| previous.path.clone()),
             indexed_message_id: previous.message_id.clone(),
             replaced_path: None,
-            recovery_cleanup_warning,
+            recovery_cleanup_warning: None,
         };
-        announce_draft_save(widgets, state, &report);
-        return Ok(Some(report));
+        start_existing_draft_reconciliation(options, widgets, state, report, completion)?;
+        return Ok(DraftSaveDisposition::Started);
     }
     if let Some(previous) = previous_draft {
         let requested = request_pending_action(
             options,
             widgets,
             state,
-            PendingTransition::SaveDraftReplacement { fields, previous },
+            PendingTransition::SaveDraftReplacement {
+                fields,
+                previous,
+                completion,
+            },
         );
         anyhow::ensure!(
             requested,
             "draft replacement confirmation could not be opened"
         );
-        return Ok(None);
+        return Ok(DraftSaveDisposition::ConfirmationPending);
     }
-    finish_captured_draft_save(options, widgets, state, fields, None).map(Some)
+    start_captured_draft_save(options, widgets, state, fields, None, completion)?;
+    Ok(DraftSaveDisposition::Started)
 }
 
-fn finish_captured_draft_save(
+fn begin_draft_save_activity(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    status: &str,
+) -> anyhow::Result<(u64, gtk::gio::ApplicationHoldGuard)> {
+    anyhow::ensure!(
+        widgets.draft_save_active.get().is_none(),
+        "draft persistence is already in progress"
+    );
+    let application = widgets
+        .window
+        .application()
+        .ok_or_else(|| anyhow::anyhow!("main window is not attached to the GTK application"))?;
+    let generation = widgets.draft_save_generation.get().saturating_add(1);
+    widgets.draft_save_generation.set(generation);
+    widgets.draft_save_active.set(Some(generation));
+    widgets.status_label.set_text(status);
+    state.borrow_mut().last_operation = Some(status.to_ascii_lowercase());
+    update_background_activity_controls(options, widgets, state);
+    update_debug(widgets, state);
+    Ok((generation, application.hold()))
+}
+
+fn start_existing_draft_reconciliation(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    report: DraftSaveReport,
+    completion: Option<DraftSaveCompletion>,
+) -> anyhow::Result<()> {
+    let (operation_generation, application_hold) =
+        begin_draft_save_activity(options, widgets, state, "Finalizing saved draft…")?;
+    let compose_generation = state.borrow().compose_generation;
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets
+        .draft_autosave
+        .flush(compose_generation, RecoveryAction::Clear, move |result| {
+            let _keep_application_alive = &application_hold;
+            if w.draft_save_active.get() != Some(operation_generation) {
+                return;
+            }
+            let mut report = report;
+            report.recovery_cleanup_warning = result.err();
+            finish_draft_save_success(&opts, &w, &st, operation_generation, report, completion);
+        });
+    Ok(())
+}
+
+fn start_captured_draft_save(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
     fields: ComposeFields,
     previous_draft: Option<ActiveDraft>,
-) -> anyhow::Result<DraftSaveReport> {
+    completion: Option<DraftSaveCompletion>,
+) -> anyhow::Result<()> {
     anyhow::ensure!(fields_has_content(&fields), "draft has no content");
+    let (operation_generation, application_hold) =
+        begin_draft_save_activity(options, widgets, state, "Saving draft recovery boundary…")?;
+    let compose_generation = state.borrow().compose_generation;
+    let pending = PendingDraftSave {
+        options: options.clone(),
+        widgets: widgets.clone(),
+        state: state.clone(),
+        fields: fields.clone(),
+        previous_draft,
+        operation_generation,
+        completion,
+        application_hold,
+    };
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets.draft_autosave.flush(
+        compose_generation,
+        RecoveryAction::Persist(Box::new(fields)),
+        move |result| {
+            let pending = pending;
+            match result {
+                Ok(()) => launch_draft_save_worker(pending),
+                Err(error) => {
+                    let options = pending.options.clone();
+                    finish_draft_save_failure(
+                        &options,
+                        &w,
+                        &st,
+                        operation_generation,
+                        pending.completion,
+                        "Draft save failed",
+                        format!("draft recovery flush failed: {error}"),
+                    );
+                }
+            }
+        },
+    );
+    Ok(())
+}
+
+fn launch_draft_save_worker(pending: PendingDraftSave) {
+    let generation = pending.operation_generation;
+    let options = pending.options.clone();
+    let fields = pending.fields.clone();
+    let previous = pending.previous_draft.clone();
+    let drafts_dir = pending.widgets.composer.drafts_dir().to_path_buf();
+    let legacy_drafts_dir = pending
+        .widgets
+        .composer
+        .legacy_drafts_dir()
+        .map(Path::to_path_buf);
+    let delay = pending.widgets.draft_io_delay.get();
+    let response = draft_io::spawn_worker("notm-draft-save", generation, move || {
+        if !delay.is_zero() {
+            thread::sleep(delay.min(draft_io::MAX_FIXTURE_DELAY));
+        }
+        perform_captured_draft_save(
+            &options,
+            &drafts_dir,
+            legacy_drafts_dir.as_deref(),
+            fields,
+            previous,
+        )
+    });
+    pending.widgets.status_label.set_text("Saving draft…");
+    let mut pending = Some(pending);
+    gtk::glib::timeout_add_local(DRAFT_IO_POLL_INTERVAL, move || {
+        let _keep_application_alive = pending.as_ref().map(|pending| &pending.application_hold);
+        let response = match response.try_recv() {
+            Ok(response) => response,
+            Err(mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => WorkerResponse {
+                generation,
+                result: Err(anyhow::anyhow!("draft save worker disconnected")),
+            },
+        };
+        let pending = pending
+            .take()
+            .expect("pending draft save is consumed only on completion");
+        if pending.widgets.draft_save_active.get() != Some(response.generation) {
+            return gtk::glib::ControlFlow::Break;
+        }
+        match response.result {
+            Ok(result) => finish_draft_save_worker_success(pending, result),
+            Err(error) => {
+                let options = pending.options.clone();
+                let widgets = pending.widgets.clone();
+                let state = pending.state.clone();
+                finish_draft_save_failure(
+                    &options,
+                    &widgets,
+                    &state,
+                    pending.operation_generation,
+                    pending.completion,
+                    "Draft save failed",
+                    error.to_string(),
+                );
+            }
+        }
+        gtk::glib::ControlFlow::Break
+    });
+}
+
+fn perform_captured_draft_save(
+    options: &LaunchOptions,
+    drafts_dir: &Path,
+    legacy_drafts_dir: Option<&Path>,
+    fields: ComposeFields,
+    previous_draft: Option<ActiveDraft>,
+) -> anyhow::Result<DraftSaveWorkerResult> {
     let persisted = if options.save_drafts_to_maildir {
         let message = composer::composed_message_from_fields(&fields)?;
         persist_draft_message(options, &message)?
@@ -7997,9 +8776,19 @@ fn finish_captured_draft_save(
         None
     };
     let local_path = if persisted.is_none() {
+        let replacement_path = previous_draft
+            .as_ref()
+            .filter(|draft| {
+                !draft.indexed
+                    && draft.path.parent() == Some(drafts_dir)
+                    && draft.path.extension().and_then(std::ffi::OsStr::to_str) == Some("json")
+            })
+            .map(|draft| draft.path.as_path());
         Some(composer::save_named_draft_fields(
-            widgets.composer.drafts_dir(),
+            drafts_dir,
+            legacy_drafts_dir,
             &fields,
+            replacement_path,
         )?)
     } else {
         None
@@ -8038,26 +8827,119 @@ fn finish_captured_draft_save(
     } else {
         None
     };
-    set_active_draft(widgets, state, Some(active_draft));
-    let recovery_cleanup_warning = reconcile_recovery_draft(widgets, state, &fields)
-        .err()
-        .map(|err| err.to_string());
     let report = DraftSaveReport {
         local_path,
         maildir_path: persisted.as_ref().map(|persisted| persisted.path.clone()),
         indexed_message_id: persisted.and_then(|persisted| persisted.indexed_message_id),
         replaced_path,
-        recovery_cleanup_warning,
+        recovery_cleanup_warning: None,
     };
-    widgets.composer.refresh_draft_list();
+    Ok(DraftSaveWorkerResult {
+        report,
+        active_draft,
+    })
+}
+
+fn finish_draft_save_worker_success(pending: PendingDraftSave, result: DraftSaveWorkerResult) {
+    if let Some(replaced_path) = result.report.replaced_path.as_deref() {
+        pending.widgets.composer.remove_named_draft(replaced_path);
+    }
+    if let Some(local_path) = result.report.local_path.clone() {
+        pending
+            .widgets
+            .composer
+            .upsert_named_draft(local_path, result.active_draft.saved_fields.clone());
+    }
+    set_active_draft(&pending.widgets, &pending.state, Some(result.active_draft));
+    let current_fields = compose_fields(&pending.widgets, &pending.state);
+    let compose_generation = {
+        let mut state = pending.state.borrow_mut();
+        state.compose_fields = current_fields.clone();
+        state.compose_generation
+    };
+    let action = recovery_action_for_fields(&pending.state, &current_fields);
+    let opts = pending.options.clone();
+    let w = pending.widgets.clone();
+    let st = pending.state.clone();
+    let generation = pending.operation_generation;
+    let completion = pending.completion;
+    let application_hold = pending.application_hold;
+    pending
+        .widgets
+        .draft_autosave
+        .flush(compose_generation, action, move |recovery_result| {
+            let _keep_application_alive = &application_hold;
+            if w.draft_save_active.get() != Some(generation) {
+                return;
+            }
+            let mut report = result.report;
+            report.recovery_cleanup_warning = recovery_result.err();
+            finish_draft_save_success(&opts, &w, &st, generation, report, completion);
+        });
+}
+
+fn finish_draft_save_success(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    generation: u64,
+    report: DraftSaveReport,
+    completion: Option<DraftSaveCompletion>,
+) {
+    if widgets.draft_save_active.get() != Some(generation) {
+        return;
+    }
+    schedule_named_draft_refresh(widgets, state, false, None);
     announce_draft_save(widgets, state, &report);
     if report.indexed_message_id.is_some() && report.recovery_cleanup_warning.is_none() {
         let current = state.borrow().current_query.clone();
-        // Refresh indexed results without selecting a background message and
-        // making a successful draft save look like the composer disappeared.
         schedule_search(options, widgets, state, &current, false, Duration::ZERO);
     }
-    Ok(report)
+    finish_draft_persistence_activity(options, widgets, state, generation);
+    if let Some(completion) = completion {
+        completion(Ok(report));
+    }
+}
+
+fn finish_draft_save_failure(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    generation: u64,
+    completion: Option<DraftSaveCompletion>,
+    action: &str,
+    error: String,
+) {
+    if widgets.draft_save_active.get() != Some(generation) {
+        return;
+    }
+    let message = format!("{action}: {error}");
+    {
+        let mut state = state.borrow_mut();
+        state.last_error = Some(message.clone());
+        state.last_operation = Some(action.to_ascii_lowercase());
+    }
+    widgets.status_label.set_text(&message);
+    update_debug(widgets, state);
+    finish_draft_persistence_activity(options, widgets, state, generation);
+    if let Some(completion) = completion {
+        completion(Err(error));
+    }
+}
+
+fn finish_draft_persistence_activity(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    generation: u64,
+) {
+    if widgets.draft_save_active.replace(None) != Some(generation) {
+        return;
+    }
+    widgets.draft_save_completed.set(Some(generation));
+    update_background_activity_controls(options, widgets, state);
+    update_debug(widgets, state);
+    close_main_window_after_background_activity(widgets, state);
 }
 
 fn announce_draft_save(widgets: &Widgets, state: &SharedState, report: &DraftSaveReport) {
@@ -8127,50 +9009,133 @@ fn delete_captured_active_draft(
     state: &SharedState,
     draft: ActiveDraft,
 ) -> bool {
-    match delete_draft_source(options, &draft) {
-        Ok(()) => {
-            if state.borrow().active_draft.as_ref() == Some(&draft) {
-                detach_deleted_indexed_draft_selection(widgets, state, &draft);
-                clear_draft_widgets(options, widgets, state);
-                if let Err(err) = composer::clear_recovery_draft_files(
-                    widgets.composer.recovery_path(),
-                    widgets.composer.legacy_recovery_path(),
-                ) {
-                    report_draft_persistence_error(
-                        widgets,
-                        state,
-                        "Draft recovery clear failed",
-                        &err,
-                    );
-                    return false;
-                }
+    let (generation, application_hold) =
+        match begin_draft_save_activity(options, widgets, state, "Deleting saved draft…") {
+            Ok(activity) => activity,
+            Err(error) => {
+                report_draft_persistence_error(widgets, state, "Delete local draft failed", &error);
+                return false;
             }
-            let current = state.borrow().current_query.clone();
-            if draft.indexed {
-                show_thread_list_loading(widgets, "Reloading after draft deletion…");
-            }
-            run_search(options, widgets, state, &current);
-            widgets.status_label.set_text(&format!(
-                "Deleted local draft {}; reloading search…",
-                draft.path.display()
-            ));
-            {
-                let mut state = state.borrow_mut();
-                state.last_error = None;
-                state.last_operation =
-                    Some(format!("deleted local draft {}", draft.path.display()));
-            }
-            true
+        };
+    let options_for_worker = options.clone();
+    let draft_for_worker = draft.clone();
+    let delay = widgets.draft_io_delay.get();
+    let response = draft_io::spawn_worker("notm-draft-delete", generation, move || {
+        if !delay.is_zero() {
+            thread::sleep(delay.min(draft_io::MAX_FIXTURE_DELAY));
         }
-        Err(err) => {
-            state.borrow_mut().last_error = Some(err.to_string());
-            widgets
-                .status_label
-                .set_text(&format!("Delete local draft failed: {err}"));
-            update_debug(widgets, state);
-            false
+        delete_draft_source(&options_for_worker, &draft_for_worker)
+    });
+    let options = options.clone();
+    let widgets = widgets.clone();
+    let state = state.clone();
+    let captured_compose_generation = state.borrow().compose_generation;
+    let mut application_hold = Some(application_hold);
+    let mut draft = Some(draft);
+    gtk::glib::timeout_add_local(DRAFT_IO_POLL_INTERVAL, move || {
+        let _keep_application_alive = application_hold.as_ref();
+        let response = match response.try_recv() {
+            Ok(response) => response,
+            Err(mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => WorkerResponse {
+                generation,
+                result: Err(anyhow::anyhow!("draft delete worker disconnected")),
+            },
+        };
+        application_hold.take();
+        if widgets.draft_save_active.get() != Some(response.generation) {
+            return gtk::glib::ControlFlow::Break;
         }
+        match response.result {
+            Ok(()) => finish_active_draft_delete(
+                &options,
+                &widgets,
+                &state,
+                generation,
+                captured_compose_generation,
+                draft
+                    .take()
+                    .expect("captured draft is consumed only on completion"),
+            ),
+            Err(error) => finish_draft_save_failure(
+                &options,
+                &widgets,
+                &state,
+                generation,
+                None,
+                "Delete local draft failed",
+                error.to_string(),
+            ),
+        }
+        gtk::glib::ControlFlow::Break
+    });
+    true
+}
+
+fn finish_active_draft_delete(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    operation_generation: u64,
+    captured_compose_generation: u64,
+    draft: ActiveDraft,
+) {
+    if !draft.indexed {
+        widgets.composer.remove_named_draft(&draft.path);
     }
+    let was_active = state.borrow().active_draft.as_ref() == Some(&draft);
+    if was_active {
+        detach_deleted_indexed_draft_selection(widgets, state, &draft);
+        set_active_draft(widgets, state, None);
+    }
+    let fields = compose_fields(widgets, state);
+    let compose_generation = state.borrow().compose_generation;
+    let unchanged = was_active && compose_generation == captured_compose_generation;
+    let action = if unchanged {
+        RecoveryAction::Clear
+    } else {
+        recovery_action_for_fields(state, &fields)
+    };
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets
+        .draft_autosave
+        .flush(compose_generation, action, move |result| {
+            if w.draft_save_active.get() != Some(operation_generation) {
+                return;
+            }
+            if let Err(error) = result {
+                finish_draft_save_failure(
+                    &opts,
+                    &w,
+                    &st,
+                    operation_generation,
+                    None,
+                    "Delete local draft failed",
+                    format!("draft recovery update failed after source deletion: {error}"),
+                );
+                return;
+            }
+            if unchanged && st.borrow().compose_generation == captured_compose_generation {
+                clear_draft_widgets(&opts, &w, &st);
+            } else {
+                st.borrow_mut().compose_fields = fields;
+            }
+            let current = st.borrow().current_query.clone();
+            if draft.indexed {
+                show_thread_list_loading(&w, "Reloading after draft deletion…");
+            }
+            run_search(&opts, &w, &st, &current);
+            let message = format!("Deleted local draft {}", draft.path.display());
+            {
+                let mut state = st.borrow_mut();
+                state.last_error = None;
+                state.last_operation = Some(message.clone());
+            }
+            w.status_label.set_text(&message);
+            finish_draft_persistence_activity(&opts, &w, &st, operation_generation);
+        });
 }
 
 fn detach_deleted_indexed_draft_selection(
@@ -8245,21 +9210,124 @@ fn detach_deleted_indexed_draft_selection(
     }
 }
 
-fn migrate_legacy_named_drafts_from_ui(widgets: &Widgets, state: &SharedState) {
-    let Some(legacy_dir) = widgets.composer.legacy_drafts_dir() else {
-        return;
-    };
-    match composer::migrate_legacy_named_drafts(widgets.composer.drafts_dir(), legacy_dir) {
-        Ok(0) => {}
-        Ok(count) => {
-            let message = format!("Migrated {count} legacy named draft(s) to persistent state");
-            state.borrow_mut().last_operation = Some(message.clone());
-            widgets.status_label.set_text(&message);
-        }
-        Err(err) => {
-            report_draft_persistence_error(widgets, state, "Named draft migration failed", &err)
-        }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamedDraftRefreshStart {
+    Started(u64),
+    MigrationBusy(u64),
+    PersistenceBusy,
+}
+
+fn schedule_named_draft_refresh(
+    widgets: &Widgets,
+    state: &SharedState,
+    migrate_legacy: bool,
+    legacy_dir_override: Option<PathBuf>,
+) -> NamedDraftRefreshStart {
+    if migrate_legacy
+        && (widgets.draft_save_active.get().is_some() || state.borrow().send_in_progress)
+    {
+        return NamedDraftRefreshStart::PersistenceBusy;
     }
+    let generation = widgets
+        .named_draft_io_coordinator
+        .borrow_mut()
+        .begin(migrate_legacy);
+    let Some(generation) = generation else {
+        let generation = widgets
+            .named_draft_io_coordinator
+            .borrow()
+            .active_generation()
+            .expect("an exclusive migration has an active generation");
+        return NamedDraftRefreshStart::MigrationBusy(generation);
+    };
+    let application_hold = migrate_legacy
+        .then(|| {
+            widgets
+                .window
+                .application()
+                .map(|application| application.hold())
+        })
+        .flatten();
+    let response = draft_io::spawn_named_draft_load(NamedDraftLoadRequest {
+        generation,
+        current_dir: widgets.composer.drafts_dir().to_path_buf(),
+        legacy_dir: legacy_dir_override
+            .or_else(|| widgets.composer.legacy_drafts_dir().map(Path::to_path_buf)),
+        migrate_legacy,
+        fixture_delay: widgets.draft_io_delay.get(),
+    });
+    update_composer_attachment_cache_controls(widgets, state);
+    let w = widgets.clone();
+    let st = state.clone();
+    let mut application_hold = application_hold;
+    gtk::glib::timeout_add_local(DRAFT_IO_POLL_INTERVAL, move || {
+        let _keep_application_alive = application_hold.as_ref();
+        let response = match response.try_recv() {
+            Ok(response) => response,
+            Err(mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => WorkerResponse {
+                generation,
+                result: Err(anyhow::anyhow!("named draft loader disconnected")),
+            },
+        };
+        if !w
+            .named_draft_io_coordinator
+            .borrow_mut()
+            .finish(response.generation)
+        {
+            application_hold.take();
+            return gtk::glib::ControlFlow::Break;
+        }
+        match response.result {
+            Ok(NamedDraftLoadResult {
+                drafts,
+                migrated,
+                warning,
+            }) => {
+                w.composer.replace_named_drafts(drafts);
+                if let Some(warning) = warning {
+                    let migration = if migrated > 0 {
+                        format!("Migrated {migrated} legacy named draft(s); ")
+                    } else {
+                        String::new()
+                    };
+                    let message = format!("{migration}Named draft refresh warning: {warning}");
+                    *w.named_draft_io_last_error.borrow_mut() = Some(message.clone());
+                    {
+                        let mut state = st.borrow_mut();
+                        state.last_error = Some(message.clone());
+                        state.last_operation =
+                            Some("named draft refresh completed with warnings".to_string());
+                    }
+                    w.status_label.set_text(&message);
+                    update_debug(&w, &st);
+                } else {
+                    *w.named_draft_io_last_error.borrow_mut() = None;
+                }
+                if migrated > 0 && w.named_draft_io_last_error.borrow().is_none() {
+                    let message =
+                        format!("Migrated {migrated} legacy named draft(s) to persistent state");
+                    st.borrow_mut().last_operation = Some(message.clone());
+                    w.status_label.set_text(&message);
+                }
+            }
+            Err(error) => {
+                let message = format!("Named draft refresh failed: {error}");
+                *w.named_draft_io_last_error.borrow_mut() = Some(message.clone());
+                {
+                    let mut state = st.borrow_mut();
+                    state.last_error = Some(message.clone());
+                    state.last_operation = Some("named draft refresh failed".to_string());
+                }
+                w.status_label.set_text(&message);
+                update_debug(&w, &st);
+            }
+        }
+        update_composer_attachment_cache_controls(&w, &st);
+        application_hold.take();
+        gtk::glib::ControlFlow::Break
+    });
+    NamedDraftRefreshStart::Started(generation)
 }
 
 fn load_selected_named_draft(
@@ -8282,7 +9350,7 @@ fn load_selected_named_draft(
             payload: ComposerReplacementPayload::Draft(Box::new(PreparedDraftReplacement {
                 fields,
                 active_source: Some(active_source),
-                attachment_inputs: Vec::new(),
+                attachment_sources: Vec::new(),
             })),
             selection: None,
             rejection_restore: None,
@@ -8316,89 +9384,369 @@ fn delete_selected_named_draft_from_ui(
     )
 }
 
-fn delete_captured_named_draft(widgets: &Widgets, state: &SharedState, path: PathBuf) -> bool {
-    match std::fs::remove_file(&path)
-        .map_err(|err| anyhow::anyhow!("removing saved draft {}: {err}", path.display()))
-    {
-        Ok(()) => {
-            if composer::active_draft_matches_path(state.borrow().active_draft.as_ref(), &path) {
-                set_active_draft(widgets, state, None);
+fn delete_captured_named_draft(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    path: PathBuf,
+) -> bool {
+    let (generation, application_hold) =
+        match begin_draft_save_activity(options, widgets, state, "Deleting named draft…") {
+            Ok(activity) => activity,
+            Err(error) => {
+                report_draft_persistence_error(widgets, state, "Saved draft delete failed", &error);
+                return false;
             }
-            widgets.composer.refresh_draft_list();
-            let message = format!("Deleted saved draft {}", path.display());
-            {
-                let mut state = state.borrow_mut();
-                state.last_error = None;
-                state.last_operation = Some(message.clone());
-            }
-            widgets.status_label.set_text(&message);
-            update_debug(widgets, state);
-            true
+        };
+    let worker_path = path.clone();
+    let delay = widgets.draft_io_delay.get();
+    let response = draft_io::spawn_worker("notm-named-draft-delete", generation, move || {
+        if !delay.is_zero() {
+            thread::sleep(delay.min(draft_io::MAX_FIXTURE_DELAY));
         }
-        Err(err) => {
-            report_draft_persistence_error(widgets, state, "Saved draft delete failed", &err);
-            false
+        composer::remove_file_if_present(&worker_path).map_err(|error| {
+            anyhow::anyhow!("removing saved draft {}: {error}", worker_path.display())
+        })
+    });
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let mut application_hold = Some(application_hold);
+    gtk::glib::timeout_add_local(DRAFT_IO_POLL_INTERVAL, move || {
+        let _keep_application_alive = application_hold.as_ref();
+        let response = match response.try_recv() {
+            Ok(response) => response,
+            Err(mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => WorkerResponse {
+                generation,
+                result: Err(anyhow::anyhow!("named draft delete worker disconnected")),
+            },
+        };
+        application_hold.take();
+        if w.draft_save_active.get() != Some(response.generation) {
+            return gtk::glib::ControlFlow::Break;
+        }
+        match response.result {
+            Ok(()) => {
+                w.composer.remove_named_draft(&path);
+                if composer::active_draft_matches_path(st.borrow().active_draft.as_ref(), &path) {
+                    set_active_draft(&w, &st, None);
+                    let fields = compose_fields(&w, &st);
+                    schedule_recovery_draft_from_ui(&w, &st, &fields);
+                }
+                schedule_named_draft_refresh(&w, &st, false, None);
+                let message = format!("Deleted saved draft {}", path.display());
+                {
+                    let mut state = st.borrow_mut();
+                    state.last_error = None;
+                    state.last_operation = Some(message.clone());
+                }
+                w.status_label.set_text(&message);
+                finish_draft_persistence_activity(&opts, &w, &st, generation);
+            }
+            Err(error) => finish_draft_save_failure(
+                &opts,
+                &w,
+                &st,
+                generation,
+                None,
+                "Saved draft delete failed",
+                error.to_string(),
+            ),
+        }
+        gtk::glib::ControlFlow::Break
+    });
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DraftRecoveryIntent {
+    Startup,
+    Manual,
+}
+
+fn fixture_startup_draft_recovery_delay(options: &LaunchOptions) -> Duration {
+    if !options.fixture_mode || !options.automation_enabled {
+        return Duration::ZERO;
+    }
+    let Some(value) = std::env::var_os(FIXTURE_STARTUP_RECOVERY_DELAY_ENV) else {
+        return Duration::ZERO;
+    };
+    match value.to_string_lossy().parse::<u64>() {
+        Ok(milliseconds) => Duration::from_millis(milliseconds.min(5_000)),
+        Err(error) => {
+            tracing::warn!(
+                variable = FIXTURE_STARTUP_RECOVERY_DELAY_ENV,
+                value = %value.to_string_lossy(),
+                %error,
+                "ignored invalid fixture startup recovery delay"
+            );
+            Duration::ZERO
         }
     }
 }
 
-fn restore_draft_if_present(
+fn fixture_startup_draft_recovery_gate(options: &LaunchOptions) -> Option<PathBuf> {
+    (options.fixture_mode && options.automation_enabled)
+        .then(|| std::env::var_os(FIXTURE_STARTUP_RECOVERY_GATE_ENV).map(PathBuf::from))
+        .flatten()
+}
+
+fn schedule_startup_draft_recovery(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
-) -> bool {
-    let source_path = if widgets.composer.recovery_path().exists() {
-        Some(widgets.composer.recovery_path())
-    } else {
-        widgets
-            .composer
-            .legacy_recovery_path()
-            .filter(|legacy_path| legacy_path.exists())
-    };
-    let Some(source_path) = source_path else {
-        return true;
-    };
-    let fields = match std::fs::read(source_path)
-        .map_err(anyhow::Error::from)
-        .and_then(|bytes| serde_json::from_slice::<ComposeFields>(&bytes).map_err(Into::into))
-    {
-        Ok(fields) => fields,
-        Err(err) => {
-            report_draft_persistence_error(widgets, state, "Draft recovery failed", &err);
-            return false;
-        }
-    };
-    if !fields_has_content(&fields) {
-        return true;
-    }
-    let status = if source_path == widgets.composer.recovery_path() {
-        format!("Recovered draft from {}", source_path.display())
-    } else {
-        format!(
-            "Recovered draft from {} (migrated from legacy cache)",
-            widgets.composer.recovery_path().display()
-        )
-    };
-    request_pending_action(
+) -> u64 {
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    schedule_draft_recovery_load(
         options,
         widgets,
         state,
-        PendingTransition::ReplaceComposer(PreparedComposerReplacement {
-            kind: ComposerReplacementKind::RecoveryDraft,
-            payload: ComposerReplacementPayload::Draft(Box::new(PreparedDraftReplacement {
-                fields,
-                active_source: None,
-                attachment_inputs: Vec::new(),
-            })),
-            selection: None,
-            rejection_restore: None,
-            status,
-            source_status: None,
-            present_main_window: false,
-            show_message_pane: false,
-            active_pane: ActivePane::Message,
-        }),
+        DraftRecoveryIntent::Startup,
+        fixture_startup_draft_recovery_delay(options),
+        fixture_startup_draft_recovery_gate(options),
+        move || continue_startup_after_draft_recovery(&opts, &w, &st),
     )
+}
+
+fn schedule_manual_draft_recovery(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) -> anyhow::Result<u64> {
+    ensure_user_operation_allowed(widgets, state, UserOperation::DraftLoad)?;
+    cancel_composer_attachment_cache(
+        widgets,
+        state,
+        "Attachment cache superseded by draft recovery",
+    );
+    anyhow::ensure!(
+        widgets
+            .draft_recovery_coordinator
+            .borrow()
+            .active_generation()
+            .is_none(),
+        "draft recovery is already loading"
+    );
+    widgets.status_label.set_text("Loading recovery draft…");
+    Ok(schedule_draft_recovery_load(
+        options,
+        widgets,
+        state,
+        DraftRecoveryIntent::Manual,
+        Duration::ZERO,
+        None,
+        || {},
+    ))
+}
+
+fn schedule_draft_recovery_load<F>(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    intent: DraftRecoveryIntent,
+    fixture_test_delay: Duration,
+    fixture_test_gate: Option<PathBuf>,
+    on_complete: F,
+) -> u64
+where
+    F: FnOnce() + 'static,
+{
+    let generation = widgets.draft_recovery_coordinator.borrow_mut().begin();
+    let compose_generation = state.borrow().compose_generation;
+    let transition_epoch = widgets.composer_transition_epoch.get();
+    widgets
+        .draft_recovery_last_outcome
+        .replace(Some("loading".to_string()));
+    let response = draft_recovery::spawn(
+        DraftRecoveryRequest::new(
+            generation,
+            widgets.composer.recovery_path().to_path_buf(),
+            widgets
+                .composer
+                .legacy_recovery_path()
+                .map(Path::to_path_buf),
+        )
+        .with_fixture_test_delay(fixture_test_delay)
+        .with_fixture_test_gate(fixture_test_gate),
+    );
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let mut on_complete = Some(on_complete);
+    gtk::glib::timeout_add_local(DRAFT_RECOVERY_POLL_INTERVAL, move || {
+        let response = match response.try_recv() {
+            Ok(response) => response,
+            Err(mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => DraftRecoveryResponse {
+                generation,
+                result: Err(anyhow::anyhow!("draft recovery worker disconnected")),
+            },
+        };
+        if finish_draft_recovery_load(
+            &opts,
+            &w,
+            &st,
+            intent,
+            compose_generation,
+            transition_epoch,
+            response,
+        ) && let Some(on_complete) = on_complete.take()
+        {
+            on_complete();
+        }
+        gtk::glib::ControlFlow::Break
+    });
+    generation
+}
+
+fn finish_draft_recovery_load(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    intent: DraftRecoveryIntent,
+    requested_compose_generation: u64,
+    requested_transition_epoch: u64,
+    response: DraftRecoveryResponse,
+) -> bool {
+    if !widgets
+        .draft_recovery_coordinator
+        .borrow_mut()
+        .finish(response.generation)
+    {
+        return false;
+    }
+    widgets
+        .draft_recovery_completed_generation
+        .set(Some(response.generation));
+    if composer_reset_was_superseded(
+        requested_compose_generation,
+        requested_transition_epoch,
+        state.borrow().compose_generation,
+        widgets.composer_transition_epoch.get(),
+    ) {
+        widgets
+            .draft_recovery_last_outcome
+            .replace(Some("superseded".to_string()));
+        widgets
+            .status_label
+            .set_text("Draft recovery superseded by newer composer changes");
+        update_debug(widgets, state);
+        return true;
+    }
+
+    match response.result {
+        Ok(DraftRecoveryOutcome::NotFound) => {
+            widgets
+                .draft_recovery_last_outcome
+                .replace(Some("not_found".to_string()));
+            if intent == DraftRecoveryIntent::Manual {
+                widgets.status_label.set_text("No recovery draft found");
+            }
+        }
+        Ok(DraftRecoveryOutcome::Empty { .. }) => {
+            widgets
+                .draft_recovery_last_outcome
+                .replace(Some("empty".to_string()));
+            if intent == DraftRecoveryIntent::Manual {
+                widgets
+                    .status_label
+                    .set_text("Recovery draft has no content");
+            }
+        }
+        Ok(DraftRecoveryOutcome::Loaded { source, fields }) => {
+            let status = if source.is_legacy() {
+                format!(
+                    "Recovered draft from {} (legacy cache)",
+                    source.path().display()
+                )
+            } else {
+                format!("Recovered draft from {}", source.path().display())
+            };
+            let requested = request_pending_action(
+                options,
+                widgets,
+                state,
+                PendingTransition::ReplaceComposer(PreparedComposerReplacement {
+                    kind: ComposerReplacementKind::RecoveryDraft,
+                    payload: ComposerReplacementPayload::Draft(Box::new(
+                        PreparedDraftReplacement {
+                            fields: *fields,
+                            active_source: None,
+                            attachment_sources: Vec::new(),
+                        },
+                    )),
+                    selection: None,
+                    rejection_restore: None,
+                    status,
+                    source_status: None,
+                    present_main_window: false,
+                    show_message_pane: false,
+                    active_pane: ActivePane::Message,
+                }),
+            );
+            let outcome = if !requested {
+                "rejected"
+            } else if widgets.composer.has_pending_confirmation() {
+                "pending_confirmation"
+            } else {
+                "loaded"
+            };
+            widgets
+                .draft_recovery_last_outcome
+                .replace(Some(outcome.to_string()));
+        }
+        Err(error) => {
+            widgets
+                .draft_recovery_last_outcome
+                .replace(Some("error".to_string()));
+            report_draft_persistence_error(widgets, state, "Draft recovery failed", &error);
+        }
+    }
+    update_debug(widgets, state);
+    true
+}
+
+fn continue_startup_after_draft_recovery(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+) {
+    let initial_mailto_opened = options
+        .mailto_uri
+        .as_deref()
+        .is_some_and(|uri| open_mailto_uri_request(options, widgets, state, uri));
+    let preserve_startup_composer = initial_mailto_opened
+        || composer_requires_confirmation(
+            &compose_fields(widgets, state),
+            state.borrow().active_draft.as_ref(),
+        );
+    if !initial_mailto_opened {
+        widgets
+            .status_label
+            .set_text("Starting notm; loading mail…");
+    }
+    widgets
+        .thread_list
+        .set_result_label("Loading initial search…");
+    show_thread_list_loading(widgets, "Loading initial search…");
+    schedule_search(
+        options,
+        widgets,
+        state,
+        &options.default_query,
+        !preserve_startup_composer,
+        Duration::ZERO,
+    );
+    refresh_address_suggestions_async(options, widgets, state);
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    gtk::glib::timeout_add_local_once(Duration::from_millis(250), move || {
+        run_startup_sync(&opts, &w, &st);
+    });
 }
 
 fn clear_current_draft_from_ui(
@@ -8414,20 +9762,55 @@ fn clear_current_draft_immediately(
     widgets: &Widgets,
     state: &SharedState,
 ) -> bool {
-    if let Err(err) = composer::clear_recovery_draft_files(
-        widgets.composer.recovery_path(),
-        widgets.composer.legacy_recovery_path(),
-    ) {
-        report_draft_persistence_error(widgets, state, "Draft recovery clear failed", &err);
-        return false;
-    }
-    clear_draft_widgets(options, widgets, state);
-    widgets.status_label.set_text("Composer closed");
-    state.borrow_mut().last_error = None;
+    cancel_pending_draft_capture(widgets);
+    let generation = state.borrow().compose_generation;
+    let transition_epoch = widgets.composer_transition_epoch.get();
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets.status_label.set_text("Clearing draft…");
+    widgets.draft_autosave.flush(
+        generation,
+        RecoveryAction::Clear,
+        move |result| match result {
+            Ok(())
+                if composer_reset_was_superseded(
+                    generation,
+                    transition_epoch,
+                    st.borrow().compose_generation,
+                    w.composer_transition_epoch.get(),
+                ) =>
+            {
+                w.status_label
+                    .set_text("Draft clear superseded by newer composer changes");
+            }
+            Ok(()) => {
+                clear_draft_widgets(&opts, &w, &st);
+                w.status_label.set_text("Composer closed");
+                st.borrow_mut().last_error = None;
+                update_debug(&w, &st);
+            }
+            Err(error) => {
+                let error = anyhow::anyhow!(error);
+                report_draft_persistence_error(&w, &st, "Draft recovery clear failed", &error);
+            }
+        },
+    );
     true
 }
 
+fn composer_reset_was_superseded(
+    requested_compose_generation: u64,
+    requested_transition_epoch: u64,
+    current_compose_generation: u64,
+    current_transition_epoch: u64,
+) -> bool {
+    current_compose_generation != requested_compose_generation
+        || current_transition_epoch != requested_transition_epoch
+}
+
 fn clear_draft_widgets(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+    cancel_composer_preparation(widgets, state);
     let fields = ComposeFields {
         from: widgets.composer.sender_entry().text().to_string(),
         ..ComposeFields::default()
@@ -8461,7 +9844,6 @@ fn apply_compose_fields(widgets: &Widgets, state: &SharedState, fields: ComposeF
     widgets.composer.apply_fields(&fields);
     update_attachment_label(widgets, &fields.attachments);
     record_compose_edit(state, fields.clone());
-    persist_recovery_draft_from_ui(widgets, state, &fields);
     update_draft_action_buttons(widgets, state);
 }
 
@@ -8470,6 +9852,12 @@ fn move_compose_cursor_to_start(widgets: &Widgets) {
 }
 
 fn add_attachment_path(widgets: &Widgets, state: &SharedState, path: PathBuf) {
+    cancel_composer_attachment_cache(
+        widgets,
+        state,
+        "Attachment cache cancelled by a newer attachment edit",
+    );
+    cancel_thread_load_for_composer_activity(widgets);
     let mut fields = compose_fields(widgets, state);
     let path_text = path.display().to_string();
     if !fields
@@ -8481,15 +9869,40 @@ fn add_attachment_path(widgets: &Widgets, state: &SharedState, path: PathBuf) {
     }
     update_attachment_label(widgets, &fields.attachments);
     record_compose_edit(state, fields.clone());
-    let saved = persist_recovery_draft_from_ui(widgets, state, &fields);
+    schedule_recovery_draft_from_ui(widgets, state, &fields);
     update_draft_action_buttons(widgets, state);
-    if saved {
-        widgets.status_label.set_text("Attachment added to draft");
-    }
+    widgets.status_label.set_text("Attachment added to draft");
 }
 
 fn update_attachment_label(widgets: &Widgets, attachments: &[String]) {
     attachments::set_compose_attachment_label(&widgets.composer.attachments_label(), attachments);
+}
+
+fn attachment_io_status_json(widgets: &Widgets) -> serde_json::Value {
+    let mut status = widgets.attachments.io_status_json();
+    let worker = widgets.composer_attachment_cache_service.snapshot();
+    let generation = widgets.composer_attachment_cache_active.get();
+    status["composer_cache"] = json!({
+        "busy": generation.is_some()
+            || worker.active_generation.is_some()
+            || worker.pending_requests > 0
+            || worker.active_preparations > 0,
+        "generation": generation,
+        "latest_generation": widgets.composer_attachment_cache_generation.get(),
+        "completed_generation": widgets.composer_attachment_cache_completed_generation.get(),
+        "outcome": widgets.composer_attachment_cache_last_outcome.borrow().clone(),
+        "worker_generation": worker.active_generation,
+        "worker_latest_generation": worker.latest_generation,
+        "pending_generation": worker.pending_generation,
+        "pending_requests": worker.pending_requests,
+        "peak_pending_requests": worker.peak_pending_requests,
+        "active_preparations": worker.active_preparations,
+        "peak_active_preparations": worker.peak_active_preparations,
+        "submitted": worker.submitted,
+        "cancelled": worker.cancelled,
+        "coalesced": worker.coalesced,
+    });
+    status
 }
 
 fn attachment_event_handler(widgets: &Widgets, state: &SharedState) -> AttachmentEventHandler {
@@ -8521,20 +9934,6 @@ fn attachment_event_handler(widgets: &Widgets, state: &SharedState) -> Attachmen
             }
         }
     })
-}
-
-fn apply_attachment_action_result(
-    widgets: &Widgets,
-    state: &SharedState,
-    result: AttachmentActionResult,
-) {
-    widgets.status_label.set_text(&result.status);
-    record_attachment_action_result(
-        &mut state.borrow_mut(),
-        &result.message_id,
-        result.operation,
-    );
-    update_debug(widgets, state);
 }
 
 fn record_attachment_action_result(state: &mut UiState, message_id: &str, operation: String) {
@@ -8571,10 +9970,50 @@ fn report_attachment_error(
 }
 
 fn refresh_thread_attachment_list(widgets: &Widgets, state: &SharedState) {
-    let messages = state.borrow().messages.clone();
+    let thread_id = state
+        .borrow()
+        .selected_thread
+        .as_ref()
+        .map(|thread| thread.thread_id.clone());
+    let prepared =
+        thread_id.and_then(|thread_id| widgets.prepared_threads.borrow().get(&thread_id).cloned());
+    widgets.attachments.refresh_prepared(
+        prepared
+            .as_ref()
+            .map(|prepared| prepared.attachments.as_slice())
+            .unwrap_or_default(),
+        attachment_event_handler(widgets, state),
+    );
+}
+
+fn prepared_thread_for_selected(
+    widgets: &Widgets,
+    state: &SharedState,
+) -> anyhow::Result<Arc<PreparedThread>> {
+    let thread_id = state
+        .borrow()
+        .selected_thread
+        .as_ref()
+        .map(|thread| thread.thread_id.clone())
+        .ok_or_else(|| anyhow::anyhow!("no selected thread"))?;
     widgets
-        .attachments
-        .refresh(&messages, attachment_event_handler(widgets, state));
+        .prepared_threads
+        .borrow()
+        .get(&thread_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("selected thread content is still loading"))
+}
+
+fn prepared_message(
+    widgets: &Widgets,
+    state: &SharedState,
+    message_id: &str,
+) -> anyhow::Result<Arc<PreparedMessage>> {
+    prepared_thread_for_selected(widgets, state)?
+        .message_contents
+        .get(message_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("selected message content is still loading"))
 }
 
 fn show_rendered_selected_thread(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -8613,13 +10052,11 @@ fn show_preferred_selected_message_view(
     widgets: &Widgets,
     state: &SharedState,
 ) {
-    let preference = {
-        let state = state.borrow();
-        state
-            .selected_message
-            .as_ref()
-            .map(|message| message_view_preference(options, &state, message))
-    };
+    let message = state.borrow().selected_message.clone();
+    let preference = message.as_ref().map(|message| {
+        let has_html = message_has_html(widgets, state, message);
+        message_view_preference(&state.borrow(), message, has_html)
+    });
     match preference.map(MessageViewKind::from_preference) {
         Some(MessageViewKind::Html) => show_visual_html_selected_message(options, widgets, state),
         Some(MessageViewKind::Headers) => show_full_headers(options, widgets, state),
@@ -8635,7 +10072,7 @@ fn show_selected_message_text_view(
     widgets: &Widgets,
     state: &SharedState,
 ) {
-    match render_selected_message_text(options, widgets, state) {
+    match render_selected_message_text(widgets, state) {
         Ok(rendered) => {
             set_active_message_view(widgets, MessageViewKind::Text);
             show_text_message_view(options, widgets, state);
@@ -8662,68 +10099,16 @@ fn show_selected_message_text_view(
 }
 
 fn render_selected_message_text(
-    options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Arc<str>> {
     let message = state
         .borrow()
         .selected_message
         .clone()
         .ok_or_else(|| anyhow::anyhow!("no selected message"))?;
-    render_message_text(options, &message, widgets.quote_collapse.get())
-}
-
-fn render_message_text(
-    options: &LaunchOptions,
-    message: &notm_notmuch::MessageSummary,
-    collapse_quotes: bool,
-) -> anyhow::Result<String> {
-    let mut rendered = String::new();
-    let source = open_message_file(options, message)?;
-    match parse_reader(source) {
-        Ok(parsed) => {
-            rendered.push_str(&render_body_with_quote_collapse(
-                &parsed.safe_body,
-                collapse_quotes,
-            ));
-            if !parsed.decode_warnings.is_empty() {
-                if !rendered.is_empty() {
-                    rendered.push_str("\n\n");
-                }
-                rendered.push_str("MIME decode warnings:\n");
-                for warning in &parsed.decode_warnings {
-                    rendered.push_str(&format!("- {warning}\n"));
-                }
-            }
-            if !parsed.attachments.is_empty() {
-                rendered.push_str("\n\nAttachments:\n");
-                for att in &parsed.attachments {
-                    let filename = att.filename.as_deref().unwrap_or("unnamed");
-                    match &att.decode_error {
-                        Some(error) => rendered.push_str(&format!(
-                            "- {filename} ({}, decode failed: {error})\n",
-                            att.content_type
-                        )),
-                        None if att.decode_warnings.is_empty() => rendered.push_str(&format!(
-                            "- {filename} ({}, {} bytes)\n",
-                            att.content_type, att.size
-                        )),
-                        None => rendered.push_str(&format!(
-                            "- {filename} ({}, {} bytes; decoded with warning)\n",
-                            att.content_type, att.size
-                        )),
-                    }
-                }
-            }
-            rendered.push_str("\n\nMIME tree:\n");
-            for node in parsed.mime_tree {
-                rendered.push_str(&format!("  {node}\n"));
-            }
-        }
-        Err(err) => rendered.push_str(&format!("Could not parse body: {err}\n")),
-    }
-    Ok(rendered)
+    let prepared = prepared_message(widgets, state, &message.message_id)?;
+    prepared.rendered_text(widgets.quote_collapse.get())
 }
 
 fn selected_message_index(state: &SharedState) -> Option<usize> {
@@ -8916,7 +10301,7 @@ fn choose_selected_message_view(
         widgets.status_label.set_text("No selected message");
         return false;
     };
-    if view == MessageViewKind::Html && !message_has_html(options, &message) {
+    if view == MessageViewKind::Html && !message_has_html(widgets, state, &message) {
         widgets.status_label.set_text("No visual HTML part");
         return false;
     }
@@ -9141,7 +10526,7 @@ fn update_message_action_buttons_with_mime_refresh(
     };
     let has_html = has_message
         && if refresh_mime {
-            selected_message_has_html(options, state)
+            selected_message_has_html(widgets, state)
         } else {
             widgets.view_html_button.is_visible()
         };
@@ -9298,7 +10683,7 @@ fn start_link_hint_mode(options: &LaunchOptions, widgets: &Widgets, state: &Shar
             .set_text("Link hints are unavailable while composing");
         return true;
     }
-    if !selected_message_has_html(options, state) {
+    if !selected_message_has_html(widgets, state) {
         widgets
             .status_label
             .set_text("The selected message has no Visual HTML links");
@@ -9331,38 +10716,41 @@ fn webkit_view_images_allowed(view: &webkit6::WebView) -> bool {
         .unwrap_or(false)
 }
 
-fn selected_message_has_html(options: &LaunchOptions, state: &SharedState) -> bool {
+fn selected_message_has_html(widgets: &Widgets, state: &SharedState) -> bool {
     state
         .borrow()
         .selected_message
-        .as_ref()
-        .is_some_and(|message| message_has_html(options, message))
+        .clone()
+        .is_some_and(|message| message_has_html(widgets, state, &message))
 }
 
-fn message_has_html(options: &LaunchOptions, message: &notm_notmuch::MessageSummary) -> bool {
-    open_message_file(options, message)
-        .and_then(parse_reader)
-        .ok()
-        .and_then(|parsed| parsed.html_body)
-        .is_some_and(|html| !html.trim().is_empty())
+fn message_has_html(
+    widgets: &Widgets,
+    state: &SharedState,
+    message: &notm_notmuch::MessageSummary,
+) -> bool {
+    prepared_message(widgets, state, &message.message_id).is_ok_and(|prepared| prepared.has_html())
 }
 
 fn show_raw_source(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     let scroll = current_message_scroll_fraction(widgets);
-    let result = (|| -> anyhow::Result<BoundedText> {
-        let message = selected_message(state)?;
-        Ok(read_raw_text(open_message_file(options, &message)?)?)
+    let result = (|| -> anyhow::Result<Arc<str>> {
+        let message_id = state
+            .borrow()
+            .selected_message
+            .as_ref()
+            .map(|message| message.message_id.clone())
+            .ok_or_else(|| anyhow::anyhow!("no selected message"))?;
+        prepared_message(widgets, state, &message_id)?.raw_shared()
     })();
     match result {
         Ok(raw) => {
             set_active_message_view(widgets, MessageViewKind::Raw);
             show_text_message_view(options, widgets, state);
             widgets.message_view.set_monospace(true);
-            widgets.message_view.buffer().set_text(&raw.text);
+            widgets.message_view.buffer().set_text(&raw);
             restore_message_scroll_fraction(widgets, scroll);
-            widgets
-                .status_label
-                .set_text(&bounded_source_status("Raw message source shown", &raw));
+            widgets.status_label.set_text("Raw message source shown");
             let mut state = state.borrow_mut();
             state.last_operation = Some("showed raw source".to_string());
             state.last_error = None;
@@ -9379,21 +10767,23 @@ fn show_raw_source(options: &LaunchOptions, widgets: &Widgets, state: &SharedSta
 
 fn show_full_headers(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     let scroll = current_message_scroll_fraction(widgets);
-    let result = (|| -> anyhow::Result<BoundedText> {
-        let message = selected_message(state)?;
-        Ok(read_header_text(open_message_file(options, &message)?)?)
+    let result = (|| -> anyhow::Result<Arc<str>> {
+        let message_id = state
+            .borrow()
+            .selected_message
+            .as_ref()
+            .map(|message| message.message_id.clone())
+            .ok_or_else(|| anyhow::anyhow!("no selected message"))?;
+        prepared_message(widgets, state, &message_id)?.headers()
     })();
     match result {
         Ok(headers) => {
             set_active_message_view(widgets, MessageViewKind::Headers);
             show_text_message_view(options, widgets, state);
             widgets.message_view.set_monospace(true);
-            widgets.message_view.buffer().set_text(&headers.text);
+            widgets.message_view.buffer().set_text(&headers);
             restore_message_scroll_fraction(widgets, scroll);
-            widgets.status_label.set_text(&bounded_source_status(
-                "Full message headers shown",
-                &headers,
-            ));
+            widgets.status_label.set_text("Full message headers shown");
             let mut state = state.borrow_mut();
             state.last_operation = Some("showed full headers".to_string());
             state.last_error = None;
@@ -9424,68 +10814,11 @@ fn toggle_quote_collapse(options: &LaunchOptions, widgets: &Widgets, state: &Sha
     update_debug(widgets, state);
 }
 
-fn render_body_with_quote_collapse(body: &str, collapse_quotes: bool) -> String {
-    if !collapse_quotes {
-        return body.to_string();
-    }
-    let mut out = Vec::new();
-    let mut in_quote = false;
-    let mut collapsed_count = 0_usize;
-    for line in body.lines() {
-        if line.trim_start().starts_with('>') {
-            if !in_quote {
-                out.push("[quoted text collapsed]".to_string());
-                in_quote = true;
-            }
-            collapsed_count += 1;
-        } else {
-            in_quote = false;
-            out.push(line.to_string());
-        }
-    }
-    if collapsed_count == 0 {
-        body.to_string()
-    } else {
-        out.join("\n")
-    }
-}
-
 fn text_view_text(view: &gtk::TextView) -> String {
     let buffer = view.buffer();
     buffer
         .text(&buffer.start_iter(), &buffer.end_iter(), true)
         .to_string()
-}
-
-fn selected_message(state: &SharedState) -> anyhow::Result<notm_notmuch::MessageSummary> {
-    state
-        .borrow()
-        .selected_message
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("no selected message"))
-}
-
-fn open_message_file(
-    options: &LaunchOptions,
-    message: &notm_notmuch::MessageSummary,
-) -> anyhow::Result<notm_notmuch::ResolvedMessageFile> {
-    let database = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
-    Ok(database.open_message_file(message)?)
-}
-
-fn bounded_source_status(base: &str, source: &BoundedText) -> String {
-    let mut notes = Vec::new();
-    if source.truncated {
-        notes.push(format!("preview limited to {} bytes", source.bytes_read));
-    }
-    if source.lossy {
-        notes.push("invalid or binary bytes replaced".to_string());
-    }
-    if notes.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base} ({})", notes.join("; "))
-    }
 }
 
 fn selected_message_is_draft(options: &LaunchOptions, state: &SharedState) -> bool {
@@ -9520,25 +10853,16 @@ fn open_selected_draft_message(
         .selected_message
         .clone()
         .ok_or_else(|| anyhow::anyhow!("no selected draft message"))?;
-    let source = open_message_file(options, &message)?;
-    let path = source.path().to_path_buf();
-    let (fields, attachment_inputs) = composer::prepare_draft_fields_from_message_reader(source)?;
-    let active_source = PreparedActiveDraft {
-        path,
-        message_id: Some(message.message_id.clone()),
-        indexed: true,
-    };
-    Ok(request_pending_action(
+    let prepared_thread = prepared_thread_for_selected(widgets, state)?;
+    Ok(schedule_composer_preparation(
         options,
         widgets,
         state,
-        PendingTransition::ReplaceComposer(PreparedComposerReplacement {
+        prepared_thread,
+        message.message_id,
+        ComposerPreparationAction::IndexedDraft,
+        ComposerPreparationIntent {
             kind: ComposerReplacementKind::IndexedDraft,
-            payload: ComposerReplacementPayload::Draft(Box::new(PreparedDraftReplacement {
-                fields,
-                active_source: Some(active_source),
-                attachment_inputs,
-            })),
             selection: Some(capture_message_selection_snapshot(state)),
             rejection_restore,
             status,
@@ -9546,7 +10870,7 @@ fn open_selected_draft_message(
             present_main_window: false,
             show_message_pane: false,
             active_pane,
-        }),
+        },
     ))
 }
 
@@ -9597,13 +10921,13 @@ fn configure_html_webview(view: &webkit6::WebView, allow_remote_images: bool) {
         settings.set_allow_universal_access_from_file_urls(false);
         settings.set_auto_load_images(allow_remote_images);
     }
-    view.load_html(
-        &visual_html_document(
-            "<p class=\"notm-empty-html\">Open an HTML message and choose Visual HTML.</p>",
-            false,
-        ),
-        Some("about:blank"),
-    );
+}
+
+fn empty_visual_html_document() -> String {
+    visual_html_document(
+        "<p class=\"notm-empty-html\">Open an HTML message and choose Visual HTML.</p>",
+        false,
+    )
 }
 
 fn connect_html_navigation_policy(view: &webkit6::WebView, status_label: &gtk::Label) {
@@ -9707,6 +11031,13 @@ enum ImagePolicy {
     Once,
 }
 
+struct PreparedVisualHtmlRender {
+    document: Arc<str>,
+    original_len: usize,
+    allow_remote_images: bool,
+    decode_warning_count: usize,
+}
+
 fn show_visual_html_selected_message(
     options: &LaunchOptions,
     widgets: &Widgets,
@@ -9726,33 +11057,32 @@ fn show_visual_html_with_image_policy(
     }
     let result = {
         let message = state.borrow().selected_message.clone();
-        (|| -> anyhow::Result<(String, String, bool, usize)> {
+        (|| -> anyhow::Result<PreparedVisualHtmlRender> {
             let message = message.ok_or_else(|| anyhow::anyhow!("no selected message"))?;
-            render_visual_html_for_message(options, &message, image_policy)
+            let prepared = prepared_message(widgets, state, &message.message_id)?;
+            render_visual_html_for_message(options, &prepared, image_policy)
         })()
     };
     match result {
-        Ok((document, original_html, allow_remote_images, decode_warning_count)) => {
-            widgets.html_view.stop_loading();
-            set_html_image_loading(&widgets.html_view, allow_remote_images);
+        Ok(rendered) => {
+            set_html_image_loading(&widgets.html_view, rendered.allow_remote_images);
             widgets
-                .html_load_generation
-                .set(widgets.html_load_generation.get().saturating_add(1));
-            widgets.html_view.load_html(&document, Some("about:blank"));
+                .html_lifecycle
+                .load_html(&rendered.document, Some("about:blank"));
             widgets.message_stack.set_visible_child_name("html");
             update_message_header(widgets, state);
             set_active_message_view(widgets, MessageViewKind::Html);
             widgets.status_label.set_text(&html_status_text(
                 image_policy,
-                allow_remote_images,
-                decode_warning_count,
+                rendered.allow_remote_images,
+                rendered.decode_warning_count,
             ));
             {
                 let mut s = state.borrow_mut();
                 s.last_operation = Some(format!(
                     "showed visual HTML ({} bytes before sanitization, images={})",
-                    original_html.len(),
-                    if allow_remote_images {
+                    rendered.original_len,
+                    if rendered.allow_remote_images {
                         "allowed"
                     } else {
                         "blocked"
@@ -9774,25 +11104,20 @@ fn show_visual_html_with_image_policy(
 
 fn render_visual_html_for_message(
     options: &LaunchOptions,
-    message: &notm_notmuch::MessageSummary,
+    prepared: &PreparedMessage,
     image_policy: ImagePolicy,
-) -> anyhow::Result<(String, String, bool, usize)> {
+) -> anyhow::Result<PreparedVisualHtmlRender> {
     let allow_remote_images = match image_policy {
         ImagePolicy::Config => settings::remote_images(&options.runtime_settings),
         ImagePolicy::Once => true,
     };
-    let parsed = parse_reader(open_message_file(options, message)?)?;
-    let decode_warning_count = parsed.decode_warnings.len();
-    let html = parsed
-        .html_body
-        .ok_or_else(|| anyhow::anyhow!("selected message has no HTML body"))?;
-    let sanitized = sanitize_html_for_visual(&html, allow_remote_images);
-    Ok((
-        visual_html_document(&sanitized, allow_remote_images),
-        html,
+    let decode_warning_count = prepared.parsed()?.decode_warnings.len();
+    Ok(PreparedVisualHtmlRender {
+        document: prepared.html_document(allow_remote_images)?,
+        original_len: prepared.html_original_len(),
         allow_remote_images,
         decode_warning_count,
-    ))
+    })
 }
 
 fn set_html_image_loading(view: &webkit6::WebView, allow_remote_images: bool) {
@@ -9903,9 +11228,9 @@ fn resolve_message_view_preference(
 }
 
 fn message_view_preference(
-    options: &LaunchOptions,
     state: &UiState,
     message: &notm_notmuch::MessageSummary,
+    has_html: bool,
 ) -> MessageViewPreference {
     resolve_message_view_preference(
         state.prefer_html_view,
@@ -9913,7 +11238,7 @@ fn message_view_preference(
         &state.sender_view_preferences,
         &message.message_id,
         message_sender_email(message).as_deref(),
-        message_has_html(options, message),
+        has_html,
     )
 }
 
@@ -9921,6 +11246,7 @@ fn normalize_sender(sender: &str) -> String {
     sender.trim().to_ascii_lowercase()
 }
 
+#[cfg(test)]
 fn sanitize_html_for_visual(html: &str, allow_remote_images: bool) -> String {
     let sanitized = sanitize_html(html);
     if allow_remote_images {
@@ -9930,6 +11256,7 @@ fn sanitize_html_for_visual(html: &str, allow_remote_images: bool) -> String {
     }
 }
 
+#[cfg(test)]
 fn strip_img_tags(html: &str) -> String {
     let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len());
@@ -10034,24 +11361,25 @@ fn html_view_state(
         .visible_child_name()
         .map(|name| name.to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    let parsed = selected_message(state)
-        .and_then(|message| open_message_file(options, &message))
-        .and_then(parse_reader);
-    let (has_html, html_len, decode_warning_count, error) = match parsed {
-        Ok(parsed) => (
-            parsed
-                .html_body
-                .as_ref()
-                .is_some_and(|html| !html.trim().is_empty()),
-            parsed
-                .html_body
-                .as_ref()
-                .map(|html| html.len())
-                .unwrap_or(0),
-            parsed.decode_warnings.len(),
-            None,
-        ),
-        Err(err) => (false, 0, 0, Some(err.to_string())),
+    let prepared = state
+        .borrow()
+        .selected_message
+        .as_ref()
+        .map(|message| message.message_id.clone())
+        .ok_or_else(|| anyhow::anyhow!("no selected message"))
+        .and_then(|message_id| prepared_message(widgets, state, &message_id))
+        .and_then(|prepared| {
+            let decode_warning_count = prepared.parsed()?.decode_warnings.len();
+            Ok((
+                prepared.has_html(),
+                prepared.html_original_len(),
+                decode_warning_count,
+                prepared.html_render_error().map(ToString::to_string),
+            ))
+        });
+    let (has_html, html_len, decode_warning_count, error) = match prepared {
+        Ok(details) => details,
+        Err(error) => (false, 0, 0, Some(error.to_string())),
     };
     let sender_email = selected_sender_email(state);
     let global_remote_images_allowed = settings::remote_images(&options.runtime_settings);
@@ -10069,6 +11397,7 @@ fn html_view_state(
         .html_view
         .network_session()
         .is_some_and(|session| session.is_ephemeral());
+    let lifecycle = widgets.html_lifecycle.snapshot();
     json!({
         "ok": error.is_none(),
         "visible_child": visible_child,
@@ -10078,8 +11407,8 @@ fn html_view_state(
         "decode_warning_count": decode_warning_count,
         "status_text": widgets.status_label.text().to_string(),
         "loading": widgets.html_view.is_loading(),
-        "load_generation": widgets.html_load_generation.get(),
-        "completed_load_generation": widgets.html_completed_load_generation.get(),
+        "load_generation": lifecycle.generation,
+        "completed_load_generation": lifecycle.completed_generation,
         "global_remote_images_allowed": global_remote_images_allowed,
         "sender_email": sender_email,
         "sender_identity_authenticated": false,
@@ -10492,7 +11821,7 @@ fn accept_search_page_response(
     response: &SearchPageResponse,
 ) -> bool {
     widgets.search_bar.current_generation() == response.generation
-        && finish_search_activity(&mut state.borrow_mut(), response.generation)
+        && state.borrow().search_generation == response.generation
 }
 
 fn run_search(options: &LaunchOptions, widgets: &Widgets, state: &SharedState, query: &str) -> u64 {
@@ -10507,6 +11836,10 @@ fn schedule_search(
     select_first: bool,
     worker_delay: Duration,
 ) -> u64 {
+    widgets.thread_load_coordinator.borrow_mut().cancel();
+    cancel_composer_preparation(widgets, state);
+    widgets.search_page_coordinator.cancel();
+    widgets.thread_list.cancel_model_update();
     let generation = reserve_search_generation(widgets);
     prepare_search_activity(widgets, state, generation, query);
     start_full_search(
@@ -10554,7 +11887,7 @@ fn start_full_search(
     state: &SharedState,
     request: SearchWorkerRequest,
 ) {
-    let coordinator = search_page_coordinator(options);
+    let coordinator = widgets.search_page_coordinator.clone();
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
@@ -10570,32 +11903,50 @@ fn start_full_search(
         "search cancelled",
         move |response| {
             if accept_search_page_response(&w, &st, &response) {
-                let refreshed = match response.result {
+                match response.result {
                     Ok(data) => {
-                        finish_replaced_search(
+                        let generation = response.generation;
+                        let continue_options = opts.clone();
+                        let continue_widgets = w.clone();
+                        let continue_state = st.clone();
+                        finish_replaced_search_then(
                             &opts,
                             &w,
                             &st,
+                            generation,
                             thread_list::reduce_replace_search(data),
                             response.select_first,
+                            move |applied| {
+                                record_full_search_outcome(&continue_state, generation);
+                                restore_tag_warning_after_search(
+                                    &continue_options,
+                                    &continue_widgets,
+                                    &continue_state,
+                                    applied,
+                                );
+                                if !applied {
+                                    continue_widgets
+                                        .tag_refresh_selected_thread_id
+                                        .borrow_mut()
+                                        .take();
+                                }
+                            },
                         );
-                        true
                     }
                     Err(err) => {
-                        let has_threads = !st.borrow().thread_list_items.is_empty();
-                        finish_search_error(
-                            &w,
-                            &st,
-                            thread_list::reduce_search_error(err, has_threads),
-                        );
-                        false
+                        if finish_search_activity(&mut st.borrow_mut(), response.generation) {
+                            let has_threads = !st.borrow().thread_list_items.is_empty();
+                            finish_search_error(
+                                &w,
+                                &st,
+                                thread_list::reduce_search_error(err, has_threads),
+                            );
+                            record_full_search_outcome(&st, response.generation);
+                            restore_tag_warning_after_search(&opts, &w, &st, false);
+                            w.tag_refresh_selected_thread_id.borrow_mut().take();
+                        }
                     }
-                };
-                restore_tag_warning_after_search(&opts, &w, &st, refreshed);
-                if !refreshed {
-                    w.tag_refresh_selected_thread_id.borrow_mut().take();
                 }
-                record_full_search_outcome(&st, response.generation);
             }
         },
     );
@@ -10707,7 +12058,7 @@ fn load_more_threads(
         delay: Duration::ZERO,
         cache_policy: SearchCachePolicy::Use,
     };
-    let coordinator = search_page_coordinator(options);
+    let coordinator = widgets.search_page_coordinator.clone();
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
@@ -10720,16 +12071,19 @@ fn load_more_threads(
                         &opts,
                         &w,
                         &st,
+                        response.generation,
                         thread_list::reduce_append_search(snapshot, data, select_last_loaded),
                     );
                 }
                 Err(err) => {
-                    let has_threads = !st.borrow().thread_list_items.is_empty();
-                    finish_search_error(
-                        &w,
-                        &st,
-                        thread_list::reduce_search_error(err, has_threads),
-                    );
+                    if finish_search_activity(&mut st.borrow_mut(), response.generation) {
+                        let has_threads = !st.borrow().thread_list_items.is_empty();
+                        finish_search_error(
+                            &w,
+                            &st,
+                            thread_list::reduce_search_error(err, has_threads),
+                        );
+                    }
                 }
             }
         }
@@ -10737,13 +12091,17 @@ fn load_more_threads(
     true
 }
 
-fn finish_replaced_search(
+fn finish_replaced_search_then<F>(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
+    generation: u64,
     outcome: ReplaceSearchOutcome,
     select_first: bool,
-) {
+    complete: F,
+) where
+    F: FnOnce(bool) + 'static,
+{
     let query = outcome.update.current_query.clone();
     let cached = outcome.cached;
     let preserve_search_focus = widgets.search_bar.has_focus();
@@ -10776,17 +12134,62 @@ fn finish_replaced_search(
         state.multi_selected_threads.clear();
         state.multi_selected_thread_snapshots.clear();
     }
-    widgets
-        .thread_list
-        .apply_model_update(&thread_model_snapshot(state), ThreadModelUpdate::Replace);
-    update_tag_searches(options, widgets, state);
+    // The prepared cache is intentionally scoped to the currently selected
+    // thread. A successful replacement search clears that selection, so do not
+    // retain raw/MIME/attachment payloads from the previous result set.
+    widgets.prepared_threads.borrow_mut().clear();
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let ui_completion = ReplacedSearchUiCompletion {
+        query,
+        cached,
+        preserve_search_focus,
+        select_first,
+        restored_thread,
+    };
+    widgets.thread_list.apply_model_update_then(
+        &thread_model_snapshot(state),
+        ThreadModelUpdate::Replace,
+        move |applied| {
+            if !finish_search_activity(&mut st.borrow_mut(), generation) {
+                return;
+            }
+            if applied {
+                finish_replaced_search_after_model(&opts, &w, &st, ui_completion);
+            }
+            complete(applied);
+        },
+    );
+}
 
+struct ReplacedSearchUiCompletion {
+    query: String,
+    cached: bool,
+    preserve_search_focus: bool,
+    select_first: bool,
+    restored_thread: Option<(usize, notm_notmuch::ThreadSummary)>,
+}
+
+fn finish_replaced_search_after_model(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    completion: ReplacedSearchUiCompletion,
+) {
+    let ReplacedSearchUiCompletion {
+        query,
+        cached,
+        preserve_search_focus,
+        select_first,
+        restored_thread,
+    } = completion;
+    update_tag_searches(options, widgets, state);
     let pending_open_message_id = { state.borrow().pending_open_message_id.clone() };
     if let Some(message_id) = pending_open_message_id {
         let has_loaded_threads = !state.borrow().thread_list_items.is_empty();
         if has_loaded_threads && open_loaded_thread_at_message(options, widgets, state, &message_id)
         {
-            state.borrow_mut().pending_open_message_id = None;
             update_thread_result_label(widgets, state);
             update_debug(widgets, state);
             return;
@@ -10844,27 +12247,35 @@ fn finish_appended_search(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
+    generation: u64,
     outcome: AppendSearchOutcome,
 ) {
     let model_update = outcome.model_update;
     let selected_index = outcome.selected_index;
     apply_thread_search_state_update(state, outcome.update);
-    widgets
-        .thread_list
-        .apply_model_update(&thread_model_snapshot(state), model_update);
-    update_tag_searches(options, widgets, state);
-    if let Some(index) = selected_index {
-        select_thread_index_clamped(options, widgets, state, index);
-        widgets
-            .status_label
-            .set_text(&message_position_status(state, index, "Selected"));
-    } else {
-        widgets
-            .status_label
-            .set_text(&format!("Loaded {}", thread_window_status(state)));
-    }
-    update_thread_result_label(widgets, state);
-    update_debug(widgets, state);
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets.thread_list.apply_model_update_then(
+        &thread_model_snapshot(state),
+        model_update,
+        move |applied| {
+            if !finish_search_activity(&mut st.borrow_mut(), generation) || !applied {
+                return;
+            }
+            update_tag_searches(&opts, &w, &st);
+            if let Some(index) = selected_index {
+                select_thread_index_clamped(&opts, &w, &st, index);
+                w.status_label
+                    .set_text(&message_position_status(&st, index, "Selected"));
+            } else {
+                w.status_label
+                    .set_text(&format!("Loaded {}", thread_window_status(&st)));
+            }
+            update_thread_result_label(&w, &st);
+            update_debug(&w, &st);
+        },
+    );
 }
 
 fn finish_search_error(widgets: &Widgets, state: &SharedState, outcome: SearchErrorOutcome) {
@@ -11506,78 +12917,49 @@ fn select_thread_by_index(
         restore_thread_list_selection(widgets, state);
         return;
     }
-    let Some(thread) = state.borrow().thread_list_items.get(index).cloned() else {
-        return;
-    };
     if open {
         open_thread_by_index(options, widgets, state, index);
         return;
     }
+    let Some(thread) = state.borrow().thread_list_items.get(index).cloned() else {
+        return;
+    };
+    let already_loaded = state
+        .borrow()
+        .selected_thread
+        .as_ref()
+        .is_some_and(|selected| selected.thread_id == thread.thread_id)
+        && widgets
+            .prepared_threads
+            .borrow()
+            .contains_key(&thread.thread_id);
+    if already_loaded {
+        widgets.thread_load_coordinator.borrow_mut().cancel();
+        widgets.pending_message_selection.set(None);
+        state.borrow_mut().active_pane = ActivePane::Threads;
+        scroll_thread_index_into_view(widgets, index);
+        if !widget_contains_focus(widgets.search_bar.entry().upcast_ref()) {
+            focus_thread_list(widgets);
+        }
+        update_active_pane_visuals(widgets, state);
+        update_debug(widgets, state);
+        return;
+    }
     let rejection_restore = capture_message_selection_snapshot(state);
     let preserve_search_focus = widget_contains_focus(widgets.search_bar.entry().upcast_ref());
-
-    let result = (|| -> anyhow::Result<()> {
-        let db = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
-        let messages = db.thread_messages_bounded(&thread.thread_id, MAX_LOADED_THREAD_MESSAGES)?;
-        {
-            let mut state = state.borrow_mut();
-            state.selected_thread = Some(thread.clone());
-            state.selected_message = messages.last().cloned();
-            state.messages = messages;
-            state.active_pane = ActivePane::Threads;
-            state.last_operation = Some(format!("previewed thread {}", thread.thread_id));
-            state.last_error = None;
-        }
-        Ok(())
-    })();
-    match result {
-        Ok(()) => {
-            refresh_thread_attachment_list(widgets, state);
-            update_message_menu(options, widgets, state);
-            if selected_message_is_draft(options, state) {
-                let status = message_position_status(state, index, "Selected draft");
-                match open_selected_draft_message(
-                    options,
-                    widgets,
-                    state,
-                    ActivePane::Threads,
-                    status,
-                    Some(rejection_restore.clone()),
-                ) {
-                    Ok(true) => {}
-                    Ok(false) => {}
-                    Err(err) => {
-                        state.borrow_mut().last_error = Some(err.to_string());
-                        widgets
-                            .status_label
-                            .set_text(&format!("Preview draft failed: {err}"));
-                    }
-                }
-            } else {
-                let status = message_position_status(state, index, "Selected");
-                let _ = request_show_selected_message(
-                    options,
-                    widgets,
-                    state,
-                    ActivePane::Threads,
-                    status,
-                    Some(rejection_restore.clone()),
-                );
-                if !widgets.composer.has_pending_confirmation() {
-                    focus_after_thread_preview(widgets, state, preserve_search_focus);
-                }
-            }
-        }
-        Err(err) => {
-            apply_message_selection_snapshot(options, widgets, state, rejection_restore);
-            state.borrow_mut().last_error = Some(err.to_string());
-            widgets
-                .status_label
-                .set_text(&format!("Preview thread failed: {err}"));
-            update_debug(widgets, state);
-            return;
-        }
-    }
+    state.borrow_mut().active_pane = ActivePane::Threads;
+    schedule_thread_load(
+        options,
+        widgets,
+        state,
+        &thread.thread_id,
+        vec![thread.thread_id.clone()],
+        None,
+        ThreadLoadIntent::Preview {
+            rejection_restore,
+            preserve_search_focus,
+        },
+    );
     scroll_thread_index_into_view(widgets, index);
     if !preserve_search_focus {
         focus_thread_list(widgets);
@@ -11610,7 +12992,6 @@ fn open_message_id_request(
 ) {
     state.borrow_mut().pending_open_message_id = Some(message_id.to_string());
     if open_loaded_thread_at_message(options, widgets, state, message_id) {
-        state.borrow_mut().pending_open_message_id = None;
         update_thread_result_label(widgets, state);
         update_debug(widgets, state);
         return;
@@ -11629,94 +13010,30 @@ fn open_loaded_thread_at_message(
     if !ensure_message_file_actions_allowed(widgets, state) {
         return false;
     }
-    let rejection_restore = capture_message_selection_snapshot(state);
     let threads = state.borrow().thread_list_items.clone();
-    for (index, thread) in threads.iter().enumerate() {
-        let result = (|| -> anyhow::Result<Option<usize>> {
-            let db = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
-            let messages =
-                db.thread_messages_bounded(&thread.thread_id, MAX_LOADED_THREAD_MESSAGES)?;
-            let Some(message_index) = messages
-                .iter()
-                .position(|message| message.message_id == message_id)
-            else {
-                return Ok(None);
-            };
-            {
-                let mut s = state.borrow_mut();
-                s.selected_thread = Some(thread.clone());
-                s.selected_message = messages.get(message_index).cloned();
-                s.messages = messages;
-                s.active_pane = ActivePane::Message;
-                s.last_operation = Some(format!("opened message {message_id}"));
-                s.last_error = None;
-            }
-            Ok(Some(message_index))
-        })();
-
-        match result {
-            Ok(Some(message_index)) => {
-                select_thread_index_for_open_message(widgets, index);
-                refresh_thread_attachment_list(widgets, state);
-                update_message_menu(options, widgets, state);
-                if selected_message_is_draft(options, state) {
-                    match open_selected_draft_message(
-                        options,
-                        widgets,
-                        state,
-                        ActivePane::Message,
-                        format!("Opened draft message {message_id}"),
-                        Some(rejection_restore.clone()),
-                    ) {
-                        Ok(true) => {}
-                        Ok(false) => {}
-                        Err(err) => {
-                            state.borrow_mut().last_error = Some(err.to_string());
-                            widgets
-                                .status_label
-                                .set_text(&format!("Open draft failed: {err}"));
-                        }
-                    }
-                } else {
-                    let status = format!(
-                        "Opened message {} ({}/{})",
-                        message_id,
-                        message_index + 1,
-                        state.borrow().messages.len()
-                    );
-                    let _ = request_show_selected_message(
-                        options,
-                        widgets,
-                        state,
-                        ActivePane::Message,
-                        status,
-                        Some(rejection_restore.clone()),
-                    );
-                }
-                scroll_thread_index_into_view(widgets, index);
-                update_custom_tag_controls(widgets, state);
-                update_active_pane_visuals(widgets, state);
-                update_message_action_buttons(options, widgets, state);
-                focus_active_pane(widgets, state);
-                return true;
-            }
-            Ok(None) => {}
-            Err(err) => {
-                apply_message_selection_snapshot(options, widgets, state, rejection_restore);
-                state.borrow_mut().last_error = Some(err.to_string());
-                widgets
-                    .status_label
-                    .set_text(&format!("Open message failed: {err}"));
-                update_debug(widgets, state);
-                return false;
-            }
-        }
-    }
-
-    widgets.status_label.set_text(&format!(
-        "Message id not found in loaded results: {message_id}"
-    ));
-    false
+    let Some(first) = threads.first() else {
+        return false;
+    };
+    let rejection_restore = capture_message_selection_snapshot(state);
+    state.borrow_mut().active_pane = ActivePane::Message;
+    schedule_thread_load(
+        options,
+        widgets,
+        state,
+        &first.thread_id,
+        threads
+            .iter()
+            .map(|thread| thread.thread_id.clone())
+            .collect(),
+        Some(message_id.to_string()),
+        ThreadLoadIntent::OpenMessage {
+            message_id: message_id.to_string(),
+            rejection_restore,
+            current_query: state.borrow().current_query.clone(),
+            search_entry: widgets.search_bar.entry().text().to_string(),
+        },
+    );
+    true
 }
 
 fn open_thread_by_index(
@@ -11733,34 +13050,253 @@ fn open_thread_by_index(
     };
     let rejection_restore = capture_message_selection_snapshot(state);
     let destination = thread_open_destination(pane_is_visible(widgets, ActivePane::Message));
-    let result = (|| -> anyhow::Result<(Vec<notm_notmuch::MessageSummary>, usize)> {
-        let db = Database::open(&open_config(options), DatabaseMode::ReadOnly)?;
-        let messages = db.thread_messages_bounded(&thread.thread_id, MAX_LOADED_THREAD_MESSAGES)?;
-        let selected_index = messages.len().saturating_sub(1);
-        {
-            let mut s = state.borrow_mut();
-            s.selected_thread = Some(thread.clone());
-            s.selected_message = messages.last().cloned();
-            s.messages = messages.clone();
-            s.active_pane = match destination {
-                ThreadOpenDestination::InlinePane => ActivePane::Message,
-                ThreadOpenDestination::StandaloneWindow => ActivePane::Threads,
-            };
-            s.last_operation = Some(format!("opened thread {}", thread.thread_id));
-            s.last_error = None;
+    state.borrow_mut().active_pane = match destination {
+        ThreadOpenDestination::InlinePane => ActivePane::Message,
+        ThreadOpenDestination::StandaloneWindow => ActivePane::Threads,
+    };
+    schedule_thread_load(
+        options,
+        widgets,
+        state,
+        &thread.thread_id,
+        vec![thread.thread_id.clone()],
+        None,
+        ThreadLoadIntent::Open {
+            destination,
+            rejection_restore,
+        },
+    );
+    update_custom_tag_controls(widgets, state);
+    update_active_pane_visuals(widgets, state);
+    update_debug(widgets, state);
+}
+
+#[derive(Clone)]
+enum ThreadLoadIntent {
+    Preview {
+        rejection_restore: MessageSelectionSnapshot,
+        preserve_search_focus: bool,
+    },
+    Open {
+        destination: ThreadOpenDestination,
+        rejection_restore: MessageSelectionSnapshot,
+    },
+    OpenMessage {
+        message_id: String,
+        rejection_restore: MessageSelectionSnapshot,
+        current_query: String,
+        search_entry: String,
+    },
+}
+
+impl ThreadLoadIntent {
+    fn rejection_restore(&self) -> MessageSelectionSnapshot {
+        match self {
+            Self::Preview {
+                rejection_restore, ..
+            }
+            | Self::Open {
+                rejection_restore, ..
+            }
+            | Self::OpenMessage {
+                rejection_restore, ..
+            } => rejection_restore.clone(),
         }
-        Ok((messages, selected_index))
-    })();
-    match result {
-        Ok((messages, selected_index)) => {
-            refresh_thread_attachment_list(widgets, state);
-            update_message_menu(options, widgets, state);
+    }
+}
+
+fn schedule_thread_load(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    thread_id: &str,
+    candidate_thread_ids: Vec<String>,
+    target_message_id: Option<String>,
+    intent: ThreadLoadIntent,
+) -> u64 {
+    cancel_composer_preparation(widgets, state);
+    widgets.pending_message_selection.set(None);
+    let generation = widgets.thread_load_coordinator.borrow_mut().begin();
+    let response = widgets
+        .thread_load_coordinator
+        .borrow()
+        .spawn(ThreadLoadRequest {
+            generation,
+            config: open_config(options),
+            thread_id: thread_id.to_string(),
+            candidate_thread_ids,
+            target_message_id,
+            delay: widgets.thread_load_delay.get(),
+        });
+    widgets.status_label.set_text("Loading thread…");
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    gtk::glib::timeout_add_local(Duration::from_millis(15), move || {
+        match response.try_recv() {
+            Ok(response) => {
+                finish_thread_load(&opts, &w, &st, response, intent.clone());
+                gtk::glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                if w.thread_load_coordinator.borrow_mut().finish(generation) {
+                    st.borrow_mut().last_error =
+                        Some("thread loader worker disconnected".to_string());
+                    w.status_label.set_text("Loading thread failed");
+                    update_debug(&w, &st);
+                }
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
+    generation
+}
+
+fn finish_thread_load(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    response: ThreadLoadResponse,
+    intent: ThreadLoadIntent,
+) {
+    if !widgets
+        .thread_load_coordinator
+        .borrow_mut()
+        .finish(response.generation)
+    {
+        return;
+    }
+    let prepared = match response.result {
+        Ok(prepared) => Arc::new(prepared),
+        Err(error) => {
+            if let Some(not_found) = error.downcast_ref::<TargetMessageNotFound>()
+                && let ThreadLoadIntent::OpenMessage {
+                    message_id,
+                    rejection_restore,
+                    current_query,
+                    search_entry,
+                } = &intent
+                && not_found.message_id() == message_id
+            {
+                finish_absent_open_message(
+                    options,
+                    widgets,
+                    state,
+                    message_id,
+                    rejection_restore.clone(),
+                    current_query,
+                    search_entry,
+                );
+                return;
+            }
+            apply_message_selection_snapshot(options, widgets, state, intent.rejection_restore());
+            state.borrow_mut().last_error = Some(error.to_string());
+            widgets
+                .status_label
+                .set_text(&format!("Loading thread failed: {error}"));
+            update_debug(widgets, state);
+            return;
+        }
+    };
+
+    let Some(index) = state
+        .borrow()
+        .thread_list_items
+        .iter()
+        .position(|thread| thread.thread_id == prepared.thread_id)
+    else {
+        return;
+    };
+    let Some(thread) = state.borrow().thread_list_items.get(index).cloned() else {
+        return;
+    };
+
+    if let ThreadLoadIntent::OpenMessage { message_id, .. } = &intent
+        && prepared.target_message_index.is_none()
+    {
+        finish_missing_open_message(options, widgets, state, message_id);
+        return;
+    }
+
+    let pending_message_selection = widgets.pending_message_selection.take();
+    let selected_index = match &intent {
+        ThreadLoadIntent::OpenMessage { .. } => prepared.target_message_index.unwrap_or(0),
+        ThreadLoadIntent::Preview { .. } | ThreadLoadIntent::Open { .. } => {
+            pending_message_selection
+                .filter(|index| *index < prepared.messages.len())
+                .unwrap_or_else(|| prepared.messages.len().saturating_sub(1))
+        }
+    };
+    let active_pane = state.borrow().active_pane;
+    let operation = match &intent {
+        ThreadLoadIntent::Preview { .. } => format!("previewed thread {}", thread.thread_id),
+        ThreadLoadIntent::Open { .. } => format!("opened thread {}", thread.thread_id),
+        ThreadLoadIntent::OpenMessage { message_id, .. } => format!("opened message {message_id}"),
+    };
+    {
+        let mut state = state.borrow_mut();
+        state.selected_thread = Some(thread);
+        state.selected_message = prepared.messages.get(selected_index).cloned();
+        state.messages = prepared.messages.clone();
+        state.active_pane = active_pane;
+        state.last_operation = Some(operation);
+        state.last_error = None;
+    }
+    {
+        let mut prepared_threads = widgets.prepared_threads.borrow_mut();
+        prepared_threads.clear();
+        prepared_threads.insert(prepared.thread_id.clone(), prepared.clone());
+    }
+    select_thread_index_for_open_message(widgets, index);
+    refresh_thread_attachment_list(widgets, state);
+    update_message_menu(options, widgets, state);
+
+    match intent {
+        ThreadLoadIntent::Preview {
+            rejection_restore,
+            preserve_search_focus,
+        } => {
+            if selected_message_is_draft(options, state) {
+                let status = message_position_status(state, index, "Selected draft");
+                if let Err(error) = open_selected_draft_message(
+                    options,
+                    widgets,
+                    state,
+                    active_pane,
+                    status,
+                    Some(rejection_restore),
+                ) {
+                    state.borrow_mut().last_error = Some(error.to_string());
+                    widgets
+                        .status_label
+                        .set_text(&format!("Preview draft failed: {error}"));
+                }
+            } else {
+                let status = message_position_status(state, index, "Selected");
+                let _ = request_show_selected_message(
+                    options,
+                    widgets,
+                    state,
+                    active_pane,
+                    status,
+                    Some(rejection_restore),
+                );
+                if !widgets.composer.has_pending_confirmation() {
+                    focus_after_thread_preview(widgets, state, preserve_search_focus);
+                }
+            }
+        }
+        ThreadLoadIntent::Open {
+            destination,
+            rejection_restore,
+        } => {
             if destination == ThreadOpenDestination::StandaloneWindow {
                 match open_standalone_message_window(
                     options,
                     widgets,
                     state,
-                    messages,
+                    prepared.messages.clone(),
                     selected_index,
                 ) {
                     Ok(()) => widgets.status_label.set_text(&message_position_status(
@@ -11768,31 +13304,27 @@ fn open_thread_by_index(
                         index,
                         "Opened in new window",
                     )),
-                    Err(err) => {
-                        state.borrow_mut().last_error = Some(err.to_string());
+                    Err(error) => {
+                        state.borrow_mut().last_error = Some(error.to_string());
                         widgets
                             .status_label
-                            .set_text(&format!("Open message window failed: {err}"));
+                            .set_text(&format!("Open message window failed: {error}"));
                     }
                 }
             } else if selected_message_is_draft(options, state) {
                 let status = message_position_status(state, index, "Opened draft");
-                match open_selected_draft_message(
+                if let Err(error) = open_selected_draft_message(
                     options,
                     widgets,
                     state,
-                    ActivePane::Message,
+                    active_pane,
                     status,
-                    Some(rejection_restore.clone()),
+                    Some(rejection_restore),
                 ) {
-                    Ok(true) => {}
-                    Ok(false) => {}
-                    Err(err) => {
-                        state.borrow_mut().last_error = Some(err.to_string());
-                        widgets
-                            .status_label
-                            .set_text(&format!("Open draft failed: {err}"));
-                    }
+                    state.borrow_mut().last_error = Some(error.to_string());
+                    widgets
+                        .status_label
+                        .set_text(&format!("Open draft failed: {error}"));
                 }
             } else {
                 let status = message_position_status(state, index, "Opened");
@@ -11800,22 +13332,103 @@ fn open_thread_by_index(
                     options,
                     widgets,
                     state,
-                    ActivePane::Message,
+                    active_pane,
                     status,
-                    Some(rejection_restore.clone()),
+                    Some(rejection_restore),
                 );
             }
         }
-        Err(err) => {
-            apply_message_selection_snapshot(options, widgets, state, rejection_restore);
-            state.borrow_mut().last_error = Some(err.to_string());
-            widgets
-                .status_label
-                .set_text(&format!("Open thread failed: {err}"));
+        ThreadLoadIntent::OpenMessage {
+            message_id,
+            rejection_restore,
+            ..
+        } => {
+            state.borrow_mut().pending_open_message_id = None;
+            if selected_message_is_draft(options, state) {
+                if let Err(error) = open_selected_draft_message(
+                    options,
+                    widgets,
+                    state,
+                    active_pane,
+                    format!("Opened draft message {message_id}"),
+                    Some(rejection_restore),
+                ) {
+                    state.borrow_mut().last_error = Some(error.to_string());
+                    widgets
+                        .status_label
+                        .set_text(&format!("Open draft failed: {error}"));
+                }
+            } else {
+                let status = format!(
+                    "Opened message {} ({}/{})",
+                    message_id,
+                    selected_index + 1,
+                    state.borrow().messages.len()
+                );
+                let _ = request_show_selected_message(
+                    options,
+                    widgets,
+                    state,
+                    active_pane,
+                    status,
+                    Some(rejection_restore),
+                );
+            }
         }
     }
+    scroll_thread_index_into_view(widgets, index);
     update_custom_tag_controls(widgets, state);
     update_active_pane_visuals(widgets, state);
+    update_message_action_buttons(options, widgets, state);
+    focus_active_pane(widgets, state);
+    update_debug(widgets, state);
+}
+
+fn finish_absent_open_message(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    message_id: &str,
+    rejection_restore: MessageSelectionSnapshot,
+    current_query: &str,
+    search_entry: &str,
+) {
+    apply_message_selection_snapshot(options, widgets, state, rejection_restore);
+    {
+        let mut state = state.borrow_mut();
+        state.current_query = current_query.to_string();
+        state.pending_open_message_id = None;
+    }
+    if widgets.search_bar.entry().text().as_str() != search_entry {
+        widgets.search_bar.set_query(search_entry);
+    }
+    widgets
+        .status_label
+        .set_text(&format!("Message id not found: {message_id}"));
+    update_thread_result_label(widgets, state);
+    update_debug(widgets, state);
+}
+
+fn finish_missing_open_message(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    message_id: &str,
+) {
+    let fallback_query = message_id_query(message_id);
+    if state.borrow().current_query != fallback_query {
+        widgets.status_label.set_text(&format!(
+            "Message id not in loaded results: {message_id}; opening direct match"
+        ));
+        widgets.search_bar.set_query(&fallback_query);
+        run_search(options, widgets, state, &fallback_query);
+        return;
+    }
+    state.borrow_mut().pending_open_message_id = None;
+    widgets
+        .status_label
+        .set_text(&format!("Message id not found: {message_id}"));
+    update_thread_result_label(widgets, state);
     update_debug(widgets, state);
 }
 
@@ -11844,6 +13457,27 @@ fn open_standalone_message_window(
         ensure_message_file_actions_allowed(widgets, state),
         "message file actions are unavailable while tags are changing"
     );
+    let thread_id = messages
+        .first()
+        .map(|message| message.thread_id.as_str())
+        .ok_or_else(|| anyhow::anyhow!("standalone thread has no messages"))?;
+    let prepared_thread = widgets
+        .prepared_threads
+        .borrow()
+        .get(thread_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("standalone message content is still loading"))?;
+    let prepared_retained_bytes = prepared_thread.retained_bytes();
+    let message_sources = prepared_thread
+        .message_contents
+        .iter()
+        .filter_map(|(message_id, prepared)| {
+            prepared
+                .source()
+                .ok()
+                .map(|source| (message_id.clone(), source.clone()))
+        })
+        .collect();
     let policy_options = options.clone();
     let policy_state = state.clone();
     let policy_quote_collapse = widgets.quote_collapse.clone();
@@ -11857,36 +13491,60 @@ fn open_standalone_message_window(
             response_sensitive: !state.send_in_progress && !tag_path_actions_blocked(&state),
         }
     });
-    let html_probe_options = options.clone();
-    let message_has_html: StandaloneMessageHasHtml =
-        Rc::new(move |message| message_has_html(&html_probe_options, message));
-    let text_options = options.clone();
+    let html_contents = prepared_thread.clone();
+    let message_has_html: StandaloneMessageHasHtml = Rc::new(move |message| {
+        html_contents
+            .message_contents
+            .get(&message.message_id)
+            .and_then(|prepared| prepared.parsed().ok())
+            .and_then(|parsed| parsed.html_body.as_deref())
+            .is_some_and(|html| !html.trim().is_empty())
+    });
+    let text_contents = prepared_thread.clone();
     let render_text: StandaloneTextRenderer = Rc::new(move |message, collapse_quotes| {
-        render_message_text(&text_options, message, collapse_quotes)
+        text_contents
+            .message_contents
+            .get(&message.message_id)
+            .ok_or_else(|| anyhow::anyhow!("message content is still loading"))?
+            .rendered_text(collapse_quotes)
+    });
+    let header_contents = prepared_thread.clone();
+    let render_headers: StandaloneSourceRenderer = Rc::new(move |message| {
+        header_contents
+            .message_contents
+            .get(&message.message_id)
+            .ok_or_else(|| anyhow::anyhow!("message content is still loading"))?
+            .headers()
+    });
+    let raw_contents = prepared_thread.clone();
+    let render_raw: StandaloneSourceRenderer = Rc::new(move |message| {
+        raw_contents
+            .message_contents
+            .get(&message.message_id)
+            .ok_or_else(|| anyhow::anyhow!("message content is still loading"))?
+            .raw_shared()
     });
     let render_options = options.clone();
+    let render_contents = prepared_thread.clone();
     let render_html: StandaloneHtmlRenderer = Rc::new(move |message, policy| {
         let policy = match policy {
             StandaloneImagePolicy::Config => ImagePolicy::Config,
             StandaloneImagePolicy::Once => ImagePolicy::Once,
         };
-        let (document, _, allow_remote_images, decode_warning_count) =
-            render_visual_html_for_message(&render_options, message, policy)?;
+        let prepared = render_contents
+            .message_contents
+            .get(&message.message_id)
+            .ok_or_else(|| anyhow::anyhow!("message content is still loading"))?;
+        let rendered = render_visual_html_for_message(&render_options, prepared, policy)?;
         Ok(StandaloneHtmlRender {
-            document,
-            allow_remote_images,
-            status: html_status_text(policy, allow_remote_images, decode_warning_count),
+            document: rendered.document,
+            allow_remote_images: rendered.allow_remote_images,
+            status: html_status_text(
+                policy,
+                rendered.allow_remote_images,
+                rendered.decode_warning_count,
+            ),
         })
-    });
-    let raw_options = options.clone();
-    let read_raw: StandaloneSourceReader =
-        Rc::new(move |message| Ok(read_raw_text(open_message_file(&raw_options, message)?)?));
-    let header_options = options.clone();
-    let read_headers: StandaloneSourceReader = Rc::new(move |message| {
-        Ok(read_header_text(open_message_file(
-            &header_options,
-            message,
-        )?)?)
     });
     let create_html_view: StandaloneHtmlViewFactory = Rc::new(new_privacy_html_webview);
     let initialize_html_view: StandaloneHtmlViewInitializer =
@@ -11895,23 +13553,19 @@ fn open_standalone_message_window(
             connect_html_navigation_policy(view, status_label);
             connect_html_hover_status(view, status_label);
         });
-    let scroll_html: StandaloneHtmlScrollHandler =
-        Rc::new(move |view, status_label, request| match request {
-            StandaloneHtmlScroll::Lines(lines) => {
-                scroll_web_view_lines(view, status_label, lines);
-            }
-            StandaloneHtmlScroll::Pages(pages) => {
-                scroll_web_view_pages(view, status_label, pages);
-            }
-            StandaloneHtmlScroll::Edge(bottom) => {
-                scroll_web_view_to_edge(view, status_label, bottom);
-            }
-        });
+    let initial_html: Arc<str> = empty_visual_html_document().into();
     let open_link: LinkHintOpener = Rc::new(open_html_link_externally);
-    let preferred_options = options.clone();
     let preferred_state = state.clone();
+    let response_contents = prepared_thread.clone();
+    let preferred_contents = prepared_thread;
     let preferred_view: StandalonePreferredView = Rc::new(move |message| {
-        message_view_preference(&preferred_options, &preferred_state.borrow(), message)
+        let has_html = preferred_contents
+            .message_contents
+            .get(&message.message_id)
+            .and_then(|prepared| prepared.parsed().ok())
+            .and_then(|parsed| parsed.html_body.as_deref())
+            .is_some_and(|html| !html.trim().is_empty());
+        message_view_preference(&preferred_state.borrow(), message, has_html)
     });
     let remember_options = options.clone();
     let remember_state = state.clone();
@@ -11947,6 +13601,7 @@ fn open_standalone_message_window(
             &response_options,
             &response_widgets,
             &response_state,
+            response_contents.clone(),
             request,
         )
     });
@@ -11955,15 +13610,17 @@ fn open_standalone_message_window(
         parent: widgets.window.clone(),
         messages,
         selected_index,
+        prepared_retained_bytes,
+        message_sources,
         policy,
         message_has_html,
         render_text,
+        render_headers,
+        render_raw,
         render_html,
-        read_raw,
-        read_headers,
         create_html_view,
         initialize_html_view,
-        scroll_html,
+        initial_html,
         open_link,
         respond,
         preferred_view,
@@ -11977,6 +13634,7 @@ fn run_standalone_response_request(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
+    prepared_thread: Arc<PreparedThread>,
     request: StandaloneResponseRequest,
 ) -> bool {
     let StandaloneResponseRequest {
@@ -11984,90 +13642,88 @@ fn run_standalone_response_request(
         message,
         source_status,
     } = request;
-    let result = match action {
-        StandaloneResponseAction::Reply(kind) => {
-            composed_reply_for_message(options, &message, kind)
-                .map(|message| (message, "Reply composer opened"))
-        }
-        StandaloneResponseAction::Forward => composed_inline_forward_for_message(options, &message)
-            .map(|message| (message, "Forward composer opened")),
-        StandaloneResponseAction::ForwardAttachment => {
-            composed_attachment_forward_for_message(options, &message)
-                .map(|message| (message, "Forward-as-attachment composer opened"))
+    let prepared_action = match action {
+        StandaloneResponseAction::Reply(kind) => reply_preparation_action(options, kind),
+        StandaloneResponseAction::Forward => forward_preparation_action(options, false),
+        StandaloneResponseAction::ForwardAttachment => forward_preparation_action(options, true),
+    };
+    let prepared_action = match prepared_action {
+        Ok(action) => action,
+        Err(error) => {
+            let message = format!("Response failed: {error}");
+            state.borrow_mut().last_error = Some(error.to_string());
+            source_status.set_text(&message);
+            widgets.status_label.set_text(&message);
+            update_debug(widgets, state);
+            return false;
         }
     };
-    match result {
-        Ok((message, status)) => {
-            let kind = match action {
-                StandaloneResponseAction::Reply(ReplyKind::Sender) => {
-                    ComposerReplacementKind::StandaloneReply
-                }
-                StandaloneResponseAction::Reply(ReplyKind::All) => {
-                    ComposerReplacementKind::StandaloneReplyAll
-                }
-                StandaloneResponseAction::Forward => ComposerReplacementKind::StandaloneForward,
-                StandaloneResponseAction::ForwardAttachment => {
-                    ComposerReplacementKind::StandaloneForwardAttachment
-                }
-            };
-            request_pending_action(
-                options,
-                widgets,
-                state,
-                PendingTransition::ReplaceComposer(PreparedComposerReplacement {
-                    kind,
-                    payload: ComposerReplacementPayload::Message(Box::new(message)),
-                    selection: None,
-                    rejection_restore: None,
-                    status: status.to_string(),
-                    source_status: Some(source_status),
-                    present_main_window: true,
-                    show_message_pane: true,
-                    active_pane: ActivePane::Message,
-                }),
-            )
-        }
-        Err(err) => {
-            state.borrow_mut().last_error = Some(err.to_string());
-            source_status.set_text(&format!("Response failed: {err}"));
-            false
-        }
-    }
+    let (kind, status) = match action {
+        StandaloneResponseAction::Reply(ReplyKind::Sender) => (
+            ComposerReplacementKind::StandaloneReply,
+            "Reply composer opened",
+        ),
+        StandaloneResponseAction::Reply(ReplyKind::All) => (
+            ComposerReplacementKind::StandaloneReplyAll,
+            "Reply composer opened",
+        ),
+        StandaloneResponseAction::Forward => (
+            ComposerReplacementKind::StandaloneForward,
+            "Forward composer opened",
+        ),
+        StandaloneResponseAction::ForwardAttachment => (
+            ComposerReplacementKind::StandaloneForwardAttachment,
+            "Forward-as-attachment composer opened",
+        ),
+    };
+    schedule_composer_preparation(
+        options,
+        widgets,
+        state,
+        prepared_thread,
+        message.message_id,
+        prepared_action,
+        ComposerPreparationIntent {
+            kind,
+            selection: None,
+            rejection_restore: None,
+            status: status.to_string(),
+            source_status: Some(source_status),
+            present_main_window: true,
+            show_message_pane: true,
+            active_pane: ActivePane::Message,
+        },
+    )
 }
 
-fn composed_reply_for_message(
+fn reply_preparation_action(
     options: &LaunchOptions,
-    message: &notm_notmuch::MessageSummary,
     kind: ReplyKind,
-) -> anyhow::Result<ComposedMessage> {
-    let source = open_message_file(options, message)?;
+) -> anyhow::Result<ComposerPreparationAction> {
     let identity =
         identity(options).ok_or_else(|| anyhow::anyhow!("No identity configured for reply"))?;
-    let mut own = options.other_email.clone();
+    let mut own_addresses = options.other_email.clone();
     if let Some(email) = &options.primary_email {
-        own.push(email.clone());
+        own_addresses.push(email.clone());
     }
-    composer::composed_reply_from_reader(source, &identity, &own, kind)
+    Ok(ComposerPreparationAction::Reply {
+        kind,
+        identity,
+        own_addresses,
+    })
 }
 
-fn composed_inline_forward_for_message(
+fn forward_preparation_action(
     options: &LaunchOptions,
-    message: &notm_notmuch::MessageSummary,
-) -> anyhow::Result<ComposedMessage> {
-    let source = open_message_file(options, message)?;
+    attached: bool,
+) -> anyhow::Result<ComposerPreparationAction> {
     let identity =
         identity(options).ok_or_else(|| anyhow::anyhow!("No identity configured for forward"))?;
-    composer::composed_inline_forward_from_reader(source, &identity)
-}
-
-fn composed_attachment_forward_for_message(
-    options: &LaunchOptions,
-    message: &notm_notmuch::MessageSummary,
-) -> anyhow::Result<ComposedMessage> {
-    let source = open_message_file(options, message)?;
-    let identity =
-        identity(options).ok_or_else(|| anyhow::anyhow!("No identity configured for forward"))?;
-    composer::composed_attachment_forward_from_reader(source, &identity)
+    Ok(if attached {
+        ComposerPreparationAction::AttachmentForward { identity }
+    } else {
+        ComposerPreparationAction::InlineForward { identity }
+    })
 }
 
 const MAX_UNDO_TAG_ACTIONS: usize = 30;
@@ -12368,11 +14024,89 @@ fn background_activity_block_reason(
     None
 }
 
+fn composer_attachment_cache_block_reason(
+    cache_pending: bool,
+    operation: UserOperation,
+) -> Option<&'static str> {
+    if !cache_pending {
+        return None;
+    }
+    match operation {
+        UserOperation::DraftSave => {
+            Some("draft saving is unavailable while composer attachments are loading")
+        }
+        UserOperation::DraftDelete => {
+            Some("draft deletion is unavailable while composer attachments are loading")
+        }
+        UserOperation::Send => {
+            Some("sending is unavailable while composer attachments are loading")
+        }
+        UserOperation::Sync => Some("sync is unavailable while composer attachments are loading"),
+        UserOperation::ComposeEdit
+        | UserOperation::Tag
+        | UserOperation::DraftLoad
+        | UserOperation::DraftClear
+        | UserOperation::ComposeReplace => None,
+    }
+}
+
+fn named_draft_migration_block_reason(
+    migration_in_progress: bool,
+    operation: UserOperation,
+) -> Option<&'static str> {
+    if !migration_in_progress {
+        return None;
+    }
+    match operation {
+        UserOperation::DraftSave => {
+            Some("draft saving is unavailable while legacy drafts are migrating")
+        }
+        UserOperation::DraftDelete => {
+            Some("draft deletion is unavailable while legacy drafts are migrating")
+        }
+        UserOperation::Send => Some("sending is unavailable while legacy drafts are migrating"),
+        UserOperation::ComposeEdit
+        | UserOperation::Tag
+        | UserOperation::DraftLoad
+        | UserOperation::DraftClear
+        | UserOperation::ComposeReplace
+        | UserOperation::Sync => None,
+    }
+}
+
 fn ensure_user_operation_allowed(
     widgets: &Widgets,
     state: &SharedState,
     operation: UserOperation,
 ) -> anyhow::Result<()> {
+    if let Some(message) = named_draft_migration_block_reason(
+        widgets
+            .named_draft_io_coordinator
+            .borrow()
+            .migration_in_progress(),
+        operation,
+    ) {
+        widgets.status_label.set_text(message);
+        state.borrow_mut().last_operation = Some(message.to_string());
+        update_debug(widgets, state);
+        anyhow::bail!(message);
+    }
+    if let Some(message) = composer_attachment_cache_block_reason(
+        widgets.composer_attachment_cache_active.get().is_some(),
+        operation,
+    ) {
+        widgets.status_label.set_text(message);
+        state.borrow_mut().last_operation = Some(message.to_string());
+        update_debug(widgets, state);
+        anyhow::bail!(message);
+    }
+    if widgets.draft_save_active.get().is_some() && operation != UserOperation::ComposeEdit {
+        let message = "this action is unavailable while draft persistence is in progress";
+        widgets.status_label.set_text(message);
+        state.borrow_mut().last_operation = Some(message.to_string());
+        update_debug(widgets, state);
+        anyhow::bail!(message);
+    }
     if matches!(operation, UserOperation::Send | UserOperation::Tag)
         && widgets.composer.has_pending_confirmation()
     {
@@ -12583,6 +14317,7 @@ fn schedule_tag_mutation(
             .set_text("Tag operation failed: application is unavailable");
         return false;
     };
+    cancel_thread_load_for_tag_mutation(widgets, state);
     let application_hold = application.hold();
     let (generation, completion_context) = {
         let interrupted_search = state.borrow().search_loading;
@@ -12686,6 +14421,20 @@ fn schedule_tag_mutation(
         }
     });
     true
+}
+
+fn cancel_thread_load_for_tag_mutation(widgets: &Widgets, state: &SharedState) {
+    if widgets
+        .thread_load_coordinator
+        .borrow()
+        .active_generation()
+        .is_none()
+    {
+        return;
+    }
+    widgets.thread_load_coordinator.borrow_mut().cancel();
+    widgets.pending_message_selection.set(None);
+    restore_thread_list_selection(widgets, state);
 }
 
 fn execute_tag_worker(
@@ -12893,7 +14642,7 @@ fn finish_tag_worker(
                 let mut operation_errors = result.operation_errors;
                 if !retained_paths_resolved {
                     operation_errors.push(
-                        "an active draft retained a filename absent from the authoritative message paths"
+                        "retained message, attachment, standalone, or draft state contains a filename absent from the authoritative message paths"
                             .to_string(),
                     );
                 }
@@ -13273,12 +15022,27 @@ fn apply_authoritative_tag_changes(
     widgets
         .standalone_messages
         .apply_authoritative_tag_changes(changes);
-    widgets
+    let path_map = AuthoritativePathMap::new(path_states);
+    let prepared_sources_resolved = {
+        let prepared_threads = widgets.prepared_threads.borrow();
+        let mut resolved = true;
+        for prepared in prepared_threads.values() {
+            resolved &= prepared.apply_authoritative_path_states(&path_map);
+        }
+        resolved
+    };
+    let attachment_sources_resolved = widgets
         .attachments
-        .apply_authoritative_messages(&state.borrow().messages);
+        .apply_authoritative_path_states(&path_map);
+    let standalone_sources_resolved = widgets
+        .standalone_messages
+        .apply_authoritative_path_states(&path_map);
     refresh_thread_model_rows(widgets, state, &row_updates.0);
     update_visual_selection_rows(widgets, state);
     row_updates.1
+        && prepared_sources_resolved
+        && attachment_sources_resolved
+        && standalone_sources_resolved
 }
 
 fn apply_active_draft_authoritative_paths(
@@ -13404,22 +15168,41 @@ fn update_background_activity_controls(
     widgets: &Widgets,
     state: &SharedState,
 ) {
-    let (background_activity, response_io_in_progress, tag_paths_blocked) = {
+    let named_draft_migration_pending = widgets
+        .named_draft_io_coordinator
+        .borrow()
+        .migration_in_progress();
+    let attachment_cache_pending = widgets.composer_attachment_cache_active.get().is_some();
+    let (
+        background_activity,
+        response_io_in_progress,
+        tag_paths_blocked,
+        manual_sync_sensitive,
+        send_sensitive,
+    ) = {
         let state = state.borrow();
         let tag_paths_blocked = tag_path_actions_blocked(&state);
+        let (manual_sync_sensitive, send_sensitive) = background_control_sensitivity(
+            &state,
+            widgets.draft_save_active.get().is_some(),
+            attachment_cache_pending,
+            named_draft_migration_pending,
+        );
         (
-            state.sync_in_progress || state.send_in_progress || tag_paths_blocked,
+            state.sync_in_progress
+                || state.send_in_progress
+                || widgets.draft_save_active.get().is_some()
+                || tag_paths_blocked,
             state.send_in_progress || tag_paths_blocked,
             tag_paths_blocked,
+            manual_sync_sensitive,
+            send_sensitive,
         )
     };
     if let Some(button) = &widgets.manual_sync_button {
-        button.set_sensitive(!background_activity);
+        button.set_sensitive(manual_sync_sensitive);
     }
-    widgets
-        .composer
-        .send_button()
-        .set_sensitive(!background_activity);
+    widgets.composer.send_button().set_sensitive(send_sensitive);
     widgets
         .compose_button
         .set_sensitive(!response_io_in_progress);
@@ -13456,45 +15239,81 @@ fn update_background_activity_controls(
 }
 
 fn update_message_menu(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
-    while let Some(child) = widgets.message_menu_box.first_child() {
-        widgets.message_menu_box.remove(&child);
-    }
-    let messages = state.borrow().messages.clone();
+    let generation = widgets.message_menu_generation.get().saturating_add(1);
+    widgets.message_menu_generation.set(generation);
     let selected_index = selected_message_index(state);
-    let total = messages.len();
+    let total = state.borrow().messages.len();
     if total == 0 {
         widgets.message_menu_button.set_label("Message");
-        widgets.message_menu_button.set_sensitive(false);
-        update_message_action_buttons(options, widgets, state);
-        return;
+    } else {
+        let label = selected_index
+            .map(|index| format!("Message {}/{}", index + 1, total))
+            .unwrap_or_else(|| "Message".to_string());
+        widgets.message_menu_button.set_label(&label);
     }
-    widgets.message_menu_button.set_sensitive(true);
-    let label = selected_index
-        .map(|index| format!("Message {}/{}", index + 1, total))
-        .unwrap_or_else(|| "Message".to_string());
-    widgets.message_menu_button.set_label(&label);
-    for (index, message) in messages.iter().enumerate() {
-        let subject = if message.subject.trim().is_empty() {
-            "(no subject)"
-        } else {
-            message.subject.trim()
-        };
-        let label = format!("{}: {}", index + 1, subject);
-        let button = gtk::Button::with_label(&label);
-        button.set_widget_name(&format!("notm-message-select-{}", index + 1));
-        if Some(index) == selected_index {
-            button.add_css_class("suggested-action");
-        }
-        let opts = options.clone();
-        let w = widgets.clone();
-        let st = state.clone();
-        button.connect_clicked(move |_| {
-            select_message_by_index(&opts, &w, &st, index);
-            w.message_menu_button.popdown();
-        });
-        widgets.message_menu_box.append(&button);
-    }
+    widgets.message_menu_button.popdown();
     update_message_action_buttons(options, widgets, state);
+    widgets.message_menu_button.set_sensitive(false);
+
+    let options = Rc::new(options.clone());
+    let widgets = Rc::new(widgets.clone());
+    let state = state.clone();
+    let mut next_index = 0_usize;
+    let mut removing_previous_rows = true;
+    gtk::glib::idle_add_local(move || {
+        if widgets.message_menu_generation.get() != generation {
+            return gtk::glib::ControlFlow::Break;
+        }
+        if removing_previous_rows {
+            for _ in 0..MESSAGE_MENU_ROWS_PER_UPDATE {
+                let Some(child) = widgets.message_menu_box.first_child() else {
+                    removing_previous_rows = false;
+                    break;
+                };
+                widgets.message_menu_box.remove(&child);
+            }
+            if removing_previous_rows {
+                return gtk::glib::ControlFlow::Continue;
+            }
+        }
+        let end = next_index
+            .saturating_add(MESSAGE_MENU_ROWS_PER_UPDATE)
+            .min(total);
+        for index in next_index..end {
+            let label = {
+                let state = state.borrow();
+                let Some(message) = state.messages.get(index) else {
+                    return gtk::glib::ControlFlow::Break;
+                };
+                let subject = if message.subject.trim().is_empty() {
+                    "(no subject)"
+                } else {
+                    message.subject.trim()
+                };
+                format!("{}: {}", index + 1, subject)
+            };
+            let button = gtk::Button::with_label(&label);
+            button.set_widget_name(&format!("notm-message-select-{}", index + 1));
+            if Some(index) == selected_index {
+                button.add_css_class("suggested-action");
+            }
+            let options = options.clone();
+            let button_widgets = widgets.clone();
+            let button_state = state.clone();
+            button.connect_clicked(move |_| {
+                select_message_by_index(&options, &button_widgets, &button_state, index);
+                button_widgets.message_menu_button.popdown();
+            });
+            widgets.message_menu_box.append(&button);
+        }
+        next_index = end;
+        if next_index < total {
+            gtk::glib::ControlFlow::Continue
+        } else {
+            widgets.message_menu_button.set_sensitive(total > 0);
+            gtk::glib::ControlFlow::Break
+        }
+    });
 }
 
 fn select_message_by_index(
@@ -13506,12 +15325,26 @@ fn select_message_by_index(
     if !ensure_message_file_actions_allowed(widgets, state) {
         return false;
     }
+    if widgets
+        .thread_load_coordinator
+        .borrow()
+        .active_generation()
+        .is_some()
+    {
+        widgets.pending_message_selection.set(Some(index));
+        widgets.status_label.set_text(&format!(
+            "Loading message {} after the thread is ready…",
+            index.saturating_add(1)
+        ));
+        return true;
+    }
     let rejection_restore = capture_message_selection_snapshot(state);
     let message = state.borrow().messages.get(index).cloned();
     if message.is_none() {
         widgets.status_label.set_text("Message index not found");
         return false;
     }
+    cancel_composer_preparation(widgets, state);
     state.borrow_mut().selected_message = message;
     widgets.attachments.select_first_for_message(index);
     update_message_menu(options, widgets, state);
@@ -14439,9 +16272,10 @@ fn close_main_window_after_background_activity(widgets: &Widgets, state: &Shared
     let background_activity = {
         let state = state.borrow();
         background_activity_requires_deferred_close(&state)
+            || widgets.draft_save_active.get().is_some()
     };
     if !background_activity && widgets.close_when_idle.replace(false) {
-        widgets.window.close();
+        flush_and_close_main_window(widgets, state);
     }
 }
 
@@ -14450,6 +16284,54 @@ fn background_activity_requires_deferred_close(state: &UiState) -> bool {
         || state.sync_in_progress
         || state.tag_in_progress
         || (state.tag_warning.is_some() && state.search_loading)
+}
+
+fn flush_and_close_main_window(widgets: &Widgets, state: &SharedState) {
+    cancel_composer_preparation(widgets, state);
+    if widgets.close_flush_in_progress.replace(true) {
+        return;
+    }
+    flush_latest_draft_then_close(widgets.clone(), state.clone());
+}
+
+fn flush_latest_draft_then_close(widgets: Widgets, state: SharedState) {
+    cancel_pending_draft_capture(&widgets);
+    let fields = compose_fields(&widgets, &state);
+    let generation = {
+        let mut state = state.borrow_mut();
+        state.compose_fields = fields.clone();
+        state.compose_generation
+    };
+    let action = recovery_action_for_fields(&state, &fields);
+    widgets
+        .status_label
+        .set_text("Saving draft before closing…");
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets
+        .draft_autosave
+        .flush(generation, action, move |result| match result {
+            Ok(()) if st.borrow().compose_generation != generation => {
+                flush_latest_draft_then_close(w, st);
+            }
+            Ok(()) => {
+                w.close_flush_in_progress.set(false);
+                w.composer.allow_close_once();
+                w.window.close();
+            }
+            Err(error) => {
+                w.close_flush_in_progress.set(false);
+                let message = format!("Draft autosave failed while closing: {error}");
+                {
+                    let mut state = st.borrow_mut();
+                    state.last_error = Some(message.clone());
+                    state.last_operation = Some("window close draft flush failed".to_string());
+                }
+                w.status_label.set_text(&message);
+                w.window.present();
+                update_debug(&w, &st);
+            }
+        });
 }
 
 fn spawn_sync_commands(
@@ -14724,36 +16606,41 @@ fn reply_selected(
             .set_text("No selected message to reply to");
         return false;
     };
-    let replied = match composed_reply_for_message(options, &message, kind) {
-        Ok(message) => request_pending_action(
-            options,
-            widgets,
-            state,
-            PendingTransition::ReplaceComposer(PreparedComposerReplacement {
-                kind: if kind == ReplyKind::All {
-                    ComposerReplacementKind::ReplyAll
-                } else {
-                    ComposerReplacementKind::Reply
-                },
-                payload: ComposerReplacementPayload::Message(Box::new(message)),
-                selection: None,
-                rejection_restore: None,
-                status: "Reply composer opened".to_string(),
-                source_status: None,
-                present_main_window: false,
-                show_message_pane: false,
-                active_pane: ActivePane::Message,
-            }),
-        ),
-        Err(err) => {
-            widgets
-                .status_label
-                .set_text(&format!("Reply failed: {err}"));
-            false
-        }
-    };
-    update_debug(widgets, state);
-    replied
+    let prepared_thread = prepared_thread_for_selected(widgets, state);
+    let action = reply_preparation_action(options, kind);
+    let (prepared_thread, action) =
+        match prepared_thread.and_then(|thread| action.map(|action| (thread, action))) {
+            Ok(values) => values,
+            Err(error) => {
+                let message = format!("Reply failed: {error}");
+                widgets.status_label.set_text(&message);
+                state.borrow_mut().last_error = Some(error.to_string());
+                update_debug(widgets, state);
+                return false;
+            }
+        };
+    schedule_composer_preparation(
+        options,
+        widgets,
+        state,
+        prepared_thread,
+        message.message_id,
+        action,
+        ComposerPreparationIntent {
+            kind: if kind == ReplyKind::All {
+                ComposerReplacementKind::ReplyAll
+            } else {
+                ComposerReplacementKind::Reply
+            },
+            selection: None,
+            rejection_restore: None,
+            status: "Reply composer opened".to_string(),
+            source_status: None,
+            present_main_window: false,
+            show_message_pane: false,
+            active_pane: ActivePane::Message,
+        },
+    )
 }
 
 fn forward_selected(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) -> bool {
@@ -14766,32 +16653,37 @@ fn forward_selected(options: &LaunchOptions, widgets: &Widgets, state: &SharedSt
             .set_text("No selected message to forward");
         return false;
     };
-    let forwarded = match composed_inline_forward_for_message(options, &message) {
-        Ok(message) => request_pending_action(
-            options,
-            widgets,
-            state,
-            PendingTransition::ReplaceComposer(PreparedComposerReplacement {
-                kind: ComposerReplacementKind::Forward,
-                payload: ComposerReplacementPayload::Message(Box::new(message)),
-                selection: None,
-                rejection_restore: None,
-                status: "Forward composer opened".to_string(),
-                source_status: None,
-                present_main_window: false,
-                show_message_pane: false,
-                active_pane: ActivePane::Message,
-            }),
-        ),
-        Err(err) => {
-            widgets
-                .status_label
-                .set_text(&format!("Forward failed: {err}"));
-            false
-        }
-    };
-    update_debug(widgets, state);
-    forwarded
+    let prepared_thread = prepared_thread_for_selected(widgets, state);
+    let action = forward_preparation_action(options, false);
+    let (prepared_thread, action) =
+        match prepared_thread.and_then(|thread| action.map(|action| (thread, action))) {
+            Ok(values) => values,
+            Err(error) => {
+                let message = format!("Forward failed: {error}");
+                widgets.status_label.set_text(&message);
+                state.borrow_mut().last_error = Some(error.to_string());
+                update_debug(widgets, state);
+                return false;
+            }
+        };
+    schedule_composer_preparation(
+        options,
+        widgets,
+        state,
+        prepared_thread,
+        message.message_id,
+        action,
+        ComposerPreparationIntent {
+            kind: ComposerReplacementKind::Forward,
+            selection: None,
+            rejection_restore: None,
+            status: "Forward composer opened".to_string(),
+            source_status: None,
+            present_main_window: false,
+            show_message_pane: false,
+            active_pane: ActivePane::Message,
+        },
+    )
 }
 
 fn forward_as_attachment_selected(
@@ -14808,36 +16700,45 @@ fn forward_as_attachment_selected(
             .set_text("No selected message to forward");
         return false;
     };
-    let forwarded = match composed_attachment_forward_for_message(options, &message) {
-        Ok(message) => request_pending_action(
-            options,
-            widgets,
-            state,
-            PendingTransition::ReplaceComposer(PreparedComposerReplacement {
-                kind: ComposerReplacementKind::ForwardAttachment,
-                payload: ComposerReplacementPayload::Message(Box::new(message)),
-                selection: None,
-                rejection_restore: None,
-                status: "Forward-as-attachment composer opened".to_string(),
-                source_status: None,
-                present_main_window: false,
-                show_message_pane: false,
-                active_pane: ActivePane::Message,
-            }),
-        ),
-        Err(err) => {
-            state.borrow_mut().last_error = Some(err.to_string());
-            widgets
-                .status_label
-                .set_text(&format!("Forward-as-attachment failed: {err}"));
-            false
-        }
-    };
-    update_debug(widgets, state);
-    forwarded
+    let prepared_thread = prepared_thread_for_selected(widgets, state);
+    let action = forward_preparation_action(options, true);
+    let (prepared_thread, action) =
+        match prepared_thread.and_then(|thread| action.map(|action| (thread, action))) {
+            Ok(values) => values,
+            Err(error) => {
+                let message = format!("Forward-as-attachment failed: {error}");
+                widgets.status_label.set_text(&message);
+                state.borrow_mut().last_error = Some(error.to_string());
+                update_debug(widgets, state);
+                return false;
+            }
+        };
+    schedule_composer_preparation(
+        options,
+        widgets,
+        state,
+        prepared_thread,
+        message.message_id,
+        action,
+        ComposerPreparationIntent {
+            kind: ComposerReplacementKind::ForwardAttachment,
+            selection: None,
+            rejection_restore: None,
+            status: "Forward-as-attachment composer opened".to_string(),
+            source_status: None,
+            present_main_window: false,
+            show_message_pane: false,
+            active_pane: ActivePane::Message,
+        },
+    )
 }
 
-fn fill_composer(widgets: &Widgets, state: &SharedState, message: ComposedMessage) {
+fn fill_composer(
+    widgets: &Widgets,
+    state: &SharedState,
+    message: ComposedMessage,
+    attachment_paths: Vec<String>,
+) {
     show_compose_view(widgets);
     set_active_draft(widgets, state, None);
     widgets.composer.apply_message_fields(&message);
@@ -14846,34 +16747,16 @@ fn fill_composer(widgets: &Widgets, state: &SharedState, message: ComposedMessag
     fields.references = message.references;
     fields.text_reply_quote = message.text_reply_quote;
     fields.html_reply_quote = message.html_reply_quote;
-    match cache_composer_attachments(&message.attachments) {
-        Ok(paths) => {
-            fields.attachments = paths;
-            update_attachment_label(widgets, &fields.attachments);
-        }
-        Err(err) => {
-            state.borrow_mut().last_error = Some(err.to_string());
-            widgets
-                .status_label
-                .set_text(&format!("Attachment cache failed: {err}"));
-        }
-    }
+    fields.attachments = attachment_paths;
+    update_attachment_label(widgets, &fields.attachments);
     record_compose_edit(state, fields.clone());
     state.borrow_mut().active_pane = ActivePane::Message;
-    persist_recovery_draft_from_ui(widgets, state, &fields);
+    schedule_recovery_draft_from_ui(widgets, state, &fields);
     if state.borrow().input_mode == InputMode::Insert {
         widgets.composer.to_entry().grab_focus();
     } else {
         focus_active_pane(widgets, state);
     }
-}
-
-fn cache_composer_attachments(attachments: &[AttachmentInput]) -> anyhow::Result<Vec<String>> {
-    attachments::cache_composer_attachments(
-        attachments,
-        &composer::default_attachment_cache_dir(),
-        composer::atomic_write_durable,
-    )
 }
 
 #[derive(Debug)]
@@ -14918,6 +16801,7 @@ fn send_compose(
     state: &SharedState,
 ) -> anyhow::Result<SendStart> {
     ensure_user_operation_allowed(widgets, state, UserOperation::Send)?;
+    cancel_pending_draft_capture(widgets);
     let snapshot = {
         let state = state.borrow();
         widgets.composer.capture_send(
@@ -14952,6 +16836,60 @@ fn send_compose(
 }
 
 fn start_captured_send(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    sent_fields: ComposeFields,
+    sent_draft: Option<ActiveDraft>,
+    sent_generation: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        widgets.window.application().is_some(),
+        "main window is not attached to the GTK application"
+    );
+    {
+        let mut state = state.borrow_mut();
+        if state.compose_generation == sent_generation {
+            state.compose_fields = sent_fields.clone();
+        }
+        state.send_in_progress = true;
+        state.last_send_report = None;
+        state.last_error = None;
+        state.last_operation = Some("saving draft before send".to_string());
+    }
+    widgets
+        .status_label
+        .set_text("Saving draft before sending…");
+    update_background_activity_controls(options, widgets, state);
+    update_debug(widgets, state);
+
+    let action = recovery_action_for_fields(state, &sent_fields);
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    widgets
+        .draft_autosave
+        .flush(sent_generation, action, move |result| match result {
+            Ok(()) => {
+                if let Err(error) = launch_captured_send_after_flush(
+                    &opts,
+                    &w,
+                    &st,
+                    sent_fields,
+                    sent_draft,
+                    sent_generation,
+                ) {
+                    fail_send_before_transport(&opts, &w, &st, error.to_string());
+                }
+            }
+            Err(error) => {
+                fail_send_before_transport(&opts, &w, &st, format!("draft flush failed: {error}"))
+            }
+        });
+    Ok(())
+}
+
+fn launch_captured_send_after_flush(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
@@ -15010,6 +16948,26 @@ fn start_captured_send(
         }
     });
     Ok(())
+}
+
+fn fail_send_before_transport(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    error: String,
+) {
+    let message = format!("Send did not start: {error}");
+    {
+        let mut state = state.borrow_mut();
+        state.send_in_progress = false;
+        state.last_error = Some(message.clone());
+        state.last_operation = Some("send draft flush failed".to_string());
+    }
+    widgets.close_when_idle.set(false);
+    widgets.status_label.set_text(&message);
+    widgets.window.present();
+    update_background_activity_controls(options, widgets, state);
+    update_debug(widgets, state);
 }
 
 fn send_start_response(
@@ -15207,8 +17165,109 @@ fn finish_send_success(pending: PendingSend, mut success: SendSuccess, draft_del
         .as_deref()
         .filter(|error| error.starts_with("Draft autosave failed:"))
         .map(ToOwned::to_owned);
+    let cleanup_plan =
+        accepted.then(|| prepare_accepted_send_cleanup(&pending, &mut success, draft_deleted));
+    if let Some(plan) = cleanup_plan
+        && plan.clear_recovery
+    {
+        let generation = pending.sent_generation;
+        let widgets = pending.widgets.clone();
+        widgets.status_label.set_text("Finalizing accepted send…");
+        widgets
+            .draft_autosave
+            .flush(generation, RecoveryAction::Clear, move |result| {
+                let mut success = success;
+                let recovery_cleared = match result {
+                    Ok(()) => true,
+                    Err(error) => {
+                        success.issues.push(composer::SendCleanupIssue::new(
+                            composer::SendCleanupStage::RecoveryClear,
+                            error,
+                        ));
+                        false
+                    }
+                };
+                let current_generation = pending.state.borrow().compose_generation;
+                let decision = accepted_send_post_clear_decision(
+                    plan,
+                    pending.sent_generation,
+                    current_generation,
+                    recovery_cleared,
+                );
+                if decision.repersist_recovery {
+                    cancel_pending_draft_capture(&pending.widgets);
+                    let fields = compose_fields(&pending.widgets, &pending.state);
+                    pending.state.borrow_mut().compose_fields = fields.clone();
+                    let action = recovery_action_for_fields(&pending.state, &fields);
+                    pending
+                        .widgets
+                        .status_label
+                        .set_text("Preserving newer composer changes…");
+                    let draft_autosave = pending.widgets.draft_autosave.clone();
+                    draft_autosave.flush(current_generation, action, move |result| {
+                        if let Err(error) = result {
+                            success.issues.push(composer::SendCleanupIssue::new(
+                                composer::SendCleanupStage::NewerDraftAutosave,
+                                error,
+                            ));
+                        }
+                        finish_send_success_after_cleanup(pending, success, true, None);
+                    });
+                    return;
+                }
+                if decision.reset_composer {
+                    reset_composer_after_send(&pending.options, &pending.widgets, &pending.state);
+                }
+                finish_send_success_after_cleanup(
+                    pending,
+                    success,
+                    decision.newer_composer_changes,
+                    pending_autosave_error,
+                );
+            });
+        return;
+    }
+    let newer_composer_changes = cleanup_plan.is_some_and(|plan| plan.newer_composer_changes);
+    finish_send_success_after_cleanup(
+        pending,
+        success,
+        newer_composer_changes,
+        pending_autosave_error,
+    );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AcceptedSendPostClearDecision {
+    reset_composer: bool,
+    repersist_recovery: bool,
+    newer_composer_changes: bool,
+}
+
+fn accepted_send_post_clear_decision(
+    plan: composer::AcceptedSendCleanupPlan,
+    sent_generation: u64,
+    current_generation: u64,
+    recovery_cleared: bool,
+) -> AcceptedSendPostClearDecision {
     let newer_composer_changes =
-        accepted && finish_accepted_send_cleanup(&pending, &mut success, draft_deleted);
+        plan.newer_composer_changes || current_generation != sent_generation;
+    AcceptedSendPostClearDecision {
+        reset_composer: !newer_composer_changes && plan.reset_composer(recovery_cleared),
+        // Capture and flush the current fields even when the clear failed: the
+        // edit may still be inside the UI debounce window, and the accepted
+        // send boundary must not leave recovery referring to the sent text.
+        repersist_recovery: newer_composer_changes,
+        newer_composer_changes,
+    }
+}
+
+fn finish_send_success_after_cleanup(
+    pending: PendingSend,
+    mut success: SendSuccess,
+    newer_composer_changes: bool,
+    pending_autosave_error: Option<String>,
+) {
+    let accepted = success.report.accepted;
     if newer_composer_changes && let Some(error) = pending_autosave_error {
         success.issues.push(composer::SendCleanupIssue::new(
             composer::SendCleanupStage::NewerDraftAutosave,
@@ -15241,15 +17300,15 @@ fn finish_send_success(pending: PendingSend, mut success: SendSuccess, draft_del
         state.last_operation = Some(operation);
     }
     pending.widgets.status_label.set_text(&status);
-    pending.widgets.composer.refresh_draft_list();
+    schedule_named_draft_refresh(&pending.widgets, &pending.state, false, None);
     finish_send_activity(&pending);
 }
 
-fn finish_accepted_send_cleanup(
+fn prepare_accepted_send_cleanup(
     pending: &PendingSend,
     success: &mut SendSuccess,
     draft_deleted: bool,
-) -> bool {
+) -> composer::AcceptedSendCleanupPlan {
     let plan = {
         let state = pending.state.borrow();
         composer::plan_accepted_send_cleanup(
@@ -15261,6 +17320,9 @@ fn finish_accepted_send_cleanup(
         )
     };
     if plan.clear_active_draft {
+        if let Some(draft) = pending.sent_draft.as_ref().filter(|draft| !draft.indexed) {
+            pending.widgets.composer.remove_named_draft(&draft.path);
+        }
         set_active_draft(&pending.widgets, &pending.state, None);
     } else if plan.draft_identity_changed {
         success.issues.push(composer::SendCleanupIssue::new(
@@ -15269,27 +17331,7 @@ fn finish_accepted_send_cleanup(
         ));
     }
 
-    let recovery_cleared = if plan.clear_recovery {
-        match composer::clear_recovery_draft_files(
-            pending.widgets.composer.recovery_path(),
-            pending.widgets.composer.legacy_recovery_path(),
-        ) {
-            Ok(()) => true,
-            Err(err) => {
-                success.issues.push(composer::SendCleanupIssue::new(
-                    composer::SendCleanupStage::RecoveryClear,
-                    err,
-                ));
-                false
-            }
-        }
-    } else {
-        false
-    };
-    if plan.reset_composer(recovery_cleared) {
-        reset_composer_after_send(&pending.options, &pending.widgets, &pending.state);
-    }
-    plan.newer_composer_changes
+    plan
 }
 
 fn reset_composer_after_send(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
@@ -15298,6 +17340,7 @@ fn reset_composer_after_send(options: &LaunchOptions, widgets: &Widgets, state: 
 }
 
 fn reset_composer_fields(widgets: &Widgets, state: &SharedState) {
+    cancel_composer_preparation(widgets, state);
     let fields = widgets.composer.reset_fields();
     update_attachment_label(widgets, &[]);
     {
@@ -15575,6 +17618,11 @@ fn setup_automation(
     let undo = undo_state.clone();
     let saved = saved_store.clone();
     let shortcuts = shortcut_router.clone();
+    let heartbeat = widgets.gtk_heartbeat.clone();
+    gtk::glib::timeout_add_local(Duration::from_millis(25), move || {
+        heartbeat.set(heartbeat.get().saturating_add(1));
+        gtk::glib::ControlFlow::Continue
+    });
     gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
         while let Ok(req) = rx.try_recv() {
             handle_automation_request(&opts, &w, &st, &undo, &saved, &shortcuts, req);
@@ -15583,7 +17631,9 @@ fn setup_automation(
     });
 }
 
-fn search_status_json(state: &SharedState) -> serde_json::Value {
+fn search_status_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
+    let worker = widgets.search_page_coordinator.worker_snapshot();
+    let model = widgets.thread_list.model_update_snapshot();
     let state = state.borrow();
     json!({
         "ok": true,
@@ -15592,6 +17642,21 @@ fn search_status_json(state: &SharedState) -> serde_json::Value {
         "pending_query": state.pending_search_query,
         "error": state.search_error,
         "current_query": state.current_query,
+        "active_preparations": worker.active_preparations,
+        "peak_active_preparations": worker.peak_active_preparations,
+        "submitted": worker.submitted,
+        "cancelled": worker.cancelled,
+        "coalesced": worker.coalesced,
+        "model_update": {
+            "generation": model.generation,
+            "busy": model.busy,
+            "model_len": model.model_len,
+            "max_rows_per_update": model.max_rows_per_update,
+            "peak_rows_per_iteration": model.peak_rows_per_iteration,
+            "last_rows_applied": model.last_rows_applied,
+            "completed": model.completed,
+            "cancelled": model.cancelled,
+        },
     })
 }
 
@@ -15679,6 +17744,7 @@ fn handle_automation_request(
     let confirmation_control = ensure_confirmation_control_allowed(
         options,
         widgets.composer.pending_confirmation_is_saved_send(),
+        widgets.composer.pending_confirmation_is_close_main_window(),
         req.command.as_str(),
     );
     if let Err(err) = confirmation_control {
@@ -15687,8 +17753,240 @@ fn handle_automation_request(
             .send(json!({"ok": false, "error": err.to_string()}));
         return;
     }
+    let mut response_deferred = false;
     let result = match req.command.as_str() {
-        "health" => json!({"ok": true, "state": "running"}),
+        "health" => {
+            let draft = widgets.draft_autosave.snapshot();
+            let thread_loader = widgets.thread_load_coordinator.borrow();
+            let thread_generation = thread_loader.active_generation();
+            let thread_loader_metrics = thread_loader.loader_snapshot();
+            drop(thread_loader);
+            let prepared_retained_bytes = widgets
+                .prepared_threads
+                .borrow()
+                .values()
+                .map(|prepared| prepared.retained_bytes())
+                .sum::<usize>();
+            let recovery_generation = widgets
+                .draft_recovery_coordinator
+                .borrow()
+                .active_generation();
+            let composer_preparation_generation = widgets
+                .composer_preparation_coordinator
+                .borrow()
+                .active_generation();
+            json!({
+                "ok": true,
+                "state": "running",
+                "gtk_heartbeat": widgets.gtk_heartbeat.get(),
+                "draft_autosave": {
+                    "busy": draft.busy,
+                    "pending_generation": draft.pending_generation,
+                    "completed_generation": draft.completed_generation,
+                    "write_count": draft.write_count,
+                },
+                "thread_load": {
+                    "busy": thread_generation.is_some(),
+                    "generation": thread_generation,
+                    "prepared_retained_bytes": prepared_retained_bytes,
+                    "active_preparations": thread_loader_metrics.active_preparations,
+                    "peak_active_preparations": thread_loader_metrics.peak_active_preparations,
+                    "submitted": thread_loader_metrics.submitted,
+                    "cancelled": thread_loader_metrics.cancelled,
+                    "coalesced": thread_loader_metrics.coalesced,
+                },
+                "composer_preparation": {
+                    "busy": composer_preparation_generation.is_some(),
+                    "generation": composer_preparation_generation,
+                    "completed_generation": widgets.composer_preparation_completed_generation.get(),
+                    "outcome": widgets.composer_preparation_last_outcome.borrow().clone(),
+                },
+                "recovery_load": {
+                    "busy": recovery_generation.is_some(),
+                    "generation": recovery_generation,
+                    "completed_generation": widgets.draft_recovery_completed_generation.get(),
+                    "outcome": widgets.draft_recovery_last_outcome.borrow().clone(),
+                },
+                "named_draft_io": {
+                    "busy": widgets.named_draft_io_coordinator.borrow().active_generation().is_some(),
+                    "generation": widgets.named_draft_io_coordinator.borrow().active_generation(),
+                    "migration_busy": widgets.named_draft_io_coordinator.borrow().migration_in_progress(),
+                    "completed_generation": widgets.named_draft_io_coordinator.borrow().completed_generation(),
+                    "last_error": widgets.named_draft_io_last_error.borrow().clone(),
+                },
+                "draft_save": {
+                    "busy": widgets.draft_save_active.get().is_some(),
+                    "generation": widgets.draft_save_active.get(),
+                    "completed_generation": widgets.draft_save_completed.get(),
+                },
+                "attachment_io": attachment_io_status_json(widgets),
+            })
+        }
+        "thread_load_status" => {
+            let thread_loader = widgets.thread_load_coordinator.borrow();
+            let generation = thread_loader.active_generation();
+            let metrics = thread_loader.loader_snapshot();
+            drop(thread_loader);
+            let prepared = widgets.prepared_threads.borrow();
+            let prepared_retained_bytes = prepared
+                .values()
+                .map(|prepared| prepared.retained_bytes())
+                .sum::<usize>();
+            let prepared_message_count = prepared
+                .values()
+                .map(|prepared| prepared.messages.len())
+                .sum::<usize>();
+            let prepared_attachment_count = prepared
+                .values()
+                .map(|prepared| prepared.attachments.len())
+                .sum::<usize>();
+            json!({
+                "ok": true,
+                "busy": generation.is_some(),
+                "generation": generation,
+                "prepared_retained_bytes": prepared_retained_bytes,
+                "prepared_message_count": prepared_message_count,
+                "prepared_attachment_count": prepared_attachment_count,
+                "active_preparations": metrics.active_preparations,
+                "peak_active_preparations": metrics.peak_active_preparations,
+                "submitted": metrics.submitted,
+                "cancelled": metrics.cancelled,
+                "coalesced": metrics.coalesced,
+            })
+        }
+        "composer_preparation_status" => {
+            let generation = widgets
+                .composer_preparation_coordinator
+                .borrow()
+                .active_generation();
+            json!({
+                "ok": true,
+                "busy": generation.is_some(),
+                "generation": generation,
+                "completed_generation": widgets.composer_preparation_completed_generation.get(),
+                "outcome": widgets.composer_preparation_last_outcome.borrow().clone(),
+                "compose_generation": state.borrow().compose_generation,
+                "transition_epoch": widgets.composer_transition_epoch.get(),
+                "last_error": state.borrow().last_error,
+            })
+        }
+        "recovery_load_status" => {
+            let generation = widgets
+                .draft_recovery_coordinator
+                .borrow()
+                .active_generation();
+            json!({
+                "ok": true,
+                "busy": generation.is_some(),
+                "generation": generation,
+                "completed_generation": widgets.draft_recovery_completed_generation.get(),
+                "outcome": widgets.draft_recovery_last_outcome.borrow().clone(),
+                "compose_generation": state.borrow().compose_generation,
+                "last_error": state.borrow().last_error,
+                "path": widgets.composer.recovery_path(),
+            })
+        }
+        "draft_autosave_status" => {
+            let draft = widgets.draft_autosave.snapshot();
+            json!({
+                "ok": true,
+                "busy": draft.busy,
+                "pending_generation": draft.pending_generation,
+                "completed_generation": draft.completed_generation,
+                "write_count": draft.write_count,
+                "compose_generation": state.borrow().compose_generation,
+                "transition_epoch": widgets.composer_transition_epoch.get(),
+                "last_error": state.borrow().last_error,
+            })
+        }
+        "draft_io_status" => json!({
+            "ok": true,
+            "list_busy": widgets.named_draft_io_coordinator.borrow().active_generation().is_some(),
+            "list_generation": widgets.named_draft_io_coordinator.borrow().active_generation(),
+            "migration_busy": widgets.named_draft_io_coordinator.borrow().migration_in_progress(),
+            "list_completed_generation": widgets.named_draft_io_coordinator.borrow().completed_generation(),
+            "save_busy": widgets.draft_save_active.get().is_some(),
+            "save_generation": widgets.draft_save_active.get(),
+            "save_completed_generation": widgets.draft_save_completed.get(),
+            "last_error": widgets.named_draft_io_last_error.borrow().clone(),
+            "gtk_heartbeat": widgets.gtk_heartbeat.get(),
+        }),
+        "refresh_named_drafts" => {
+            let migrate_legacy = req
+                .args
+                .get("migrate_legacy")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let legacy_dir_override = req
+                .args
+                .get("legacy_dir")
+                .and_then(serde_json::Value::as_str)
+                .filter(|_| migrate_legacy)
+                .map(PathBuf::from);
+            match schedule_named_draft_refresh(widgets, state, migrate_legacy, legacy_dir_override)
+            {
+                NamedDraftRefreshStart::Started(generation) => json!({
+                    "ok": true,
+                    "generation": generation,
+                    "migrate_legacy": migrate_legacy,
+                }),
+                NamedDraftRefreshStart::MigrationBusy(generation) => json!({
+                    "ok": false,
+                    "generation": generation,
+                    "migrate_legacy": migrate_legacy,
+                    "error": "named draft refresh is unavailable while legacy drafts are migrating",
+                }),
+                NamedDraftRefreshStart::PersistenceBusy => json!({
+                    "ok": false,
+                    "generation": serde_json::Value::Null,
+                    "migrate_legacy": migrate_legacy,
+                    "error": "legacy draft migration is unavailable while draft persistence or send cleanup is in progress",
+                }),
+            }
+        }
+        "set_fixture_draft_delay" => {
+            let milliseconds = req
+                .args
+                .get("milliseconds")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                .min(5_000);
+            widgets
+                .draft_autosave
+                .set_test_delay(Duration::from_millis(milliseconds));
+            widgets
+                .draft_io_delay
+                .set(Duration::from_millis(milliseconds));
+            json!({"ok": true, "milliseconds": milliseconds})
+        }
+        "set_fixture_thread_delay" => {
+            let milliseconds = req
+                .args
+                .get("milliseconds")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                .min(5_000);
+            widgets
+                .thread_load_delay
+                .set(Duration::from_millis(milliseconds));
+            json!({"ok": true, "milliseconds": milliseconds})
+        }
+        "set_fixture_composer_preparation_delay" => {
+            let milliseconds = req
+                .args
+                .get("milliseconds")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                .min(5_000);
+            widgets
+                .composer_preparation_delay
+                .set(Duration::from_millis(milliseconds));
+            json!({"ok": true, "milliseconds": milliseconds})
+        }
+        "fail_next_draft_write" => {
+            widgets.draft_autosave.fail_next_for_test();
+            json!({"ok": true})
+        }
         "close_main_window" => {
             let window = widgets.window.clone();
             let response_written = req.response_written;
@@ -15704,7 +18002,7 @@ fn handle_automation_request(
             json!({"ok": true})
         }
         "app_state" => json!({"ok": true, "state": &*state.borrow()}),
-        "search_status" => search_status_json(state),
+        "search_status" => search_status_json(widgets, state),
         "tag_status" => tag_status_json(state),
         "screenshot" => {
             let name = req
@@ -15843,6 +18141,7 @@ fn handle_automation_request(
             json!({"ok": true, "scheduled": scheduled, "state": &*state.borrow()})
         }
         "thread_page_info" => {
+            let model = widgets.thread_list.model_update_snapshot();
             let state = state.borrow();
             json!({
                 "ok": true,
@@ -15858,6 +18157,10 @@ fn handle_automation_request(
                 "search_generation": state.search_generation,
                 "pending_search_query": state.pending_search_query,
                 "search_error": state.search_error,
+                "model_update_busy": model.busy,
+                "model_len": model.model_len,
+                "max_rows_per_update": model.max_rows_per_update,
+                "peak_rows_per_iteration": model.peak_rows_per_iteration,
             })
         }
         "thread_selection_view_state" | "selection_view_state" => {
@@ -16176,6 +18479,36 @@ fn handle_automation_request(
                 None => json!({"ok": false, "error": "standalone window index not found"}),
             }
         }
+        "standalone_show_visual_html" => {
+            let window_index = req
+                .args
+                .get("window_index")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            match widgets.standalone_messages.show_visual_html(window_index) {
+                Some((ok, window)) => json!({"ok": ok, "window": window}),
+                None => json!({"ok": false, "error": "standalone window index not found"}),
+            }
+        }
+        "standalone_scroll_html_lines" => {
+            let window_index = req
+                .args
+                .get("window_index")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            let lines = req
+                .args
+                .get("lines")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(1.0);
+            match widgets
+                .standalone_messages
+                .scroll_html_lines(window_index, lines)
+            {
+                Some(window) => json!({"ok": true, "window": window}),
+                None => json!({"ok": false, "error": "standalone window index not found"}),
+            }
+        }
         "standalone_respond" => {
             let window_index = req
                 .args
@@ -16202,8 +18535,14 @@ fn handle_automation_request(
                 Some(action) => match widgets.standalone_messages.respond(window_index, action) {
                     Some((ok, window)) => {
                         let status = window.status.clone();
+                        let preparation_generation = widgets
+                            .composer_preparation_coordinator
+                            .borrow()
+                            .active_generation();
                         json!({
                             "ok": ok,
+                            "pending": preparation_generation.is_some(),
+                            "generation": preparation_generation,
                             "window": window,
                             "compose_fields": state.borrow().compose_fields,
                             "main_selected_message": state.borrow().selected_message,
@@ -16503,8 +18842,11 @@ fn handle_automation_request(
                 }
                 _ => {}
             }
-            record_compose_edit(state, compose_fields(widgets, state));
-            json!({"ok": true, "compose_fields": state.borrow().compose_fields})
+            // The persisted state snapshot intentionally updates only after
+            // the debounce expires. Harness field mutations should still
+            // report the GTK widgets' current value rather than that older
+            // persistence snapshot.
+            json!({"ok": true, "compose_fields": compose_fields(widgets, state)})
         }
         "compose_add_attachment" => {
             if let Some(path) = req.args.get("path").and_then(|v| v.as_str()) {
@@ -16537,7 +18879,6 @@ fn handle_automation_request(
                 widgets
                     .composer
                     .apply_recipient_suggestion(&widgets.composer.to_entry(), suggestion);
-                record_compose_edit(state, compose_fields(widgets, state));
                 json!({"ok": true, "suggestion": suggestion, "compose_fields": state.borrow().compose_fields})
             } else {
                 json!({"ok": false, "error": "address suggestion index not found"})
@@ -16565,29 +18906,37 @@ fn handle_automation_request(
                 &suggestions,
                 6,
             );
-            record_compose_edit(state, compose_fields(widgets, state));
             json!({"ok": completed, "compose_fields": state.borrow().compose_fields})
         }
-        "save_draft" => match request_save_current_draft(options, widgets, state) {
-            Ok(Some(report)) => {
-                widgets.composer.refresh_draft_list();
-                json!({"ok": true, "report": report})
-            }
-            Ok(None) => json!({
+        "save_draft" => {
+            let response_sender = req.response.clone();
+            let completion = Box::new(move |result: Result<DraftSaveReport, String>| {
+                let response_value = match result {
+                    Ok(report) => json!({"ok": true, "report": report}),
+                    Err(error) => json!({"ok": false, "error": error}),
+                };
+                let _ = response_sender.send(response_value);
+            });
+            match request_save_current_draft(options, widgets, state, Some(completion)) {
+                Ok(DraftSaveDisposition::Started) => {
+                    response_deferred = true;
+                    json!({"ok": true, "pending": true})
+                }
+                Ok(DraftSaveDisposition::ConfirmationPending) => json!({
                 "ok": true,
                 "pending_confirmation": true,
                 "state": &*state.borrow(),
-            }),
-            Err(err) => json!({"ok": false, "error": err.to_string()}),
-        },
+                }),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            }
+        }
         "list_drafts" => {
-            let drafts = composer::list_named_drafts(
-                widgets.composer.drafts_dir(),
-                widgets.composer.legacy_drafts_dir(),
-            )
-            .into_iter()
-            .map(|(path, fields)| json!({"path": path, "fields": fields}))
-            .collect::<Vec<_>>();
+            let drafts = widgets
+                .composer
+                .named_drafts()
+                .into_iter()
+                .map(|draft| json!({"path": draft.path, "fields": draft.fields}))
+                .collect::<Vec<_>>();
             json!({"ok": true, "drafts": drafts})
         }
         "select_draft_by_index" => {
@@ -16608,7 +18957,43 @@ fn handle_automation_request(
             pending_confirmation_state_json(widgets, state)
         }
         "respond_confirmation" => match respond_pending_confirmation(widgets, state, &req.args) {
-            Ok(response) => response,
+            Ok(response) if widgets.draft_save_active.get().is_some() => {
+                response_deferred = true;
+                let response_sender = req.response.clone();
+                let w = widgets.clone();
+                let st = state.clone();
+                let mut response = Some(response);
+                gtk::glib::timeout_add_local(DRAFT_IO_POLL_INTERVAL, move || {
+                    if w.draft_save_active.get().is_some() {
+                        return gtk::glib::ControlFlow::Continue;
+                    }
+                    let mut response = response
+                        .take()
+                        .expect("confirmation response is sent only once");
+                    let status = w.status_label.text().to_string();
+                    let failed = status.starts_with("Draft save failed:")
+                        || status.starts_with("Delete local draft failed:")
+                        || status.starts_with("Saved draft delete failed:");
+                    response["ok"] = json!(!failed);
+                    response["error"] = json!(failed.then_some(status.clone()));
+                    response["status_text"] = json!(status);
+                    response["state"] = json!(&*st.borrow());
+                    let _ = response_sender.send(response);
+                    gtk::glib::ControlFlow::Break
+                });
+                json!({"ok": true, "pending": true})
+            }
+            Ok(mut response) => {
+                let status = widgets.status_label.text().to_string();
+                let failed = status.starts_with("Draft save failed:")
+                    || status.starts_with("Delete local draft failed:")
+                    || status.starts_with("Saved draft delete failed:");
+                if failed {
+                    response["ok"] = json!(false);
+                    response["error"] = json!(status);
+                }
+                response
+            }
             Err(err) => json!({"ok": false, "error": err.to_string()}),
         },
         "activate_draft_by_index" => {
@@ -16667,10 +19052,12 @@ fn handle_automation_request(
             let error = (!ok).then(|| widgets.status_label.text().to_string());
             json!({"ok": ok, "pending_confirmation": widgets.composer.has_pending_confirmation(), "error": error, "compose_fields": state.borrow().compose_fields, "active_draft": state.borrow().active_draft, "last_error": state.borrow().last_error})
         }
-        "load_draft" => {
-            let loaded = restore_draft_if_present(options, widgets, state);
-            automation_reply_response(loaded, widgets, state)
-        }
+        "load_draft" => match schedule_manual_draft_recovery(options, widgets, state) {
+            Ok(generation) => {
+                json!({"ok": true, "pending": true, "generation": generation})
+            }
+            Err(error) => json!({"ok": false, "error": error.to_string()}),
+        },
         "clear_draft" => {
             let ok = clear_current_draft_from_ui(options, widgets, state);
             let error = (!ok).then(|| widgets.status_label.text().to_string());
@@ -16770,7 +19157,6 @@ fn handle_automation_request(
                 .and_then(|value| value.as_f64())
                 .unwrap_or(1.0);
             scroll_html_view_lines(widgets, lines);
-            spin_main_context_for(Duration::from_millis(150));
             html_scroll_state(widgets)
         }
         "image_policy" => {
@@ -16801,7 +19187,7 @@ fn handle_automation_request(
             })
         }
         "html_view_state" => html_view_state(options, widgets, state),
-        "view_preference_state" => view_preference_state_json(options, widgets, state),
+        "view_preference_state" => view_preference_state_json(widgets, state),
         "click_sender_view_preference" => {
             update_sender_view_preference_button(widgets, state);
             widgets.view_menu_button.popup();
@@ -16811,7 +19197,7 @@ fn handle_automation_request(
                 && selected_sender_email(state).is_some()
             {
                 widgets.sender_view_preference_button.emit_clicked();
-                let mut result = view_preference_state_json(options, widgets, state);
+                let mut result = view_preference_state_json(widgets, state);
                 result["sender_button_was_visible"] = json!(button_was_visible);
                 result
             } else {
@@ -16956,20 +19342,22 @@ fn handle_automation_request(
                 .get("dir")
                 .and_then(|v| v.as_str())
                 .map(PathBuf::from);
-            let selected_message = state.borrow().selected_message.clone();
-            match widgets
-                .attachments
-                .payload_at_index(selected_message, index)
-            {
+            match widgets.attachments.payload_at_index(index) {
                 Ok(payload) => {
                     let result = match dir.as_deref() {
-                        Some(dir) => widgets.attachments.save_to_directory(&payload, dir).map(
-                            |result| {
-                                let path = result.path.clone();
-                                apply_attachment_action_result(widgets, state, result);
-                                json!({"ok": true, "pending": false, "path": path})
-                            },
-                        ),
+                        Some(dir) => {
+                            let token = widgets.attachments.save_to_directory(
+                                payload,
+                                dir.to_path_buf(),
+                                attachment_event_handler(widgets, state),
+                            );
+                            Ok(json!({
+                                "ok": true,
+                                "pending": true,
+                                "generation": token.generation,
+                                "request_id": token.request_id,
+                            }))
+                        }
                         None => widgets
                             .attachments
                             .request_save(payload, attachment_event_handler(widgets, state))
@@ -16993,16 +19381,17 @@ fn handle_automation_request(
         }
         "open_selected_attachment" | "open_attachment" => {
             let index = req.args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let selected_message = state.borrow().selected_message.clone();
-            let result = widgets
-                .attachments
-                .payload_at_index(selected_message, index)
-                .and_then(|payload| widgets.attachments.open(&payload));
-            match result {
-                Ok(result) => {
-                    let path = result.path.clone();
-                    apply_attachment_action_result(widgets, state, result);
-                    json!({"ok": true, "path": path})
+            match widgets.attachments.payload_at_index(index) {
+                Ok(payload) => {
+                    let token = widgets
+                        .attachments
+                        .open(payload, attachment_event_handler(widgets, state));
+                    json!({
+                        "ok": true,
+                        "pending": true,
+                        "generation": token.generation,
+                        "request_id": token.request_id,
+                    })
                 }
                 Err(err) => {
                     report_attachment_error(widgets, state, "Open attachment", &err);
@@ -17013,6 +19402,26 @@ fn handle_automation_request(
         "attachment_test_state" => widgets
             .attachments
             .test_state_json(&widgets.status_label.text()),
+        "attachment_io_status" => attachment_io_status_json(widgets),
+        "set_fixture_attachment_delay" => {
+            let milliseconds = req
+                .args
+                .get("milliseconds")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                .min(5_000);
+            let applied = widgets
+                .attachments
+                .set_fixture_io_delay(Duration::from_millis(milliseconds));
+            json!({
+                "ok": true,
+                "milliseconds": u64::try_from(applied.as_millis()).unwrap_or(u64::MAX),
+            })
+        }
+        "fail_next_attachment_write" => match widgets.attachments.fail_next_fixture_write() {
+            Ok(()) => json!({"ok": true}),
+            Err(err) => json!({"ok": false, "error": err.to_string()}),
+        },
         "respond_attachment_save" => {
             let response = req
                 .args
@@ -17024,49 +19433,52 @@ fn handle_automation_request(
                 .get("id")
                 .and_then(|value| value.as_u64())
                 .or_else(|| widgets.attachments.pending_save_id());
-            let result = (|| -> anyhow::Result<(bool, Option<PathBuf>)> {
-                let chooser_id = chooser_id
-                    .ok_or_else(|| anyhow::anyhow!("no attachment save chooser is pending"))?;
-                match response {
-                    "accept" => {
-                        let target = req
-                            .args
-                            .get("path")
-                            .and_then(|value| value.as_str())
-                            .map(Path::new)
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("respond_attachment_save accept requires a path")
-                            })?;
-                        let result = widgets.attachments.complete_pending_save(
-                            chooser_id,
-                            true,
-                            Some(target),
-                        )?;
-                        let path = result.as_ref().map(|result| result.path.clone());
-                        if let Some(result) = result {
-                            apply_attachment_action_result(widgets, state, result);
+            let result =
+                (|| -> anyhow::Result<(bool, Option<crate::attachment_io::AttachmentIoToken>)> {
+                    let chooser_id = chooser_id
+                        .ok_or_else(|| anyhow::anyhow!("no attachment save chooser is pending"))?;
+                    match response {
+                        "accept" => {
+                            let target = req
+                                .args
+                                .get("path")
+                                .and_then(|value| value.as_str())
+                                .map(Path::new)
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "respond_attachment_save accept requires a path"
+                                    )
+                                })?;
+                            let result = widgets.attachments.complete_pending_save(
+                                chooser_id,
+                                true,
+                                Some(target),
+                                attachment_event_handler(widgets, state),
+                            )?;
+                            Ok((true, result))
                         }
-                        Ok((true, path))
-                    }
-                    "cancel" => {
-                        let result = widgets
-                            .attachments
-                            .complete_pending_save(chooser_id, false, None)?;
-                        let path = result.as_ref().map(|result| result.path.clone());
-                        if let Some(result) = result {
-                            apply_attachment_action_result(widgets, state, result);
+                        "cancel" => {
+                            let result = widgets.attachments.complete_pending_save(
+                                chooser_id,
+                                false,
+                                None,
+                                attachment_event_handler(widgets, state),
+                            )?;
+                            Ok((false, result))
                         }
-                        Ok((false, path))
+                        _ => anyhow::bail!(
+                            "respond_attachment_save response must be accept or cancel"
+                        ),
                     }
-                    _ => anyhow::bail!("respond_attachment_save response must be accept or cancel"),
-                }
-            })();
+                })();
             match result {
-                Ok((accepted, path)) => json!({
+                Ok((accepted, token)) => json!({
                     "ok": true,
                     "accepted": accepted,
-                    "pending": false,
-                    "path": path,
+                    "pending": token.is_some(),
+                    "generation": token.map(|token| token.generation),
+                    "request_id": token.map(|token| token.request_id),
+                    "path": serde_json::Value::Null,
                 }),
                 Err(err) => {
                     report_attachment_error(widgets, state, "Save attachment", &err);
@@ -17079,7 +19491,9 @@ fn handle_automation_request(
         }
         other => json!({"ok": false, "error": format!("unknown test-harness command: {other}")}),
     };
-    let _ = req.response.send(result);
+    if !response_deferred {
+        let _ = req.response.send(result);
+    }
 }
 
 fn automation_command_allowed_while_confirmation_pending(command: &str) -> bool {
@@ -17089,6 +19503,11 @@ fn automation_command_allowed_while_confirmation_pending(command: &str) -> bool 
             | "app_state"
             | "search_status"
             | "tag_status"
+            | "draft_autosave_status"
+            | "draft_io_status"
+            | "thread_load_status"
+            | "composer_preparation_status"
+            | "recovery_load_status"
             | "entry_state"
             | "thread_page_info"
             | "thread_selection_view_state"
@@ -17117,6 +19536,7 @@ fn automation_command_allowed_while_confirmation_pending(command: &str) -> bool 
             | "settings_test_state"
             | "attachment_list_items"
             | "attachment_test_state"
+            | "attachment_io_status"
             | "get_logs"
     )
 }
@@ -17199,6 +19619,7 @@ fn draft_list_state_json(widgets: &Widgets, state: &SharedState) -> serde_json::
         "active_draft": &state.active_draft,
         "recovery_path": widgets.composer.recovery_path(),
         "drafts_dir": widgets.composer.drafts_dir(),
+        "legacy_drafts_dir": widgets.composer.legacy_drafts_dir(),
         "last_error": &state.last_error,
         "last_operation": &state.last_operation,
         "status_text": widgets.status_label.text().to_string(),
@@ -17228,12 +19649,13 @@ fn pending_confirmation_state_json(widgets: &Widgets, state: &SharedState) -> se
                 "succeeded": completion.succeeded,
             })
         });
+    let current_fields = compose_fields(widgets, state);
     let state = state.borrow();
     json!({
         "ok": true,
         "pending": pending,
         "last_completion": completion,
-        "compose_fields": &state.compose_fields,
+        "compose_fields": current_fields,
         "active_draft": &state.active_draft,
         "recovery_path": widgets.composer.recovery_path(),
         "drafts_dir": widgets.composer.drafts_dir(),
@@ -17348,9 +19770,16 @@ fn respond_settings_dialog(
 
 fn standalone_message_windows_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
     let windows = widgets.standalone_messages.snapshots();
+    let prepared_retained_bytes = windows
+        .iter()
+        .map(|window| window.prepared_retained_bytes)
+        .sum::<usize>();
     json!({
         "ok": true,
         "windows": windows,
+        "window_limit": STANDALONE_MESSAGE_WINDOW_LIMIT,
+        "prepared_retained_bytes": prepared_retained_bytes,
+        "prepared_retained_bytes_limit": STANDALONE_PREPARED_BYTES_LIMIT,
         "main_selected_thread": state.borrow().selected_thread,
         "main_selected_message": state.borrow().selected_message,
     })
@@ -17365,16 +19794,15 @@ fn link_hint_state_json(widgets: &Widgets) -> serde_json::Value {
     })
 }
 
-fn view_preference_state_json(
-    options: &LaunchOptions,
-    widgets: &Widgets,
-    state: &SharedState,
-) -> serde_json::Value {
+fn view_preference_state_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
+    let selected_message = state.borrow().selected_message.clone();
+    let selected_has_html = selected_message
+        .as_ref()
+        .is_some_and(|message| message_has_html(widgets, state, message));
     let state_ref = state.borrow();
-    let selected_message = state_ref.selected_message.clone();
     let resolved = selected_message
         .as_ref()
-        .map(|message| message_view_preference(options, &state_ref, message));
+        .map(|message| message_view_preference(&state_ref, message, selected_has_html));
     let selected_sender = selected_message.as_ref().and_then(message_sender_email);
     json!({
         "ok": true,
@@ -17490,6 +19918,7 @@ fn ensure_automation_request_allowed(
         | "click_message_tag_action"
         | ADD_CUSTOM_TAG_FROM_ENTRY_COMMAND
         | REMOVE_CUSTOM_TAG_FROM_ENTRY_COMMAND
+        | "set_fixture_thread_delay"
         | "tag_selected"
         | "add_tag_selected"
         | "remove_tag_selected"
@@ -17497,6 +19926,12 @@ fn ensure_automation_request_allowed(
         "run_manual_sync" => Some(AutomationOperation::ExternalSync),
         "attachment_test_state"
         | "respond_attachment_save"
+        | "fail_next_attachment_write"
+        | "set_fixture_attachment_delay"
+        | "set_fixture_draft_delay"
+        | "refresh_named_drafts"
+        | "set_fixture_composer_preparation_delay"
+        | "fail_next_draft_write"
         | "draft_list_state"
         | "activate_draft_by_index"
         | "click_delete_selected_draft"
@@ -17504,6 +19939,8 @@ fn ensure_automation_request_allowed(
         | "respond_settings"
         | "view_preference_state"
         | "click_sender_view_preference"
+        | "standalone_show_visual_html"
+        | "standalone_scroll_html_lines"
         | "send_key" => Some(AutomationOperation::FixtureOnly),
         "pending_confirmation" | "respond_confirmation" => {
             Some(AutomationOperation::ConfirmationControl)
@@ -17559,6 +19996,7 @@ fn ensure_automation_request_allowed(
 fn ensure_confirmation_control_allowed(
     options: &LaunchOptions,
     pending_saved_send: bool,
+    pending_close_main_window: bool,
     command: &str,
 ) -> anyhow::Result<()> {
     if !matches!(command, "pending_confirmation" | "respond_confirmation") || options.fixture_mode {
@@ -17569,8 +20007,8 @@ fn ensure_confirmation_control_allowed(
         "confirmation controls require automation.allow_live_send_test=true"
     );
     anyhow::ensure!(
-        pending_saved_send,
-        "live confirmation controls are available only for a pending saved-draft Send"
+        pending_saved_send || pending_close_main_window,
+        "live confirmation controls are available only for a pending saved-draft Send or main-window Close"
     );
     Ok(())
 }
@@ -17590,8 +20028,14 @@ fn automation_reply_response(
     state: &SharedState,
 ) -> serde_json::Value {
     if replied {
+        let preparation_generation = widgets
+            .composer_preparation_coordinator
+            .borrow()
+            .active_generation();
         json!({
             "ok": true,
+            "pending": preparation_generation.is_some(),
+            "generation": preparation_generation,
             "pending_confirmation": widgets.composer.has_pending_confirmation(),
             "compose_fields": state.borrow().compose_fields,
         })
@@ -17884,15 +20328,11 @@ fn run_named_command(
             json!({"ok": true, "show_thread_preview": state.borrow().show_thread_preview})
         }
         "save_attachment" => {
-            let selected_message = state.borrow().selected_message.clone();
-            let result = widgets
-                .attachments
-                .active_payload(selected_message)
-                .and_then(|payload| {
-                    widgets
-                        .attachments
-                        .request_save(payload, attachment_event_handler(widgets, state))
-                });
+            let result = widgets.attachments.active_payload().and_then(|payload| {
+                widgets
+                    .attachments
+                    .request_save(payload, attachment_event_handler(widgets, state))
+            });
             match result {
                 Ok(chooser_id) => {
                     json!({"ok": true, "pending": true, "chooser_id": chooser_id})
@@ -17903,24 +20343,23 @@ fn run_named_command(
                 }
             }
         }
-        "open_attachment" => {
-            let selected_message = state.borrow().selected_message.clone();
-            let result = widgets
-                .attachments
-                .active_payload(selected_message)
-                .and_then(|payload| widgets.attachments.open(&payload));
-            match result {
-                Ok(result) => {
-                    let path = result.path.clone();
-                    apply_attachment_action_result(widgets, state, result);
-                    json!({"ok": true, "path": path})
-                }
-                Err(err) => {
-                    report_attachment_error(widgets, state, "Open attachment", &err);
-                    json!({"ok": false, "error": err.to_string()})
-                }
+        "open_attachment" => match widgets.attachments.active_payload() {
+            Ok(payload) => {
+                let token = widgets
+                    .attachments
+                    .open(payload, attachment_event_handler(widgets, state));
+                json!({
+                    "ok": true,
+                    "pending": true,
+                    "generation": token.generation,
+                    "request_id": token.request_id,
+                })
             }
-        }
+            Err(err) => {
+                report_attachment_error(widgets, state, "Open attachment", &err);
+                json!({"ok": false, "error": err.to_string()})
+            }
+        },
         "copy_message_id" => {
             copy_selected_message_id(widgets, state);
             json!({"ok": true, "selected_message": state.borrow().selected_message})
@@ -19205,7 +21644,38 @@ fn apply_pane_visibility_values(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
+    #[test]
+    fn composer_reset_completion_requires_unchanged_generations() {
+        assert!(!composer_reset_was_superseded(7, 11, 7, 11));
+        assert!(composer_reset_was_superseded(7, 11, 8, 11));
+        assert!(composer_reset_was_superseded(7, 11, 7, 12));
+        assert!(composer_reset_was_superseded(7, 11, 8, 12));
+    }
+
+    fn indexed_draft_test_options(temp: &tempfile::TempDir) -> (LaunchOptions, PathBuf) {
+        let database_path = temp.path().join("mail");
+        let maildir = database_path.join("Drafts/cur");
+        fs::create_dir_all(&maildir).expect("create draft Maildir");
+        let config_path = temp.path().join("notmuch-config");
+        fs::write(
+            &config_path,
+            format!(
+                "[database]\npath={}\n\n[user]\nname=Fixture User\nprimary_email=fixture@example.test\n\n[new]\ntags=\nignore=\n\n[search]\nexclude_tags=\n\n[maildir]\nsynchronize_flags=true\n",
+                database_path.display()
+            ),
+        )
+        .expect("write Notmuch config");
+        (
+            LaunchOptions {
+                database_path: Some(database_path),
+                config_path: Some(config_path),
+                ..LaunchOptions::default()
+            },
+            maildir,
+        )
+    }
     fn visual_search_fingerprint(
         revision: u64,
         uuid: &str,
@@ -20156,30 +22626,64 @@ mod tests {
         );
     }
 
-    #[test]
-    fn html_load_completion_ignores_replaced_generations() {
-        let mut lifecycle = HtmlLoadLifecycle::default();
+    fn indexed_draft_message(message_id: &str, subject: &str) -> Vec<u8> {
+        format!(
+            "From: Fixture User <fixture@example.test>\r\n\
+             To: recipient@example.test\r\n\
+             Subject: {subject}\r\n\
+             Message-ID: <{message_id}>\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\r\n\
+             Indexed draft body.\r\n"
+        )
+        .into_bytes()
+    }
 
-        lifecycle.load_changed(webkit6::LoadEvent::Started, 0);
-        assert_eq!(lifecycle.bind_main_resource(), Some(0));
-        assert_eq!(lifecycle.finish_main_resource(0, 1), None);
+    fn prepare_indexed_draft_thread(
+        options: &LaunchOptions,
+        summary: notm_notmuch::MessageSummary,
+    ) -> Arc<PreparedThread> {
+        Arc::new(
+            crate::thread_loader::prepare_thread_from_summaries_for_test(
+                summary.thread_id.clone(),
+                vec![summary],
+                Some(&open_config(options)),
+            )
+            .expect("prepare indexed draft thread"),
+        )
+    }
 
-        lifecycle.load_changed(webkit6::LoadEvent::Started, 1);
-        assert_eq!(lifecycle.bind_main_resource(), Some(1));
-        lifecycle.load_changed(webkit6::LoadEvent::Started, 2);
-        assert_eq!(lifecycle.bind_main_resource(), Some(2));
-
-        // Concrete replacement race: Started(g1), request g2, Started(g2),
-        // then the old resource and WebView emit their stale Finished events.
-        assert_eq!(lifecycle.finish_main_resource(1, 2), None);
-        let before_stale_finish = lifecycle.clone();
-        lifecycle.load_changed(webkit6::LoadEvent::Finished, 2);
-        assert_eq!(lifecycle, before_stale_finish);
-
-        assert_eq!(lifecycle.finish_main_resource(2, 2), Some(2));
-        let after_current_resource = lifecycle.clone();
-        lifecycle.load_changed(webkit6::LoadEvent::Finished, 2);
-        assert_eq!(lifecycle, after_current_resource);
+    fn prepared_indexed_draft_active_source(
+        prepared_thread: Arc<PreparedThread>,
+        message_id: &str,
+    ) -> PreparedActiveDraft {
+        let output = composer_preparation::prepare_indexed_draft_for_test(
+            prepared_thread,
+            message_id.to_string(),
+        )
+        .expect("prepare indexed draft composer output");
+        let replacement = match prepared_composer_replacement_from_output(
+            ComposerPreparationIntent {
+                kind: ComposerReplacementKind::IndexedDraft,
+                selection: None,
+                rejection_restore: None,
+                status: "Loaded indexed draft".to_string(),
+                source_status: None,
+                present_main_window: false,
+                show_message_pane: false,
+                active_pane: ActivePane::Message,
+            },
+            output,
+        ) {
+            Ok(replacement) => replacement,
+            Err(error) => panic!("indexed draft output must build a replacement: {}", error.1),
+        };
+        let ComposerReplacementPayload::Draft(draft) = replacement.payload else {
+            panic!("indexed draft output built a non-draft replacement");
+        };
+        draft
+            .active_source
+            .expect("indexed draft replacement must retain its active source")
     }
 
     #[test]
@@ -20236,6 +22740,196 @@ mod tests {
                 .to_string()
                 .contains("cannot be combined")
         );
+    }
+
+    #[test]
+    fn indexed_draft_replacement_retains_later_readable_candidate_for_cleanup() {
+        let temp = tempfile::tempdir().expect("temporary indexed-draft root");
+        let (options, maildir) = indexed_draft_test_options(&temp);
+        let message_id = "later-readable@fixture.test";
+        let stale_first = maildir.join("a-stale-draft:2,D");
+        let readable_later = maildir.join("b-readable-draft:2,D");
+        let raw = indexed_draft_message(message_id, "Later readable draft");
+        fs::write(&stale_first, &raw).expect("write first indexed draft copy");
+        fs::hard_link(&stale_first, &readable_later)
+            .expect("create later readable indexed draft copy");
+        let database = Database::create(&open_config(&options)).expect("create Notmuch database");
+        database
+            .index_file_with_tags(&stale_first, &["draft"])
+            .expect("index first draft copy");
+        database
+            .index_file_with_tags(&readable_later, &["draft"])
+            .expect("index later draft copy");
+        let summary = database
+            .find_message(message_id)
+            .expect("look up duplicate draft")
+            .expect("duplicate draft summary");
+        drop(database);
+        assert!(
+            summary
+                .filenames
+                .iter()
+                .any(|path| Path::new(path) == stale_first)
+        );
+        assert!(
+            summary
+                .filenames
+                .iter()
+                .any(|path| Path::new(path) == readable_later)
+        );
+        fs::remove_file(&stale_first).expect("remove first indexed draft copy");
+
+        let prepared_thread = prepare_indexed_draft_thread(&options, summary);
+        let active = prepared_indexed_draft_active_source(prepared_thread, message_id);
+
+        assert_ne!(active.path, stale_first);
+        assert_eq!(active.path, readable_later);
+        assert_eq!(active.message_id.as_deref(), Some(message_id));
+        assert!(active.indexed);
+        delete_draft_source(
+            &options,
+            &ActiveDraft {
+                path: active.path,
+                message_id: active.message_id,
+                indexed: active.indexed,
+                saved_fields: ComposeFields::default(),
+            },
+        )
+        .expect("delete the later readable indexed draft source");
+        assert!(
+            !readable_later.exists(),
+            "later readable indexed draft survived cleanup"
+        );
+    }
+
+    #[test]
+    fn indexed_draft_replacement_retains_message_id_refresh_path_for_cleanup() {
+        let temp = tempfile::tempdir().expect("temporary indexed-draft root");
+        let (options, maildir) = indexed_draft_test_options(&temp);
+        let message_id = "refreshed-draft@fixture.test";
+        let stale_summary_path = maildir.join("a-stale-before-load:2,D");
+        let refreshed_for_thread = maildir.join("b-refreshed-for-thread:2,D");
+        let resolved_for_composer = maildir.join("c-resolved-for-composer:2,D");
+        fs::write(
+            &stale_summary_path,
+            indexed_draft_message(message_id, "Message-ID refreshed draft"),
+        )
+        .expect("write original indexed draft");
+        let database = Database::create(&open_config(&options)).expect("create Notmuch database");
+        database
+            .index_file_with_tags(&stale_summary_path, &["draft"])
+            .expect("index original draft");
+        let summary = database
+            .find_message(message_id)
+            .expect("look up original draft")
+            .expect("original draft summary");
+        drop(database);
+
+        fs::rename(&stale_summary_path, &refreshed_for_thread)
+            .expect("move draft before thread preparation");
+        let database = Database::open(&open_config(&options), DatabaseMode::ReadWrite)
+            .expect("open Notmuch for first draft move");
+        database
+            .remove_message_file(&stale_summary_path)
+            .expect("remove stale pre-load path from Notmuch");
+        database
+            .index_file_with_tags(&refreshed_for_thread, &["draft"])
+            .expect("index first refreshed draft path");
+        drop(database);
+        assert!(
+            summary
+                .filenames
+                .iter()
+                .all(|path| !Path::new(path).exists()),
+            "summary unexpectedly retained a readable path"
+        );
+
+        let prepared_thread = prepare_indexed_draft_thread(&options, summary);
+        assert_eq!(
+            prepared_thread.message_contents[message_id]
+                .source()
+                .expect("prepared draft source")
+                .path(),
+            refreshed_for_thread
+        );
+
+        fs::rename(&refreshed_for_thread, &resolved_for_composer)
+            .expect("move draft before composer preparation");
+        let database = Database::open(&open_config(&options), DatabaseMode::ReadWrite)
+            .expect("open Notmuch for second draft move");
+        database
+            .remove_message_file(&refreshed_for_thread)
+            .expect("remove stale prepared path from Notmuch");
+        database
+            .index_file_with_tags(&resolved_for_composer, &["draft"])
+            .expect("index composer-resolved draft path");
+        drop(database);
+
+        let active = prepared_indexed_draft_active_source(prepared_thread, message_id);
+
+        assert_ne!(active.path, stale_summary_path);
+        assert_ne!(active.path, refreshed_for_thread);
+        assert_eq!(active.path, resolved_for_composer);
+        assert_eq!(active.message_id.as_deref(), Some(message_id));
+        assert!(active.indexed);
+        delete_draft_source(
+            &options,
+            &ActiveDraft {
+                path: active.path,
+                message_id: active.message_id,
+                indexed: active.indexed,
+                saved_fields: ComposeFields::default(),
+            },
+        )
+        .expect("delete the Message-ID-resolved indexed draft source");
+        assert!(
+            !resolved_for_composer.exists(),
+            "Message-ID-resolved indexed draft survived cleanup"
+        );
+    }
+
+    #[test]
+    fn captured_named_draft_save_counts_retained_legacy_entries() {
+        let root = tempfile::tempdir().expect("temporary named-draft root");
+        let current = root.path().join("current");
+        let legacy = root.path().join("legacy");
+        fs::create_dir_all(&current).expect("create current named-draft directory");
+        fs::create_dir_all(&legacy).expect("create legacy named-draft directory");
+        for index in 0..(draft_io::MAX_NAMED_DRAFTS - 1) {
+            fs::write(current.join(format!("current-{index:03}.json")), b"{}")
+                .expect("write current named draft");
+        }
+        let retained = legacy.join("retained-malformed.json");
+        fs::write(&retained, b"{truncated").expect("write retained malformed legacy draft");
+        let options = LaunchOptions {
+            save_drafts_to_maildir: false,
+            index_draft_after_save: false,
+            ..LaunchOptions::default()
+        };
+
+        let error = match perform_captured_draft_save(
+            &options,
+            &current,
+            Some(&legacy),
+            ComposeFields {
+                subject: "Must not become the 257th draft".to_string(),
+                body: "combined current and legacy limits apply".to_string(),
+                ..ComposeFields::default()
+            },
+            None,
+        ) {
+            Ok(_) => panic!("captured save ignored retained legacy entries"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("would contain 257"), "{error:#}");
+        assert_eq!(
+            fs::read_dir(&current)
+                .expect("list current named drafts")
+                .count(),
+            draft_io::MAX_NAMED_DRAFTS - 1
+        );
+        assert!(retained.is_file());
     }
 
     #[test]
@@ -20644,12 +23338,23 @@ mod tests {
                 .contains("allow_live_tag_test=true")
         );
 
+        let thread_delay_error =
+            ensure_automation_request_allowed(&options, "set_fixture_thread_delay", &json!({}))
+                .expect_err("live thread preparation delay should require the tag-test gate");
+        assert!(
+            thread_delay_error
+                .to_string()
+                .contains("allow_live_tag_test=true")
+        );
+
         options.allow_live_send_test = true;
         options.allow_live_tag_test = true;
         ensure_automation_request_allowed(&options, "compose_send", &json!({}))
             .expect("explicit send gate");
         ensure_automation_request_allowed(&options, "archive_selected", &json!({}))
             .expect("explicit tag gate");
+        ensure_automation_request_allowed(&options, "set_fixture_thread_delay", &json!({}))
+            .expect("explicit tag gate should allow the disposable preparation race seam");
         ensure_automation_request_allowed(&options, "run_command", &json!({"command": ":archive"}))
             .expect("explicit tag gate should cover nested command");
     }
@@ -20724,6 +23429,14 @@ mod tests {
             ensure_automation_request_allowed(&live_options, "attachment_test_state", &json!({}))
                 .expect_err("live harness must not expose attachment dialog internals");
         assert!(error.to_string().contains("available only in fixture mode"));
+        ensure_automation_request_allowed(
+            &live_options,
+            "set_fixture_attachment_delay",
+            &json!({}),
+        )
+        .expect_err("live harness must not inject attachment I/O latency");
+        ensure_automation_request_allowed(&live_options, "fail_next_attachment_write", &json!({}))
+            .expect_err("live harness must not inject attachment write failures");
 
         let fixture_options = LaunchOptions {
             fixture_mode: true,
@@ -20733,6 +23446,18 @@ mod tests {
             .expect("fixture state inspection");
         ensure_automation_request_allowed(&fixture_options, "respond_attachment_save", &json!({}))
             .expect("fixture chooser response");
+        ensure_automation_request_allowed(
+            &fixture_options,
+            "set_fixture_attachment_delay",
+            &json!({}),
+        )
+        .expect("fixture attachment delay");
+        ensure_automation_request_allowed(
+            &fixture_options,
+            "fail_next_attachment_write",
+            &json!({}),
+        )
+        .expect("fixture attachment write failure");
     }
 
     #[test]
@@ -20750,7 +23475,6 @@ mod tests {
         };
         let result = AttachmentActionResult {
             message_id: message.message_id.clone(),
-            path: PathBuf::from("/tmp/saved-attachment.txt"),
             status: "Attachment saved".to_string(),
             operation: "saved attachment".to_string(),
         };
@@ -20816,20 +23540,18 @@ mod tests {
                 .expect("the dispatch layer performs the exact pending-Send check");
         }
         for command in ["pending_confirmation", "respond_confirmation"] {
-            ensure_confirmation_control_allowed(&live_send_options, true, command)
+            ensure_confirmation_control_allowed(&live_send_options, true, false, command)
                 .expect("gated live controls should drive the exact pending Send");
+            ensure_confirmation_control_allowed(&live_send_options, false, true, command)
+                .expect("gated live controls should drive a pending main-window Close");
             let no_pending =
-                ensure_confirmation_control_allowed(&live_send_options, false, command)
+                ensure_confirmation_control_allowed(&live_send_options, false, false, command)
                     .expect_err("gated controls must not inspect an absent live confirmation");
-            assert!(no_pending.to_string().contains("pending saved-draft Send"));
+            assert!(no_pending.to_string().contains("main-window Close"));
             let wrong_action =
-                ensure_confirmation_control_allowed(&live_send_options, false, command)
-                    .expect_err("gated controls must not drive a non-Send confirmation");
-            assert!(
-                wrong_action
-                    .to_string()
-                    .contains("pending saved-draft Send")
-            );
+                ensure_confirmation_control_allowed(&live_send_options, false, false, command)
+                    .expect_err("gated controls must not drive another confirmation kind");
+            assert!(wrong_action.to_string().contains("main-window Close"));
         }
 
         let fixture_options = LaunchOptions {
@@ -21231,6 +23953,21 @@ mod tests {
     }
 
     #[test]
+    fn launch_rejects_out_of_range_page_sizes_before_gtk_startup() {
+        for page_size in [0, MAX_SEARCH_PAGE_SIZE + 1] {
+            let options = LaunchOptions {
+                page_size,
+                ..LaunchOptions::default()
+            };
+            let error = launch(options).expect_err("invalid launch options must fail");
+            assert!(
+                error.to_string().contains("page size"),
+                "unexpected error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
     fn launch_rejects_unsupported_send_timeouts_before_gtk_startup() {
         for send_timeout_seconds in [0, notm_mail::MAX_SEND_TIMEOUT_SECONDS + 1, i64::MAX as u64] {
             let options = LaunchOptions {
@@ -21503,6 +24240,50 @@ mod tests {
     }
 
     #[test]
+    fn cache_or_draft_refresh_completion_keeps_tag_path_controls_disabled() {
+        let mut state = UiState {
+            tag_in_progress: true,
+            ..UiState::default()
+        };
+        assert_eq!(
+            background_control_sensitivity(&state, false, true, false),
+            (false, false)
+        );
+        assert_eq!(
+            background_control_sensitivity(&state, false, false, false),
+            (false, false),
+            "a cache completion must not re-enable controls during a tag write"
+        );
+
+        state.tag_in_progress = false;
+        state.tag_warning = Some("reconciliation pending".to_string());
+        assert_eq!(
+            background_control_sensitivity(&state, false, false, false),
+            (false, false),
+            "a named-draft refresh completion must not bypass tag reconciliation"
+        );
+
+        state.tag_warning = None;
+        state.tag_paths_uncertain = true;
+        assert_eq!(
+            background_control_sensitivity(&state, false, false, false),
+            (false, false),
+            "uncertain retained paths must keep controls disabled"
+        );
+
+        state.tag_paths_uncertain = false;
+        assert_eq!(
+            background_control_sensitivity(&state, false, false, false),
+            (true, true)
+        );
+        assert_eq!(
+            background_control_sensitivity(&state, false, false, true),
+            (true, false),
+            "named-draft migration blocks send without unnecessarily blocking sync"
+        );
+    }
+
+    #[test]
     fn settings_application_waits_for_tag_path_reconciliation() {
         let mut state = UiState::default();
         assert_eq!(settings_application_block_reason(&state), None);
@@ -21540,6 +24321,96 @@ mod tests {
         state.search_loading = false;
         state.tag_paths_uncertain = true;
         assert!(!background_activity_requires_deferred_close(&state));
+    }
+
+    #[test]
+    fn composer_attachment_cache_blocks_persistence_but_allows_supersession() {
+        for operation in [
+            UserOperation::DraftSave,
+            UserOperation::DraftDelete,
+            UserOperation::Send,
+            UserOperation::Sync,
+        ] {
+            assert!(
+                composer_attachment_cache_block_reason(true, operation).is_some(),
+                "composer attachment cache did not block {operation:?}"
+            );
+        }
+        for operation in [
+            UserOperation::ComposeEdit,
+            UserOperation::Tag,
+            UserOperation::DraftLoad,
+            UserOperation::DraftClear,
+            UserOperation::ComposeReplace,
+        ] {
+            assert_eq!(
+                composer_attachment_cache_block_reason(true, operation),
+                None,
+                "composer attachment cache unnecessarily blocked {operation:?}"
+            );
+        }
+        assert_eq!(
+            composer_attachment_cache_block_reason(false, UserOperation::Send),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_draft_migration_blocks_store_mutations_but_not_composer_edits() {
+        for operation in [
+            UserOperation::DraftSave,
+            UserOperation::DraftDelete,
+            UserOperation::Send,
+        ] {
+            assert!(
+                named_draft_migration_block_reason(true, operation)
+                    .is_some_and(|message| message.contains("legacy drafts are migrating")),
+                "legacy draft migration did not block {operation:?}"
+            );
+        }
+        for operation in [
+            UserOperation::ComposeEdit,
+            UserOperation::Tag,
+            UserOperation::DraftLoad,
+            UserOperation::DraftClear,
+            UserOperation::ComposeReplace,
+            UserOperation::Sync,
+        ] {
+            assert_eq!(
+                named_draft_migration_block_reason(true, operation),
+                None,
+                "legacy draft migration unnecessarily blocked {operation:?}"
+            );
+        }
+        assert_eq!(
+            named_draft_migration_block_reason(false, UserOperation::DraftSave),
+            None
+        );
+    }
+
+    #[test]
+    fn accepted_send_repersists_an_edit_made_while_recovery_is_clearing() {
+        let sent_generation = 7;
+        let plan = composer::plan_accepted_send_cleanup(
+            sent_generation,
+            sent_generation,
+            None,
+            None,
+            false,
+        );
+        assert!(plan.clear_recovery);
+
+        let unchanged =
+            accepted_send_post_clear_decision(plan, sent_generation, sent_generation, true);
+        assert!(unchanged.reset_composer);
+        assert!(!unchanged.repersist_recovery);
+        assert!(!unchanged.newer_composer_changes);
+
+        let edited_during_clear =
+            accepted_send_post_clear_decision(plan, sent_generation, sent_generation + 1, true);
+        assert!(!edited_during_clear.reset_composer);
+        assert!(edited_during_clear.repersist_recovery);
+        assert!(edited_during_clear.newer_composer_changes);
     }
 
     #[test]

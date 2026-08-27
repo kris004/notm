@@ -2,21 +2,31 @@ use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
     rc::Rc,
+    sync::Arc,
 };
 
 use chrono::Utc;
 use gtk::prelude::*;
 use gtk4 as gtk;
-use notm_mail::{ReplyKind, address::parse_address_list, message_io::BoundedText};
+use notm_mail::{ReplyKind, address::parse_address_list};
+#[cfg(test)]
+use notm_notmuch::MessagePathState;
 use notm_notmuch::{AppliedTagChange, MessageSummary};
 use serde::Serialize;
 use webkit6::prelude::WebViewExt;
 
 use super::link_hints::{LinkHintController, LinkHintOpener, LinkHintSnapshot};
-use crate::model::MessageViewPreference;
+use crate::{
+    html_view_lifecycle::{HtmlViewLifecycle, HtmlViewLifecycleSnapshot},
+    model::MessageViewPreference,
+    thread_loader::{AuthoritativePathMap, MessageSource},
+};
 
 const MESSAGE_HEADER_VALUE_LINES: i32 = 1;
+const MESSAGE_MENU_ROWS_PER_UPDATE: usize = 24;
 const STATUS_BAR_MAX_WIDTH_CHARS: i32 = 120;
+pub(crate) const STANDALONE_MESSAGE_WINDOW_LIMIT: usize = 4;
+pub(crate) const STANDALONE_PREPARED_BYTES_LIMIT: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StandaloneImagePolicy {
@@ -35,16 +45,9 @@ pub(crate) struct StandalonePolicySnapshot {
 
 #[derive(Debug, Clone)]
 pub(crate) struct StandaloneHtmlRender {
-    pub(crate) document: String,
+    pub(crate) document: Arc<str>,
     pub(crate) allow_remote_images: bool,
     pub(crate) status: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum StandaloneHtmlScroll {
-    Lines(f64),
-    Pages(f64),
-    Edge(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,14 +66,12 @@ pub(crate) struct StandaloneResponseRequest {
 pub(crate) type StandalonePolicyProvider = Rc<dyn Fn() -> StandalonePolicySnapshot>;
 pub(crate) type StandaloneMessageHasHtml = Rc<dyn Fn(&MessageSummary) -> bool>;
 pub(crate) type StandaloneTextRenderer =
-    Rc<dyn Fn(&MessageSummary, bool) -> anyhow::Result<String>>;
+    Rc<dyn Fn(&MessageSummary, bool) -> anyhow::Result<Arc<str>>>;
+pub(crate) type StandaloneSourceRenderer = Rc<dyn Fn(&MessageSummary) -> anyhow::Result<Arc<str>>>;
 pub(crate) type StandaloneHtmlRenderer =
     Rc<dyn Fn(&MessageSummary, StandaloneImagePolicy) -> anyhow::Result<StandaloneHtmlRender>>;
-pub(crate) type StandaloneSourceReader = Rc<dyn Fn(&MessageSummary) -> anyhow::Result<BoundedText>>;
 pub(crate) type StandaloneHtmlViewFactory = Rc<dyn Fn() -> webkit6::WebView>;
 pub(crate) type StandaloneHtmlViewInitializer = Rc<dyn Fn(&webkit6::WebView, &gtk::Label, bool)>;
-pub(crate) type StandaloneHtmlScrollHandler =
-    Rc<dyn Fn(&webkit6::WebView, &gtk::Label, StandaloneHtmlScroll)>;
 pub(crate) type StandaloneResponseHandler = Rc<dyn Fn(StandaloneResponseRequest) -> bool>;
 pub(crate) type StandalonePreferredView = Rc<dyn Fn(&MessageSummary) -> MessageViewPreference>;
 pub(crate) type StandaloneRememberView =
@@ -83,15 +84,17 @@ pub(crate) struct StandaloneOpenOptions {
     pub(crate) parent: gtk::ApplicationWindow,
     pub(crate) messages: Vec<MessageSummary>,
     pub(crate) selected_index: usize,
+    pub(crate) prepared_retained_bytes: usize,
+    pub(crate) message_sources: BTreeMap<String, MessageSource>,
     pub(crate) policy: StandalonePolicyProvider,
     pub(crate) message_has_html: StandaloneMessageHasHtml,
     pub(crate) render_text: StandaloneTextRenderer,
+    pub(crate) render_headers: StandaloneSourceRenderer,
+    pub(crate) render_raw: StandaloneSourceRenderer,
     pub(crate) render_html: StandaloneHtmlRenderer,
-    pub(crate) read_raw: StandaloneSourceReader,
-    pub(crate) read_headers: StandaloneSourceReader,
     pub(crate) create_html_view: StandaloneHtmlViewFactory,
     pub(crate) initialize_html_view: StandaloneHtmlViewInitializer,
-    pub(crate) scroll_html: StandaloneHtmlScrollHandler,
+    pub(crate) initial_html: Arc<str>,
     pub(crate) open_link: LinkHintOpener,
     pub(crate) respond: StandaloneResponseHandler,
     pub(crate) preferred_view: StandalonePreferredView,
@@ -105,6 +108,7 @@ pub(crate) struct StandaloneWindowSnapshot {
     pub(crate) id: u64,
     pub(crate) selected_index: usize,
     pub(crate) message_count: usize,
+    pub(crate) prepared_retained_bytes: usize,
     pub(crate) selected_message: Option<MessageSummary>,
     pub(crate) message_ids: Vec<String>,
     pub(crate) view: &'static str,
@@ -121,6 +125,7 @@ pub(crate) struct StandaloneWindowSnapshot {
     pub(crate) network_session_ephemeral: bool,
     pub(crate) title: Option<String>,
     pub(crate) status: String,
+    pub(crate) html_lifecycle: HtmlViewLifecycleSnapshot,
     pub(crate) link_hints: LinkHintSnapshot,
 }
 
@@ -309,8 +314,10 @@ impl StandaloneMessageController {
         html_view.set_vexpand(true);
         let policy = (options.policy)();
         (options.initialize_html_view)(&html_view, &status_label, policy.remote_images);
+        let html_lifecycle = HtmlViewLifecycle::new(&html_view, &status_label);
         let link_hints =
             LinkHintController::new(&html_view, &status_label, options.open_link.clone());
+        html_lifecycle.load_html(&options.initial_html, Some("about:blank"));
         let html_scrolled = gtk::ScrolledWindow::builder()
             .hexpand(true)
             .vexpand(true)
@@ -333,6 +340,7 @@ impl StandaloneMessageController {
         let initial_view = MessageViewKind::from_preference((options.preferred_view)(&message));
         let standalone = Rc::new(StandaloneMessageWindow {
             id,
+            prepared_retained_bytes: options.prepared_retained_bytes,
             window: window.clone(),
             response_menu_button,
             response_menu_box,
@@ -342,6 +350,8 @@ impl StandaloneMessageController {
             forward_attachment_button,
             message_menu_button,
             message_menu_box,
+            message_menu_generation: Cell::new(0),
+            message_menu_buttons: RefCell::new(Vec::new()),
             view_menu_button,
             view_menu_box,
             view_text_button,
@@ -358,6 +368,7 @@ impl StandaloneMessageController {
             text_view,
             text_scrolled,
             html_view,
+            html_lifecycle,
             link_hints,
             status_label,
             copy_menu_button,
@@ -371,10 +382,9 @@ impl StandaloneMessageController {
             policy: options.policy,
             message_has_html: options.message_has_html,
             render_text: options.render_text,
+            render_headers: options.render_headers,
+            render_raw: options.render_raw,
             render_html: options.render_html,
-            read_raw: options.read_raw,
-            read_headers: options.read_headers,
-            scroll_html: options.scroll_html,
             respond: options.respond,
             preferred_view: options.preferred_view,
             remember_view: options.remember_view,
@@ -382,6 +392,7 @@ impl StandaloneMessageController {
             toggle_sender_view: options.toggle_sender_view,
             path_actions_sensitive: Cell::new(policy.response_sensitive),
             message_html_by_id: RefCell::new(BTreeMap::new()),
+            message_sources: options.message_sources,
             state: RefCell::new(StandaloneMessageState {
                 messages: options.messages,
                 selected_index,
@@ -391,7 +402,23 @@ impl StandaloneMessageController {
             }),
         });
 
-        self.windows.borrow_mut().push(standalone.clone());
+        let evicted = {
+            let mut windows = self.windows.borrow_mut();
+            let resident_bytes = windows
+                .iter()
+                .map(|window| window.prepared_retained_bytes)
+                .collect::<Vec<_>>();
+            let evict_count = standalone_window_eviction_count(
+                &resident_bytes,
+                standalone.prepared_retained_bytes,
+            );
+            let evicted = windows.drain(..evict_count).collect::<Vec<_>>();
+            windows.push(standalone.clone());
+            evicted
+        };
+        for evicted in evicted {
+            evicted.window.close();
+        }
         update_response_controls(&standalone, policy.response_sensitive);
         let windows = self.windows.clone();
         window.connect_close_request(move |_| {
@@ -473,6 +500,23 @@ impl StandaloneMessageController {
         updated_messages
     }
 
+    /// Remaps sources captured by standalone render and response closures.
+    /// Standalone windows can outlive the main prepared-thread cache, so
+    /// updating their String-only summaries does not make retained file paths
+    /// authoritative by itself.
+    pub(crate) fn apply_authoritative_path_states(
+        &self,
+        path_map: &AuthoritativePathMap<'_>,
+    ) -> bool {
+        let windows = self.windows.borrow().clone();
+        let mut resolved = true;
+        for standalone in windows {
+            resolved &=
+                apply_authoritative_path_states_to_sources(&standalone.message_sources, path_map);
+        }
+        resolved
+    }
+
     pub(crate) fn close_all(&self) -> usize {
         let windows = self.windows.borrow().clone();
         let count = windows.len();
@@ -540,6 +584,43 @@ impl StandaloneMessageController {
         let accepted = run_response_action(&standalone, action);
         Some((accepted, standalone.snapshot()))
     }
+
+    pub(crate) fn show_visual_html(
+        &self,
+        window_index: usize,
+    ) -> Option<(bool, StandaloneWindowSnapshot)> {
+        let standalone = self.windows.borrow().get(window_index).cloned()?;
+        let shown = choose_message_view(&standalone, MessageViewKind::Html);
+        Some((shown, standalone.snapshot()))
+    }
+
+    pub(crate) fn scroll_html_lines(
+        &self,
+        window_index: usize,
+        lines: f64,
+    ) -> Option<StandaloneWindowSnapshot> {
+        let standalone = self.windows.borrow().get(window_index).cloned()?;
+        if html_view_is_visible(&standalone) {
+            standalone.html_lifecycle.scroll_lines(lines);
+        }
+        Some(standalone.snapshot())
+    }
+}
+
+fn standalone_window_eviction_count(current_bytes: &[usize], incoming_bytes: usize) -> usize {
+    let mut evicted = current_bytes
+        .len()
+        .saturating_add(1)
+        .saturating_sub(STANDALONE_MESSAGE_WINDOW_LIMIT);
+    let mut retained = current_bytes
+        .iter()
+        .skip(evicted)
+        .fold(incoming_bytes, |total, bytes| total.saturating_add(*bytes));
+    while retained > STANDALONE_PREPARED_BYTES_LIMIT && evicted < current_bytes.len() {
+        retained = retained.saturating_sub(current_bytes[evicted]);
+        evicted += 1;
+    }
+    evicted
 }
 
 fn apply_authoritative_changes_to_messages(
@@ -562,6 +643,17 @@ fn apply_authoritative_changes_to_messages(
             Some(index)
         })
         .collect()
+}
+
+fn apply_authoritative_path_states_to_sources(
+    sources: &BTreeMap<String, MessageSource>,
+    path_map: &AuthoritativePathMap<'_>,
+) -> bool {
+    let mut resolved = true;
+    for (message_id, source) in sources {
+        resolved &= path_map.apply_to_source(message_id, source);
+    }
+    resolved
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -603,6 +695,7 @@ struct StandaloneMessageState {
 
 struct StandaloneMessageWindow {
     id: u64,
+    prepared_retained_bytes: usize,
     window: gtk::ApplicationWindow,
     response_menu_button: gtk::MenuButton,
     response_menu_box: gtk::Box,
@@ -612,6 +705,8 @@ struct StandaloneMessageWindow {
     forward_attachment_button: gtk::Button,
     message_menu_button: gtk::MenuButton,
     message_menu_box: gtk::Box,
+    message_menu_generation: Cell<u64>,
+    message_menu_buttons: RefCell<Vec<gtk::Button>>,
     view_menu_button: gtk::MenuButton,
     view_menu_box: gtk::Box,
     view_text_button: gtk::Button,
@@ -628,6 +723,7 @@ struct StandaloneMessageWindow {
     text_view: gtk::TextView,
     text_scrolled: gtk::ScrolledWindow,
     html_view: webkit6::WebView,
+    html_lifecycle: HtmlViewLifecycle,
     link_hints: LinkHintController,
     status_label: gtk::Label,
     copy_menu_button: gtk::MenuButton,
@@ -641,10 +737,9 @@ struct StandaloneMessageWindow {
     policy: StandalonePolicyProvider,
     message_has_html: StandaloneMessageHasHtml,
     render_text: StandaloneTextRenderer,
+    render_headers: StandaloneSourceRenderer,
+    render_raw: StandaloneSourceRenderer,
     render_html: StandaloneHtmlRenderer,
-    read_raw: StandaloneSourceReader,
-    read_headers: StandaloneSourceReader,
-    scroll_html: StandaloneHtmlScrollHandler,
     respond: StandaloneResponseHandler,
     preferred_view: StandalonePreferredView,
     remember_view: StandaloneRememberView,
@@ -652,6 +747,7 @@ struct StandaloneMessageWindow {
     toggle_sender_view: StandaloneToggleSenderView,
     path_actions_sensitive: Cell<bool>,
     message_html_by_id: RefCell<BTreeMap<String, bool>>,
+    message_sources: BTreeMap<String, MessageSource>,
     state: RefCell<StandaloneMessageState>,
 }
 
@@ -671,6 +767,7 @@ impl StandaloneMessageWindow {
             id: self.id,
             selected_index: state.selected_index,
             message_count: state.messages.len(),
+            prepared_retained_bytes: self.prepared_retained_bytes,
             selected_message: state.messages.get(state.selected_index).cloned(),
             message_ids: state
                 .messages
@@ -703,6 +800,7 @@ impl StandaloneMessageWindow {
                 .is_some_and(|session| session.is_ephemeral()),
             title: self.window.title().map(|title| title.to_string()),
             status: self.status_label.text().to_string(),
+            html_lifecycle: self.html_lifecycle.snapshot(),
             link_hints: self.link_hints.snapshot(),
         }
     }
@@ -1252,19 +1350,20 @@ fn select_message(standalone: &Rc<StandaloneMessageWindow>, index: usize) -> boo
     if !ensure_path_actions_sensitive(standalone) {
         return false;
     }
-    let message = {
+    let (message, previous_index) = {
         let mut state = standalone.state.borrow_mut();
         if index >= state.messages.len() {
             standalone.status_label.set_text("Message index not found");
             return false;
         }
+        let previous_index = state.selected_index;
         state.selected_index = index;
         state.image_policy = StandaloneImagePolicy::Config;
-        state.messages[index].clone()
+        (state.messages[index].clone(), previous_index)
     };
     let view = MessageViewKind::from_preference((standalone.preferred_view)(&message));
     show_message_view(standalone, view);
-    populate_message_menu(standalone);
+    update_message_menu_selection(standalone, previous_index, index);
     standalone.message_menu_button.popdown();
     true
 }
@@ -1316,12 +1415,14 @@ fn select_relative_message(standalone: &Rc<StandaloneMessageWindow>, delta: isiz
 }
 
 fn populate_message_menu(standalone: &Rc<StandaloneMessageWindow>) {
+    let generation = standalone.message_menu_generation.get().saturating_add(1);
+    standalone.message_menu_generation.set(generation);
     clear_box(&standalone.message_menu_box);
-    let (messages, selected_index) = {
+    standalone.message_menu_buttons.borrow_mut().clear();
+    let (total, selected_index) = {
         let state = standalone.state.borrow();
-        (state.messages.clone(), state.selected_index)
+        (state.messages.len(), state.selected_index)
     };
-    let total = messages.len();
     standalone.message_menu_button.set_visible(total > 1);
     standalone.collapse_quotes_button.set_visible(total > 1);
     standalone.message_menu_button.set_label(&format!(
@@ -1329,19 +1430,69 @@ fn populate_message_menu(standalone: &Rc<StandaloneMessageWindow>) {
         selected_index.saturating_add(1),
         total.max(1)
     ));
-    for (index, message) in messages.iter().enumerate() {
-        let subject = non_empty_or(message.subject.trim(), "(no subject)");
-        let button = gtk::Button::with_label(&format!("{}: {}", index + 1, subject));
-        if index == selected_index {
-            button.add_css_class("suggested-action");
+    let standalone_weak = Rc::downgrade(standalone);
+    let mut next_index = 0_usize;
+    gtk::glib::idle_add_local(move || {
+        let Some(standalone) = standalone_weak.upgrade() else {
+            return gtk::glib::ControlFlow::Break;
+        };
+        if standalone.message_menu_generation.get() != generation {
+            return gtk::glib::ControlFlow::Break;
         }
-        let standalone_weak = Rc::downgrade(standalone);
-        button.connect_clicked(move |_| {
-            if let Some(standalone) = standalone_weak.upgrade() {
-                select_message(&standalone, index);
+        let end = next_index
+            .saturating_add(MESSAGE_MENU_ROWS_PER_UPDATE)
+            .min(total);
+        for index in next_index..end {
+            let label = {
+                let state = standalone.state.borrow();
+                let Some(message) = state.messages.get(index) else {
+                    return gtk::glib::ControlFlow::Break;
+                };
+                format!(
+                    "{}: {}",
+                    index + 1,
+                    non_empty_or(message.subject.trim(), "(no subject)")
+                )
+            };
+            let button = gtk::Button::with_label(&label);
+            if index == selected_index {
+                button.add_css_class("suggested-action");
             }
-        });
-        standalone.message_menu_box.append(&button);
+            let standalone_weak = Rc::downgrade(&standalone);
+            button.connect_clicked(move |_| {
+                if let Some(standalone) = standalone_weak.upgrade() {
+                    select_message(&standalone, index);
+                }
+            });
+            standalone.message_menu_box.append(&button);
+            standalone.message_menu_buttons.borrow_mut().push(button);
+        }
+        next_index = end;
+        if next_index < total {
+            gtk::glib::ControlFlow::Continue
+        } else {
+            gtk::glib::ControlFlow::Break
+        }
+    });
+}
+
+fn update_message_menu_selection(
+    standalone: &StandaloneMessageWindow,
+    previous_index: usize,
+    selected_index: usize,
+) {
+    let total = standalone.state.borrow().messages.len();
+    standalone.message_menu_button.set_label(&format!(
+        "Message {}/{}",
+        selected_index.saturating_add(1),
+        total.max(1)
+    ));
+    let buttons = standalone.message_menu_buttons.borrow();
+    if let Some(button) = buttons.get(previous_index) {
+        button.remove_css_class("suggested-action");
+    }
+    if let Some(button) = buttons.get(selected_index) {
+        button.add_css_class("suggested-action");
     }
 }
 
@@ -1523,7 +1674,7 @@ fn show_html_message(standalone: &StandaloneMessageWindow, message: &MessageSumm
             standalone.html_view.stop_loading();
             set_html_image_loading(&standalone.html_view, rendered.allow_remote_images);
             standalone
-                .html_view
+                .html_lifecycle
                 .load_html(&rendered.document, Some("about:blank"));
             set_active_message_view(standalone, MessageViewKind::Html);
             standalone.status_label.set_text(&rendered.status);
@@ -1546,16 +1697,14 @@ fn take_image_policy_for_render(state: &RefCell<StandaloneMessageState>) -> Stan
 }
 
 fn show_headers(standalone: &StandaloneMessageWindow, message: &MessageSummary) -> bool {
-    let result = (standalone.read_headers)(message);
-    match result {
+    match (standalone.render_headers)(message) {
         Ok(headers) => {
             set_active_message_view(standalone, MessageViewKind::Headers);
             standalone.text_view.set_monospace(true);
-            standalone.text_view.buffer().set_text(&headers.text);
-            standalone.status_label.set_text(&bounded_source_status(
-                "Full message headers shown",
-                &headers,
-            ));
+            standalone.text_view.buffer().set_text(&headers);
+            standalone
+                .status_label
+                .set_text("Full message headers shown");
             true
         }
         Err(err) => {
@@ -1568,15 +1717,12 @@ fn show_headers(standalone: &StandaloneMessageWindow, message: &MessageSummary) 
 }
 
 fn show_raw(standalone: &StandaloneMessageWindow, message: &MessageSummary) -> bool {
-    let result = (standalone.read_raw)(message);
-    match result {
+    match (standalone.render_raw)(message) {
         Ok(raw) => {
             set_active_message_view(standalone, MessageViewKind::Raw);
             standalone.text_view.set_monospace(true);
-            standalone.text_view.buffer().set_text(&raw.text);
-            standalone
-                .status_label
-                .set_text(&bounded_source_status("Raw message source shown", &raw));
+            standalone.text_view.buffer().set_text(&raw);
+            standalone.status_label.set_text("Raw message source shown");
             true
         }
         Err(err) => {
@@ -1849,11 +1995,7 @@ fn html_view_is_visible(standalone: &StandaloneMessageWindow) -> bool {
 
 fn scroll_message_lines(standalone: &StandaloneMessageWindow, lines: f64) {
     if html_view_is_visible(standalone) {
-        (standalone.scroll_html)(
-            &standalone.html_view,
-            &standalone.status_label,
-            StandaloneHtmlScroll::Lines(lines),
-        );
+        standalone.html_lifecycle.scroll_lines(lines);
     } else {
         scroll_window_lines(&standalone.text_scrolled, lines);
     }
@@ -1861,11 +2003,7 @@ fn scroll_message_lines(standalone: &StandaloneMessageWindow, lines: f64) {
 
 fn scroll_message_pages(standalone: &StandaloneMessageWindow, pages: f64) {
     if html_view_is_visible(standalone) {
-        (standalone.scroll_html)(
-            &standalone.html_view,
-            &standalone.status_label,
-            StandaloneHtmlScroll::Pages(pages),
-        );
+        standalone.html_lifecycle.scroll_pages(pages);
     } else {
         scroll_window_pages(&standalone.text_scrolled, pages);
     }
@@ -1873,11 +2011,7 @@ fn scroll_message_pages(standalone: &StandaloneMessageWindow, pages: f64) {
 
 fn scroll_message_to_edge(standalone: &StandaloneMessageWindow, bottom: bool) {
     if html_view_is_visible(standalone) {
-        (standalone.scroll_html)(
-            &standalone.html_view,
-            &standalone.status_label,
-            StandaloneHtmlScroll::Edge(bottom),
-        );
+        standalone.html_lifecycle.scroll_to_edge(bottom);
     } else {
         scroll_window_to_edge(&standalone.text_scrolled, bottom);
     }
@@ -2061,21 +2195,6 @@ fn truncate_status_text(value: &str, max_chars: usize) -> String {
     out
 }
 
-fn bounded_source_status(base: &str, source: &BoundedText) -> String {
-    let mut notes = Vec::new();
-    if source.truncated {
-        notes.push(format!("preview limited to {} bytes", source.bytes_read));
-    }
-    if source.lossy {
-        notes.push("invalid or binary bytes replaced".to_string());
-    }
-    if notes.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base} ({})", notes.join("; "))
-    }
-}
-
 fn header_emails(value: &str) -> String {
     let emails = parse_address_list(value)
         .into_iter()
@@ -2200,6 +2319,61 @@ mod tests {
         );
         assert_eq!(messages[0].tags, ["inbox"]);
         assert_eq!(messages[0].filenames, ["final:2,"]);
+    }
+
+    #[test]
+    fn standalone_sources_remap_all_matches_and_report_any_unresolved_path() {
+        let unresolved = MessageSource::new("/mail/cur/unresolved:2,S".into(), 1);
+        let mapped = MessageSource::new("/mail/cur/mapped:2,S".into(), 1);
+        let sources = BTreeMap::from([
+            ("a-unresolved@example.test".to_string(), unresolved.clone()),
+            ("z-mapped@example.test".to_string(), mapped.clone()),
+        ]);
+        let path_states = vec![
+            MessagePathState {
+                message_id: "a-unresolved@example.test".to_string(),
+                paths: vec!["/mail/cur/other:2,".into()],
+                path_changes: Vec::new(),
+            },
+            MessagePathState {
+                message_id: "z-mapped@example.test".to_string(),
+                paths: vec!["/mail/cur/mapped:2,".into()],
+                path_changes: vec![notm_notmuch::MaildirPathChange {
+                    previous_path: "/mail/cur/mapped:2,S".into(),
+                    current_path: "/mail/cur/mapped:2,".into(),
+                }],
+            },
+        ];
+
+        let path_map = AuthoritativePathMap::new(&path_states);
+        assert!(!apply_authoritative_path_states_to_sources(
+            &sources, &path_map,
+        ));
+        assert_eq!(
+            unresolved.path(),
+            std::path::Path::new("/mail/cur/unresolved:2,S")
+        );
+        assert_eq!(mapped.path(), std::path::Path::new("/mail/cur/mapped:2,"));
+    }
+
+    #[test]
+    fn standalone_window_count_and_resident_byte_limits_evict_oldest_entries() {
+        assert_eq!(standalone_window_eviction_count(&[], 1), 0);
+        assert_eq!(standalone_window_eviction_count(&[1, 1, 1], 1), 0);
+        assert_eq!(standalone_window_eviction_count(&[1, 1, 1, 1], 1), 1);
+        assert_eq!(
+            standalone_window_eviction_count(&[1, 1, 1, 1, 1, 1, 1], 1),
+            4
+        );
+        let sixty_four_mib = 64 * 1024 * 1024;
+        assert_eq!(
+            standalone_window_eviction_count(&[sixty_four_mib, sixty_four_mib], sixty_four_mib,),
+            1
+        );
+        assert_eq!(
+            standalone_window_eviction_count(&[100 * 1024 * 1024], 100 * 1024 * 1024),
+            1
+        );
     }
 
     #[test]

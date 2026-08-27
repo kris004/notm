@@ -25,7 +25,24 @@ current search is refreshed. Fixture mode never executes configured external
 sync commands. Sending uses the same hardened runner for a configured external
 transport or the fake capture transport used in tests.
 
-Search input is debounced and run through a background worker with stale-generation discard. Search results are paged (`ui.page_size`), expose a Load more action, and auto-load the next page when the thread list is scrolled to the bottom. Search pages use a 64-entry least-recently-used cache keyed by database path, Notmuch UUID/revision, query, page offset/limit, and the complete excluded-tag vector. Thread UI details use a separate 4,096-entry least-recently-used cache keyed by database path, UUID/revision, and thread ID. Hits refresh recency, so new database generations naturally evict stale entries instead of accumulating without a bound. Cache locks cover only lookup or insertion; Notmuch queries, filesystem reads, and MIME parsing run outside them. Thread previews are cached before the configured display-line limit is applied, so that presentation setting is not part of either key.
+Search input is debounced and submitted to one persistent background worker.
+A newer request cancels active work, coalesces queued requests to the latest
+generation, and checks cancellation between the delay, Notmuch query, and
+bounded thread-detail file-read phases. Search results are paged
+(`ui.page_size`, from 1 through 1,000), expose a Load more action, and auto-load
+the next page when the thread list is scrolled to the bottom. GTK removes,
+appends, or refreshes at most 48 thread-model rows per main-loop iteration and
+cancels stale model updates by generation.
+
+Search pages use a 64-entry least-recently-used cache keyed by database path,
+Notmuch UUID/revision, query, page offset/limit, and the complete excluded-tag
+vector. Thread UI details use a separate 4,096-entry least-recently-used cache
+keyed by database path, UUID/revision, and thread ID. Hits refresh recency, so
+new database generations naturally evict stale entries instead of accumulating
+without a bound. Cache locks cover only lookup or insertion; Notmuch queries,
+bounded filesystem reads, and MIME parsing run outside them. Thread previews
+are cached before the configured display-line limit is applied, so that
+presentation setting is not part of either key.
 
 Tag mutations run on a serialized background writer and target exact thread or
 message IDs captured from the displayed result snapshot. Thread targets use a
@@ -36,12 +53,18 @@ snapshot before mutation; safely isolated missing, invalid, or oversized
 threads remain explicit partial results for the other exact targets. Their
 batch reports retain partial failures and authoritative current Maildir
 filenames. Search generations that overlap a write are discarded and
-reconciled before another tag mutation is accepted; retained message,
-attachment, draft, and standalone window models receive filename mappings
-without reparsing MIME on the GTK callback. Explicit partial reports keep path
-actions disabled until the reconciliation search completes. An unreported
-result, close/commit failure, or unresolved retained filename keeps those
-actions disabled until restart rather than allowing a stale path to escape.
+reconciled before another tag mutation is accepted; retained message, draft,
+attachment, and standalone window models receive byte-preserving path mappings
+without reparsing MIME on the GTK callback. Cloned lazy message sources share a
+thread-safe current path, so a Maildir rename updates raw, attachment,
+reply/forward, indexed-draft, and standalone actions together. Payload reads
+remain cached-path-first, but only after that cache has been remapped to the
+authoritative path; Message-ID lookup is the fallback for a missing cached
+file, not a substitute for remapping a still-readable old file. Explicit
+partial reports keep path actions disabled until the reconciliation search
+completes. An unreported result, close/commit failure, or unresolved retained
+message, attachment, standalone, or draft filename keeps those actions
+disabled until restart rather than allowing a stale path to escape.
 Durable undo-history writes are serialized on a separate worker.
 
 ## Implementation notes

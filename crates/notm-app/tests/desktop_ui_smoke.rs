@@ -3,6 +3,7 @@ use std::{
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{Arc, Barrier},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -30,6 +31,12 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const LARGE_THREAD_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_HARNESS_APPLICATION_ID_ENV: &str = "NOTM_TEST_HARNESS_APPLICATION_ID";
+const FIXTURE_STARTUP_RECOVERY_DELAY_ENV: &str = "NOTM_FIXTURE_TEST_STARTUP_RECOVERY_DELAY_MS";
+const FIXTURE_RECOVERY_PATH_ENV: &str = "NOTM_FIXTURE_TEST_RECOVERY_PATH";
+const FIXTURE_STARTUP_RECOVERY_GATE_ENV: &str = "NOTM_FIXTURE_TEST_STARTUP_RECOVERY_GATE";
+const FIXTURE_LARGE_ATTACHMENT_BYTES_ENV: &str = "NOTM_FIXTURE_TEST_LARGE_ATTACHMENT_BYTES";
+const FIXTURE_HUGE_BODY_BYTES_ENV: &str = "NOTM_FIXTURE_TEST_HUGE_BODY_BYTES";
+const FIXTURE_SEARCH_THREADS_ENV: &str = "NOTM_FIXTURE_TEST_SEARCH_THREADS";
 
 struct FixtureApp {
     child: Child,
@@ -50,6 +57,12 @@ struct FixtureLaunchOptions<'a> {
     application_id: Option<&'a str>,
     fixture: bool,
     system_prefers_dark: Option<bool>,
+    startup_recovery_delay_ms: Option<u64>,
+    fixture_recovery_path: Option<PathBuf>,
+    fixture_startup_recovery_gate: Option<PathBuf>,
+    large_attachment_bytes: Option<usize>,
+    huge_body_bytes: Option<usize>,
+    search_threads: Option<usize>,
 }
 
 impl Drop for ChildGuard {
@@ -110,6 +123,92 @@ impl FixtureApp {
             FixtureLaunchOptions {
                 application_id: Some(application_id),
                 fixture: true,
+                ..FixtureLaunchOptions::default()
+            },
+        )
+    }
+
+    fn spawn_with_startup_recovery_delay(
+        work_dir: PathBuf,
+        token: &str,
+        milliseconds: u64,
+    ) -> anyhow::Result<Self> {
+        let recovery_path = work_dir.join("state/notm/draft.json");
+        let recovery_gate = work_dir.join("startup-recovery.release");
+        Self::spawn_inner(
+            work_dir,
+            token,
+            FixtureLaunchOptions {
+                fixture: true,
+                startup_recovery_delay_ms: Some(milliseconds),
+                fixture_recovery_path: Some(recovery_path),
+                fixture_startup_recovery_gate: Some(recovery_gate),
+                ..FixtureLaunchOptions::default()
+            },
+        )
+    }
+
+    fn spawn_with_large_attachment(
+        work_dir: PathBuf,
+        token: &str,
+        bytes: usize,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(
+            work_dir,
+            token,
+            FixtureLaunchOptions {
+                fixture: true,
+                large_attachment_bytes: Some(bytes),
+                ..FixtureLaunchOptions::default()
+            },
+        )
+    }
+
+    fn spawn_with_huge_body(work_dir: PathBuf, token: &str, bytes: usize) -> anyhow::Result<Self> {
+        Self::spawn_inner(
+            work_dir,
+            token,
+            FixtureLaunchOptions {
+                fixture: true,
+                huge_body_bytes: Some(bytes),
+                ..FixtureLaunchOptions::default()
+            },
+        )
+    }
+
+    fn spawn_with_search_threads(
+        work_dir: PathBuf,
+        token: &str,
+        count: usize,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(
+            work_dir,
+            token,
+            FixtureLaunchOptions {
+                fixture: true,
+                search_threads: Some(count),
+                ..FixtureLaunchOptions::default()
+            },
+        )
+    }
+
+    fn spawn_with_mailto_and_startup_recovery_delay(
+        work_dir: PathBuf,
+        token: &str,
+        mailto_uri: &str,
+        milliseconds: u64,
+    ) -> anyhow::Result<Self> {
+        let recovery_path = work_dir.join("state/notm/draft.json");
+        let recovery_gate = work_dir.join("startup-recovery.release");
+        Self::spawn_inner(
+            work_dir,
+            token,
+            FixtureLaunchOptions {
+                mailto_uri: Some(mailto_uri),
+                fixture: true,
+                startup_recovery_delay_ms: Some(milliseconds),
+                fixture_recovery_path: Some(recovery_path),
+                fixture_startup_recovery_gate: Some(recovery_gate),
                 ..FixtureLaunchOptions::default()
             },
         )
@@ -242,6 +341,30 @@ impl FixtureApp {
         command.env_remove(TEST_HARNESS_APPLICATION_ID_ENV);
         if let Some(application_id) = options.application_id {
             command.env(TEST_HARNESS_APPLICATION_ID_ENV, application_id);
+        }
+        command.env_remove(FIXTURE_STARTUP_RECOVERY_DELAY_ENV);
+        if let Some(milliseconds) = options.startup_recovery_delay_ms {
+            command.env(FIXTURE_STARTUP_RECOVERY_DELAY_ENV, milliseconds.to_string());
+        }
+        command.env_remove(FIXTURE_RECOVERY_PATH_ENV);
+        if let Some(path) = options.fixture_recovery_path {
+            command.env(FIXTURE_RECOVERY_PATH_ENV, path);
+        }
+        command.env_remove(FIXTURE_STARTUP_RECOVERY_GATE_ENV);
+        if let Some(path) = options.fixture_startup_recovery_gate {
+            command.env(FIXTURE_STARTUP_RECOVERY_GATE_ENV, path);
+        }
+        command.env_remove(FIXTURE_LARGE_ATTACHMENT_BYTES_ENV);
+        if let Some(bytes) = options.large_attachment_bytes {
+            command.env(FIXTURE_LARGE_ATTACHMENT_BYTES_ENV, bytes.to_string());
+        }
+        command.env_remove(FIXTURE_HUGE_BODY_BYTES_ENV);
+        if let Some(bytes) = options.huge_body_bytes {
+            command.env(FIXTURE_HUGE_BODY_BYTES_ENV, bytes.to_string());
+        }
+        command.env_remove(FIXTURE_SEARCH_THREADS_ENV);
+        if let Some(count) = options.search_threads {
+            command.env(FIXTURE_SEARCH_THREADS_ENV, count.to_string());
         }
         // Keep non-fixture smokes independent of the invoking account's
         // Notmuch selection and libnotmuch's NAME/EMAIL identity defaults.
@@ -462,6 +585,33 @@ impl Drop for FixtureApp {
     }
 }
 
+fn wait_for_search_generation_loading(
+    driver: &mut UiDriver,
+    generation: u64,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = driver.command("search_status", json!({}))?;
+        ensure!(status["ok"] == true, "search status failed: {status}");
+        let current_generation = status["generation"]
+            .as_u64()
+            .with_context(|| format!("search status had no generation: {status}"))?;
+        ensure!(
+            current_generation <= generation,
+            "search generation {generation} was superseded before its loading state was observed: {status}"
+        );
+        if current_generation == generation && status["loading"] == true {
+            return Ok(status);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "search generation {generation} did not report loading within {timeout:?}: {status}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
 #[test]
 fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
@@ -496,6 +646,7 @@ fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
         health["state"], "running",
         "unhealthy fixture app: {health}"
     );
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
 
     let delayed_search = driver.command(
         "run_search",
@@ -509,16 +660,19 @@ fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
         delayed_search["scheduled"], true,
         "fixture search response did not report async scheduling: {delayed_search}"
     );
-    assert_eq!(
-        delayed_search["state"]["search_loading"], true,
-        "fixture search completed synchronously instead of returning control: {delayed_search}"
-    );
+    let delayed_generation = delayed_search["generation"]
+        .as_u64()
+        .context("delayed search response had no generation")?;
+    let outstanding = wait_for_search_generation_loading(
+        &mut driver,
+        delayed_generation,
+        Duration::from_secs(2),
+    )?;
     let responsive_health = driver.command("health", json!({}))?;
     assert_eq!(
         responsive_health["ok"], true,
         "harness stopped responding while a search was outstanding: {responsive_health}"
     );
-    let outstanding = driver.command("search_status", json!({}))?;
     assert_eq!(
         outstanding["loading"], true,
         "delayed fixture search was not outstanding during the responsiveness check: {outstanding}"
@@ -533,9 +687,6 @@ fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
         current_search["loading"], true,
         "debounced query edit did not reserve background search work: {current_search}"
     );
-    let delayed_generation = delayed_search["generation"]
-        .as_u64()
-        .context("delayed search response had no generation")?;
     let current_generation = current_search["generation"]
         .as_u64()
         .context("debounced search status had no generation")?;
@@ -672,6 +823,188 @@ fn fixture_app_serves_authenticated_desktop_harness() -> anyhow::Result<()> {
         "fixture app did not exit cleanly: {status}"
     );
 
+    Ok(())
+}
+
+#[test]
+fn fixture_rapid_searches_coalesce_and_apply_large_pages_incrementally() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_rapid_searches_coalesce_and_apply_large_pages_incrementally: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running coalesced-search UI stress with {display}");
+
+    const EXTRA_THREADS: usize = 144;
+    const BURST_SEARCHES: usize = 12;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-search-worker-ui-{run_id}"));
+    let token = format!("notm-search-worker-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_search_threads(work_dir, &token, EXTRA_THREADS)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let baseline = driver.command("search_status", json!({}))?;
+
+    let barrier = Arc::new(Barrier::new(BURST_SEARCHES + 1));
+    let mut burst = Vec::new();
+    for index in 0..BURST_SEARCHES {
+        let socket_path = app.socket_path.clone();
+        let token = token.clone();
+        let barrier = barrier.clone();
+        burst.push(thread::spawn(move || -> anyhow::Result<Value> {
+            let mut driver = UiDriver::connect(socket_path, token)?;
+            barrier.wait();
+            driver.command(
+                "run_search",
+                json!({
+                    "query": format!("subject:\"discarded burst {index}\""),
+                    "test_delay_ms": 1600,
+                }),
+            )
+        }));
+    }
+    barrier.wait();
+    for request in burst {
+        let response = request.join().expect("burst search driver")?;
+        assert_eq!(
+            response["scheduled"], true,
+            "burst search was not scheduled: {response}"
+        );
+    }
+
+    let final_search = driver.command(
+        "run_search",
+        json!({"query": "tag:search-stress", "test_delay_ms": 800}),
+    )?;
+    assert_eq!(
+        final_search["scheduled"], true,
+        "final search was not scheduled: {final_search}"
+    );
+    let final_generation = final_search["generation"]
+        .as_u64()
+        .with_context(|| format!("final search had no generation: {final_search}"))?;
+
+    let before = driver.command("health", json!({}))?;
+    let input_started = Instant::now();
+    let input = driver.command("send_key", json!({"key": "Escape"}))?;
+    let input_elapsed = input_started.elapsed();
+    ensure!(
+        input_elapsed < Duration::from_millis(500),
+        "GTK input blocked behind rapid search work for {input_elapsed:?}: {input}"
+    );
+    thread::sleep(Duration::from_millis(175));
+    let after = driver.command("health", json!({}))?;
+    ensure!(
+        after["gtk_heartbeat"].as_u64().unwrap_or(0)
+            > before["gtk_heartbeat"].as_u64().unwrap_or(0),
+        "GTK timers did not advance while the search worker was busy: before={before}, after={after}"
+    );
+    let outstanding = driver.command("search_status", json!({}))?;
+    assert_eq!(
+        outstanding["generation"], final_generation,
+        "a stale search reclaimed the active generation: {outstanding}"
+    );
+    assert_eq!(
+        outstanding["peak_active_preparations"], 1,
+        "rapid searches ran preparation concurrently: {outstanding}"
+    );
+
+    let settled = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    assert_eq!(
+        settled["state"]["current_query"], "tag:search-stress",
+        "latest rapid search did not win: {settled}"
+    );
+    assert_eq!(
+        settled["state"]["thread_list_items"]
+            .as_array()
+            .map(Vec::len),
+        Some(100),
+        "first stress page did not honor the configured page size: {settled}"
+    );
+    let first_page_status = driver.command("search_status", json!({}))?;
+    ensure!(
+        first_page_status["cancelled"].as_u64().unwrap_or(0)
+            > baseline["cancelled"].as_u64().unwrap_or(0),
+        "rapid searches did not cancel stale work: baseline={baseline}, final={first_page_status}"
+    );
+    ensure!(
+        first_page_status["coalesced"].as_u64().unwrap_or(0)
+            > baseline["coalesced"].as_u64().unwrap_or(0),
+        "rapid searches did not coalesce queued work: baseline={baseline}, final={first_page_status}"
+    );
+    assert_eq!(
+        first_page_status["peak_active_preparations"], 1,
+        "search worker peak exceeded one: {first_page_status}"
+    );
+    let model = &first_page_status["model_update"];
+    assert_eq!(model["busy"], false, "model update did not settle: {model}");
+    ensure!(
+        model["peak_rows_per_iteration"]
+            .as_u64()
+            .unwrap_or(u64::MAX)
+            <= model["max_rows_per_update"].as_u64().unwrap_or(0),
+        "thread model exceeded its GTK-iteration row budget: {model}"
+    );
+    assert_eq!(
+        model["model_len"], 100,
+        "thread model did not finish the first bounded replacement: {model}"
+    );
+
+    let appended = driver.command("load_more_threads", json!({"select_last": false}))?;
+    assert_eq!(
+        appended["scheduled"], true,
+        "stress append was not scheduled: {appended}"
+    );
+    let appended = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    assert_eq!(
+        appended["state"]["thread_list_items"]
+            .as_array()
+            .map(Vec::len),
+        Some(EXTRA_THREADS),
+        "bounded append did not load the remaining stress rows: {appended}"
+    );
+    let appended_status = driver.command("search_status", json!({}))?;
+    assert_eq!(
+        appended_status["model_update"]["model_len"], EXTRA_THREADS,
+        "GTK model did not finish the bounded append: {appended_status}"
+    );
+    ensure!(
+        appended_status["model_update"]["peak_rows_per_iteration"]
+            .as_u64()
+            .unwrap_or(u64::MAX)
+            <= appended_status["model_update"]["max_rows_per_update"]
+                .as_u64()
+                .unwrap_or(0),
+        "append exceeded the per-iteration GTK row budget: {appended_status}"
+    );
+
+    thread::sleep(Duration::from_millis(1700));
+    let after_stale_deadline = driver.command("search_status", json!({}))?;
+    assert_eq!(
+        after_stale_deadline["current_query"], "tag:search-stress",
+        "stale delayed search replaced the final result: {after_stale_deadline}"
+    );
+    let oversized = driver.command("save_settings", json!({"page_size": 1001}))?;
+    assert_eq!(
+        oversized["ok"], false,
+        "oversized page setting was accepted: {oversized}"
+    );
+    ensure!(
+        oversized["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("between 1 and 1000")),
+        "oversized page error did not report the portable bound: {oversized}"
+    );
+
+    eprintln!(
+        "coalesced-search responsiveness passed: submitted={}, cancelled={}, coalesced={}, model_peak={}/{}",
+        appended_status["submitted"],
+        appended_status["cancelled"],
+        appended_status["coalesced"],
+        appended_status["model_update"]["peak_rows_per_iteration"],
+        appended_status["model_update"]["max_rows_per_update"],
+    );
     Ok(())
 }
 
@@ -937,8 +1270,14 @@ fn fixture_harness_quarantines_external_commands() -> anyhow::Result<()> {
         reply["ok"], true,
         "fixture identity was not available for safe reply testing: {reply}"
     );
+    assert_eq!(
+        reply["pending"], true,
+        "reply was not prepared asynchronously: {reply}"
+    );
+    wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let reply = driver.command("app_state", json!({}))?;
     ensure!(
-        reply["compose_fields"]["from"]
+        reply["state"]["compose_fields"]["from"]
             .as_str()
             .is_some_and(|from| from.contains("fixture@example.test")),
         "fixture reply did not use the fixture identity: {reply}"
@@ -1132,13 +1471,29 @@ fn slow_manual_sync_keeps_desktop_responsive() -> anyhow::Result<()> {
         restored["ok"], true,
         "composer writing stayed blocked during sync: {restored}"
     );
+    let before_close = draft_write_count(&draft_autosave_status(&mut driver)?)?;
     let closed = driver.command("clear_draft", json!({}))?;
     assert_eq!(
         closed["ok"], true,
         "unchanged active draft did not close during sync: {closed}"
     );
     assert_eq!(closed["pending_confirmation"], false);
-    assert_eq!(closed["active_draft"], Value::Null);
+    let close_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let autosave = draft_autosave_status(&mut driver)?;
+        let state = driver.command("app_state", json!({}))?;
+        if draft_write_count(&autosave)? > before_close
+            && autosave["busy"] == false
+            && state["state"]["active_draft"] == Value::Null
+        {
+            break;
+        }
+        ensure!(
+            Instant::now() < close_deadline,
+            "unchanged draft close did not flush and finish asynchronously: autosave={autosave}, state={state}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
 
     let refresh_search = driver.command("run_search", json!({"query": "tag:sync-refresh"}))?;
     assert_eq!(
@@ -1260,6 +1615,7 @@ fn startup_sync_runs_receive_then_database_update() -> anyhow::Result<()> {
     let work_dir = std::env::temp_dir().join(format!("notm-startup-sync-ui-{run_id}"));
     fs::create_dir_all(&work_dir)?;
     let marker = work_dir.join("sync-order");
+    let empty_query = format!("tag:startup-sync-empty-{run_id}");
     let receive_command =
         toml::Value::String(format!("printf receive > {:?}; printf receive-ok", marker))
             .to_string();
@@ -1272,12 +1628,13 @@ fn startup_sync_runs_receive_then_database_update() -> anyhow::Result<()> {
     fs::write(
         &config_path,
         format!(
-            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = {}\n\
              \n[sync]\nenabled = true\ntimeout_seconds = 5\n\
              external_receive_enabled = true\nexternal_receive_on_startup = true\nexternal_receive_command = {}\n\
              notmuch_database_update_enabled = true\nnotmuch_database_update_on_startup = true\nnotmuch_database_update_command = {}\n",
             toml_path(&fixture.root),
             toml_path(&fixture.config_path),
+            toml::Value::String(empty_query),
             receive_command,
             update_command,
         ),
@@ -1618,6 +1975,11 @@ fn default_draft_recovery_migrates_clears_and_reports_autosave_failures() -> any
     let token = format!("notm-draft-recovery-ui-{run_id}");
     let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
     let mut driver = app.connect(&token)?;
+    let recovery_status = wait_for_recovery_load_completion(&mut driver, Duration::from_secs(3))?;
+    assert_eq!(
+        recovery_status["outcome"], "loaded",
+        "legacy recovery did not complete: {recovery_status}"
+    );
     let recovered = driver.command("app_state", json!({}))?;
     assert_eq!(
         recovered["state"]["compose_fields"]["subject"], "Recovered legacy draft",
@@ -1646,6 +2008,7 @@ fn default_draft_recovery_migrates_clears_and_reports_autosave_failures() -> any
         recovery_path.display()
     );
 
+    let before_clear = draft_write_count(&draft_autosave_status(&mut driver)?)?;
     for (command, value) in [("compose_set_body", ""), ("compose_set_subject", "")] {
         let cleared = driver.command(command, json!({"value": value}))?;
         assert_eq!(cleared["ok"], true, "composer clear failed: {cleared}");
@@ -1659,17 +2022,21 @@ fn default_draft_recovery_migrates_clears_and_reports_autosave_failures() -> any
         cleared["ok"], true,
         "final composer clear failed: {cleared}"
     );
+    wait_for_draft_write_after(&mut driver, before_clear, Duration::from_secs(3))?;
     ensure!(
         !recovery_path.exists() && !legacy_path.exists(),
         "empty composer left stale recovery state"
     );
 
     fs::create_dir(&recovery_path)?;
+    let before_failure = draft_write_count(&draft_autosave_status(&mut driver)?)?;
     let failed = driver.command(
         "compose_set_subject",
         json!({"value": "Autosave failure must be visible"}),
     )?;
     assert_eq!(failed["ok"], true, "composer update failed: {failed}");
+    let failed_autosave =
+        wait_for_draft_write_after(&mut driver, before_failure, Duration::from_secs(3))?;
     let failed_state = driver.command("app_state", json!({}))?;
     let last_error = failed_state["state"]["last_error"]
         .as_str()
@@ -1692,6 +2059,7 @@ fn default_draft_recovery_migrates_clears_and_reports_autosave_failures() -> any
         "failed atomic autosave left temporary files: {state_entries:?}"
     );
     fs::remove_dir(&recovery_path)?;
+    let failed_write_count = draft_write_count(&failed_autosave)?;
     let recovered_autosave = driver.command(
         "compose_set_subject",
         json!({"value": "Autosave recovered"}),
@@ -1700,6 +2068,7 @@ fn default_draft_recovery_migrates_clears_and_reports_autosave_failures() -> any
         recovered_autosave["ok"], true,
         "composer did not recover after transient autosave failure: {recovered_autosave}"
     );
+    wait_for_draft_write_after(&mut driver, failed_write_count, Duration::from_secs(3))?;
     let recovered_state = driver.command("app_state", json!({}))?;
     assert_eq!(
         recovered_state["state"]["last_error"],
@@ -1716,7 +2085,15 @@ fn default_draft_recovery_migrates_clears_and_reports_autosave_failures() -> any
         "recovered autosave did not recreate persistent draft state"
     );
 
-    fs::remove_file(&recovery_path)?;
+    let initial_saved = driver.command("save_draft", json!({}))?;
+    assert_eq!(
+        initial_saved["ok"], true,
+        "could not establish the durable named draft before cleanup-failure testing: {initial_saved}"
+    );
+    ensure!(
+        !recovery_path.exists(),
+        "successful named draft save did not clear recovery state"
+    );
     fs::create_dir(&recovery_path)?;
     let saved_with_warning = driver.command("save_draft", json!({}))?;
     assert_eq!(
@@ -1745,6 +2122,1275 @@ fn default_draft_recovery_migrates_clears_and_reports_autosave_failures() -> any
         "partial-success save did not retain its cleanup warning: {warning_state}"
     );
     fs::remove_dir(&recovery_path)?;
+
+    Ok(())
+}
+
+fn draft_autosave_status(driver: &mut UiDriver) -> anyhow::Result<Value> {
+    let status = driver.command("draft_autosave_status", json!({}))?;
+    ensure!(
+        status["ok"] == true,
+        "draft autosave status failed: {status}"
+    );
+    Ok(status)
+}
+
+fn wait_for_recovery_load_completion(
+    driver: &mut UiDriver,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = driver.command("recovery_load_status", json!({}))?;
+        ensure!(status["ok"] == true, "recovery status failed: {status}");
+        if status["busy"] == false && !status["completed_generation"].is_null() {
+            return Ok(status);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "draft recovery did not complete within {timeout:?}: {status}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
+fn write_recovery_fields(path: &Path, subject: &str, body: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&json!({
+            "from": "Fixture User <fixture@example.test>",
+            "to": "recipient@example.test",
+            "cc": "",
+            "bcc": "",
+            "subject": subject,
+            "body": body,
+            "attachments": [],
+            "in_reply_to": null,
+            "references": [],
+            "text_reply_quote": null,
+            "html_reply_quote": null
+        }))?,
+    )?;
+    Ok(())
+}
+
+fn wait_for_recovery_health_heartbeat(
+    driver: &mut UiDriver,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let first = driver.command("health", json!({}))?;
+    ensure!(first["ok"] == true, "fixture health failed: {first}");
+    ensure!(
+        first["recovery_load"]["busy"] == true,
+        "startup recovery completed before the responsiveness warmup: {first}"
+    );
+    let first_heartbeat = first["gtk_heartbeat"]
+        .as_u64()
+        .with_context(|| format!("health response had no GTK heartbeat: {first}"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        thread::sleep(STARTUP_POLL_INTERVAL);
+        let health = driver.command("health", json!({}))?;
+        ensure!(health["ok"] == true, "fixture health failed: {health}");
+        ensure!(
+            health["recovery_load"]["busy"] == true,
+            "startup recovery completed before the timed responsiveness samples: {health}"
+        );
+        let heartbeat = health["gtk_heartbeat"]
+            .as_u64()
+            .with_context(|| format!("health response had no GTK heartbeat: {health}"))?;
+        if heartbeat > first_heartbeat {
+            return Ok(health);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "GTK heartbeat did not settle during startup recovery within {timeout:?}: first={first}, current={health}"
+        );
+    }
+}
+
+#[test]
+fn fixture_slow_startup_recovery_is_responsive_and_stale_completion_is_safe() -> anyhow::Result<()>
+{
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_slow_startup_recovery_is_responsive_and_stale_completion_is_safe: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running slow startup recovery UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    {
+        let work_dir = std::env::temp_dir().join(format!("notm-slow-startup-recovery-ui-{run_id}"));
+        let recovery_path = work_dir.join("state/notm/draft.json");
+        let recovery_gate = work_dir.join("startup-recovery.release");
+        write_recovery_fields(
+            &recovery_path,
+            "Delayed startup recovery",
+            "body recovered after slow startup I/O",
+        )?;
+        let token = format!("notm-slow-startup-recovery-ui-{run_id}");
+        let mut app = FixtureApp::spawn_with_mailto_and_startup_recovery_delay(
+            work_dir,
+            &token,
+            "mailto:startup@example.test?subject=Mailto%20after%20recovery",
+            250,
+        )?;
+        let mut driver = app.connect(&token)?;
+        let loading = driver.command("recovery_load_status", json!({}))?;
+        assert_eq!(
+            loading["busy"], true,
+            "startup recovery was not outstanding after harness startup: {loading}"
+        );
+        let reported_recovery_path = loading["path"]
+            .as_str()
+            .map(PathBuf::from)
+            .with_context(|| format!("recovery status had no path: {loading}"))?;
+        assert_eq!(reported_recovery_path, recovery_path, "{loading}");
+
+        let warmed_health =
+            wait_for_recovery_health_heartbeat(&mut driver, Duration::from_secs(2))?;
+        assert_eq!(
+            warmed_health["recovery_load"]["busy"], true,
+            "recovery gate opened during health warmup: {warmed_health}"
+        );
+
+        let first_started = Instant::now();
+        let first_health = driver.command("health", json!({}))?;
+        let first_elapsed = first_started.elapsed();
+        thread::sleep(Duration::from_millis(150));
+        let second_started = Instant::now();
+        let second_health = driver.command("health", json!({}))?;
+        let second_elapsed = second_started.elapsed();
+        ensure!(
+            first_elapsed < Duration::from_millis(500)
+                && second_elapsed < Duration::from_millis(500),
+            "health blocked behind delayed startup recovery: first={first_elapsed:?}, second={second_elapsed:?}"
+        );
+        ensure!(
+            second_health["gtk_heartbeat"].as_u64().unwrap_or(0)
+                > first_health["gtk_heartbeat"].as_u64().unwrap_or(0),
+            "GTK heartbeat did not advance during delayed startup recovery: first={first_health}, second={second_health}"
+        );
+        assert_eq!(first_health["recovery_load"]["busy"], true);
+        fs::write(&recovery_gate, b"release")?;
+
+        let completed = wait_for_recovery_load_completion(&mut driver, Duration::from_secs(4))?;
+        assert_eq!(
+            completed["outcome"], "loaded",
+            "delayed recovery did not load: {completed}"
+        );
+        driver.wait_for_search(STARTUP_TIMEOUT)?;
+        let recovered = driver.command("app_state", json!({}))?;
+        assert_eq!(
+            recovered["state"]["compose_fields"]["body"], "body recovered after slow startup I/O",
+            "startup search displaced the recovered composer: {recovered}"
+        );
+        let pending = driver.command("pending_confirmation", json!({}))?;
+        assert_eq!(
+            pending["pending"]["kind"], "mailto",
+            "startup mailto did not wait for recovery and preserve the modal replacement workflow: {pending}"
+        );
+        assert_eq!(
+            pending["compose_fields"]["body"], "body recovered after slow startup I/O",
+            "startup mailto replaced recovery before confirmation: {pending}"
+        );
+        assert_eq!(
+            recovery_body(&recovery_path)?,
+            "body recovered after slow startup I/O"
+        );
+    }
+
+    {
+        let work_dir =
+            std::env::temp_dir().join(format!("notm-stale-startup-recovery-ui-{run_id}"));
+        let recovery_path = work_dir.join("state/notm/draft.json");
+        let recovery_gate = work_dir.join("startup-recovery.release");
+        write_recovery_fields(
+            &recovery_path,
+            "Stale startup recovery",
+            "stale body must not replace a newer edit",
+        )?;
+        let token = format!("notm-stale-startup-recovery-ui-{run_id}");
+        let mut app = FixtureApp::spawn_with_startup_recovery_delay(work_dir, &token, 250)?;
+        let mut driver = app.connect(&token)?;
+        let loading = driver.command("recovery_load_status", json!({}))?;
+        assert_eq!(loading["busy"], true, "{loading}");
+        let reported_recovery_path = loading["path"]
+            .as_str()
+            .map(PathBuf::from)
+            .with_context(|| format!("recovery status had no path: {loading}"))?;
+        assert_eq!(reported_recovery_path, recovery_path, "{loading}");
+        let before_edit = draft_write_count(&draft_autosave_status(&mut driver)?)?;
+        let edited = driver.command(
+            "compose_set_body",
+            json!({"value": "newer edit wins over startup recovery"}),
+        )?;
+        assert_eq!(edited["ok"], true, "composer edit failed: {edited}");
+        fs::write(&recovery_gate, b"release")?;
+
+        let completed = wait_for_recovery_load_completion(&mut driver, Duration::from_secs(4))?;
+        assert_eq!(
+            completed["outcome"], "superseded",
+            "late recovery completion was not rejected: {completed}"
+        );
+        driver.wait_for_search(STARTUP_TIMEOUT)?;
+        let state = driver.command("app_state", json!({}))?;
+        assert_eq!(
+            state["state"]["compose_fields"]["body"], "newer edit wins over startup recovery",
+            "late recovery completion overwrote a newer edit: {state}"
+        );
+        wait_for_draft_write_after(&mut driver, before_edit, Duration::from_secs(3))?;
+        assert_eq!(
+            recovery_body(&recovery_path)?,
+            "newer edit wins over startup recovery",
+            "superseded recovery removed or replaced the newer durable recovery draft"
+        );
+    }
+
+    Ok(())
+}
+
+fn draft_write_count(status: &Value) -> anyhow::Result<u64> {
+    status["write_count"]
+        .as_u64()
+        .with_context(|| format!("draft autosave status had no write count: {status}"))
+}
+
+fn wait_for_draft_write_after(
+    driver: &mut UiDriver,
+    previous_write_count: u64,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = draft_autosave_status(driver)?;
+        let write_count = draft_write_count(&status)?;
+        let busy = status["busy"]
+            .as_bool()
+            .with_context(|| format!("draft autosave status had no busy flag: {status}"))?;
+        if write_count > previous_write_count && !busy {
+            return Ok(status);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "draft autosave did not finish a write after count {previous_write_count} within {timeout:?}: {status}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
+fn wait_for_draft_worker_after(
+    driver: &mut UiDriver,
+    previous_write_count: u64,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = draft_autosave_status(driver)?;
+        if draft_write_count(&status)? > previous_write_count && status["busy"] == true {
+            return Ok(status);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "draft autosave worker did not start after count {previous_write_count} within {timeout:?}: {status}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
+fn recovery_path_from_harness(driver: &mut UiDriver) -> anyhow::Result<PathBuf> {
+    let state = driver.command("draft_list_state", json!({}))?;
+    state["recovery_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("draft state had no recovery path: {state}"))
+}
+
+fn recovery_body(path: &Path) -> anyhow::Result<String> {
+    let value: Value = serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("reading recovery draft {}", path.display()))?,
+    )?;
+    value["body"]
+        .as_str()
+        .map(ToOwned::to_owned)
+        .with_context(|| format!("recovery draft had no body: {value}"))
+}
+
+fn regular_file_count(path: &Path) -> anyhow::Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    Ok(fs::read_dir(path)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .count())
+}
+
+fn wait_for_named_draft_io_idle(driver: &mut UiDriver, timeout: Duration) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = driver.command("draft_io_status", json!({}))?;
+        if status["list_busy"] == false {
+            return Ok(status);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "named-draft I/O did not become idle within {timeout:?}: {status}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
+fn wait_for_named_draft_generation(
+    driver: &mut UiDriver,
+    generation: u64,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = driver.command("draft_io_status", json!({}))?;
+        if status["list_busy"] == false
+            && status["list_completed_generation"].as_u64() == Some(generation)
+        {
+            return Ok(status);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "named-draft generation {generation} did not complete within {timeout:?}: {status}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+fn prepare_app_work_dir_for_restart(
+    app: &mut FixtureApp,
+    terminate_abruptly: bool,
+) -> anyhow::Result<()> {
+    if app.child.try_wait()?.is_none() {
+        ensure!(
+            terminate_abruptly,
+            "application was still running before a graceful restart"
+        );
+        app.child.kill()?;
+        let status = app.child.wait()?;
+        ensure!(
+            !status.success(),
+            "abruptly terminated application exited successfully: {status}"
+        );
+    }
+    drop(app.display.take());
+    for path in [&app.socket_path, &app.log_path] {
+        if path.exists() {
+            fs::remove_file(path)
+                .with_context(|| format!("removing restart artifact {}", path.display()))?;
+        }
+    }
+    let display_dir = app.work_dir.join("gui-display");
+    if display_dir.exists() {
+        fs::remove_dir_all(&display_dir)
+            .with_context(|| format!("removing restart display {}", display_dir.display()))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn fixture_high_rate_draft_autosave_is_debounced_and_keeps_gtk_responsive() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_high_rate_draft_autosave_is_debounced_and_keeps_gtk_responsive: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running high-rate draft autosave UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-draft-debounce-ui-{run_id}"));
+    let token = format!("notm-draft-debounce-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
+    let recovery_path = recovery_path_from_harness(&mut driver)?;
+
+    let before_baseline = draft_write_count(&draft_autosave_status(&mut driver)?)?;
+    for (command, value) in [
+        ("compose_set_from", "Fixture User <fixture@example.test>"),
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Debounced recovery draft"),
+        ("compose_set_body", "baseline body"),
+    ] {
+        assert_eq!(
+            driver.command(command, json!({"value": value}))?["ok"],
+            true
+        );
+    }
+    wait_for_draft_write_after(&mut driver, before_baseline, Duration::from_secs(3))?;
+    let delayed = driver.command("set_fixture_draft_delay", json!({"milliseconds": 1200}))?;
+    assert_eq!(
+        delayed["ok"], true,
+        "could not delay draft worker: {delayed}"
+    );
+    let before_burst = draft_write_count(&draft_autosave_status(&mut driver)?)?;
+
+    let mut final_body = String::new();
+    for index in 1..=24 {
+        final_body = format!("continuous edit {index:02} {}", "x".repeat(index));
+        let edited = driver.command("compose_set_body", json!({"value": final_body}))?;
+        assert_eq!(
+            edited["ok"], true,
+            "continuous edit {index} failed: {edited}"
+        );
+    }
+    let immediately_after = draft_autosave_status(&mut driver)?;
+    assert_eq!(
+        draft_write_count(&immediately_after)?,
+        before_burst,
+        "high-rate edits escaped the debounce window: {immediately_after}"
+    );
+
+    let active = wait_for_draft_worker_after(&mut driver, before_burst, Duration::from_secs(2))?;
+    assert_eq!(
+        draft_write_count(&active)?,
+        before_burst + 1,
+        "debounced burst launched more than one worker: {active}"
+    );
+    let first_health_started = Instant::now();
+    let first_health = driver.command("health", json!({}))?;
+    let first_health_elapsed = first_health_started.elapsed();
+    thread::sleep(Duration::from_millis(150));
+    let second_health_started = Instant::now();
+    let second_health = driver.command("health", json!({}))?;
+    let second_health_elapsed = second_health_started.elapsed();
+    ensure!(
+        first_health_elapsed < Duration::from_millis(500)
+            && second_health_elapsed < Duration::from_millis(500),
+        "health blocked behind delayed draft I/O: first={first_health_elapsed:?}, second={second_health_elapsed:?}"
+    );
+    ensure!(
+        second_health["gtk_heartbeat"].as_u64().unwrap_or(0)
+            > first_health["gtk_heartbeat"].as_u64().unwrap_or(0),
+        "GTK heartbeat did not advance during delayed draft I/O: first={first_health}, second={second_health}"
+    );
+
+    let completed = wait_for_draft_write_after(&mut driver, before_burst, Duration::from_secs(4))?;
+    assert_eq!(
+        draft_write_count(&completed)?,
+        before_burst + 1,
+        "high-rate edits produced multiple recovery writes: {completed}"
+    );
+    assert_eq!(recovery_body(&recovery_path)?, final_body);
+    ensure!(
+        fs::read_dir(recovery_path.parent().expect("recovery parent"))?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp")),
+        "atomic autosave left a temporary file beside {}",
+        recovery_path.display()
+    );
+    Ok(())
+}
+
+#[test]
+fn fixture_explicit_draft_save_keeps_gtk_responsive_and_preserves_newer_edits() -> anyhow::Result<()>
+{
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_explicit_draft_save_keeps_gtk_responsive_and_preserves_newer_edits: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running async explicit draft-save UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-explicit-draft-save-ui-{run_id}"));
+    let token = format!("notm-explicit-draft-save-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut save_driver = app.connect(&token)?;
+    let mut observer = app.connect(&token)?;
+    save_driver.wait_for_search(STARTUP_TIMEOUT)?;
+    assert_eq!(save_driver.command("open_compose", json!({}))?["ok"], true);
+    for (command, value) in [
+        ("compose_set_from", "Fixture User <fixture@example.test>"),
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Slow explicit save"),
+        ("compose_set_body", "captured before slow save"),
+    ] {
+        assert_eq!(
+            save_driver.command(command, json!({"value": value}))?["ok"],
+            true
+        );
+    }
+    let recovery_path = recovery_path_from_harness(&mut observer)?;
+    assert_eq!(
+        observer.command("set_fixture_draft_delay", json!({"milliseconds": 600}))?["ok"],
+        true
+    );
+
+    let save = thread::spawn(move || save_driver.command("save_draft", json!({})));
+    thread::sleep(Duration::from_millis(125));
+    let before = observer.command("health", json!({}))?;
+    assert_eq!(
+        before["draft_save"]["busy"], true,
+        "explicit save did not enter worker-backed persistence: {before}"
+    );
+    let edited = observer.command(
+        "compose_set_body",
+        json!({"value": "newer edit kept while explicit save runs"}),
+    )?;
+    assert_eq!(
+        edited["ok"], true,
+        "typing was blocked by draft I/O: {edited}"
+    );
+    thread::sleep(Duration::from_millis(175));
+    let after = observer.command("health", json!({}))?;
+    ensure!(
+        after["gtk_heartbeat"].as_u64().unwrap_or(0)
+            > before["gtk_heartbeat"].as_u64().unwrap_or(0),
+        "GTK heartbeat stopped during explicit draft I/O: before={before}, after={after}"
+    );
+
+    let saved = save
+        .join()
+        .map_err(|_| anyhow::anyhow!("explicit draft-save driver panicked"))??;
+    assert_eq!(saved["ok"], true, "explicit draft save failed: {saved}");
+    let saved_path = saved["report"]["local_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("saved draft had no local path: {saved}"))?;
+    ensure!(saved_path.is_file(), "saved draft file is missing");
+    let saved_fields: Value = serde_json::from_slice(&fs::read(&saved_path)?)?;
+    assert_eq!(saved_fields["body"], "captured before slow save");
+    let recovery: Value = serde_json::from_slice(&fs::read(&recovery_path)?)?;
+    assert_eq!(recovery["body"], "newer edit kept while explicit save runs");
+    let status = observer.command("draft_io_status", json!({}))?;
+    assert_eq!(
+        status["save_busy"], false,
+        "draft save stayed busy: {status}"
+    );
+    Ok(())
+}
+
+#[test]
+fn fixture_draft_autosave_failure_preserves_last_good_and_retries() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_draft_autosave_failure_preserves_last_good_and_retries: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running draft autosave failure/retry UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-draft-failure-ui-{run_id}"));
+    let token = format!("notm-draft-failure-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
+    let recovery_path = recovery_path_from_harness(&mut driver)?;
+    let before_good = draft_write_count(&draft_autosave_status(&mut driver)?)?;
+    assert_eq!(
+        driver.command("compose_set_body", json!({"value": "last good body"}))?["ok"],
+        true
+    );
+    let good = wait_for_draft_write_after(&mut driver, before_good, Duration::from_secs(3))?;
+    let good_count = draft_write_count(&good)?;
+    let good_bytes = fs::read(&recovery_path)?;
+
+    assert_eq!(
+        driver.command("fail_next_draft_write", json!({}))?["ok"],
+        true
+    );
+    assert_eq!(
+        driver.command(
+            "compose_set_body",
+            json!({"value": "failed replacement body"})
+        )?["ok"],
+        true
+    );
+    let failed = wait_for_draft_write_after(&mut driver, good_count, Duration::from_secs(3))?;
+    ensure!(
+        failed["last_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("injected draft write failure")),
+        "injected write failure was not visible: {failed}"
+    );
+    assert_eq!(
+        fs::read(&recovery_path)?,
+        good_bytes,
+        "failed atomic replace damaged the last good recovery draft"
+    );
+
+    let failed_count = draft_write_count(&failed)?;
+    assert_eq!(
+        driver.command(
+            "compose_set_body",
+            json!({"value": "successful retry body"})
+        )?["ok"],
+        true
+    );
+    let recovered = wait_for_draft_write_after(&mut driver, failed_count, Duration::from_secs(3))?;
+    assert_eq!(
+        recovered["last_error"],
+        Value::Null,
+        "successful retry left a stale autosave error: {recovered}"
+    );
+    assert_eq!(recovery_body(&recovery_path)?, "successful retry body");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn immediate_close_flush_survives_normal_and_abrupt_restart() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP immediate_close_flush_survives_normal_and_abrupt_restart: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running close/crash draft recovery UI smoke with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-draft-boundary-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:notm-autosave-empty\"\n\
+             \n[identity]\nname = \"Fixture Sender\"\nprimary_email = \"sender@example.test\"\n\
+             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n\
+             \n[automation]\nallow_live_send_test = true\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+        ),
+    )?;
+    let recovery_path = work_dir.join("state/notm/draft.json");
+
+    let token = format!("notm-draft-boundary-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir.clone(), &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
+    for (command, value) in [
+        ("compose_set_from", "Fixture Sender <sender@example.test>"),
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Immediate close recovery"),
+        ("compose_set_body", "body flushed at close boundary"),
+    ] {
+        assert_eq!(
+            driver.command(command, json!({"value": value}))?["ok"],
+            true
+        );
+    }
+    assert_eq!(driver.command("close_main_window", json!({}))?["ok"], true);
+    let confirmation_id = pending_confirmation_id(&mut driver, "close_main_window")?;
+    let accepted = driver.command(
+        "respond_confirmation",
+        json!({"response": "accept", "id": confirmation_id}),
+    )?;
+    assert_eq!(
+        accepted["ok"], true,
+        "close confirmation failed: {accepted}"
+    );
+    drop(driver);
+    let status = app.wait_for_exit(Duration::from_secs(5))?;
+    ensure!(
+        status.success(),
+        "application did not exit after close flush: {status}\n{}",
+        app.logs()
+    );
+    assert_eq!(
+        recovery_body(&recovery_path)?,
+        "body flushed at close boundary"
+    );
+
+    prepare_app_work_dir_for_restart(&mut app, false)?;
+    let restart_token = format!("notm-draft-boundary-restart-ui-{run_id}");
+    let mut restarted =
+        FixtureApp::spawn_with_config(work_dir.clone(), &restart_token, &config_path)?;
+    let mut restarted_driver = restarted.connect(&restart_token)?;
+    restarted_driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let recovered = restarted_driver.command("app_state", json!({}))?;
+    assert_eq!(
+        recovered["state"]["compose_fields"]["body"], "body flushed at close boundary",
+        "normal restart did not recover the close-boundary draft: {recovered}"
+    );
+
+    let before_crash = draft_write_count(&draft_autosave_status(&mut restarted_driver)?)?;
+    assert_eq!(
+        restarted_driver.command(
+            "compose_set_body",
+            json!({"value": "body preserved across abrupt termination"}),
+        )?["ok"],
+        true
+    );
+    wait_for_draft_write_after(&mut restarted_driver, before_crash, Duration::from_secs(3))?;
+    assert_eq!(
+        recovery_body(&recovery_path)?,
+        "body preserved across abrupt termination"
+    );
+    drop(restarted_driver);
+    prepare_app_work_dir_for_restart(&mut restarted, true)?;
+
+    let crash_restart_token = format!("notm-draft-boundary-crash-ui-{run_id}");
+    let mut crash_restarted =
+        FixtureApp::spawn_with_config(work_dir, &crash_restart_token, &config_path)?;
+    let mut crash_restarted_driver = crash_restarted.connect(&crash_restart_token)?;
+    crash_restarted_driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let crash_recovered = crash_restarted_driver.command("app_state", json!({}))?;
+    assert_eq!(
+        crash_recovered["state"]["compose_fields"]["body"],
+        "body preserved across abrupt termination",
+        "abrupt restart did not recover the last completed atomic draft: {crash_recovered}"
+    );
+    Ok(())
+}
+
+#[test]
+fn fixture_send_waits_for_draft_flush_and_aborts_on_flush_failure() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_send_waits_for_draft_flush_and_aborts_on_flush_failure: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running send/draft-flush ordering UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-send-draft-flush-ui-{run_id}"));
+    let token = format!("notm-send-draft-flush-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
+    let recovery_path = recovery_path_from_harness(&mut driver)?;
+    let capture_dir = recovery_path
+        .parent()
+        .expect("fixture recovery parent")
+        .join("captured-send");
+    assert_eq!(
+        driver.command("set_fixture_draft_delay", json!({"milliseconds": 900}))?["ok"],
+        true
+    );
+    for (command, value) in [
+        ("compose_set_from", "Fixture User <fixture@example.test>"),
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Send waits for recovery flush"),
+        ("compose_set_body", "successful send flush body"),
+    ] {
+        assert_eq!(
+            driver.command(command, json!({"value": value}))?["ok"],
+            true
+        );
+    }
+
+    let before_send_write_count = draft_write_count(&draft_autosave_status(&mut driver)?)?;
+    let started = driver.command("compose_send", json!({}))?;
+    assert_eq!(started["ok"], true, "fixture send did not start: {started}");
+    assert_eq!(
+        started["pending"], true,
+        "send did not report pending: {started}"
+    );
+    thread::sleep(Duration::from_millis(150));
+    let during_flush = driver.command("health", json!({}))?;
+    assert_eq!(
+        during_flush["ok"], true,
+        "GTK blocked during send flush: {during_flush}"
+    );
+    assert_eq!(
+        regular_file_count(&capture_dir)?,
+        0,
+        "fixture transport ran before the delayed draft flush completed"
+    );
+    let sent_generation = started["state"]["compose_generation"]
+        .as_u64()
+        .with_context(|| format!("send start had no composer generation: {started}"))?;
+    let finalizing_deadline = Instant::now() + Duration::from_secs(3);
+    let (finalizing, finalizing_autosave) = loop {
+        let state = driver.command("draft_list_state", json!({}))?;
+        let autosave = draft_autosave_status(&mut driver)?;
+        if state["status_text"] == "Finalizing accepted send…"
+            && state["compose_fields"]["subject"] == "Send waits for recovery flush"
+            && autosave["busy"] == true
+            && autosave["pending_generation"] == sent_generation
+            && draft_write_count(&autosave)? >= before_send_write_count.saturating_add(2)
+        {
+            break (state, autosave);
+        }
+        ensure!(
+            Instant::now() < finalizing_deadline,
+            "send did not reach the active accepted-send recovery clear: state={state}, autosave={autosave}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+    assert_eq!(
+        regular_file_count(&capture_dir)?,
+        1,
+        "accepted-send recovery clear started before the fixture transport completed"
+    );
+    let mut last_edit = Value::Null;
+    for (command, value) in [
+        ("compose_set_subject", "Newer subject during final clear"),
+        ("compose_set_body", "newer body during final clear"),
+    ] {
+        let edited = driver.command(command, json!({"value": value}))?;
+        assert_eq!(
+            edited["ok"], true,
+            "{command} was blocked during accepted-send finalization: {edited}"
+        );
+        last_edit = edited;
+    }
+    assert_eq!(
+        last_edit["compose_fields"]["subject"], "Newer subject during final clear",
+        "accepted-send finalization did not retain the live subject edit: {last_edit}"
+    );
+    assert_eq!(
+        last_edit["compose_fields"]["body"], "newer body during final clear",
+        "accepted-send finalization did not retain the live body edit: {last_edit}"
+    );
+    let edited_state = driver.command("app_state", json!({}))?;
+    ensure!(
+        edited_state["state"]["compose_generation"]
+            .as_u64()
+            .is_some_and(|generation| generation > sent_generation),
+        "composer edits did not supersede accepted-send generation {sent_generation}: {edited_state}"
+    );
+    thread::sleep(Duration::from_millis(150));
+    let finalizing_health = driver.command("health", json!({}))?;
+    ensure!(
+        finalizing_health["gtk_heartbeat"].as_u64().unwrap_or(0)
+            > during_flush["gtk_heartbeat"].as_u64().unwrap_or(0),
+        "GTK heartbeat stopped before/during accepted-send finalization: before={during_flush}, finalizing={finalizing}, autosave={finalizing_autosave}, after={finalizing_health}"
+    );
+    let sent = driver.wait_for_send(Duration::from_secs(4))?;
+    assert_eq!(
+        sent["state"]["last_send_report"]["accepted"], true,
+        "send was not accepted after draft flush: {sent}"
+    );
+    assert_eq!(
+        sent["state"]["compose_fields"]["subject"], "Newer subject during final clear",
+        "accepted-send final clear discarded the newer subject: {sent}"
+    );
+    assert_eq!(
+        sent["state"]["compose_fields"]["body"], "newer body during final clear",
+        "accepted-send final clear discarded the newer body: {sent}"
+    );
+    let recovery: Value = serde_json::from_slice(&fs::read(&recovery_path)?)?;
+    assert_eq!(recovery["subject"], "Newer subject during final clear");
+    assert_eq!(recovery["body"], "newer body during final clear");
+    assert_eq!(regular_file_count(&capture_dir)?, 1);
+
+    for (command, value) in [
+        ("compose_set_from", "Fixture User <fixture@example.test>"),
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Failed flush must abort send"),
+        ("compose_set_body", "failed send flush body"),
+    ] {
+        assert_eq!(
+            driver.command(command, json!({"value": value}))?["ok"],
+            true
+        );
+    }
+    assert_eq!(
+        driver.command("fail_next_draft_write", json!({}))?["ok"],
+        true
+    );
+    let failed_start = driver.command("compose_send", json!({}))?;
+    assert_eq!(
+        failed_start["ok"], true,
+        "failed-flush send did not enter the pending state: {failed_start}"
+    );
+    let failed = driver.wait_for_send(Duration::from_secs(4))?;
+    assert_eq!(
+        failed["state"]["last_send_report"],
+        Value::Null,
+        "transport produced a report after draft flush failure: {failed}"
+    );
+    ensure!(
+        failed["state"]["last_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("draft flush failed")
+                && error.contains("injected draft write failure")),
+        "draft flush failure was not visible: {failed}"
+    );
+    assert_eq!(
+        failed["state"]["compose_fields"]["body"], "failed send flush body",
+        "failed flush cleared the composer: {failed}"
+    );
+    assert_eq!(
+        regular_file_count(&capture_dir)?,
+        1,
+        "transport ran despite the failed draft flush"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_named_draft_corruption_keeps_valid_rows_and_reports_warning() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_named_draft_corruption_keeps_valid_rows_and_reports_warning: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running named-draft corruption UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-draft-corruption-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let token = format!("notm-draft-corruption-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir.clone(), &token)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+
+    let initial = driver.command("draft_list_state", json!({}))?;
+    let drafts_dir = initial["drafts_dir"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("fixture exposed no named-draft directory: {initial}"))?;
+    fs::create_dir_all(&drafts_dir)?;
+    fs::write(
+        drafts_dir.join("valid.json"),
+        serde_json::to_vec_pretty(&json!({
+            "from": "",
+            "to": "recipient@example.test",
+            "cc": "",
+            "bcc": "",
+            "subject": "Valid draft survives corruption",
+            "body": "valid body",
+            "attachments": [],
+            "in_reply_to": null,
+            "references": [],
+            "text_reply_quote": null,
+            "html_reply_quote": null,
+        }))?,
+    )?;
+    fs::write(drafts_dir.join("malformed.json"), b"{truncated")?;
+    fs::create_dir(drafts_dir.join("unreadable.json"))?;
+
+    let requested = driver.command("refresh_named_drafts", json!({}))?;
+    assert_eq!(
+        requested["ok"], true,
+        "refresh was not scheduled: {requested}"
+    );
+    let generation = requested["generation"]
+        .as_u64()
+        .with_context(|| format!("refresh had no generation: {requested}"))?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let completed = loop {
+        let status = driver.command("draft_io_status", json!({}))?;
+        if status["list_busy"] == false
+            && status["list_completed_generation"].as_u64() == Some(generation)
+        {
+            break status;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "named-draft refresh did not complete: {status}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+    let warning = completed["last_error"]
+        .as_str()
+        .with_context(|| format!("rejected entries did not produce a warning: {completed}"))?;
+    ensure!(
+        warning.contains("Named draft refresh warning:")
+            && warning.contains("rejected 2")
+            && warning.contains("malformed.json")
+            && warning.contains("unreadable.json"),
+        "rejected-entry warning was not useful: {completed}"
+    );
+
+    let drafts = driver.command("list_drafts", json!({}))?;
+    let entries = json_array_at(&drafts, &["drafts"])?;
+    ensure!(
+        entries.len() == 1 && entries[0]["fields"]["subject"] == "Valid draft survives corruption",
+        "valid named draft was lost when neighbors were rejected: {drafts}"
+    );
+    let ui = driver.command("draft_list_state", json!({}))?;
+    let rows = json_array_at(&ui, &["list", "rows"])?;
+    ensure!(
+        rows.len() == 1
+            && rows[0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Valid draft survives corruption")),
+        "GTK draft rows were not replaced with the valid subset: {ui}"
+    );
+    assert_eq!(ui["last_error"], warning);
+    ensure!(
+        ui["status_text"]
+            .as_str()
+            .is_some_and(|status| status.contains("Named draft refresh warning:")),
+        "partial refresh warning was not visible in the status UI: {ui}"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_legacy_draft_migration_serializes_mutations_and_keeps_gtk_responsive()
+-> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_legacy_draft_migration_serializes_mutations_and_keeps_gtk_responsive: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running legacy draft migration serialization UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-draft-migration-ui-{run_id}"));
+    let legacy_dir = work_dir.join("legacy-drafts");
+    let token = format!("notm-draft-migration-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    wait_for_named_draft_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+
+    assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
+    for (command, value) in [
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Migration serialization sentinel"),
+        ("compose_set_body", "saved before legacy migration"),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(response["ok"], true, "{command} failed: {response}");
+    }
+    let saved = driver.command("save_draft", json!({}))?;
+    assert_eq!(
+        saved["ok"], true,
+        "initial named-draft save failed: {saved}"
+    );
+    let active_path = saved["report"]["local_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("initial save had no local path: {saved}"))?;
+    wait_for_named_draft_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+
+    let paths = driver.command("draft_list_state", json!({}))?;
+    let drafts_dir = paths["drafts_dir"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("fixture exposed no current draft directory: {paths}"))?;
+    fs::create_dir_all(&drafts_dir)?;
+    fs::create_dir_all(&legacy_dir)?;
+    assert_eq!(regular_file_count(&drafts_dir)?, 1);
+
+    let filler = serde_json::to_vec_pretty(&json!({
+        "from": "Fixture User <fixture@example.test>",
+        "to": "recipient@example.test",
+        "cc": "",
+        "bcc": "",
+        "subject": "Pre-existing capacity draft",
+        "body": "bounded migration fixture",
+        "attachments": [],
+        "in_reply_to": null,
+        "references": [],
+        "text_reply_quote": null,
+        "html_reply_quote": null,
+    }))?;
+    for index in 0..254 {
+        fs::write(
+            drafts_dir.join(format!("pre-existing-{index:03}.json")),
+            &filler,
+        )?;
+    }
+    let legacy_path = legacy_dir.join("legacy-newcomer.json");
+    fs::write(
+        &legacy_path,
+        serde_json::to_vec_pretty(&json!({
+            "from": "Fixture User <fixture@example.test>",
+            "to": "recipient@example.test",
+            "cc": "",
+            "bcc": "",
+            "subject": "Legacy capacity draft",
+            "body": "must migrate without racing a 257th write",
+            "attachments": [],
+            "in_reply_to": null,
+            "references": [],
+            "text_reply_quote": null,
+            "html_reply_quote": null,
+        }))?,
+    )?;
+    assert_eq!(regular_file_count(&drafts_dir)?, 255);
+    assert_eq!(regular_file_count(&legacy_dir)?, 1);
+
+    assert_eq!(
+        driver.command("set_fixture_draft_delay", json!({"milliseconds": 1200}))?["ok"],
+        true
+    );
+    let requested = driver.command(
+        "refresh_named_drafts",
+        json!({"migrate_legacy": true, "legacy_dir": legacy_dir}),
+    )?;
+    assert_eq!(
+        requested["ok"], true,
+        "migration was not scheduled: {requested}"
+    );
+    let generation = requested["generation"]
+        .as_u64()
+        .with_context(|| format!("migration had no generation: {requested}"))?;
+    let active = driver.command("draft_io_status", json!({}))?;
+    assert_eq!(
+        active["migration_busy"], true,
+        "migration was not exclusive: {active}"
+    );
+    assert_eq!(active["list_generation"].as_u64(), Some(generation));
+
+    let before_health = driver.command("health", json!({}))?;
+    let edited = driver.command(
+        "compose_set_body",
+        json!({"value": "composer edit while migration is delayed"}),
+    )?;
+    assert_eq!(
+        edited["ok"], true,
+        "migration blocked composer editing: {edited}"
+    );
+    for (command, args) in [
+        ("save_draft", json!({})),
+        ("delete_active_draft", json!({})),
+        ("compose_send", json!({})),
+    ] {
+        let blocked = driver.command(command, args)?;
+        assert_eq!(blocked["ok"], false, "{command} raced migration: {blocked}");
+        ensure!(
+            blocked["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("legacy drafts are migrating")),
+            "{command} did not explain the migration conflict: {blocked}"
+        );
+    }
+    let overlapping = driver.command("refresh_named_drafts", json!({}))?;
+    assert_eq!(
+        overlapping["ok"], false,
+        "refresh superseded a mutating migration: {overlapping}"
+    );
+    assert_eq!(overlapping["generation"].as_u64(), Some(generation));
+    assert_eq!(regular_file_count(&drafts_dir)?, 255);
+    assert_eq!(regular_file_count(&legacy_dir)?, 1);
+
+    thread::sleep(Duration::from_millis(175));
+    let after_health = driver.command("health", json!({}))?;
+    ensure!(
+        after_health["gtk_heartbeat"].as_u64().unwrap_or(0)
+            > before_health["gtk_heartbeat"].as_u64().unwrap_or(0),
+        "GTK heartbeat stopped during delayed migration: before={before_health}, after={after_health}"
+    );
+    let completed =
+        wait_for_named_draft_generation(&mut driver, generation, Duration::from_secs(5))?;
+    assert_eq!(completed["migration_busy"], false);
+    assert_eq!(
+        completed["last_error"],
+        Value::Null,
+        "migration failed: {completed}"
+    );
+    assert_eq!(regular_file_count(&drafts_dir)?, 256);
+    assert_eq!(regular_file_count(&legacy_dir)?, 0);
+    ensure!(
+        !legacy_path.exists(),
+        "migrated legacy source was not removed"
+    );
+
+    assert_eq!(
+        driver.command("set_fixture_draft_delay", json!({"milliseconds": 0}))?["ok"],
+        true
+    );
+    let delete = driver.command("delete_active_draft", json!({}))?;
+    assert_eq!(
+        delete["ok"], true,
+        "delete stayed blocked after migration: {delete}"
+    );
+    assert_eq!(delete["pending_confirmation"], true);
+    let delete_id = pending_confirmation_id(&mut driver, "delete_active_draft")?;
+    let deleted = driver.command(
+        "respond_confirmation",
+        json!({"response": "accept", "id": delete_id}),
+    )?;
+    assert_eq!(
+        deleted["ok"], true,
+        "post-migration delete failed: {deleted}"
+    );
+    wait_for_named_draft_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert!(!active_path.exists());
+    assert_eq!(regular_file_count(&drafts_dir)?, 255);
+
+    for (command, value) in [
+        ("compose_set_to", "recipient@example.test"),
+        ("compose_set_subject", "Post-migration save sentinel"),
+        ("compose_set_body", "save after migration gate released"),
+    ] {
+        let response = driver.command(command, json!({"value": value}))?;
+        assert_eq!(response["ok"], true, "{command} failed: {response}");
+    }
+    let resaved = driver.command("save_draft", json!({}))?;
+    assert_eq!(resaved["ok"], true, "post-migration save failed: {resaved}");
+    wait_for_named_draft_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(regular_file_count(&drafts_dir)?, 256);
+
+    let overflow_legacy = legacy_dir.join("overflow-newcomer.json");
+    fs::write(&overflow_legacy, &filler)?;
+    assert_eq!(
+        driver.command("set_fixture_draft_delay", json!({"milliseconds": 350}))?["ok"],
+        true
+    );
+    let rejected_request = driver.command(
+        "refresh_named_drafts",
+        json!({"migrate_legacy": true, "legacy_dir": legacy_dir}),
+    )?;
+    assert_eq!(rejected_request["ok"], true);
+    let rejected_generation = rejected_request["generation"]
+        .as_u64()
+        .with_context(|| format!("failing migration had no generation: {rejected_request}"))?;
+    let blocked = driver.command("save_draft", json!({}))?;
+    assert_eq!(
+        blocked["ok"], false,
+        "save raced failing migration: {blocked}"
+    );
+    let rejected =
+        wait_for_named_draft_generation(&mut driver, rejected_generation, Duration::from_secs(5))?;
+    assert_eq!(rejected["migration_busy"], false);
+    ensure!(
+        rejected["last_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("would contain 257 JSON files")),
+        "fatal migration policy error was not visible: {rejected}"
+    );
+    assert_eq!(regular_file_count(&drafts_dir)?, 256);
+    assert_eq!(regular_file_count(&legacy_dir)?, 1);
+
+    assert_eq!(
+        driver.command("set_fixture_draft_delay", json!({"milliseconds": 0}))?["ok"],
+        true
+    );
+    let final_delete = driver.command("delete_active_draft", json!({}))?;
+    assert_eq!(
+        final_delete["pending_confirmation"], true,
+        "fatal migration left draft deletion blocked: {final_delete}"
+    );
+    let final_delete_id = pending_confirmation_id(&mut driver, "delete_active_draft")?;
+    let final_deleted = driver.command(
+        "respond_confirmation",
+        json!({"response": "accept", "id": final_delete_id}),
+    )?;
+    assert_eq!(
+        final_deleted["ok"], true,
+        "delete after migration error failed: {final_deleted}"
+    );
+    wait_for_named_draft_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(regular_file_count(&drafts_dir)?, 255);
+    assert_eq!(regular_file_count(&legacy_dir)?, 1);
 
     Ok(())
 }
@@ -2045,6 +3691,7 @@ fn indexed_maildir_draft_refresh_stays_clean_during_message_navigation() -> anyh
         initial_selection["ok"], true,
         "initial thread selection failed: {initial_selection}"
     );
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
 
     let opened = driver.command("open_compose", json!({}))?;
     assert_eq!(opened["ok"], true, "composer did not open: {opened}");
@@ -2240,20 +3887,24 @@ fn indexed_maildir_saved_draft_restart_does_not_prompt_as_unsaved() -> anyhow::R
         recovery_path.display()
     );
 
+    let before_post_save_edit = draft_write_count(&draft_autosave_status(&mut driver)?)?;
     let edited = driver.command(
         "compose_set_body",
         json!({"value": "A later edit must recreate transient recovery state."}),
     )?;
     assert_eq!(edited["ok"], true, "post-save edit failed: {edited}");
+    wait_for_draft_write_after(&mut driver, before_post_save_edit, Duration::from_secs(3))?;
     ensure!(
         recovery_path.is_file(),
         "a post-save edit did not recreate transient recovery state"
     );
+    let before_revert = draft_write_count(&draft_autosave_status(&mut driver)?)?;
     let reverted = driver.command(
         "compose_set_body",
         json!({"value": "A saved draft must not become unsaved recovery state after restart."}),
     )?;
     assert_eq!(reverted["ok"], true, "post-save revert failed: {reverted}");
+    wait_for_draft_write_after(&mut driver, before_revert, Duration::from_secs(3))?;
     ensure!(
         !recovery_path.exists(),
         "returning exactly to saved fields left transient recovery state"
@@ -2625,11 +4276,13 @@ fn fixture_draft_confirmations_preserve_rejected_state() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .with_context(|| format!("draft state had no recovery path: {list_state}"))?;
 
+    let before_dirty = draft_write_count(&draft_autosave_status(&mut driver)?)?;
     let dirtied = driver.command(
         "compose_set_subject",
         json!({"value": "Dirty replacement must be confirmed"}),
     )?;
     assert_eq!(dirtied["ok"], true, "composer edit failed: {dirtied}");
+    wait_for_draft_write_after(&mut driver, before_dirty, Duration::from_secs(3))?;
     let before_replacement = capture_draft_confirmation_snapshot(
         &mut driver,
         &recovery_path,
@@ -2701,6 +4354,7 @@ fn fixture_draft_confirmations_preserve_rejected_state() -> anyhow::Result<()> {
         "accepted New did not clear recovery while preserving the named draft"
     );
 
+    let before_transient = draft_write_count(&draft_autosave_status(&mut driver)?)?;
     for (command, value) in [
         ("compose_set_subject", "Transient discard must be confirmed"),
         (
@@ -2711,6 +4365,7 @@ fn fixture_draft_confirmations_preserve_rejected_state() -> anyhow::Result<()> {
         let response = driver.command(command, json!({"value": value}))?;
         assert_eq!(response["ok"], true, "{command} failed: {response}");
     }
+    wait_for_draft_write_after(&mut driver, before_transient, Duration::from_secs(3))?;
     let before_discard = capture_draft_confirmation_snapshot(
         &mut driver,
         &recovery_path,
@@ -2829,6 +4484,7 @@ fn fixture_draft_confirmations_preserve_rejected_state() -> anyhow::Result<()> {
         selected["ok"], true,
         "named draft was not selectable: {selected}"
     );
+    let before_unrelated = draft_write_count(&draft_autosave_status(&mut driver)?)?;
     for (command, value) in [
         ("compose_set_subject", "Unrelated transient composer"),
         (
@@ -2839,6 +4495,7 @@ fn fixture_draft_confirmations_preserve_rejected_state() -> anyhow::Result<()> {
         let response = driver.command(command, json!({"value": value}))?;
         assert_eq!(response["ok"], true, "{command} failed: {response}");
     }
+    wait_for_draft_write_after(&mut driver, before_unrelated, Duration::from_secs(3))?;
     let before_named_delete = capture_draft_confirmation_snapshot(
         &mut driver,
         &recovery_path,
@@ -2979,7 +4636,7 @@ fn validated_config_launches_and_invalid_layout_requests_are_rejected() -> anyho
     ensure!(
         rejected_page_size["error"]
             .as_str()
-            .is_some_and(|error| error.contains("page size must be greater than zero")),
+            .is_some_and(|error| error.contains("page size must be between 1 and 1000")),
         "zero page size returned an unclear error: {rejected_page_size}"
     );
     assert_eq!(
@@ -3103,6 +4760,8 @@ fn fixture_existing_instance_message_id_request_reaches_primary() -> anyhow::Res
     let target = "thread-root-three-message@fixture.test";
     let mut app = FixtureApp::spawn_with_application_id(work_dir, &token, &application_id)?;
     let mut driver = app.connect(&token)?;
+    select_first_thread(&mut driver, "subject:\"Read inbox message\"")?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
     let initial = driver.command("app_state", json!({}))?;
     assert_ne!(
         initial["state"]["selected_message"]["message_id"], target,
@@ -3127,8 +4786,212 @@ fn fixture_existing_instance_message_id_request_reaches_primary() -> anyhow::Res
     };
 
     assert_eq!(state["state"]["active_pane"], "Message", "{state}");
-    assert_eq!(state["state"]["current_query"], "tag:inbox", "{state}");
+    assert_eq!(
+        state["state"]["current_query"],
+        format!("id:{target}"),
+        "outside-candidate target did not use the direct id-query fallback: {state}"
+    );
+    ensure!(
+        state["state"]["search_generation"].as_u64().unwrap_or(0)
+            > initial["state"]["search_generation"].as_u64().unwrap_or(0),
+        "outside-candidate target did not schedule its direct fallback search: initial={initial}, state={state}"
+    );
     assert_target_message_rendered(&mut driver)?;
+
+    Ok(())
+}
+
+#[test]
+fn fixture_existing_instance_absent_message_id_preserves_current_view() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_existing_instance_absent_message_id_preserves_current_view: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running absent existing-instance message-id UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-message-id-absent-remote-ui-{run_id}"));
+    let token = format!("notm-message-id-absent-remote-ui-{run_id}");
+    let application_id = format!("io.github.kris004.notm.test.r{}", run_id.replace('-', ""));
+    let missing = "globally-absent-message@fixture.test";
+    let query = "subject:\"Three message thread\"";
+    let root_message_id = "thread-root-three-message@fixture.test";
+
+    let mut app = FixtureApp::spawn_with_application_id(work_dir, &token, &application_id)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let requested = driver.command("set_search_query", json!({"query": query}))?;
+    assert_eq!(
+        requested["ok"], true,
+        "could not set visible query: {requested}"
+    );
+    let searched = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let rows = json_array_at(&searched, &["state", "thread_list_items"])?;
+    ensure!(rows.len() == 1, "expected one fixture thread: {searched}");
+    let selected_thread = driver.command("select_thread_by_index", json!({"index": 0}))?;
+    assert_eq!(
+        selected_thread["ok"], true,
+        "could not select fixture thread: {selected_thread}"
+    );
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let selected = driver.command("select_message_by_index", json!({"index": 0}))?;
+    assert_eq!(
+        selected["selected_message"]["message_id"], root_message_id,
+        "fixture root message was not selected: {selected}"
+    );
+    let pane = driver.command("send_key", json!({"key": "h", "modifiers": ["control"]}))?;
+    assert_eq!(pane["handled"], true, "Ctrl+h was not handled: {pane}");
+    assert_eq!(pane["active_pane"], "Threads", "{pane}");
+
+    let before_state = driver.command("app_state", json!({}))?;
+    let before_entry = driver.command("entry_state", json!({}))?;
+    let before_selection = driver.command("thread_selection_view_state", json!({}))?;
+    let before_rendered = driver.command("message_view_text", json!({}))?;
+    assert_eq!(
+        before_state["state"]["current_query"], query,
+        "{before_state}"
+    );
+    assert_eq!(before_entry["search"], query, "{before_entry}");
+    assert_eq!(
+        before_state["state"]["active_pane"], "Threads",
+        "{before_state}"
+    );
+    assert_eq!(before_entry["active_pane"], "Threads", "{before_entry}");
+    assert_eq!(
+        before_state["state"]["selected_message"]["message_id"], root_message_id,
+        "{before_state}"
+    );
+    assert_eq!(
+        before_selection["selected_local"].as_u64(),
+        Some(0),
+        "{before_selection}"
+    );
+    ensure!(
+        before_rendered["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Thread root body.")),
+        "known message was not rendered before the absent request: {before_rendered}"
+    );
+
+    app.request_message_id(&token, &application_id, missing)?;
+    let expected_status = format!("Message id not found: {missing}");
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let state = driver.command("app_state", json!({})).with_context(|| {
+            format!(
+                "reading state after absent message-id request\n{}",
+                app.logs()
+            )
+        })?;
+        let entry = driver.command("entry_state", json!({})).with_context(|| {
+            format!(
+                "reading entry after absent message-id request\n{}",
+                app.logs()
+            )
+        })?;
+        let load = driver
+            .command("thread_load_status", json!({}))
+            .with_context(|| {
+                format!(
+                    "reading load state after absent message-id request\n{}",
+                    app.logs()
+                )
+            })?;
+        if entry["status"].as_str() == Some(expected_status.as_str())
+            && state["state"]["pending_open_message_id"].is_null()
+            && state["state"]["search_loading"] == false
+            && load["busy"] == false
+        {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "absent message-id request did not settle: state={state}, entry={entry}, load={load}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+
+    // Wait past SearchBar's debounce so an unnecessary programmatic change
+    // cannot schedule a late replacement search after the rollback appears done.
+    thread::sleep(Duration::from_millis(500));
+    let after_state = driver
+        .command("app_state", json!({}))
+        .with_context(|| format!("reading settled absent-request state\n{}", app.logs()))?;
+    let after_entry = driver
+        .command("entry_state", json!({}))
+        .with_context(|| format!("reading settled absent-request entry\n{}", app.logs()))?;
+    let after_load = driver
+        .command("thread_load_status", json!({}))
+        .with_context(|| format!("reading settled absent-request loader\n{}", app.logs()))?;
+    let after_selection = driver
+        .command("thread_selection_view_state", json!({}))
+        .with_context(|| format!("reading settled absent-request selection\n{}", app.logs()))?;
+    let after_rendered = driver
+        .command("message_view_text", json!({}))
+        .with_context(|| format!("reading settled absent-request message\n{}", app.logs()))?;
+
+    assert_eq!(after_entry["status"], expected_status, "{after_entry}");
+    assert_eq!(
+        after_state["state"]["pending_open_message_id"],
+        Value::Null,
+        "{after_state}"
+    );
+    assert_eq!(
+        after_state["state"]["search_loading"], false,
+        "{after_state}"
+    );
+    assert_eq!(after_load["busy"], false, "{after_load}");
+    assert_eq!(
+        after_state["state"]["current_query"], before_state["state"]["current_query"],
+        "absent message request replaced the active query: {after_state}"
+    );
+    assert_eq!(
+        after_state["state"]["search_generation"], before_state["state"]["search_generation"],
+        "absent message request scheduled a direct fallback search: {after_state}"
+    );
+    assert_eq!(
+        after_state["state"]["thread_list_items"], before_state["state"]["thread_list_items"],
+        "absent message request replaced the visible result set: {after_state}"
+    );
+    assert_eq!(
+        after_entry["search"], before_entry["search"],
+        "absent message request replaced the visible search text: {after_entry}"
+    );
+    assert_eq!(
+        after_state["state"]["selected_thread"], before_state["state"]["selected_thread"],
+        "absent message request changed the state thread selection: {after_state}"
+    );
+    assert_eq!(
+        after_state["state"]["selected_message"], before_state["state"]["selected_message"],
+        "absent message request changed the state message selection: {after_state}"
+    );
+    assert_eq!(
+        after_state["state"]["messages"], before_state["state"]["messages"],
+        "absent message request replaced the loaded thread: {after_state}"
+    );
+    assert_eq!(
+        after_selection["selected_local"], before_selection["selected_local"],
+        "absent message request changed the GTK local selection: {after_selection}"
+    );
+    assert_eq!(
+        after_selection["selected_abs"], before_selection["selected_abs"],
+        "absent message request changed the GTK absolute selection: {after_selection}"
+    );
+    assert_eq!(
+        after_state["state"]["active_pane"], before_state["state"]["active_pane"],
+        "absent message request changed the state pane: {after_state}"
+    );
+    assert_eq!(
+        after_entry["active_pane"], before_entry["active_pane"],
+        "absent message request changed the visible pane: {after_entry}"
+    );
+    assert_eq!(
+        after_rendered["text"], before_rendered["text"],
+        "absent message request replaced or cleared the rendered message"
+    );
 
     Ok(())
 }
@@ -3304,7 +5167,13 @@ fn fixture_reply_all_preserves_quoted_names_and_flattens_groups() -> anyhow::Res
 
     let reply = driver.command("reply_all_selected", json!({}))?;
     assert_eq!(reply["ok"], true, "reply-all command failed: {reply}");
-    let fields = &reply["compose_fields"];
+    assert_eq!(
+        reply["pending"], true,
+        "reply-all was not prepared asynchronously: {reply}"
+    );
+    wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let reply = driver.command("app_state", json!({}))?;
+    let fields = &reply["state"]["compose_fields"];
     assert_eq!(
         fields["to"], r#"Sender <sender@example.test>, "Doe, Jane" <jane@example.test>"#,
         "reply-all did not preserve the quoted display name: {reply}"
@@ -3358,10 +5227,19 @@ fn fixture_attachment_save_keeps_existing_files() -> anyhow::Result<()> {
         json!({"index": 0, "dir": downloads}),
     )?;
     assert_eq!(first["ok"], true, "first attachment save failed: {first}");
-    let first_path = first["path"]
+    assert_eq!(
+        first["pending"], true,
+        "first save was not asynchronous: {first}"
+    );
+    let first_status = wait_for_attachment_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let first_path = first_status["last_completion"]["path"]
         .as_str()
         .map(PathBuf::from)
-        .with_context(|| format!("first save returned no path: {first}"))?;
+        .with_context(|| format!("first save returned no path: {first_status}"))?;
+    assert_eq!(
+        first_status["last_completion"]["applied"], true,
+        "first save completion was stale: {first_status}"
+    );
     assert_eq!(first_path, downloads.join("note (1).txt"));
     assert_eq!(fs::read(&original_path)?, b"keep this file");
     ensure!(
@@ -3377,10 +5255,15 @@ fn fixture_attachment_save_keeps_existing_files() -> anyhow::Result<()> {
         second["ok"], true,
         "second attachment save failed: {second}"
     );
-    let second_path = second["path"]
+    assert_eq!(
+        second["pending"], true,
+        "second save was not asynchronous: {second}"
+    );
+    let second_status = wait_for_attachment_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let second_path = second_status["last_completion"]["path"]
         .as_str()
         .map(PathBuf::from)
-        .with_context(|| format!("second save returned no path: {second}"))?;
+        .with_context(|| format!("second save returned no path: {second_status}"))?;
     assert_eq!(second_path, downloads.join("note (2).txt"));
     assert_eq!(fs::read(&original_path)?, b"keep this file");
     ensure!(
@@ -3395,6 +5278,496 @@ fn fixture_attachment_save_keeps_existing_files() -> anyhow::Result<()> {
     ensure!(
         last_operation.contains(&second_path.display().to_string()),
         "attachment log did not report the collision-free path: {logs}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn fixture_attachment_io_stays_responsive_and_rejects_stale_ui_completion() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_attachment_io_stays_responsive_and_rejects_stale_ui_completion: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running asynchronous attachment I/O stress with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-attachment-async-ui-{run_id}"));
+    let downloads = work_dir.join("downloads");
+    fs::create_dir_all(&downloads)?;
+    let token = format!("notm-attachment-async-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir.clone(), &token)?;
+    let mut driver = app.connect(&token)?;
+    select_first_thread(&mut driver, "subject:\"Attachment message\"")?;
+
+    driver.command("set_fixture_attachment_delay", json!({"milliseconds": 900}))?;
+    let slow_started = Instant::now();
+    let slow = driver.command(
+        "save_selected_attachment",
+        json!({"index": 0, "dir": downloads}),
+    )?;
+    ensure!(
+        slow_started.elapsed() < Duration::from_millis(500),
+        "delayed attachment save blocked the GTK harness: elapsed={:?}, response={slow}",
+        slow_started.elapsed()
+    );
+    assert_eq!(
+        slow["pending"], true,
+        "slow save did not remain pending: {slow}"
+    );
+    let slow_request = slow["request_id"]
+        .as_u64()
+        .with_context(|| format!("slow save returned no request ID: {slow}"))?;
+    let first_health = driver.command("health", json!({}))?;
+    assert_eq!(
+        first_health["attachment_io"]["busy"], true,
+        "health did not report delayed attachment I/O: {first_health}"
+    );
+
+    driver.command("set_fixture_attachment_delay", json!({"milliseconds": 0}))?;
+    let current = driver.command(
+        "save_selected_attachment",
+        json!({"index": 0, "dir": downloads}),
+    )?;
+    let current_request = current["request_id"]
+        .as_u64()
+        .with_context(|| format!("current save returned no request ID: {current}"))?;
+    ensure!(
+        current_request > slow_request,
+        "newer save did not receive a newer request ID: slow={slow}, current={current}"
+    );
+    let current_deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let status = driver.command("attachment_io_status", json!({}))?;
+        if status["last_completion"]["request_id"] == current_request
+            && status["last_completion"]["applied"] == true
+        {
+            assert_eq!(
+                status["busy"], true,
+                "slow stale write unexpectedly finished before the current write: {status}"
+            );
+            break;
+        }
+        ensure!(
+            Instant::now() < current_deadline,
+            "current attachment save did not complete in time: {status}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+
+    let compose = driver.command("open_compose", json!({}))?;
+    assert_eq!(
+        compose["ok"], true,
+        "GTK input was not processed during stale attachment I/O: {compose}"
+    );
+    let cleared = driver.command("attachment_list_items", json!({}))?;
+    assert_eq!(
+        json_array_at(&cleared, &["attachments"])?.len(),
+        0,
+        "hiding the thread retained stale attachment items: {cleared}"
+    );
+    thread::sleep(Duration::from_millis(150));
+    let second_health = driver.command("health", json!({}))?;
+    ensure!(
+        second_health["gtk_heartbeat"].as_u64().unwrap_or(0)
+            > first_health["gtk_heartbeat"].as_u64().unwrap_or(0),
+        "GTK heartbeat stopped during delayed attachment I/O: before={first_health}, after={second_health}"
+    );
+    assert_eq!(
+        second_health["attachment_io"]["busy"], true,
+        "delayed attachment I/O ended before the responsiveness assertion: {second_health}"
+    );
+
+    let settled = wait_for_attachment_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+    ensure!(
+        settled["stale_completion_count"].as_u64().unwrap_or(0) >= 1,
+        "stale completion was not rejected: {settled}"
+    );
+    assert_eq!(
+        settled["last_completion"]["request_id"], slow_request,
+        "delayed stale completion did not arrive last: {settled}"
+    );
+    assert_eq!(
+        settled["last_completion"]["applied"], false,
+        "stale attachment completion updated the UI: {settled}"
+    );
+    for path in [downloads.join("note.txt"), downloads.join("note (1).txt")] {
+        ensure!(
+            path.is_file(),
+            "accepted attachment save was lost: {}",
+            path.display()
+        );
+        ensure!(
+            String::from_utf8_lossy(&fs::read(&path)?).contains("attached text"),
+            "saved attachment had unexpected contents: {}",
+            path.display()
+        );
+    }
+    let logs = driver.command("get_logs", json!({}))?;
+    ensure!(
+        logs["last_operation"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&downloads.join("note.txt").display().to_string()),
+        "stale completion replaced the current attachment operation: {logs}"
+    );
+
+    select_first_thread(&mut driver, "subject:\"Attachment message\"")?;
+    let blocked_parent = work_dir.join("not-a-directory");
+    fs::write(&blocked_parent, b"block attachment directory creation")?;
+    driver.command("set_fixture_attachment_delay", json!({"milliseconds": 600}))?;
+    let failed = driver.command(
+        "save_selected_attachment",
+        json!({"index": 0, "dir": blocked_parent.join("child")}),
+    )?;
+    assert_eq!(
+        failed["pending"], true,
+        "failure path blocked synchronously: {failed}"
+    );
+    let failure_health_before = driver.command("health", json!({}))?;
+    thread::sleep(Duration::from_millis(150));
+    let failure_health_after = driver.command("health", json!({}))?;
+    ensure!(
+        failure_health_after["gtk_heartbeat"].as_u64().unwrap_or(0)
+            > failure_health_before["gtk_heartbeat"].as_u64().unwrap_or(0),
+        "GTK heartbeat stopped during a failing attachment write: before={failure_health_before}, after={failure_health_after}"
+    );
+    let failure_status = wait_for_attachment_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        failure_status["last_completion"]["applied"], true,
+        "current attachment failure was treated as stale: {failure_status}"
+    );
+    ensure!(
+        failure_status["last_completion"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("saving attachment")),
+        "typed attachment write failure was not reported: {failure_status}"
+    );
+    let failure_logs = driver.command("get_logs", json!({}))?;
+    ensure!(
+        failure_logs["recent_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("saving attachment")),
+        "attachment write failure was not visible in UI state: {failure_logs}"
+    );
+
+    let composer_cache_directory = work_dir.join("state/notm/compose-attachments");
+    let count_composer_cache_files = || -> anyhow::Result<usize> {
+        match fs::read_dir(&composer_cache_directory) {
+            Ok(entries) => Ok(entries.collect::<Result<Vec<_>, _>>()?.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "reading composer cache directory {}",
+                    composer_cache_directory.display()
+                )
+            }),
+        }
+    };
+    let cache_metrics_start = driver.command("health", json!({}))?;
+    let initial_submitted = cache_metrics_start["attachment_io"]["composer_cache"]["submitted"]
+        .as_u64()
+        .unwrap_or(0);
+    let initial_cancelled = cache_metrics_start["attachment_io"]["composer_cache"]["cancelled"]
+        .as_u64()
+        .unwrap_or(0);
+    let initial_heartbeat = cache_metrics_start["gtk_heartbeat"].as_u64().unwrap_or(0);
+
+    const RAPID_CACHE_REQUESTS: u64 = 8;
+    driver.command(
+        "set_fixture_attachment_delay",
+        json!({"milliseconds": 1200}),
+    )?;
+    for request_index in 0..RAPID_CACHE_REQUESTS {
+        let cache_started = Instant::now();
+        let forward = driver.command("forward_as_attachment_selected", json!({}))?;
+        let command_elapsed = cache_started.elapsed();
+        assert_eq!(
+            forward["ok"], true,
+            "forward-as-attachment request {request_index} did not start: {forward}"
+        );
+        assert_eq!(
+            forward["pending"], true,
+            "forward request {request_index} was not asynchronous: {forward}"
+        );
+        ensure!(
+            command_elapsed < Duration::from_millis(500),
+            "forward request {request_index} blocked GTK: elapsed={command_elapsed:?}, response={forward}"
+        );
+        wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    }
+    let cache_health_before = driver.command("health", json!({}))?;
+    let cache_before = &cache_health_before["attachment_io"]["composer_cache"];
+    assert_eq!(
+        cache_before["busy"], true,
+        "health did not report delayed composer caching: {cache_health_before}"
+    );
+    ensure!(
+        cache_health_before["gtk_heartbeat"].as_u64().unwrap_or(0) > initial_heartbeat,
+        "GTK heartbeat did not advance during rapid cache requests: before={cache_metrics_start}, after={cache_health_before}"
+    );
+    ensure!(
+        cache_before["submitted"].as_u64().unwrap_or(0) >= initial_submitted + RAPID_CACHE_REQUESTS,
+        "rapid requests were not all submitted to the bounded cache service: {cache_health_before}"
+    );
+    assert_eq!(
+        cache_before["peak_active_preparations"], 1,
+        "composer cache ran more than one preparation concurrently: {cache_health_before}"
+    );
+    ensure!(
+        cache_before["pending_requests"]
+            .as_u64()
+            .unwrap_or(u64::MAX)
+            <= 1
+            && cache_before["peak_pending_requests"]
+                .as_u64()
+                .unwrap_or(u64::MAX)
+                <= 1,
+        "composer cache retained an unbounded pending queue: {cache_health_before}"
+    );
+    ensure!(
+        cache_before["cancelled"].as_u64().unwrap_or(0)
+            >= initial_cancelled + RAPID_CACHE_REQUESTS - 1,
+        "superseded cache requests were not cooperatively cancelled: {cache_health_before}"
+    );
+    driver.command(
+        "compose_set_subject",
+        json!({"value": "Keep newer composer edit"}),
+    )?;
+    thread::sleep(Duration::from_millis(150));
+    let cache_health_after = driver.command("health", json!({}))?;
+    ensure!(
+        cache_health_after["gtk_heartbeat"].as_u64().unwrap_or(0)
+            > cache_health_before["gtk_heartbeat"].as_u64().unwrap_or(0),
+        "GTK heartbeat stopped during delayed composer caching: before={cache_health_before}, after={cache_health_after}"
+    );
+    let cancelled_cache = wait_for_composer_attachment_cache_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        cancelled_cache["composer_cache"]["outcome"], "cancelled",
+        "typing did not cancel the pending composer cache: {cancelled_cache}"
+    );
+    ensure!(
+        cancelled_cache["composer_cache"]["cancelled"]
+            .as_u64()
+            .unwrap_or(0)
+            >= initial_cancelled + RAPID_CACHE_REQUESTS,
+        "typing did not cooperatively cancel the latest cache worker: {cancelled_cache}"
+    );
+    assert_eq!(
+        count_composer_cache_files()?,
+        0,
+        "cancelled composer caches left stale files in {}",
+        composer_cache_directory.display()
+    );
+    // Cancellation is intentionally faster than the outer draft debounce;
+    // wait for the state snapshot rather than mistaking a still-pending GTK
+    // field capture for lost typing.
+    thread::sleep(Duration::from_millis(350));
+    let stale_composer = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        stale_composer["state"]["compose_fields"]["subject"], "Keep newer composer edit",
+        "stale composer cache completion replaced newer typing: {stale_composer}"
+    );
+    assert_eq!(
+        json_array_at(&stale_composer, &["state", "compose_fields", "attachments"])?.len(),
+        0,
+        "stale composer cache completion installed its attachment: {stale_composer}"
+    );
+
+    driver.command("set_fixture_attachment_delay", json!({"milliseconds": 0}))?;
+    let replacement = driver.command("forward_as_attachment_selected", json!({}))?;
+    assert_eq!(
+        replacement["pending"], true,
+        "replacement preparation was not asynchronous: {replacement}"
+    );
+    wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let replacement = driver.command("pending_confirmation", json!({}))?;
+    assert!(
+        replacement["pending"].is_object(),
+        "dirty composer replacement did not preserve modal confirmation: {replacement}"
+    );
+    let accepted = driver.command("respond_confirmation", json!({"response": "accept"}))?;
+    assert_eq!(
+        accepted["ok"], true,
+        "composer replacement failed: {accepted}"
+    );
+    let applied_cache = wait_for_composer_attachment_cache_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        applied_cache["composer_cache"]["outcome"], "applied",
+        "accepted composer cache did not report an applied completion: {applied_cache}"
+    );
+    assert_eq!(
+        applied_cache["composer_cache"]["completed_generation"],
+        applied_cache["composer_cache"]["latest_generation"],
+        "accepted composer cache was not the latest generation: {applied_cache}"
+    );
+    assert_eq!(
+        applied_cache["composer_cache"]["peak_active_preparations"], 1,
+        "composer cache exceeded one worker after the accepted replacement: {applied_cache}"
+    );
+    let cached_composer = driver.command("app_state", json!({}))?;
+    let cached_paths = json_array_at(
+        &cached_composer,
+        &["state", "compose_fields", "attachments"],
+    )?;
+    assert_eq!(
+        cached_paths.len(),
+        1,
+        "accepted forward did not install one cached attachment: {cached_composer}"
+    );
+    let cached_path = cached_paths[0]
+        .as_str()
+        .with_context(|| format!("cached forward path was not a string: {cached_composer}"))?;
+    ensure!(
+        Path::new(cached_path).starts_with(&composer_cache_directory),
+        "accepted composer cache path escaped the isolated cache directory: {cached_path}"
+    );
+    assert_eq!(
+        count_composer_cache_files()?,
+        1,
+        "accepted composer cache did not leave exactly one committed file"
+    );
+    ensure!(
+        fs::read(cached_path)?.starts_with(b"From:"),
+        "cached forward did not contain the exact RFC 5322 source: {cached_path}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn fixture_closing_last_window_waits_for_atomic_attachment_save() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_closing_last_window_waits_for_atomic_attachment_save: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running atomic attachment lifetime UI smoke with {display}");
+
+    const LARGE_ATTACHMENT_BYTES: usize = 6 * 1024 * 1024;
+    const ATTACHMENT_FILENAME: &str = "fixture-0-00.txt";
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-attachment-lifetime-ui-{run_id}"));
+    let failed_downloads = work_dir.join("failed-downloads");
+    let completed_downloads = work_dir.join("completed-downloads");
+    fs::create_dir_all(&failed_downloads)?;
+    fs::create_dir_all(&completed_downloads)?;
+    let preserved_target = failed_downloads.join(ATTACHMENT_FILENAME);
+    fs::write(&preserved_target, b"preserve the prior destination")?;
+    let failed_tree_before = directory_tree_snapshot(&failed_downloads)?;
+
+    let token = format!("notm-attachment-lifetime-ui-{run_id}");
+    let mut app =
+        FixtureApp::spawn_with_large_attachment(work_dir, &token, LARGE_ATTACHMENT_BYTES)?;
+    let mut driver = app.connect(&token)?;
+    select_first_thread(&mut driver, "id:attachment-heavy-0@fixture.test")?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+
+    let listed = driver.command("attachment_list_items", json!({}))?;
+    let attachments = json_array_at(&listed, &["attachments"])?;
+    ensure!(
+        attachments.first().is_some_and(|attachment| {
+            attachment["filename"] == ATTACHMENT_FILENAME
+                && attachment["size"] == LARGE_ATTACHMENT_BYTES
+        }),
+        "large fixture attachment was not available first: {listed}"
+    );
+
+    let armed = driver.command("fail_next_attachment_write", json!({}))?;
+    assert_eq!(
+        armed["ok"], true,
+        "fixture attachment failure did not arm: {armed}"
+    );
+    let failed = driver.command(
+        "save_selected_attachment",
+        json!({"index": 0, "dir": failed_downloads}),
+    )?;
+    assert_eq!(
+        failed["pending"], true,
+        "injected attachment write did not start asynchronously: {failed}"
+    );
+    let failed_status = wait_for_attachment_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+    ensure!(
+        failed_status["last_completion"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("injected attachment write failure")),
+        "injected atomic attachment failure was not reported: {failed_status}"
+    );
+    assert_eq!(
+        fs::read(&preserved_target)?,
+        b"preserve the prior destination",
+        "failed atomic save replaced the prior destination"
+    );
+    assert_eq!(
+        directory_tree_snapshot(&failed_downloads)?,
+        failed_tree_before,
+        "failed atomic save left a numbered destination or temporary artifact"
+    );
+
+    let applied_delay = driver.command(
+        "set_fixture_attachment_delay",
+        json!({"milliseconds": 1200}),
+    )?;
+    assert_eq!(applied_delay["milliseconds"], 1200);
+    let completed_target = completed_downloads.join(ATTACHMENT_FILENAME);
+    let started = driver.command(
+        "save_selected_attachment",
+        json!({"index": 0, "dir": completed_downloads}),
+    )?;
+    assert_eq!(
+        started["pending"], true,
+        "delayed large attachment save did not start: {started}"
+    );
+    assert_eq!(
+        driver.command("attachment_io_status", json!({}))?["busy"],
+        true,
+        "attachment worker was not active before closing"
+    );
+    ensure!(
+        !completed_target.exists(),
+        "atomic destination became visible before the delayed worker completed"
+    );
+
+    let closed = driver.command("close_main_window", json!({}))?;
+    assert_eq!(closed["ok"], true, "main-window close failed: {closed}");
+    drop(driver);
+    thread::sleep(Duration::from_millis(250));
+    ensure!(
+        app.child.try_wait()?.is_none(),
+        "application exited while its attachment worker was still pending\n{}",
+        app.logs()
+    );
+    ensure!(
+        !completed_target.exists(),
+        "attachment destination was exposed before the delayed write completed"
+    );
+
+    let status = app.wait_for_exit(STARTUP_TIMEOUT)?;
+    ensure!(
+        status.success(),
+        "application failed while finishing attachment save after close: {status}\n{}",
+        app.logs()
+    );
+    let completed = fs::read(&completed_target)?;
+    ensure!(
+        completed.len() == LARGE_ATTACHMENT_BYTES && completed.iter().all(|byte| *byte == b'x'),
+        "attachment destination did not contain the exact complete fixture payload: bytes={}",
+        completed.len()
+    );
+    let completed_tree = directory_tree_snapshot(&completed_downloads)?;
+    ensure!(
+        completed_tree.len() == 2
+            && completed_tree
+                .get(Path::new("."))
+                .is_some_and(Option::is_none)
+            && completed_tree
+                .get(Path::new(ATTACHMENT_FILENAME))
+                .is_some_and(|entry| entry.as_deref() == Some(completed.as_slice())),
+        "successful atomic attachment save left an unexpected partial or temporary artifact: {completed_tree:?}"
     );
 
     Ok(())
@@ -3461,9 +5834,14 @@ fn fixture_attachment_save_chooser_and_private_open_are_deterministic() -> anyho
     )?;
     assert_eq!(accepted["ok"], true, "chooser accept failed: {accepted}");
     assert_eq!(
-        accepted["path"],
+        accepted["pending"], true,
+        "accepted chooser write was not asynchronous: {accepted}"
+    );
+    let accepted_status = wait_for_attachment_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        accepted_status["last_completion"]["path"],
         collision_target.display().to_string(),
-        "chooser did not honor the renamed full target and collision policy: {accepted}"
+        "chooser did not honor the renamed full target and collision policy: {accepted_status}"
     );
     assert_eq!(fs::read(&selected_target)?, b"keep renamed target");
     ensure!(
@@ -3519,10 +5897,15 @@ fn fixture_attachment_save_chooser_and_private_open_are_deterministic() -> anyho
         opened["ok"], true,
         "private attachment Open failed: {opened}"
     );
-    let opened_path = opened["path"]
+    assert_eq!(
+        opened["pending"], true,
+        "Open was not asynchronous: {opened}"
+    );
+    let opened_io = wait_for_attachment_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let opened_path = opened_io["last_completion"]["path"]
         .as_str()
         .map(PathBuf::from)
-        .with_context(|| format!("Open returned no path: {opened}"))?;
+        .with_context(|| format!("Open returned no path: {opened_io}"))?;
     assert_eq!(opened_path.parent(), Some(open_temp_dir.as_path()));
     assert_eq!(
         opened_path.file_name().and_then(|name| name.to_str()),
@@ -3630,10 +6013,11 @@ fn fixture_malformed_text_shows_a_decode_warning() -> anyhow::Result<()> {
         saved["ok"], true,
         "valid sibling could not be saved: {saved}"
     );
-    let saved_path = saved["path"]
+    let saved_status = wait_for_attachment_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let saved_path = saved_status["last_completion"]["path"]
         .as_str()
         .map(PathBuf::from)
-        .with_context(|| format!("sibling save returned no path: {saved}"))?;
+        .with_context(|| format!("sibling save returned no path: {saved_status}"))?;
     assert_eq!(fs::read(saved_path)?, b"good sibling");
 
     let text_view = driver.command("show_text_thread", json!({}))?;
@@ -4148,14 +6532,17 @@ fn oversized_thread_rejection_restores_selection_before_tagging() -> anyhow::Res
         selected["selected_thread"]["thread_id"], safe_thread_id,
         "safe thread was not selected before rejection: {selected}"
     );
+    wait_for_thread_load_idle(&mut driver, LARGE_THREAD_COMMAND_TIMEOUT)?;
 
     let rejected = driver.command("select_thread_by_index", json!({"index": oversized_index}))?;
     assert_eq!(
-        rejected["selected_thread_index"], safe_index,
-        "rejected oversized row remained selected: {rejected}"
+        rejected["ok"], true,
+        "oversized selection was not scheduled: {rejected}"
     );
+    wait_for_thread_load_idle(&mut driver, LARGE_THREAD_COMMAND_TIMEOUT)?;
+    let rejected = driver.command("app_state", json!({}))?;
     assert_eq!(
-        rejected["selected_thread"]["thread_id"], safe_thread_id,
+        rejected["state"]["selected_thread"]["thread_id"], safe_thread_id,
         "rejected oversized selection changed the state target: {rejected}"
     );
     let selection = driver.command("thread_selection_view_state", json!({}))?;
@@ -4163,9 +6550,8 @@ fn oversized_thread_rejection_restores_selection_before_tagging() -> anyhow::Res
         selection["selected_local"], safe_index,
         "GTK selection did not roll back with state: {selection}"
     );
-    let rejected_state = driver.command("app_state", json!({}))?;
     ensure!(
-        rejected_state["state"]["last_error"]
+        rejected["state"]["last_error"]
             .as_str()
             .is_some_and(|error| {
                 error.contains(&format!("contains {OVERSIZED_MESSAGE_COUNT} message(s)"))
@@ -4175,7 +6561,7 @@ fn oversized_thread_rejection_restores_selection_before_tagging() -> anyhow::Res
                     ))
                     && error.contains("no partial thread was loaded")
             }),
-        "oversized rejection was not surfaced: {rejected_state}"
+        "oversized rejection was not surfaced: {rejected}"
     );
 
     let tagged = driver.command("tag_selected", json!({"add": [&mutation_tag]}))?;
@@ -4358,6 +6744,7 @@ fn isolated_message_io_mime_survives_missing_copy_limits_and_restart() -> anyhow
     // complete on slower CI runners.
     let mut driver = app.connect_with_command_timeout(&token, LARGE_THREAD_COMMAND_TIMEOUT)?;
     select_first_thread(&mut driver, &format!("id:{root_message_id}"))?;
+    wait_for_thread_load_idle(&mut driver, LARGE_THREAD_COMMAND_TIMEOUT)?;
     let first_state = driver.command("app_state", json!({}))?;
     assert_complete_message_io_thread(
         &first_state,
@@ -4533,6 +6920,7 @@ fn isolated_message_io_mime_survives_missing_copy_limits_and_restart() -> anyhow
     let mut restarted_driver =
         restarted.connect_with_command_timeout(&restart_token, LARGE_THREAD_COMMAND_TIMEOUT)?;
     select_first_thread(&mut restarted_driver, &format!("id:{root_message_id}"))?;
+    wait_for_thread_load_idle(&mut restarted_driver, LARGE_THREAD_COMMAND_TIMEOUT)?;
     let restart_state = restarted_driver.command("app_state", json!({}))?;
     assert_complete_message_io_thread(
         &restart_state,
@@ -4564,12 +6952,26 @@ fn isolated_message_io_mime_survives_missing_copy_limits_and_restart() -> anyhow
     let reply = restarted_driver.command("reply_selected", json!({}))?;
     assert_eq!(reply["ok"], true, "reply via moved copy failed: {reply}");
     assert_eq!(
-        reply["compose_fields"]["in_reply_to"],
+        reply["pending"], true,
+        "reply preparation was not asynchronous: {reply}"
+    );
+    let reply_preparation =
+        wait_for_composer_preparation_idle(&mut restarted_driver, LARGE_THREAD_COMMAND_TIMEOUT)?;
+    assert_eq!(
+        reply_preparation["outcome"], "prepared",
+        "reply via moved copy did not finish preparing: {reply_preparation}"
+    );
+    let reply = restarted_driver.command("app_state", json!({}))?;
+    assert_eq!(
+        reply["state"]["compose_fields"]["in_reply_to"],
         format!("<{root_message_id}>")
     );
-    assert_eq!(reply["compose_fields"]["subject"], format!("Re: {subject}"));
+    assert_eq!(
+        reply["state"]["compose_fields"]["subject"],
+        format!("Re: {subject}")
+    );
     ensure!(
-        reply["compose_fields"]["body"]
+        reply["state"]["compose_fields"]["body"]
             .as_str()
             .is_some_and(|body| body.contains("> Valid attachment-bearing root body.")),
         "reply did not quote the selected valid root: {reply}"
@@ -4756,6 +7158,338 @@ fn fixture_ctrl_e_y_scroll_message_list_without_changing_selection() -> anyhow::
 }
 
 #[test]
+fn fixture_html_readiness_and_scroll_are_event_driven_and_generation_safe() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_html_readiness_and_scroll_are_event_driven_and_generation_safe: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running HTML lifecycle desktop UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-html-lifecycle-ui-{run_id}"));
+    let token = format!("notm-html-lifecycle-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+    select_first_thread(&mut driver, "id:long-html-message@fixture.test")?;
+
+    let visual = driver.command("show_visual_html", json!({}))?;
+    assert_eq!(visual["ok"], true, "long HTML could not render: {visual}");
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    let initial = loop {
+        let lifecycle = driver.command("html_scroll_state", json!({}))?;
+        if lifecycle["ready"] == true && lifecycle["scroll"]["canScroll"] == true {
+            break lifecycle;
+        }
+        ensure!(
+            Instant::now() < ready_deadline,
+            "HTML lifecycle did not become ready and scrollable: {lifecycle}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+    let initial_generation = initial["generation"]
+        .as_u64()
+        .with_context(|| format!("HTML lifecycle had no generation: {initial}"))?;
+    let initial_y = initial["scroll"]["y"]
+        .as_f64()
+        .with_context(|| format!("HTML lifecycle had no scroll offset: {initial}"))?;
+
+    let scheduled = driver.command("scroll_html_view_lines", json!({"lines": 8}))?;
+    ensure!(
+        scheduled["pending"] == true
+            || scheduled["scroll"]["y"].as_f64().unwrap_or(initial_y) > initial_y,
+        "HTML scroll was neither scheduled nor observed: {scheduled}"
+    );
+    let scroll_deadline = Instant::now() + Duration::from_secs(5);
+    let scrolled = loop {
+        let lifecycle = driver.command("html_scroll_state", json!({}))?;
+        if lifecycle["scroll"]["y"]
+            .as_f64()
+            .is_some_and(|y| y > initial_y)
+        {
+            break lifecycle;
+        }
+        ensure!(
+            Instant::now() < scroll_deadline,
+            "event-driven HTML scroll did not complete: {lifecycle}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+    let scrolled_fraction = scrolled["scroll"]["fraction"]
+        .as_f64()
+        .with_context(|| format!("HTML lifecycle had no scroll fraction: {scrolled}"))?;
+    ensure!(
+        scrolled_fraction > 0.0,
+        "HTML scroll fraction did not advance: {scrolled}"
+    );
+
+    assert_eq!(driver.command("show_text_thread", json!({}))?["ok"], true);
+    thread::sleep(STARTUP_POLL_INTERVAL);
+    assert_eq!(driver.command("show_visual_html", json!({}))?["ok"], true);
+    let restore_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let lifecycle = driver.command("html_scroll_state", json!({}))?;
+        if lifecycle["ready"] == true
+            && lifecycle["pending_restore"].is_null()
+            && lifecycle["scroll"]["fraction"]
+                .as_f64()
+                .is_some_and(|fraction| fraction >= scrolled_fraction * 0.8)
+        {
+            break;
+        }
+        ensure!(
+            Instant::now() < restore_deadline,
+            "HTML scroll restoration did not complete after view replacement: {lifecycle}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+
+    // Start two replacements without waiting for the first document to finish.
+    // Only the newest document generation may become ready or publish metrics.
+    assert_eq!(driver.command("show_visual_html", json!({}))?["ok"], true);
+    assert_eq!(driver.command("show_visual_html", json!({}))?["ok"], true);
+    let replacement_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let lifecycle = driver.command("html_scroll_state", json!({}))?;
+        if lifecycle["ready"] == true
+            && lifecycle["generation"]
+                .as_u64()
+                .is_some_and(|generation| generation >= initial_generation + 2)
+        {
+            assert_eq!(
+                lifecycle["error"],
+                Value::Null,
+                "stale HTML completion surfaced an error: {lifecycle}"
+            );
+            break;
+        }
+        ensure!(
+            Instant::now() < replacement_deadline,
+            "newest HTML generation did not become ready: {lifecycle}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn fixture_standalone_html_replacements_and_scroll_are_generation_safe() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_standalone_html_replacements_and_scroll_are_generation_safe: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running standalone HTML lifecycle desktop UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-standalone-html-ui-{run_id}"));
+    let token = format!("notm-standalone-html-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+    select_first_thread(&mut driver, "id:long-html-message@fixture.test")?;
+    assert_eq!(
+        driver.command(
+            "set_pane_visibility",
+            json!({"pane": "message", "visible": false}),
+        )?["ok"],
+        true
+    );
+    driver.command("open_selected_thread", json!({}))?;
+
+    let open_deadline = Instant::now() + Duration::from_secs(5);
+    let opened = loop {
+        let windows = driver.command("standalone_message_windows", json!({}))?;
+        if !json_array_at(&windows, &["windows"])?.is_empty() {
+            break windows;
+        }
+        ensure!(
+            Instant::now() < open_deadline,
+            "standalone HTML window did not open: {windows}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+    assert_eq!(
+        opened["window_limit"], 4,
+        "window cap was not exposed: {opened}"
+    );
+    let first_window_id = opened["windows"][0]["id"]
+        .as_u64()
+        .with_context(|| format!("standalone window had no id: {opened}"))?;
+    let empty_generation = opened["windows"][0]["html_lifecycle"]["generation"]
+        .as_u64()
+        .with_context(|| format!("standalone empty HTML had no lifecycle token: {opened}"))?;
+    ensure!(
+        empty_generation > 0,
+        "standalone empty HTML bypassed the lifecycle: {opened}"
+    );
+
+    let first_visual = driver.command("standalone_show_visual_html", json!({"window_index": 0}))?;
+    assert_eq!(
+        first_visual["ok"], true,
+        "standalone long HTML could not render: {first_visual}"
+    );
+    let first_generation = first_visual["window"]["html_lifecycle"]["generation"]
+        .as_u64()
+        .with_context(|| format!("standalone lifecycle had no generation: {first_visual}"))?;
+    ensure!(
+        first_generation > empty_generation,
+        "first standalone message load reused the empty-document generation: {first_visual}"
+    );
+
+    // Replace the document twice more without waiting for either load to finish.
+    // A stale load or scroll callback must not publish readiness for the newest token.
+    assert_eq!(
+        driver.command("standalone_show_visual_html", json!({"window_index": 0}),)?["ok"],
+        true
+    );
+    assert_eq!(
+        driver.command("standalone_show_visual_html", json!({"window_index": 0}),)?["ok"],
+        true
+    );
+
+    let health_before_started = Instant::now();
+    let health_before = driver.command("health", json!({}))?;
+    let health_before_elapsed = health_before_started.elapsed();
+    thread::sleep(Duration::from_millis(150));
+    let health_after_started = Instant::now();
+    let health_after = driver.command("health", json!({}))?;
+    let health_after_elapsed = health_after_started.elapsed();
+    ensure!(
+        health_before_elapsed < Duration::from_millis(500)
+            && health_after_elapsed < Duration::from_millis(500),
+        "GTK health blocked behind standalone WebKit loading: before={health_before_elapsed:?}, after={health_after_elapsed:?}"
+    );
+    ensure!(
+        health_after["gtk_heartbeat"].as_u64().unwrap_or(0)
+            > health_before["gtk_heartbeat"].as_u64().unwrap_or(0),
+        "GTK heartbeat did not advance during standalone WebKit replacements: before={health_before}, after={health_after}"
+    );
+
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    let ready = loop {
+        let windows = driver.command("standalone_message_windows", json!({}))?;
+        let lifecycle = &windows["windows"][0]["html_lifecycle"];
+        if lifecycle["ready"] == true
+            && lifecycle["generation"]
+                .as_u64()
+                .is_some_and(|generation| generation >= first_generation + 2)
+            && lifecycle["scroll"]["canScroll"] == true
+        {
+            assert_eq!(
+                lifecycle["error"],
+                Value::Null,
+                "stale standalone completion surfaced an error: {windows}"
+            );
+            break windows;
+        }
+        ensure!(
+            Instant::now() < ready_deadline,
+            "newest standalone HTML generation did not become ready: {windows}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+    let initial_y = ready["windows"][0]["html_lifecycle"]["scroll"]["y"]
+        .as_f64()
+        .with_context(|| format!("standalone lifecycle had no scroll offset: {ready}"))?;
+
+    let scheduled = driver.command(
+        "standalone_scroll_html_lines",
+        json!({"window_index": 0, "lines": 8}),
+    )?;
+    assert_eq!(
+        scheduled["ok"], true,
+        "standalone scroll failed: {scheduled}"
+    );
+    let scroll_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let windows = driver.command("standalone_message_windows", json!({}))?;
+        let lifecycle = &windows["windows"][0]["html_lifecycle"];
+        if lifecycle["scroll"]["y"]
+            .as_f64()
+            .is_some_and(|y| y > initial_y)
+        {
+            assert_eq!(lifecycle["error"], Value::Null, "{windows}");
+            break;
+        }
+        ensure!(
+            Instant::now() < scroll_deadline,
+            "event-driven standalone HTML scroll did not complete: {windows}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+
+    // Repeated opens retain prepared-thread Arcs. The controller must evict the
+    // oldest window instead of allowing that cache ownership to grow forever.
+    for expected_count in 2..=4 {
+        driver.command("open_selected_thread", json!({}))?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let windows = driver.command("standalone_message_windows", json!({}))?;
+            if json_array_at(&windows, &["windows"])?.len() == expected_count {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "standalone window {expected_count} did not open: {windows}\n{}",
+                app.logs()
+            );
+            thread::sleep(STARTUP_POLL_INTERVAL);
+        }
+    }
+    driver.command("open_selected_thread", json!({}))?;
+    let eviction_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let windows = driver.command("standalone_message_windows", json!({}))?;
+        let snapshots = json_array_at(&windows, &["windows"])?;
+        if snapshots.len() == 4
+            && snapshots
+                .iter()
+                .all(|window| window["id"].as_u64() != Some(first_window_id))
+        {
+            break;
+        }
+        ensure!(
+            Instant::now() < eviction_deadline,
+            "oldest standalone window was not evicted at the cap: {windows}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+
+    Ok(())
+}
+
+fn wait_for_active_resolved_view(
+    driver: &mut UiDriver,
+    expected: &str,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let state = driver.command("view_preference_state", json!({}))?;
+        ensure!(state["ok"] == true, "view preference state failed: {state}");
+        if state["resolved_view"] == expected && state["active_view"] == state["resolved_view"] {
+            return Ok(state);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "message view did not render resolved view {expected:?} within {timeout:?}: {state}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
+#[test]
 fn fixture_message_and_sender_views_persist_with_message_precedence() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
@@ -4885,7 +7619,8 @@ fn fixture_message_and_sender_views_persist_with_message_precedence() -> anyhow:
         selected["selected_message"]["message_id"], "thread-reply1-three-message@fixture.test",
         "{selected}"
     );
-    let sender_restored = driver.command("view_preference_state", json!({}))?;
+    let sender_restored =
+        wait_for_active_resolved_view(&mut driver, "raw_source", STARTUP_TIMEOUT)?;
     assert_eq!(
         sender_restored["active_view"], "raw_source",
         "{sender_restored}"
@@ -4913,7 +7648,8 @@ fn fixture_message_and_sender_views_persist_with_message_precedence() -> anyhow:
     select_first_thread(&mut driver, "id:unicode@fixture.test")?;
     select_first_thread(&mut driver, "id:thread-reply1-three-message@fixture.test")?;
     driver.command("select_message_by_index", json!({"index": 1}))?;
-    let message_override = driver.command("view_preference_state", json!({}))?;
+    let message_override =
+        wait_for_active_resolved_view(&mut driver, "full_headers", STARTUP_TIMEOUT)?;
     assert_eq!(
         message_override["active_view"], "full_headers",
         "{message_override}"
@@ -5798,7 +8534,19 @@ fn fixture_standalone_message_window_keeps_its_thread_snapshot() -> anyhow::Resu
         "fixture thread did not open in a standalone window: {opened}"
     );
 
-    let standalone = driver.command("standalone_message_windows", json!({}))?;
+    let standalone_deadline = Instant::now() + Duration::from_secs(5);
+    let standalone = loop {
+        let snapshot = driver.command("standalone_message_windows", json!({}))?;
+        if json_array_at(&snapshot, &["windows"])?.len() == 1 {
+            break snapshot;
+        }
+        ensure!(
+            Instant::now() < standalone_deadline,
+            "standalone message window did not finish opening: {snapshot}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
     let windows = json_array_at(&standalone, &["windows"])?;
     ensure!(
         windows.len() == 1,
@@ -5864,21 +8612,208 @@ fn fixture_standalone_message_window_keeps_its_thread_snapshot() -> anyhow::Resu
         "standalone reply did not bridge to the main composer: {reply}"
     );
     assert_eq!(
-        reply["compose_fields"]["in_reply_to"], "<thread-root-three-message@fixture.test>",
+        reply["pending"], true,
+        "standalone reply was not prepared asynchronously: {reply}"
+    );
+    wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let reply = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        reply["state"]["compose_fields"]["in_reply_to"], "<thread-root-three-message@fixture.test>",
         "standalone reply targeted the main thread instead of its snapshot: {reply}"
     );
     assert_eq!(
-        reply["compose_fields"]["subject"], "Re: Three message thread",
+        reply["state"]["compose_fields"]["subject"], "Re: Three message thread",
         "standalone reply used the wrong subject: {reply}"
     );
     assert_eq!(
-        reply["main_selected_message"]["message_id"], "unicode@fixture.test",
+        reply["state"]["selected_message"]["message_id"], "unicode@fixture.test",
         "standalone reply rewrote the main message selection: {reply}"
     );
     let visibility = driver.command("pane_visibility", json!({}))?;
     assert_eq!(
         visibility["message_view"], true,
         "standalone reply did not reveal the main composer pane: {visibility}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn fixture_older_draft_clear_does_not_cancel_newer_standalone_forward() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_older_draft_clear_does_not_cancel_newer_standalone_forward: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running composer clear/preparation ordering UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-composer-clear-epoch-ui-{run_id}"));
+    let token = format!("notm-composer-clear-epoch-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+
+    select_first_thread(&mut driver, "subject:\"Three message thread\"")?;
+    let hidden = driver.command(
+        "set_pane_visibility",
+        json!({"pane": "message", "visible": false}),
+    )?;
+    assert_eq!(hidden["ok"], true, "message pane did not hide: {hidden}");
+    let opened = driver.command("open_selected_thread", json!({}))?;
+    assert_eq!(
+        opened["ok"], true,
+        "fixture thread did not open standalone: {opened}"
+    );
+    let standalone_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let standalone = driver.command("standalone_message_windows", json!({}))?;
+        if json_array_at(&standalone, &["windows"])?.len() == 1 {
+            break;
+        }
+        ensure!(
+            Instant::now() < standalone_deadline,
+            "standalone message window did not open: {standalone}\n{}",
+            app.logs()
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+    let selected = driver.command(
+        "standalone_select_message",
+        json!({"window_index": 0, "message_index": 0}),
+    )?;
+    assert_eq!(
+        selected["ok"], true,
+        "standalone source message could not be selected: {selected}"
+    );
+    let authoritative_path = selected["window"]["selected_message"]["filenames"]
+        .as_array()
+        .and_then(|filenames| filenames.first())
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .with_context(|| format!("standalone source had no filename: {selected}"))?;
+    let authoritative_bytes = fs::read(&authoritative_path)?;
+
+    assert_eq!(
+        driver.command("set_fixture_draft_delay", json!({"milliseconds": 300}))?["ok"],
+        true
+    );
+    assert_eq!(
+        driver.command(
+            "set_fixture_composer_preparation_delay",
+            json!({"milliseconds": 800}),
+        )?["ok"],
+        true
+    );
+    let clear_before = draft_autosave_status(&mut driver)?;
+    let clear_write_count = draft_write_count(&clear_before)?;
+    let compose_generation = clear_before["compose_generation"]
+        .as_u64()
+        .with_context(|| format!("clear status had no compose generation: {clear_before}"))?;
+    let transition_epoch = clear_before["transition_epoch"]
+        .as_u64()
+        .with_context(|| format!("clear status had no transition epoch: {clear_before}"))?;
+    let clear = driver.command("clear_draft", json!({}))?;
+    assert_eq!(clear["ok"], true, "delayed clear did not start: {clear}");
+    assert_eq!(clear["pending_confirmation"], false, "{clear}");
+    let clear_busy = wait_for_draft_worker_after(&mut driver, clear_write_count, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        clear_busy["busy"], true,
+        "delayed clear was not active: {clear_busy}"
+    );
+
+    let cache_before = driver.command("attachment_io_status", json!({}))?;
+    let cache_generation = cache_before["composer_cache"]["latest_generation"]
+        .as_u64()
+        .with_context(|| format!("composer cache had no generation: {cache_before}"))?;
+    let forward = driver.command(
+        "standalone_respond",
+        json!({"window_index": 0, "action": "forward_attachment"}),
+    )?;
+    assert_eq!(forward["ok"], true, "standalone forward failed: {forward}");
+    assert_eq!(
+        forward["pending"], true,
+        "standalone forward was not prepared asynchronously: {forward}"
+    );
+    let preparation_generation = forward["generation"]
+        .as_u64()
+        .with_context(|| format!("standalone forward had no generation: {forward}"))?;
+    assert_eq!(
+        driver.command(
+            "set_fixture_composer_preparation_delay",
+            json!({"milliseconds": 0}),
+        )?["ok"],
+        true
+    );
+    assert_eq!(
+        driver.command("set_fixture_draft_delay", json!({"milliseconds": 0}))?["ok"],
+        true
+    );
+
+    let clear_completed =
+        wait_for_draft_write_after(&mut driver, clear_write_count, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        clear_completed["compose_generation"], compose_generation,
+        "older clear changed the composer after the newer preparation started: before={clear_before}, after={clear_completed}"
+    );
+    assert_eq!(
+        clear_completed["transition_epoch"],
+        transition_epoch.saturating_add(1),
+        "standalone preparation did not advance exactly one transition epoch: before={clear_before}, after={clear_completed}"
+    );
+    assert_eq!(
+        clear_completed["last_error"],
+        Value::Null,
+        "older draft clear failed: {clear_completed}"
+    );
+    let in_flight = driver.command("composer_preparation_status", json!({}))?;
+    assert_eq!(
+        in_flight["busy"], true,
+        "older clear cancelled the newer standalone preparation: {in_flight}"
+    );
+    assert_eq!(
+        in_flight["generation"], preparation_generation,
+        "older clear replaced the newer standalone preparation generation: {in_flight}"
+    );
+    assert_eq!(in_flight["outcome"], "pending", "{in_flight}");
+
+    let prepared = wait_for_composer_preparation_generation(
+        &mut driver,
+        preparation_generation,
+        STARTUP_TIMEOUT,
+    )?;
+    assert_eq!(
+        prepared["outcome"], "prepared",
+        "newer standalone preparation did not finish: {prepared}"
+    );
+    let cached =
+        wait_for_new_composer_attachment_cache(&mut driver, cache_generation, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        cached["composer_cache"]["outcome"], "applied",
+        "standalone message source was not cached: {cached}"
+    );
+    assert_eq!(
+        cached["composer_cache"]["completed_generation"],
+        cached["composer_cache"]["latest_generation"],
+        "standalone cache did not complete its requested generation: {cached}"
+    );
+    let final_state = driver.command("app_state", json!({}))?;
+    ensure!(
+        final_state["state"]["compose_generation"]
+            .as_u64()
+            .is_some_and(|generation| generation > compose_generation),
+        "newer standalone preparation never applied composer fields: {final_state}"
+    );
+    let cached_path = final_state["state"]["compose_fields"]["attachments"]
+        .as_array()
+        .and_then(|attachments| attachments.first())
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .with_context(|| format!("standalone forward cached no attachment: {final_state}"))?;
+    assert_eq!(
+        fs::read(&cached_path)?,
+        authoritative_bytes,
+        "standalone forward cache did not preserve the authoritative source bytes"
     );
 
     Ok(())
@@ -5977,7 +8912,7 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
             "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = {}\nexcluded_tags = []\nsync_maildir_flags_after_tag_change = true\n\
              \n[identity]\nname = \"Fixture User\"\nprimary_email = \"fixture@example.test\"\n\
              \n[drafts]\nsave_maildir = false\nindex_after_save = false\n\
-             \n[automation]\nallow_live_tag_test = true\n",
+             \n[automation]\nallow_live_tag_test = true\nallow_live_send_test = true\n",
             toml_path(&fixture.root),
             toml_path(&fixture.config_path),
             toml::Value::String(initial_query.to_string()),
@@ -6014,8 +8949,14 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
     let attachment_selected =
         driver.command("select_thread_by_index", json!({"index": attachment_index}))?;
     assert_eq!(
-        attachment_selected["selected_thread"]["subject"], "Attachment message",
-        "could not select attachment thread: {attachment_selected}"
+        attachment_selected["ok"], true,
+        "could not schedule attachment-thread selection: {attachment_selected}"
+    );
+    wait_for_thread_load_idle(&mut driver, LARGE_THREAD_COMMAND_TIMEOUT)?;
+    let attachment_selected = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        attachment_selected["state"]["selected_thread"]["subject"], "Attachment message",
+        "attachment thread did not settle as selected: {attachment_selected}"
     );
     let raw_preference = driver.command("show_raw_source", json!({}))?;
     assert_eq!(
@@ -6058,6 +8999,7 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
         second_multi["ok"], true,
         "second multi-select failed: {second_multi}"
     );
+    wait_for_thread_load_idle(&mut driver, LARGE_THREAD_COMMAND_TIMEOUT)?;
     let selected_ids = second_multi["multi_selected_threads"]
         .as_array()
         .with_context(|| format!("multi-selection did not return thread IDs: {second_multi}"))?
@@ -6125,11 +9067,33 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
 
     let race_tag = format!("notm/tag-race-{run_id}");
     let rejected_tag = format!("notm/rejected-race-{run_id}");
+    let loader_before_race = driver.command("thread_load_status", json!({}))?;
+    let cancelled_before_race = loader_before_race["cancelled"].as_u64().unwrap_or(0);
     let refresh = driver.command("run_search", json!({"query": "*", "test_delay_ms": 1_200}))?;
     assert_eq!(
         refresh["scheduled"], true,
         "delayed refresh was not scheduled: {refresh}"
     );
+    let delayed = driver.command("set_fixture_thread_delay", json!({"milliseconds": 1_200}))?;
+    assert_eq!(
+        delayed["ok"], true,
+        "could not delay preparation during the tag race: {delayed}"
+    );
+    let delayed_preparation =
+        driver.command("select_thread_by_index", json!({"index": other_index}))?;
+    assert_eq!(
+        delayed_preparation["ok"], true,
+        "could not schedule the overlapping thread preparation: {delayed_preparation}"
+    );
+    let delayed_status = driver.command("thread_load_status", json!({}))?;
+    assert_eq!(
+        delayed_status["busy"], true,
+        "overlapping thread preparation was not active: {delayed_status}"
+    );
+    let delayed_generation = delayed_status["generation"]
+        .as_u64()
+        .with_context(|| format!("overlapping preparation had no generation: {delayed_status}"))?;
+    driver.command("set_fixture_thread_delay", json!({"milliseconds": 0}))?;
     let tagged = driver.command(
         "tag_selected",
         json!({
@@ -6141,6 +9105,23 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
     assert_eq!(
         tagged["pending"], true,
         "tag mutation did not remain asynchronous: {tagged}"
+    );
+    let cancelled_preparation = driver.command("thread_load_status", json!({}))?;
+    assert_eq!(
+        cancelled_preparation["busy"], false,
+        "tag mutation left the stale preparation active: delayed_generation={delayed_generation}, status={cancelled_preparation}"
+    );
+    ensure!(
+        cancelled_preparation["cancelled"]
+            .as_u64()
+            .is_some_and(|cancelled| cancelled > cancelled_before_race),
+        "tag mutation did not cancel overlapping generation {delayed_generation}: before={loader_before_race}, after={cancelled_preparation}"
+    );
+    let retained_after_cancel = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        retained_after_cancel["state"]["selected_thread"]["thread_id"],
+        attachment_before_duplicate.thread_id,
+        "tag cancellation let delayed preparation replace the retained attachment thread: {retained_after_cancel}"
     );
     assert_eq!(
         driver.command("health", json!({}))?["ok"],
@@ -6264,8 +9245,59 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
         "the newly front-positioned thread was tagged instead of an immutable target"
     );
 
+    // Recreate the attachment message's pre-rename paths as readable, unindexed
+    // poison files. Cached-path-first reads must still use the raw authoritative
+    // path mappings from the tag report rather than accepting these stale files.
+    const STALE_PATH_SENTINEL: &str = "STALE-PATH-SENTINEL";
+    let stale_attachment_paths = old_filenames
+        .get(attachment_message_id)
+        .context("attachment message had no pre-rename paths")?
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let poison_message = format!(
+        "From: poison@example.test\r\nTo: fixture@example.test\r\nSubject: Poison stale attachment source\r\nDate: Thu, 18 Jun 2037 20:01:00 -0600\r\nMessage-ID: <{attachment_message_id}>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=stale-path-boundary\r\n\r\n--stale-path-boundary\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{STALE_PATH_SENTINEL} body\r\n--stale-path-boundary\r\nContent-Type: text/plain; name=note.txt\r\nContent-Disposition: attachment; filename=note.txt\r\n\r\n{STALE_PATH_SENTINEL} attachment\r\n--stale-path-boundary--\r\n"
+    );
+    for path in &stale_attachment_paths {
+        fs::write(path, poison_message.as_bytes())
+            .with_context(|| format!("creating readable stale path {}", path.display()))?;
+    }
+
+    let retained_attachments = driver.command("attachment_list_items", json!({}))?;
+    ensure!(
+        json_array_at(&retained_attachments, &["attachments"])?
+            .iter()
+            .any(|attachment| attachment["filename"] == "note.txt"),
+        "tag reconciliation lost the retained attachment payload: {retained_attachments}"
+    );
+    let retained_downloads = work_dir.join("retained-authoritative-downloads");
+    fs::create_dir_all(&retained_downloads)?;
+    let retained_save = driver.command(
+        "save_selected_attachment",
+        json!({"index": 0, "dir": retained_downloads}),
+    )?;
+    assert_eq!(
+        retained_save["pending"], true,
+        "retained attachment save did not start: {retained_save}"
+    );
+    let retained_save_status = wait_for_attachment_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let retained_saved_path = retained_save_status["last_completion"]["path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| {
+            format!("retained attachment save returned no path: {retained_save_status}")
+        })?;
+    let retained_saved = fs::read(&retained_saved_path)?;
+    ensure!(
+        String::from_utf8_lossy(&retained_saved).contains("attached text")
+            && !String::from_utf8_lossy(&retained_saved).contains(STALE_PATH_SENTINEL),
+        "retained attachment payload read a stale pre-rename source: {}",
+        String::from_utf8_lossy(&retained_saved)
+    );
+
     let verify_ui_thread = |driver: &mut UiDriver, thread_id: &str| -> anyhow::Result<Value> {
         select_first_thread(driver, &format!("thread:{thread_id}"))?;
+        wait_for_thread_load_idle(driver, LARGE_THREAD_COMMAND_TIMEOUT)?;
         let state = driver.command("app_state", json!({}))?;
         let ui_messages = json_array_at(&state, &["state", "messages"])?;
         ensure!(
@@ -6369,6 +9401,14 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
         raw["ok"], true,
         "raw view could not open the renamed message: {raw}"
     );
+    let raw_text = driver.command("message_view_text", json!({}))?;
+    ensure!(
+        raw_text["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Subject: Attachment message")
+                && !text.contains(STALE_PATH_SENTINEL)),
+        "main raw view exposed the readable stale path: {raw_text}"
+    );
     let listed = driver.command("attachment_list_items", json!({}))?;
     ensure!(
         json_array_at(&listed, &["attachments"])?
@@ -6381,10 +9421,27 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
         attachment_opened["ok"], true,
         "attachment Open used a stale message path: {attachment_opened}"
     );
-    let opened_attachment_path = attachment_opened["path"]
+    assert_eq!(
+        attachment_opened["pending"], true,
+        "attachment Open was not asynchronous: {attachment_opened}"
+    );
+    let attachment_completion = wait_for_attachment_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        attachment_completion["last_completion"]["request_id"], attachment_opened["request_id"],
+        "attachment Open completed a different request: started={attachment_opened}, completion={attachment_completion}"
+    );
+    assert_eq!(
+        attachment_completion["last_completion"]["applied"], true,
+        "attachment Open completion was stale: {attachment_completion}"
+    );
+    ensure!(
+        attachment_completion["last_completion"]["error"].is_null(),
+        "attachment Open failed: {attachment_completion}"
+    );
+    let opened_attachment_path = attachment_completion["last_completion"]["path"]
         .as_str()
         .map(PathBuf::from)
-        .with_context(|| format!("attachment Open returned no path: {attachment_opened}"))?;
+        .with_context(|| format!("attachment Open returned no path: {attachment_completion}"))?;
     ensure!(
         String::from_utf8_lossy(&fs::read(&opened_attachment_path)?).contains("attached text"),
         "attachment Open did not extract the expected bytes"
@@ -6408,8 +9465,31 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
         "main reply could not parse the renamed message: {main_reply}"
     );
     assert_eq!(
-        main_reply["compose_fields"]["in_reply_to"],
+        main_reply["pending"], true,
+        "main reply was not prepared asynchronously: {main_reply}"
+    );
+    let main_preparation_generation = main_reply["generation"]
+        .as_u64()
+        .with_context(|| format!("main reply returned no preparation generation: {main_reply}"))?;
+    let main_preparation = wait_for_composer_preparation_generation(
+        &mut driver,
+        main_preparation_generation,
+        STARTUP_TIMEOUT,
+    )?;
+    assert_eq!(
+        main_preparation["outcome"], "prepared",
+        "main reply did not finish preparing: {main_preparation}"
+    );
+    let main_reply = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        main_reply["state"]["compose_fields"]["in_reply_to"],
         "<attachment-message@fixture.test>"
+    );
+    ensure!(
+        main_reply["state"]["compose_fields"]["body"]
+            .as_str()
+            .is_some_and(|body| !body.contains(STALE_PATH_SENTINEL)),
+        "main reply quoted the readable stale path: {main_reply}"
     );
     for command in [
         "compose_set_to",
@@ -6421,12 +9501,32 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
         let cleared = driver.command(command, json!({"value": ""}))?;
         assert_eq!(cleared["ok"], true, "could not clear main reply: {cleared}");
     }
+    let main_clear_before = draft_autosave_status(&mut driver)?;
+    let main_clear_write_count = draft_write_count(&main_clear_before)?;
+    let main_clear_compose_generation = main_clear_before["compose_generation"]
+        .as_u64()
+        .with_context(|| {
+            format!("main clear status had no composer generation: {main_clear_before}")
+        })?;
     let clear_main_reply = driver.command("clear_draft", json!({}))?;
     assert_eq!(
         clear_main_reply["ok"], true,
         "could not close cleared main reply: {clear_main_reply}"
     );
     assert_eq!(clear_main_reply["pending_confirmation"], false);
+    let main_clear_completed =
+        wait_for_draft_write_after(&mut driver, main_clear_write_count, STARTUP_TIMEOUT)?;
+    ensure!(
+        main_clear_completed["compose_generation"]
+            .as_u64()
+            .is_some_and(|generation| generation > main_clear_compose_generation),
+        "main reply clear did not reach its composer boundary: before={main_clear_before}, after={main_clear_completed}"
+    );
+    assert_eq!(
+        main_clear_completed["last_error"],
+        Value::Null,
+        "main reply clear failed: {main_clear_completed}"
+    );
 
     let standalone_reply = driver.command(
         "standalone_respond",
@@ -6437,8 +9537,32 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
         "pre-existing standalone window could not reply after rename: {standalone_reply}"
     );
     assert_eq!(
-        standalone_reply["compose_fields"]["in_reply_to"],
+        standalone_reply["pending"], true,
+        "standalone reply was not prepared asynchronously: {standalone_reply}"
+    );
+    let standalone_preparation_generation =
+        standalone_reply["generation"].as_u64().with_context(|| {
+            format!("standalone reply returned no preparation generation: {standalone_reply}")
+        })?;
+    let standalone_preparation = wait_for_composer_preparation_generation(
+        &mut driver,
+        standalone_preparation_generation,
+        STARTUP_TIMEOUT,
+    )?;
+    assert_eq!(
+        standalone_preparation["outcome"], "prepared",
+        "standalone reply did not finish preparing: {standalone_preparation}"
+    );
+    let standalone_reply = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        standalone_reply["state"]["compose_fields"]["in_reply_to"],
         "<attachment-message@fixture.test>"
+    );
+    ensure!(
+        standalone_reply["state"]["compose_fields"]["body"]
+            .as_str()
+            .is_some_and(|body| !body.contains(STALE_PATH_SENTINEL)),
+        "standalone reply quoted the readable stale path: {standalone_reply}"
     );
     for command in [
         "compose_set_to",
@@ -6453,12 +9577,108 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
             "could not clear standalone reply: {cleared}"
         );
     }
+    let standalone_clear_before = draft_autosave_status(&mut driver)?;
+    let standalone_clear_write_count = draft_write_count(&standalone_clear_before)?;
+    let standalone_clear_compose_generation = standalone_clear_before["compose_generation"]
+        .as_u64()
+        .with_context(|| {
+            format!("standalone clear status had no composer generation: {standalone_clear_before}")
+        })?;
     let clear_standalone_reply = driver.command("clear_draft", json!({}))?;
     assert_eq!(
         clear_standalone_reply["ok"], true,
         "could not close cleared standalone reply: {clear_standalone_reply}"
     );
     assert_eq!(clear_standalone_reply["pending_confirmation"], false);
+    let standalone_clear_completed =
+        wait_for_draft_write_after(&mut driver, standalone_clear_write_count, STARTUP_TIMEOUT)?;
+    ensure!(
+        standalone_clear_completed["compose_generation"]
+            .as_u64()
+            .is_some_and(|generation| generation > standalone_clear_compose_generation),
+        "standalone reply clear did not reach its composer boundary: before={standalone_clear_before}, after={standalone_clear_completed}"
+    );
+    assert_eq!(
+        standalone_clear_completed["last_error"],
+        Value::Null,
+        "standalone reply clear failed: {standalone_clear_completed}"
+    );
+
+    // Keep the pre-mutation standalone window alive through the fresh main
+    // reloads above, then exercise its independently retained lazy source.
+    // The resulting dirty forward is closed through the real modal main-window
+    // workflow below; that workflow intentionally preserves recovery state.
+    let cache_before_forward = driver.command("attachment_io_status", json!({}))?;
+    let previous_cache_generation = cache_before_forward["composer_cache"]["latest_generation"]
+        .as_u64()
+        .with_context(|| {
+            format!("composer cache had no generation before forward: {cache_before_forward}")
+        })?;
+    let retained_standalone_forward = driver.command(
+        "standalone_respond",
+        json!({"window_index": 0, "action": "forward_attachment"}),
+    )?;
+    assert_eq!(
+        retained_standalone_forward["pending"], true,
+        "retained standalone forward did not prepare asynchronously: {retained_standalone_forward}"
+    );
+    let retained_standalone_generation = retained_standalone_forward["generation"]
+        .as_u64()
+        .with_context(|| {
+            format!(
+                "retained standalone forward returned no preparation generation: {retained_standalone_forward}"
+            )
+        })?;
+    let retained_standalone_preparation = wait_for_composer_preparation_generation(
+        &mut driver,
+        retained_standalone_generation,
+        STARTUP_TIMEOUT,
+    )?;
+    assert_eq!(
+        retained_standalone_preparation["outcome"], "prepared",
+        "retained standalone forward did not finish preparing: {retained_standalone_preparation}"
+    );
+    let retained_standalone_cache = wait_for_new_composer_attachment_cache(
+        &mut driver,
+        previous_cache_generation,
+        STARTUP_TIMEOUT,
+    )?;
+    assert_eq!(
+        retained_standalone_cache["composer_cache"]["outcome"], "applied",
+        "retained standalone source was not cached: {retained_standalone_cache}"
+    );
+    assert_eq!(
+        retained_standalone_cache["composer_cache"]["completed_generation"],
+        retained_standalone_cache["composer_cache"]["latest_generation"],
+        "retained standalone cache did not complete its requested generation: {retained_standalone_cache}"
+    );
+    let retained_forward_state = driver.command("app_state", json!({}))?;
+    let retained_forward_paths = json_array_at(
+        &retained_forward_state,
+        &["state", "compose_fields", "attachments"],
+    )?;
+    ensure!(
+        retained_forward_paths.len() == 1,
+        "retained standalone forward did not cache exactly one source: {retained_forward_state}"
+    );
+    let retained_forward_path = retained_forward_paths[0]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| {
+            format!("retained standalone forward path was not a string: {retained_forward_state}")
+        })?;
+    let retained_forward_bytes = fs::read(&retained_forward_path)?;
+    ensure!(
+        String::from_utf8_lossy(&retained_forward_bytes).contains("Subject: Attachment message")
+            && !String::from_utf8_lossy(&retained_forward_bytes).contains(STALE_PATH_SENTINEL),
+        "retained standalone forward cached a stale pre-rename source: {}",
+        String::from_utf8_lossy(&retained_forward_bytes)
+    );
+
+    for path in &stale_attachment_paths {
+        fs::remove_file(path)
+            .with_context(|| format!("removing readable stale path {}", path.display()))?;
+    }
 
     let standalone_closed = driver.command("close_standalone_message_windows", json!({}))?;
     assert_eq!(
@@ -6467,6 +9687,21 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
     );
     let closed = driver.command("close_main_window", json!({}))?;
     assert_eq!(closed["ok"], true, "first app close failed: {closed}");
+    let close_id = pending_confirmation_id(&mut driver, "close_main_window")?;
+    let accepted_close = driver.command(
+        "respond_confirmation",
+        json!({"response": "accept", "id": close_id}),
+    )?;
+    assert_eq!(
+        accepted_close["ok"], true,
+        "could not close the retained standalone forward at main-window Close: {accepted_close}"
+    );
+    let recovery_path = accepted_close["recovery_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| {
+            format!("main-window Close returned no recovery path: {accepted_close}")
+        })?;
     drop(driver);
     let status = app.wait_for_exit(Duration::from_secs(5))?;
     ensure!(
@@ -6474,6 +9709,21 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
         "first app did not exit normally: {status}\n{}",
         app.logs()
     );
+
+    // The restart phase verifies tag/path persistence, not draft recovery.
+    // Remove only this disposable process's expected recovery file so it does
+    // not raise a modal while the restarted harness switches between threads.
+    ensure!(
+        recovery_path.is_file(),
+        "main-window Close did not preserve the expected isolated recovery file: {}",
+        recovery_path.display()
+    );
+    fs::remove_file(&recovery_path).with_context(|| {
+        format!(
+            "removing isolated retained-forward recovery {}",
+            recovery_path.display()
+        )
+    })?;
 
     // Preserve the clean XDG state and Notmuch database while replacing only the
     // first process's private display and harness artifacts.
@@ -7353,6 +10603,15 @@ fn clean_xdg_local_smtp_wire_interoperability() -> anyhow::Result<()> {
     select_first_thread(&mut driver, "id:html-message@fixture.test")?;
     let reply = driver.command("reply_selected", json!({}))?;
     assert_eq!(reply["ok"], true, "HTML reply did not open: {reply}");
+    assert_eq!(
+        reply["pending"], true,
+        "HTML reply preparation was not asynchronous: {reply}"
+    );
+    let reply_preparation = wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        reply_preparation["outcome"], "prepared",
+        "HTML reply did not finish preparing: {reply_preparation}"
+    );
     for (command, value) in [
         ("compose_set_cc", "Reply Team <reply+cc@example.test>"),
         (
@@ -7385,6 +10644,20 @@ fn clean_xdg_local_smtp_wire_interoperability() -> anyhow::Result<()> {
     assert_eq!(
         forward["ok"], true,
         "forward-as-attachment did not open: {forward}"
+    );
+    assert_eq!(
+        forward["pending"], true,
+        "forward-as-attachment preparation was not asynchronous: {forward}"
+    );
+    let forward_preparation = wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        forward_preparation["outcome"], "prepared",
+        "forward-as-attachment did not finish preparing: {forward_preparation}"
+    );
+    let forward_cache = wait_for_composer_attachment_cache_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        forward_cache["composer_cache"]["outcome"], "applied",
+        "forward-as-attachment cache was not applied: {forward_cache}"
     );
     for (command, value) in [
         (
@@ -7547,11 +10820,9 @@ fn clean_xdg_local_smtp_wire_interoperability() -> anyhow::Result<()> {
         "<attachment-message@fixture.test>"
     );
     assert_eq!(forwarded_part["nested_subject"], "Attachment message");
-    ensure!(
-        forwarded_part["filename"]
-            .as_str()
-            .is_some_and(|filename| filename.ends_with(".eml")),
-        "forwarded message filename was not interoperable: {forwarded_part}"
+    assert_eq!(
+        forwarded_part["filename"], "forwarded-attachment-message.eml",
+        "forwarded message filename was not exact: {forwarded_part}"
     );
     ensure!(
         !forwarded_part["content_transfer_encoding"]
@@ -8291,6 +11562,1189 @@ fn fixture_theme_modes_follow_both_simulated_system_preferences() -> anyhow::Res
     Ok(())
 }
 
+#[test]
+fn fixture_near_limit_html_preparation_and_rendering_keep_gtk_responsive() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_near_limit_html_preparation_and_rendering_keep_gtk_responsive: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running near-limit HTML responsiveness UI stress with {display}");
+
+    const HUGE_BODY_BYTES: usize = 3 * 1024 * 1024 + 768 * 1024;
+    const UI_RESPONSE_LIMIT: Duration = Duration::from_millis(750);
+    const PREPARED_THREAD_LIMIT: u64 = 96 * 1024 * 1024;
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-huge-html-ui-{run_id}"));
+    let token = format!("notm-huge-html-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_huge_body(work_dir, &token, HUGE_BODY_BYTES)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+
+    assert_eq!(
+        driver.command("set_fixture_thread_delay", json!({"milliseconds": 900}),)?["ok"],
+        true
+    );
+    let preparation_started = Instant::now();
+    select_first_thread(&mut driver, "id:huge-html-body@fixture.test")?;
+    let initial_load = driver.command("thread_load_status", json!({}))?;
+    assert_eq!(
+        initial_load["busy"], true,
+        "near-limit MIME preparation did not stay outstanding: {initial_load}"
+    );
+
+    let first_health = driver.command("health", json!({}))?;
+    let first_heartbeat = first_health["gtk_heartbeat"].as_u64().unwrap_or(0);
+    let mut last_heartbeat = first_heartbeat;
+    let mut max_preparation_command = Duration::ZERO;
+    let mut preparation_samples = 0_u32;
+    let preparation_deadline = Instant::now() + STARTUP_TIMEOUT;
+    let settled_load = loop {
+        thread::sleep(Duration::from_millis(50));
+        let health = responsive_harness_command(
+            &mut driver,
+            "health",
+            json!({}),
+            UI_RESPONSE_LIMIT,
+            "near-limit MIME preparation",
+            &mut max_preparation_command,
+        )?;
+        assert_eq!(health["ok"], true, "fixture app became unhealthy: {health}");
+        last_heartbeat = health["gtk_heartbeat"].as_u64().unwrap_or(last_heartbeat);
+        preparation_samples = preparation_samples.saturating_add(1);
+
+        let status = responsive_harness_command(
+            &mut driver,
+            "thread_load_status",
+            json!({}),
+            UI_RESPONSE_LIMIT,
+            "near-limit MIME preparation",
+            &mut max_preparation_command,
+        )?;
+        if status["busy"] == false {
+            break status;
+        }
+        ensure!(
+            Instant::now() < preparation_deadline,
+            "near-limit MIME preparation did not finish: {status}\n{}",
+            app.logs()
+        );
+    };
+    ensure!(
+        preparation_samples >= 3,
+        "near-limit preparation completed before sustained responsiveness sampling: samples={preparation_samples}"
+    );
+    ensure!(
+        last_heartbeat > first_heartbeat,
+        "GTK heartbeat did not advance during near-limit MIME preparation: first={first_health}, last={last_heartbeat}"
+    );
+    assert_eq!(settled_load["prepared_message_count"], 1, "{settled_load}");
+    assert_eq!(
+        settled_load["prepared_attachment_count"], 0,
+        "{settled_load}"
+    );
+    ensure!(
+        settled_load["prepared_retained_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > HUGE_BODY_BYTES as u64 && bytes < PREPARED_THREAD_LIMIT),
+        "near-limit HTML payload escaped the prepared-thread byte budget: {settled_load}"
+    );
+    let selected = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        selected["state"]["selected_message"]["message_id"], "huge-html-body@fixture.test",
+        "near-limit fixture message was not selected: {selected}"
+    );
+
+    // The worker completion above applies the prepared near-limit text payload
+    // to GTK. Re-apply it explicitly so both that bounded main-thread update
+    // and a harness input queued around it are covered by the latency budget.
+    let before_text = driver.command("health", json!({}))?;
+    let text_started = Instant::now();
+    let mut max_text_command = Duration::ZERO;
+    let text = responsive_harness_command(
+        &mut driver,
+        "show_text_thread",
+        json!({}),
+        UI_RESPONSE_LIMIT,
+        "near-limit GTK text rendering",
+        &mut max_text_command,
+    )?;
+    assert_eq!(text["ok"], true, "near-limit text could not render: {text}");
+    let text_view = responsive_harness_command(
+        &mut driver,
+        "html_view_state",
+        json!({}),
+        UI_RESPONSE_LIMIT,
+        "near-limit GTK text rendering",
+        &mut max_text_command,
+    )?;
+    assert_eq!(
+        text_view["visible_child"], "text",
+        "near-limit body was not applied to the GTK text view: {text_view}"
+    );
+    thread::sleep(Duration::from_millis(100));
+    let after_text = responsive_harness_command(
+        &mut driver,
+        "health",
+        json!({}),
+        UI_RESPONSE_LIMIT,
+        "near-limit GTK text rendering",
+        &mut max_text_command,
+    )?;
+    ensure!(
+        after_text["gtk_heartbeat"].as_u64().unwrap_or(0)
+            > before_text["gtk_heartbeat"].as_u64().unwrap_or(0),
+        "GTK heartbeat did not advance across near-limit text rendering: before={before_text}, after={after_text}"
+    );
+    let text_elapsed = text_started.elapsed();
+
+    let before_webkit = driver.command("health", json!({}))?;
+    let webkit_started = Instant::now();
+    let mut max_webkit_command = Duration::ZERO;
+    let visual = responsive_harness_command(
+        &mut driver,
+        "show_visual_html",
+        json!({}),
+        UI_RESPONSE_LIMIT,
+        "near-limit WebKit rendering",
+        &mut max_webkit_command,
+    )?;
+    assert_eq!(
+        visual["ok"], true,
+        "near-limit HTML document could not render: {visual}"
+    );
+    ensure!(
+        visual["html_view"]["html_bytes"]
+            .as_u64()
+            .is_some_and(
+                |bytes| bytes >= (HUGE_BODY_BYTES - 1024) as u64 && bytes < 4 * 1024 * 1024
+            ),
+        "fixture body was not near the responsive HTML limit: {visual}"
+    );
+    let first_load_generation = visual["html_view"]["load_generation"]
+        .as_u64()
+        .with_context(|| format!("near-limit WebKit load had no generation: {visual}"))?;
+    ensure!(
+        visual["html_view"]["loading"] == true
+            || visual["html_view"]["completed_load_generation"]
+                .as_u64()
+                .unwrap_or(0)
+                < first_load_generation,
+        "near-limit WebKit load completed before it could be responsiveness-tested: {visual}"
+    );
+
+    // Supersede the still-loading near-limit document. Only this newest token
+    // may publish readiness or scroll metrics after the older WebKit callbacks
+    // eventually arrive.
+    let replacement = responsive_harness_command(
+        &mut driver,
+        "show_visual_html",
+        json!({}),
+        UI_RESPONSE_LIMIT,
+        "near-limit WebKit replacement",
+        &mut max_webkit_command,
+    )?;
+    assert_eq!(
+        replacement["ok"], true,
+        "near-limit replacement could not render: {replacement}"
+    );
+    let load_generation = replacement["html_view"]["load_generation"]
+        .as_u64()
+        .with_context(|| format!("replacement WebKit load had no generation: {replacement}"))?;
+    ensure!(
+        load_generation > first_load_generation,
+        "near-limit replacement reused the stale generation: first={visual}, replacement={replacement}"
+    );
+
+    let webkit_deadline = Instant::now() + STARTUP_TIMEOUT;
+    let ready = loop {
+        thread::sleep(Duration::from_millis(50));
+        let health = responsive_harness_command(
+            &mut driver,
+            "health",
+            json!({}),
+            UI_RESPONSE_LIMIT,
+            "near-limit WebKit rendering",
+            &mut max_webkit_command,
+        )?;
+        assert_eq!(health["ok"], true, "fixture app became unhealthy: {health}");
+        last_heartbeat = health["gtk_heartbeat"].as_u64().unwrap_or(last_heartbeat);
+
+        let lifecycle = responsive_harness_command(
+            &mut driver,
+            "html_scroll_state",
+            json!({}),
+            UI_RESPONSE_LIMIT,
+            "near-limit WebKit rendering",
+            &mut max_webkit_command,
+        )?;
+        if lifecycle["ready"] == true
+            && lifecycle["completed_generation"] == load_generation
+            && lifecycle["scroll"]["canScroll"] == true
+        {
+            break lifecycle;
+        }
+        ensure!(
+            Instant::now() < webkit_deadline,
+            "near-limit WebKit load did not become ready and scrollable: {lifecycle}\n{}",
+            app.logs()
+        );
+    };
+    ensure!(
+        last_heartbeat > before_webkit["gtk_heartbeat"].as_u64().unwrap_or(0),
+        "GTK heartbeat did not advance while WebKit rendered the near-limit document: before={before_webkit}, after={last_heartbeat}"
+    );
+    thread::sleep(Duration::from_millis(250));
+    let after_stale_completion = responsive_harness_command(
+        &mut driver,
+        "html_scroll_state",
+        json!({}),
+        UI_RESPONSE_LIMIT,
+        "near-limit stale WebKit completion",
+        &mut max_webkit_command,
+    )?;
+    assert_eq!(
+        after_stale_completion["generation"], load_generation,
+        "stale near-limit WebKit completion replaced the newest generation: {after_stale_completion}"
+    );
+    assert_eq!(
+        after_stale_completion["completed_generation"], load_generation,
+        "stale near-limit WebKit completion changed readiness: {after_stale_completion}"
+    );
+    assert_eq!(
+        after_stale_completion["error"],
+        Value::Null,
+        "stale near-limit WebKit completion surfaced an error: {after_stale_completion}"
+    );
+
+    let initial_y = ready["scroll"]["y"]
+        .as_f64()
+        .with_context(|| format!("near-limit lifecycle had no scroll offset: {ready}"))?;
+    let scroll = responsive_harness_command(
+        &mut driver,
+        "scroll_html_view_lines",
+        json!({"lines": 8}),
+        UI_RESPONSE_LIMIT,
+        "near-limit WebKit input",
+        &mut max_webkit_command,
+    )?;
+    ensure!(
+        scroll["pending"] == true
+            || scroll["scroll"]["y"].as_f64().unwrap_or(initial_y) > initial_y,
+        "near-limit WebKit view did not accept scroll input: {scroll}"
+    );
+    let scroll_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let lifecycle = responsive_harness_command(
+            &mut driver,
+            "html_scroll_state",
+            json!({}),
+            UI_RESPONSE_LIMIT,
+            "near-limit WebKit input",
+            &mut max_webkit_command,
+        )?;
+        if lifecycle["scroll"]["y"]
+            .as_f64()
+            .is_some_and(|y| y > initial_y)
+        {
+            break;
+        }
+        ensure!(
+            Instant::now() < scroll_deadline,
+            "near-limit WebKit view did not process scroll input: {lifecycle}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+
+    eprintln!(
+        "near-limit HTML responsiveness passed: body={} bytes, retained={} bytes, preparation={:?}, preparation_samples={}, max_preparation_command={:?}, text={:?}, max_text_command={:?}, webkit={:?}, generations={}->{}, max_webkit_command={:?}",
+        visual["html_view"]["html_bytes"],
+        settled_load["prepared_retained_bytes"],
+        preparation_started.elapsed(),
+        preparation_samples,
+        max_preparation_command,
+        text_elapsed,
+        max_text_command,
+        webkit_started.elapsed(),
+        first_load_generation,
+        load_generation,
+        max_webkit_command,
+    );
+
+    Ok(())
+}
+
+#[test]
+fn fixture_fast_tag_cancels_delayed_thread_load_without_switching_visible_state()
+-> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_fast_tag_cancels_delayed_thread_load_without_switching_visible_state: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running thread-load/tag cancellation UI regression with {display}");
+
+    const DELAYED_LOAD_MS: u64 = 1_200;
+    const STALE_COMPLETION_WINDOW: Duration = Duration::from_millis(1_400);
+    const UI_RESPONSE_LIMIT: Duration = Duration::from_millis(500);
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-thread-tag-race-ui-{run_id}"));
+    let token = format!("notm-thread-tag-race-ui-{run_id}");
+    let mutation_tag = format!("thread-load-race-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+
+    let query = "subject:\"Read inbox message\" or subject:\"Unread inbox message\"";
+    let scheduled = driver.command("run_search", json!({"query": query}))?;
+    assert_eq!(
+        scheduled["scheduled"], true,
+        "thread-load/tag fixture search was not scheduled: {scheduled}"
+    );
+    let search = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let rows = json_array_at(&search, &["state", "thread_list_items"])?;
+    ensure!(
+        rows.len() == 2,
+        "thread-load/tag fixture query did not return two rows: {search}"
+    );
+    let initial_index = rows
+        .iter()
+        .position(|row| row["subject"] == "Read inbox message")
+        .with_context(|| format!("initial thread was missing: {search}"))?;
+    let delayed_index = rows
+        .iter()
+        .position(|row| row["subject"] == "Unread inbox message")
+        .with_context(|| format!("delayed thread was missing: {search}"))?;
+    let initial_thread_id = rows[initial_index]["thread_id"]
+        .as_str()
+        .with_context(|| format!("initial row had no thread ID: {}", rows[initial_index]))?
+        .to_string();
+    let delayed_thread_id = rows[delayed_index]["thread_id"]
+        .as_str()
+        .with_context(|| format!("delayed row had no thread ID: {}", rows[delayed_index]))?
+        .to_string();
+
+    let selected = driver.command("select_thread_by_index", json!({"index": initial_index}))?;
+    assert_eq!(
+        selected["ok"], true,
+        "initial thread selection was not scheduled: {selected}"
+    );
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let selected_message = driver.command("select_message_by_index", json!({"index": 0}))?;
+    assert_eq!(
+        selected_message["ok"], true,
+        "initial message could not be selected: {selected_message}"
+    );
+    let before_state = driver.command("app_state", json!({}))?;
+    let before_view = driver.command("message_view_text", json!({}))?;
+    let before_selection = driver.command("thread_selection_view_state", json!({}))?;
+    assert_eq!(
+        before_state["state"]["selected_thread"]["thread_id"], initial_thread_id,
+        "initial thread did not settle before the race: {before_state}"
+    );
+    let initial_message_id = before_state["state"]["selected_message"]["message_id"]
+        .as_str()
+        .with_context(|| format!("initial state had no selected message: {before_state}"))?
+        .to_string();
+    let before_message_ids = json_array_at(&before_state, &["state", "messages"])?
+        .iter()
+        .map(|message| {
+            message["message_id"]
+                .as_str()
+                .map(ToOwned::to_owned)
+                .with_context(|| format!("loaded message had no ID: {message}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    ensure!(
+        !before_message_ids.is_empty(),
+        "initial thread had no prepared messages: {before_state}"
+    );
+    ensure!(
+        before_view["text"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty()),
+        "initial message had no visible prepared text: {before_view}"
+    );
+    assert_eq!(
+        before_selection["selected_local"].as_u64(),
+        Some(initial_index as u64),
+        "GTK did not settle on the initial row: {before_selection}"
+    );
+    let loader_before = driver.command("thread_load_status", json!({}))?;
+    let cancelled_before = loader_before["cancelled"].as_u64().unwrap_or(0);
+
+    let delayed = driver.command(
+        "set_fixture_thread_delay",
+        json!({"milliseconds": DELAYED_LOAD_MS}),
+    )?;
+    assert_eq!(
+        delayed["ok"], true,
+        "could not delay thread load: {delayed}"
+    );
+    let delayed_selection =
+        driver.command("select_thread_by_index", json!({"index": delayed_index}))?;
+    assert_eq!(
+        delayed_selection["ok"], true,
+        "delayed target selection was not scheduled: {delayed_selection}"
+    );
+    let delayed_status = driver.command("thread_load_status", json!({}))?;
+    assert_eq!(
+        delayed_status["busy"], true,
+        "delayed target loader was not active: {delayed_status}"
+    );
+    let delayed_generation = delayed_status["generation"]
+        .as_u64()
+        .with_context(|| format!("delayed loader had no generation: {delayed_status}"))?;
+    let retained = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        retained["state"]["selected_thread"]["thread_id"], initial_thread_id,
+        "delayed selection replaced retained state before preparation: {retained}"
+    );
+    assert_eq!(
+        retained["state"]["selected_message"]["message_id"], initial_message_id,
+        "delayed selection replaced the retained message before preparation: {retained}"
+    );
+    driver.command("set_fixture_thread_delay", json!({"milliseconds": 0}))?;
+
+    let health_started = Instant::now();
+    let health_before = driver.command("health", json!({}))?;
+    let health_elapsed = health_started.elapsed();
+    ensure!(
+        health_elapsed < UI_RESPONSE_LIMIT,
+        "health blocked behind delayed thread load for {health_elapsed:?}: {health_before}"
+    );
+    assert_eq!(
+        health_before["thread_load"]["generation"], delayed_generation,
+        "health did not report the delayed loader generation: {health_before}"
+    );
+
+    let tag_started = Instant::now();
+    let tagged = driver.command("tag_selected", json!({"add": [&mutation_tag]}))?;
+    let tag_elapsed = tag_started.elapsed();
+    ensure!(
+        tag_elapsed < UI_RESPONSE_LIMIT,
+        "fast tag scheduling blocked for {tag_elapsed:?}: {tagged}"
+    );
+    assert_eq!(tagged["ok"], true, "fast tag was rejected: {tagged}");
+    assert_eq!(
+        tagged["pending"], true,
+        "fast tag did not run asynchronously: {tagged}"
+    );
+    let tag_completion = wait_for_tag(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        tag_completion["state"]["last_error"],
+        Value::Null,
+        "fast tag did not complete cleanly: {tag_completion}\n{}",
+        app.logs()
+    );
+
+    // The pre-fix worker ignores the tag refresh and publishes after its full
+    // fixture delay. Keep one explicit bounded stale-completion window so that
+    // ordering bug cannot hide behind an early assertion.
+    thread::sleep(STALE_COMPLETION_WINDOW);
+
+    let final_health_started = Instant::now();
+    let final_health = driver.command("health", json!({}))?;
+    let final_health_elapsed = final_health_started.elapsed();
+    ensure!(
+        final_health_elapsed < UI_RESPONSE_LIMIT,
+        "health blocked after tag/load cancellation for {final_health_elapsed:?}: {final_health}"
+    );
+    ensure!(
+        final_health["gtk_heartbeat"].as_u64().unwrap_or(0)
+            > health_before["gtk_heartbeat"].as_u64().unwrap_or(0),
+        "GTK heartbeat did not advance through the tag/load race: before={health_before}, after={final_health}"
+    );
+    let final_loader = driver.command("thread_load_status", json!({}))?;
+    assert_eq!(
+        final_loader["busy"], false,
+        "thread loader remained active after the stale-completion window: {final_loader}"
+    );
+    ensure!(
+        final_loader["cancelled"].as_u64().unwrap_or(0) > cancelled_before,
+        "tag mutation did not cancel the delayed loader: before={loader_before}, after={final_loader}"
+    );
+
+    let final_state = driver.command("app_state", json!({}))?;
+    let final_view = driver.command("message_view_text", json!({}))?;
+    let final_selection = driver.command("thread_selection_view_state", json!({}))?;
+    assert_eq!(
+        final_state["state"]["selected_thread"]["thread_id"], initial_thread_id,
+        "stale delayed load replaced the retained tagged thread: {final_state}"
+    );
+    assert_eq!(
+        final_state["state"]["selected_message"]["message_id"], initial_message_id,
+        "stale delayed load replaced the retained tagged message: {final_state}"
+    );
+    let final_message_ids = json_array_at(&final_state, &["state", "messages"])?
+        .iter()
+        .map(|message| {
+            message["message_id"]
+                .as_str()
+                .map(ToOwned::to_owned)
+                .with_context(|| format!("final loaded message had no ID: {message}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    assert_eq!(
+        final_message_ids, before_message_ids,
+        "stale delayed load replaced the visible prepared message set: {final_state}"
+    );
+    assert_eq!(
+        final_view["text"], before_view["text"],
+        "stale delayed load replaced the visible prepared text: before={before_view}, after={final_view}"
+    );
+    assert_eq!(
+        final_selection["selected_local"].as_u64(),
+        Some(initial_index as u64),
+        "GTK selection did not return to the retained tagged row: {final_selection}"
+    );
+
+    let final_rows = json_array_at(&final_state, &["state", "thread_list_items"])?;
+    let row_has_tag = |thread_id: &str| -> anyhow::Result<bool> {
+        let row = final_rows
+            .iter()
+            .find(|row| row["thread_id"].as_str() == Some(thread_id))
+            .with_context(|| format!("final result omitted thread {thread_id}: {final_state}"))?;
+        Ok(row["tags"]
+            .as_array()
+            .is_some_and(|tags| tags.iter().any(|tag| tag == &mutation_tag)))
+    };
+    assert!(
+        row_has_tag(&initial_thread_id)?,
+        "fast tag missed the retained exact thread: {final_state}"
+    );
+    assert!(
+        !row_has_tag(&delayed_thread_id)?,
+        "fast tag leaked onto the delayed target: {final_state}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn fixture_delayed_thread_loading_is_generation_safe_and_responsive() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_delayed_thread_loading_is_generation_safe_and_responsive: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running delayed thread-loading UI stress with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-thread-loader-ui-{run_id}"));
+    let token = format!("notm-thread-loader-ui-{run_id}");
+    const LARGE_ATTACHMENT_BYTES: usize = 6 * 1024 * 1024;
+    let mut app =
+        FixtureApp::spawn_with_large_attachment(work_dir, &token, LARGE_ATTACHMENT_BYTES)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+
+    let scheduled = driver.command("run_search", json!({"query": "*"}))?;
+    assert_eq!(
+        scheduled["scheduled"], true,
+        "search was not scheduled: {scheduled}"
+    );
+    let search = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let current_thread_id =
+        driver.command("app_state", json!({}))?["state"]["selected_thread"]["thread_id"]
+            .as_str()
+            .map(ToOwned::to_owned);
+    let rows = json_array_at(&search, &["state", "thread_list_items"])?;
+    let candidates = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            let is_draft = row["tags"]
+                .as_array()
+                .is_some_and(|tags| tags.iter().any(|tag| tag == "draft"));
+            let is_current = row["thread_id"]
+                .as_str()
+                .is_some_and(|thread_id| current_thread_id.as_deref() == Some(thread_id));
+            !is_draft && !is_current
+        })
+        .take(2)
+        .map(|(index, row)| {
+            Ok((
+                index,
+                row["thread_id"]
+                    .as_str()
+                    .with_context(|| format!("thread row had no id: {row}"))?
+                    .to_string(),
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    ensure!(
+        candidates.len() == 2,
+        "fixture search did not provide two non-draft thread-switch targets: {search}"
+    );
+
+    let delayed = driver.command("set_fixture_thread_delay", json!({"milliseconds": 1200}))?;
+    assert_eq!(
+        delayed["ok"], true,
+        "could not delay thread loader: {delayed}"
+    );
+    driver.command("select_thread_by_index", json!({"index": candidates[0].0}))?;
+    let first_load = driver.command("thread_load_status", json!({}))?;
+    assert_eq!(
+        first_load["busy"], true,
+        "first delayed load was not active: {first_load}"
+    );
+    let first_generation = first_load["generation"]
+        .as_u64()
+        .with_context(|| format!("first delayed load had no generation: {first_load}"))?;
+
+    driver.command("set_fixture_thread_delay", json!({"milliseconds": 300}))?;
+    driver.command("select_thread_by_index", json!({"index": candidates[1].0}))?;
+    let final_load = driver.command("thread_load_status", json!({}))?;
+    assert_eq!(
+        final_load["busy"], true,
+        "final delayed load was not active: {final_load}"
+    );
+    let final_generation = final_load["generation"]
+        .as_u64()
+        .with_context(|| format!("final delayed load had no generation: {final_load}"))?;
+    ensure!(
+        final_generation > first_generation,
+        "rapid selection did not invalidate the earlier generation: first={first_load}, final={final_load}"
+    );
+
+    let first_health_started = Instant::now();
+    let first_health = driver.command("health", json!({}))?;
+    let first_health_elapsed = first_health_started.elapsed();
+    thread::sleep(Duration::from_millis(150));
+    let second_health_started = Instant::now();
+    let second_health = driver.command("health", json!({}))?;
+    let second_health_elapsed = second_health_started.elapsed();
+    ensure!(
+        first_health_elapsed < Duration::from_millis(500)
+            && second_health_elapsed < Duration::from_millis(500),
+        "health blocked behind delayed thread work: first={first_health_elapsed:?}, second={second_health_elapsed:?}"
+    );
+    ensure!(
+        second_health["gtk_heartbeat"].as_u64().unwrap_or(0)
+            > first_health["gtk_heartbeat"].as_u64().unwrap_or(0),
+        "GTK heartbeat did not advance during delayed thread work: first={first_health}, second={second_health}"
+    );
+    assert_eq!(
+        second_health["thread_load"]["generation"], final_generation,
+        "health did not report the active final generation: {second_health}"
+    );
+
+    wait_for_thread_load_idle(&mut driver, Duration::from_secs(5))?;
+    let settled = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        settled["state"]["selected_thread"]["thread_id"], candidates[1].1,
+        "newest delayed selection did not win: {settled}"
+    );
+    thread::sleep(Duration::from_millis(1100));
+    let after_stale_completion = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        after_stale_completion["state"]["selected_thread"]["thread_id"], candidates[1].1,
+        "stale delayed completion replaced the final selection: {after_stale_completion}"
+    );
+    let stale_status = driver.command("thread_load_status", json!({}))?;
+    assert_eq!(
+        stale_status["busy"], false,
+        "stale completion reactivated the loader: {stale_status}"
+    );
+    assert_eq!(
+        stale_status["peak_active_preparations"], 1,
+        "rapid switching prepared multiple thread payloads concurrently: {stale_status}"
+    );
+    ensure!(
+        stale_status["cancelled"].as_u64().unwrap_or(0) >= 1,
+        "rapid switching did not cancel stale preparation work: {stale_status}"
+    );
+
+    driver.command("set_fixture_thread_delay", json!({"milliseconds": 900}))?;
+    select_first_thread(&mut driver, "id:attachment-heavy-0@fixture.test")?;
+    let heavy_load = driver.command("thread_load_status", json!({}))?;
+    assert_eq!(
+        heavy_load["busy"], true,
+        "attachment-heavy load was not delayed: {heavy_load}"
+    );
+    ensure!(
+        heavy_load["generation"].as_u64().unwrap_or(0) > final_generation,
+        "attachment-heavy load did not use a fresh generation: {heavy_load}"
+    );
+    let heavy_health_before = driver.command("health", json!({}))?;
+    thread::sleep(Duration::from_millis(150));
+    let heavy_health_after = driver.command("health", json!({}))?;
+    ensure!(
+        heavy_health_after["gtk_heartbeat"].as_u64().unwrap_or(0)
+            > heavy_health_before["gtk_heartbeat"].as_u64().unwrap_or(0),
+        "GTK heartbeat did not advance during attachment-heavy loading: before={heavy_health_before}, after={heavy_health_after}"
+    );
+    assert_eq!(
+        heavy_health_after["thread_load"]["busy"], true,
+        "attachment-heavy loader finished before the responsiveness assertion: {heavy_health_after}"
+    );
+    let bounded_heavy_load = wait_for_thread_load_idle(&mut driver, Duration::from_secs(5))?;
+    ensure!(
+        bounded_heavy_load["prepared_retained_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0 && bytes < LARGE_ATTACHMENT_BYTES as u64),
+        "decoded large-attachment payload appears resident in prepared content: {bounded_heavy_load}"
+    );
+    assert_eq!(
+        bounded_heavy_load["prepared_attachment_count"], 72,
+        "attachment-heavy metadata count was not bounded/reported: {bounded_heavy_load}"
+    );
+    assert_eq!(
+        bounded_heavy_load["peak_active_preparations"], 1,
+        "attachment-heavy preparation overlapped another payload producer: {bounded_heavy_load}"
+    );
+
+    let heavy_state = driver.command("app_state", json!({}))?;
+    let heavy_messages = json_array_at(&heavy_state, &["state", "messages"])?;
+    assert_eq!(
+        heavy_messages.len(),
+        3,
+        "attachment-heavy thread did not load all messages: {heavy_state}"
+    );
+    ensure!(
+        heavy_messages
+            .iter()
+            .any(|message| message["message_id"] == "attachment-heavy-0@fixture.test"),
+        "explicit attachment-heavy target was missing: {heavy_state}"
+    );
+    let listed = driver.command("attachment_list_items", json!({}))?;
+    assert_eq!(
+        json_array_at(&listed, &["attachments"])?.len(),
+        72,
+        "attachment-heavy metadata was incomplete: {listed}"
+    );
+    let row_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let attachment_state = driver.command("attachment_test_state", json!({}))?;
+        if attachment_state["row_count"] == 72 {
+            break;
+        }
+        ensure!(
+            Instant::now() < row_deadline,
+            "attachment rows were not incrementally completed: {attachment_state}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+
+    let downloads = app.work_dir.join("large-attachment-downloads");
+    fs::create_dir_all(&downloads)?;
+    driver.command("set_fixture_attachment_delay", json!({"milliseconds": 600}))?;
+    let before_lazy_save = driver.command("health", json!({}))?;
+    let lazy_save = driver.command(
+        "save_selected_attachment",
+        json!({"index": 0, "dir": downloads}),
+    )?;
+    assert_eq!(
+        lazy_save["pending"], true,
+        "large lazy attachment save did not start asynchronously: {lazy_save}"
+    );
+    thread::sleep(Duration::from_millis(150));
+    let during_lazy_save = driver.command("health", json!({}))?;
+    ensure!(
+        during_lazy_save["gtk_heartbeat"].as_u64().unwrap_or(0)
+            > before_lazy_save["gtk_heartbeat"].as_u64().unwrap_or(0),
+        "GTK heartbeat stopped while lazily reading/decoding the large attachment: before={before_lazy_save}, during={during_lazy_save}"
+    );
+    assert_eq!(
+        during_lazy_save["attachment_io"]["busy"], true,
+        "large lazy attachment save finished before responsiveness was measured: {during_lazy_save}"
+    );
+    let saved = wait_for_attachment_io_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let saved_path = saved["last_completion"]["path"]
+        .as_str()
+        .map(PathBuf::from)
+        .with_context(|| format!("large lazy save returned no path: {saved}"))?;
+    assert_eq!(
+        fs::metadata(&saved_path)?.len(),
+        LARGE_ATTACHMENT_BYTES as u64,
+        "large lazy save did not extract the requested payload: {saved}"
+    );
+
+    driver.command("set_fixture_thread_delay", json!({"milliseconds": 0}))?;
+    driver.command("run_search", json!({"query": "*"}))?;
+    let composer_search = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let before_composer = driver.command("app_state", json!({}))?;
+    let before_composer_thread = before_composer["state"]["selected_thread"]["thread_id"]
+        .as_str()
+        .map(ToOwned::to_owned);
+    let composer_target = json_array_at(&composer_search, &["state", "thread_list_items"])?
+        .iter()
+        .enumerate()
+        .find(|(_, row)| {
+            let is_draft = row["tags"]
+                .as_array()
+                .is_some_and(|tags| tags.iter().any(|tag| tag == "draft"));
+            let is_current = row["thread_id"]
+                .as_str()
+                .is_some_and(|thread_id| before_composer_thread.as_deref() == Some(thread_id));
+            !is_draft && !is_current
+        })
+        .map(|(index, row)| (index, row["thread_id"].clone()))
+        .with_context(|| format!("no delayed preview target remained: {composer_search}"))?;
+    let before_cancel = driver.command("thread_load_status", json!({}))?;
+    driver.command("set_fixture_thread_delay", json!({"milliseconds": 800}))?;
+    driver.command(
+        "select_thread_by_index",
+        json!({"index": composer_target.0}),
+    )?;
+    let delayed_preview = driver.command("thread_load_status", json!({}))?;
+    assert_eq!(
+        delayed_preview["busy"], true,
+        "composer cancellation regression did not start a delayed preview: {delayed_preview}"
+    );
+    let before_typing = driver.command("health", json!({}))?;
+    assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
+    assert_eq!(
+        driver.command(
+            "compose_set_subject",
+            json!({"value": "Typing cancels delayed preview"}),
+        )?["ok"],
+        true
+    );
+    assert_eq!(
+        driver.command(
+            "compose_set_body",
+            json!({"value": "A stale thread completion must not replace this composer."}),
+        )?["ok"],
+        true
+    );
+    thread::sleep(Duration::from_millis(175));
+    let during_typing = driver.command("health", json!({}))?;
+    ensure!(
+        during_typing["gtk_heartbeat"].as_u64().unwrap_or(0)
+            > before_typing["gtk_heartbeat"].as_u64().unwrap_or(0),
+        "GTK heartbeat stopped while typing cancelled a delayed preview: before={before_typing}, during={during_typing}"
+    );
+    thread::sleep(Duration::from_millis(850));
+    let after_cancel = driver.command("thread_load_status", json!({}))?;
+    assert_eq!(
+        after_cancel["busy"], false,
+        "cancelled delayed preview remained active: {after_cancel}"
+    );
+    ensure!(
+        after_cancel["cancelled"].as_u64().unwrap_or(0)
+            > before_cancel["cancelled"].as_u64().unwrap_or(0),
+        "opening and typing in the composer did not cancel the delayed preview: before={before_cancel}, after={after_cancel}"
+    );
+    let after_typing = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        after_typing["state"]["compose_fields"]["subject"], "Typing cancels delayed preview",
+        "stale preview replaced the newer composer: target={}, state={after_typing}",
+        composer_target.1
+    );
+    assert_eq!(
+        after_typing["state"]["selected_thread"]["thread_id"],
+        before_composer_thread
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+        "cancelled preview changed the selected thread after its worker settled: {after_typing}"
+    );
+    let pending = driver.command("pending_confirmation", json!({}))?;
+    assert_eq!(
+        pending["pending"],
+        Value::Null,
+        "stale preview reached the dirty-composer replacement workflow after cancellation: {pending}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn fixture_slow_composer_preparation_is_generation_safe_and_responsive() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_slow_composer_preparation_is_generation_safe_and_responsive: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running async composer-preparation UI smoke with {display}");
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-composer-preparation-ui-{run_id}"));
+    let token = format!("notm-composer-preparation-ui-{run_id}");
+    let mut app = FixtureApp::spawn(work_dir, &token)?;
+    let mut driver = app.connect(&token)?;
+    select_first_thread(&mut driver, "subject:\"Three message thread\"")?;
+
+    driver.command(
+        "set_fixture_composer_preparation_delay",
+        json!({"milliseconds": 800}),
+    )?;
+    let started = Instant::now();
+    let slow_reply = driver.command("reply_selected", json!({}))?;
+    assert_eq!(
+        slow_reply["ok"], true,
+        "slow reply failed to start: {slow_reply}"
+    );
+    assert_eq!(
+        slow_reply["pending"], true,
+        "slow reply was not asynchronous: {slow_reply}"
+    );
+    ensure!(
+        started.elapsed() < Duration::from_millis(500),
+        "slow reply preparation blocked its command response for {:?}: {slow_reply}",
+        started.elapsed()
+    );
+    let before = driver.command("health", json!({}))?;
+    assert_eq!(
+        before["composer_preparation"]["busy"], true,
+        "health did not report slow composer preparation: {before}"
+    );
+    driver.command(
+        "compose_set_subject",
+        json!({"value": "Newer typing must win"}),
+    )?;
+    thread::sleep(Duration::from_millis(175));
+    let after = driver.command("health", json!({}))?;
+    ensure!(
+        after["gtk_heartbeat"].as_u64().unwrap_or(0)
+            > before["gtk_heartbeat"].as_u64().unwrap_or(0),
+        "GTK heartbeat stopped during composer preparation: before={before}, after={after}"
+    );
+    let stale = wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        stale["outcome"], "superseded",
+        "newer typing did not supersede slow preparation: {stale}"
+    );
+    let state = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        state["state"]["compose_fields"]["subject"], "Newer typing must win",
+        "stale reply preparation replaced newer typing: {state}"
+    );
+
+    driver.command("compose_set_subject", json!({"value": ""}))?;
+    driver.command(
+        "set_fixture_composer_preparation_delay",
+        json!({"milliseconds": 700}),
+    )?;
+    let first = driver.command("reply_selected", json!({}))?;
+    assert_eq!(
+        first["pending"], true,
+        "first rapid response was not pending: {first}"
+    );
+    driver.command(
+        "set_fixture_composer_preparation_delay",
+        json!({"milliseconds": 0}),
+    )?;
+    let second = driver.command("forward_selected", json!({}))?;
+    assert_eq!(
+        second["pending"], true,
+        "newer rapid response was not pending: {second}"
+    );
+    let latest = wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        latest["outcome"], "prepared",
+        "newer response did not win: {latest}"
+    );
+    let state = driver.command("app_state", json!({}))?;
+    ensure!(
+        state["state"]["compose_fields"]["subject"]
+            .as_str()
+            .is_some_and(|subject| subject.starts_with("Fwd:")),
+        "newer forward was not applied: {state}"
+    );
+    thread::sleep(Duration::from_millis(850));
+    let after_stale_worker = driver.command("app_state", json!({}))?;
+    ensure!(
+        after_stale_worker["state"]["compose_fields"]["subject"]
+            .as_str()
+            .is_some_and(|subject| subject.starts_with("Fwd:")),
+        "older slow reply overtook the newer forward: {after_stale_worker}"
+    );
+
+    Ok(())
+}
+
+fn wait_for_thread_load_idle(driver: &mut UiDriver, timeout: Duration) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = driver.command("thread_load_status", json!({}))?;
+        ensure!(status["ok"] == true, "thread load status failed: {status}");
+        if status["busy"] == false {
+            return Ok(status);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "thread load did not become idle within {timeout:?}: {status}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
+fn responsive_harness_command(
+    driver: &mut UiDriver,
+    command: &str,
+    args: Value,
+    limit: Duration,
+    phase: &str,
+    max_elapsed: &mut Duration,
+) -> anyhow::Result<Value> {
+    let started = Instant::now();
+    let response = driver.command(command, args)?;
+    let elapsed = started.elapsed();
+    *max_elapsed = (*max_elapsed).max(elapsed);
+    ensure!(
+        elapsed < limit,
+        "GTK input {command:?} blocked for {elapsed:?} during {phase}; response={response}"
+    );
+    Ok(response)
+}
+
+fn wait_for_composer_preparation_idle(
+    driver: &mut UiDriver,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = driver.command("composer_preparation_status", json!({}))?;
+        ensure!(
+            status["ok"] == true,
+            "composer preparation status failed: {status}"
+        );
+        if status["busy"] == false {
+            return Ok(status);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "composer preparation did not become idle within {timeout:?}: {status}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
+fn wait_for_composer_preparation_generation(
+    driver: &mut UiDriver,
+    requested_generation: u64,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = driver.command("composer_preparation_status", json!({}))?;
+        ensure!(
+            status["ok"] == true,
+            "composer preparation status failed: {status}"
+        );
+        let busy = status["busy"]
+            .as_bool()
+            .with_context(|| format!("composer preparation status had no busy flag: {status}"))?;
+        let active_generation = status["generation"].as_u64();
+        let completed_generation = status["completed_generation"].as_u64();
+        if !busy && completed_generation == Some(requested_generation) {
+            return Ok(status);
+        }
+        ensure!(
+            !active_generation.is_some_and(|generation| generation > requested_generation)
+                && !completed_generation
+                    .is_some_and(|generation| generation > requested_generation),
+            "composer preparation generation {requested_generation} was superseded: {status}"
+        );
+        ensure!(
+            busy || !matches!(
+                status["outcome"].as_str(),
+                Some("cancelled" | "superseded" | "failed" | "rejected")
+            ),
+            "composer preparation generation {requested_generation} became idle without completing: {status}"
+        );
+        ensure!(
+            Instant::now() < deadline,
+            "composer preparation generation {requested_generation} did not complete within {timeout:?}: {status}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
+fn wait_for_attachment_io_idle(driver: &mut UiDriver, timeout: Duration) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = driver.command("attachment_io_status", json!({}))?;
+        ensure!(
+            status["ok"] == true,
+            "attachment I/O status failed: {status}"
+        );
+        if status["busy"] == false {
+            return Ok(status);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "attachment I/O did not become idle within {timeout:?}: {status}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
+fn wait_for_composer_attachment_cache_idle(
+    driver: &mut UiDriver,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = driver.command("attachment_io_status", json!({}))?;
+        ensure!(
+            status["ok"] == true,
+            "attachment I/O status failed: {status}"
+        );
+        if status["composer_cache"]["busy"] == false {
+            return Ok(status);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "composer attachment cache did not become idle within {timeout:?}: {status}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
+fn wait_for_new_composer_attachment_cache(
+    driver: &mut UiDriver,
+    previous_generation: u64,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = driver.command("attachment_io_status", json!({}))?;
+        ensure!(
+            status["ok"] == true,
+            "attachment I/O status failed: {status}"
+        );
+        let cache = &status["composer_cache"];
+        let latest_generation = cache["latest_generation"].as_u64().with_context(|| {
+            format!("composer attachment cache had no latest generation: {status}")
+        })?;
+        let completed_generation = cache["completed_generation"].as_u64();
+        let busy = cache["busy"]
+            .as_bool()
+            .with_context(|| format!("composer attachment cache had no busy flag: {status}"))?;
+        if latest_generation > previous_generation
+            && completed_generation == Some(latest_generation)
+            && !busy
+        {
+            return Ok(status);
+        }
+        ensure!(
+            busy || latest_generation == previous_generation
+                || !matches!(cache["outcome"].as_str(), Some("cancelled" | "failed")),
+            "composer attachment cache generation after {previous_generation} became idle without completing: {status}"
+        );
+        ensure!(
+            Instant::now() < deadline,
+            "composer attachment cache did not complete a generation after {previous_generation} within {timeout:?}: {status}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
 fn select_first_thread(driver: &mut UiDriver, query: &str) -> anyhow::Result<()> {
     driver.wait_for_search(STARTUP_TIMEOUT)?;
     driver.command("thread_selection_view_state", json!({}))?;
@@ -8801,10 +13255,27 @@ fn open_message_io_attachment(
         opened["ok"] == true,
         "root attachment could not be opened via {source_description}: {opened}"
     );
-    let opened_path = opened["path"]
+    assert_eq!(
+        opened["pending"], true,
+        "root attachment Open was not asynchronous via {source_description}: {opened}"
+    );
+    let completion = wait_for_attachment_io_idle(driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        completion["last_completion"]["request_id"], opened["request_id"],
+        "attachment Open completed a different request via {source_description}: started={opened}, completion={completion}"
+    );
+    assert_eq!(
+        completion["last_completion"]["applied"], true,
+        "attachment Open completion was stale via {source_description}: {completion}"
+    );
+    ensure!(
+        completion["last_completion"]["error"].is_null(),
+        "attachment Open failed via {source_description}: {completion}"
+    );
+    let opened_path = completion["last_completion"]["path"]
         .as_str()
         .map(PathBuf::from)
-        .with_context(|| format!("attachment Open returned no path: {opened}"))?;
+        .with_context(|| format!("attachment Open returned no path: {completion}"))?;
     ensure!(
         fs::read(&opened_path)? == b"message-I/O attachment\r\n",
         "attachment bytes changed when opened via {source_description}"

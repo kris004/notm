@@ -7,6 +7,11 @@ use chrono::{Duration, Utc};
 use notm_notmuch::{Database, DatabaseMode, OpenConfig};
 use tempfile::TempDir;
 
+const HUGE_HTML_BODY_BYTES_ENV: &str = "NOTM_FIXTURE_TEST_HUGE_BODY_BYTES";
+const MAX_HUGE_HTML_BODY_BYTES: usize = 4 * 1024 * 1024 - 64 * 1024;
+const EXTRA_SEARCH_THREADS_ENV: &str = "NOTM_FIXTURE_TEST_SEARCH_THREADS";
+const MAX_EXTRA_SEARCH_THREADS: usize = 256;
+
 pub struct FixtureDatabase {
     _temp: TempDir,
     pub root: PathBuf,
@@ -86,7 +91,7 @@ struct FixtureMessage {
 fn fixture_messages() -> Vec<FixtureMessage> {
     let now = Utc::now();
     let thread_id = "three-message";
-    vec![
+    let mut messages = vec![
         msg(
             "unread inbox message",
             "alice@example.test",
@@ -203,7 +208,39 @@ fn fixture_messages() -> Vec<FixtureMessage> {
         malformed_msg(),
         malformed_transfer_encoding_msg(),
         unicode_msg(),
-    ]
+    ];
+    if let Some(bytes) = fixture_huge_html_body_bytes() {
+        messages.push(huge_html_msg(bytes));
+    }
+    let extra_search_threads = std::env::var(EXTRA_SEARCH_THREADS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(MAX_EXTRA_SEARCH_THREADS);
+    messages.extend((0..extra_search_threads).map(|index| {
+        msg(
+            &format!("search-stress-{index}"),
+            "search-stress@example.test",
+            "fixture@example.test",
+            &format!("Search stress row {index:04}"),
+            "Small body used to exercise bounded search result model updates.",
+            &["search-stress"],
+            now - Duration::seconds(100 + index as i64),
+            None,
+            None,
+            None,
+        )
+    }));
+    messages.extend(attachment_heavy_thread());
+    messages
+}
+
+fn fixture_huge_html_body_bytes() -> Option<usize> {
+    std::env::var(HUGE_HTML_BODY_BYTES_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|bytes| *bytes > 0)
+        .map(|bytes| bytes.min(MAX_HUGE_HTML_BODY_BYTES))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -261,11 +298,95 @@ fn long_html_msg() -> FixtureMessage {
     }
 }
 
+fn huge_html_msg(target_bytes: usize) -> FixtureMessage {
+    const PREFIX: &str = "<html><body><h1>Near-limit HTML body</h1>";
+    const SUFFIX: &str = "</body></html>";
+    let paragraph = format!(
+        "<p>Near-limit rendering fixture content {}.</p>\r\n",
+        "0123456789abcdef ".repeat(52)
+    );
+
+    let target_bytes = target_bytes.max(PREFIX.len() + SUFFIX.len());
+    let mut body = String::with_capacity(target_bytes);
+    body.push_str(PREFIX);
+    while body.len() + paragraph.len() + SUFFIX.len() <= target_bytes {
+        body.push_str(&paragraph);
+    }
+    body.extend(std::iter::repeat_n(
+        'x',
+        target_bytes.saturating_sub(body.len() + SUFFIX.len()),
+    ));
+    body.push_str(SUFFIX);
+
+    FixtureMessage {
+        raw: format!(
+            "From: huge-html@example.test\r\nTo: fixture@example.test\r\nSubject: Near-limit HTML body\r\nDate: Thu, 18 Jun 2026 20:00:45 -0600\r\nMessage-ID: <huge-html-body@fixture.test>\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{body}"
+        ),
+        tags: vec!["inbox"],
+    }
+}
+
 fn attachment_msg() -> FixtureMessage {
     FixtureMessage {
         raw: "From: attach@example.test\r\nTo: fixture@example.test\r\nSubject: Attachment message\r\nDate: Thu, 18 Jun 2026 20:01:00 -0600\r\nMessage-ID: <attachment-message@fixture.test>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=fixture-boundary\r\n\r\n--fixture-boundary\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nMessage with attachment.\r\n--fixture-boundary\r\nContent-Type: text/plain; name=note.txt\r\nContent-Disposition: attachment; filename=note.txt\r\n\r\nattached text\r\n--fixture-boundary--\r\n".to_string(),
         tags: vec!["inbox"],
     }
+}
+
+fn attachment_heavy_thread() -> Vec<FixtureMessage> {
+    const MESSAGE_COUNT: usize = 3;
+    const ATTACHMENTS_PER_MESSAGE: usize = 24;
+    const LARGE_ATTACHMENT_BYTES_ENV: &str = "NOTM_FIXTURE_TEST_LARGE_ATTACHMENT_BYTES";
+    const MAX_LARGE_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+    let large_attachment_bytes = std::env::var(LARGE_ATTACHMENT_BYTES_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(MAX_LARGE_ATTACHMENT_BYTES);
+    (0..MESSAGE_COUNT)
+        .map(|message_index| {
+            let message_id = format!("attachment-heavy-{message_index}@fixture.test");
+            let boundary = format!("attachment-heavy-boundary-{message_index}");
+            let mut raw = format!(
+                "From: attachment-heavy@example.test\r\nTo: fixture@example.test\r\nSubject: {}Attachment-heavy thread\r\nDate: Thu, 18 Jun 2026 20:03:0{message_index} -0600\r\nMessage-ID: <{message_id}>\r\n",
+                if message_index == 0 { "" } else { "Re: " }
+            );
+            if message_index > 0 {
+                raw.push_str(
+                    "In-Reply-To: <attachment-heavy-0@fixture.test>\r\nReferences: <attachment-heavy-0@fixture.test>\r\n",
+                );
+            }
+            raw.push_str(&format!(
+                "MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary={boundary}\r\n\r\n--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nAttachment-heavy fixture message {message_index}.\r\n"
+            ));
+            for attachment_index in 0..ATTACHMENTS_PER_MESSAGE {
+                let filename = format!("fixture-{message_index}-{attachment_index:02}.txt");
+                let payload = if message_index == 0
+                    && attachment_index == 0
+                    && large_attachment_bytes > 0
+                {
+                    "x".repeat(large_attachment_bytes)
+                } else {
+                    format!(
+                        "attachment {message_index}/{attachment_index}: {}",
+                        "0123456789abcdef".repeat(64)
+                    )
+                };
+                raw.push_str(&format!(
+                    "--{boundary}\r\nContent-Type: text/plain; name={filename}\r\nContent-Disposition: attachment; filename={filename}\r\n\r\n{payload}\r\n"
+                ));
+            }
+            raw.push_str(&format!("--{boundary}--\r\n"));
+            FixtureMessage {
+                raw,
+                tags: if message_index == 0 {
+                    vec!["inbox"]
+                } else {
+                    vec!["sent"]
+                },
+            }
+        })
+        .collect()
 }
 
 fn html_with_malformed_attachment_msg() -> FixtureMessage {

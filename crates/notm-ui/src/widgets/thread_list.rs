@@ -1,11 +1,16 @@
 use std::{
     cell::Cell,
     collections::{BTreeMap, BTreeSet},
+    fs::File,
+    io::Read,
+    path::Path,
     rc::Rc,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        mpsc,
     },
+    thread,
     time::Duration,
 };
 
@@ -13,18 +18,23 @@ use chrono::Utc;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use notm_notmuch::{
-    Database, DatabaseMode, OpenConfig, QueryOptions, Revision, SortOrder, ThreadSummary,
+    Database, DatabaseMode, MessageSummary, OpenConfig, QueryOptions, Revision, SortOrder,
+    ThreadSummary, database::BoundedThreadMessages,
 };
 use serde_json::json;
 
 use crate::{
     cache::{BoundedLruCache, SEARCH_PAGE_CACHE_CAPACITY, THREAD_DETAIL_CACHE_CAPACITY},
-    model::{MAX_THREAD_DETAIL_MESSAGES, ThreadUiDetails},
+    model::{MAX_SEARCH_PAGE_SIZE, MAX_THREAD_DETAIL_MESSAGES, ThreadUiDetails},
 };
 
-use super::search_bar::{self, SearchWorkerRequest};
-
 const THREAD_PREVIEW_CACHE_MAX_CHARS: usize = 1024;
+const THREAD_DETAIL_SOURCE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const THREAD_DETAIL_BATCH_MESSAGE_LIMIT: usize = 4_096;
+const MAX_VISIBLE_SEARCH_TAGS: usize = 256;
+const SEARCH_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const SEARCH_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const THREAD_MODEL_ROWS_PER_UPDATE: usize = 48;
 const THREAD_ROW_PREFIX: &str = "thread";
 const THREAD_STATUS_PREFIX: &str = "status";
 
@@ -59,8 +69,8 @@ pub(crate) type SearchRuntimeProvider = Arc<dyn Fn() -> SearchRuntimeSnapshot + 
 
 #[derive(Clone)]
 pub(crate) struct SearchPageCoordinator {
-    open_config: OpenConfig,
     runtime: SearchRuntimeProvider,
+    worker: SearchWorkerService,
 }
 
 #[derive(Debug, Clone)]
@@ -79,12 +89,239 @@ pub(crate) struct SearchPageResponse {
     pub(crate) result: anyhow::Result<SearchData>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SearchWorkerSnapshot {
+    pub(crate) active_preparations: usize,
+    pub(crate) peak_active_preparations: usize,
+    pub(crate) submitted: usize,
+    pub(crate) cancelled: usize,
+    pub(crate) coalesced: usize,
+}
+
+#[derive(Debug, Default)]
+struct SearchWorkerMetrics {
+    active_preparations: AtomicUsize,
+    peak_active_preparations: AtomicUsize,
+    submitted: AtomicUsize,
+    cancelled: AtomicUsize,
+    coalesced: AtomicUsize,
+}
+
+impl SearchWorkerMetrics {
+    fn snapshot(&self) -> SearchWorkerSnapshot {
+        SearchWorkerSnapshot {
+            active_preparations: self.active_preparations.load(Ordering::Acquire),
+            peak_active_preparations: self.peak_active_preparations.load(Ordering::Acquire),
+            submitted: self.submitted.load(Ordering::Acquire),
+            cancelled: self.cancelled.load(Ordering::Acquire),
+            coalesced: self.coalesced.load(Ordering::Acquire),
+        }
+    }
+
+    fn begin_preparation(&self) {
+        let active = self
+            .active_preparations
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        self.peak_active_preparations
+            .fetch_max(active, Ordering::AcqRel);
+    }
+
+    fn finish_preparation(&self) {
+        self.active_preparations.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+type SearchWorkerFn = dyn Fn(&SearchPageRequest, SearchRuntimeSnapshot, &AtomicBool) -> anyhow::Result<SearchData>
+    + Send
+    + Sync
+    + 'static;
+
+struct SearchPageJob {
+    request: SearchPageRequest,
+    runtime: SearchRuntimeSnapshot,
+    cancelled: Arc<AtomicBool>,
+    response: mpsc::Sender<SearchPageResponse>,
+}
+
+enum SearchWorkerCommand {
+    Search(SearchPageJob),
+    Cancel,
+}
+
+#[derive(Clone)]
+struct SearchWorkerService {
+    sender: Option<mpsc::Sender<SearchWorkerCommand>>,
+    start_error: Option<Arc<str>>,
+    active_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    metrics: Arc<SearchWorkerMetrics>,
+}
+
+impl SearchWorkerService {
+    fn new(worker: Arc<SearchWorkerFn>) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let active_cancel = Arc::new(Mutex::new(None));
+        let metrics = Arc::new(SearchWorkerMetrics::default());
+        let worker_cancel = active_cancel.clone();
+        let worker_metrics = metrics.clone();
+        match thread::Builder::new()
+            .name("notm-search-worker".to_string())
+            .spawn(move || {
+                search_worker_loop(receiver, worker_cancel, worker_metrics, worker);
+            }) {
+            Ok(_) => Self {
+                sender: Some(sender),
+                start_error: None,
+                active_cancel,
+                metrics,
+            },
+            Err(error) => Self {
+                sender: None,
+                start_error: Some(Arc::from(error.to_string())),
+                active_cancel,
+                metrics,
+            },
+        }
+    }
+
+    fn submit(
+        &self,
+        request: SearchPageRequest,
+        runtime: SearchRuntimeSnapshot,
+    ) -> mpsc::Receiver<SearchPageResponse> {
+        let (response, receiver) = mpsc::channel();
+        self.metrics.submitted.fetch_add(1, Ordering::AcqRel);
+        self.cancel_active();
+        let generation = request.generation;
+        let select_first = request.select_first;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        *self
+            .active_cancel
+            .lock()
+            .expect("search worker cancellation mutex poisoned") = Some(cancelled.clone());
+        let job = SearchPageJob {
+            request,
+            runtime,
+            cancelled,
+            response: response.clone(),
+        };
+        if let Some(sender) = &self.sender
+            && sender.send(SearchWorkerCommand::Search(job)).is_ok()
+        {
+            return receiver;
+        }
+        self.cancel_active();
+        let error = self
+            .start_error
+            .as_deref()
+            .unwrap_or("search worker disconnected");
+        let _ = response.send(SearchPageResponse {
+            generation,
+            select_first,
+            result: Err(anyhow::anyhow!(error.to_string())),
+        });
+        receiver
+    }
+
+    fn cancel(&self) {
+        self.cancel_active();
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(SearchWorkerCommand::Cancel);
+        }
+    }
+
+    fn cancel_active(&self) {
+        if let Some(cancelled) = self
+            .active_cancel
+            .lock()
+            .expect("search worker cancellation mutex poisoned")
+            .take()
+            && !cancelled.swap(true, Ordering::AcqRel)
+        {
+            self.metrics.cancelled.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn snapshot(&self) -> SearchWorkerSnapshot {
+        self.metrics.snapshot()
+    }
+}
+
+fn search_worker_loop(
+    receiver: mpsc::Receiver<SearchWorkerCommand>,
+    active_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    metrics: Arc<SearchWorkerMetrics>,
+    worker: Arc<SearchWorkerFn>,
+) {
+    while let Ok(first) = receiver.recv() {
+        let Some(job) = latest_search_job(first, &receiver, &metrics) else {
+            continue;
+        };
+        metrics.begin_preparation();
+        let generation = job.request.generation;
+        let select_first = job.request.select_first;
+        let result = worker(&job.request, job.runtime, &job.cancelled);
+        metrics.finish_preparation();
+        {
+            let mut active = active_cancel
+                .lock()
+                .expect("search worker cancellation mutex poisoned");
+            if active
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &job.cancelled))
+            {
+                *active = None;
+            }
+        }
+        let _ = job.response.send(SearchPageResponse {
+            generation,
+            select_first,
+            result,
+        });
+    }
+}
+
+fn latest_search_job(
+    first: SearchWorkerCommand,
+    receiver: &mpsc::Receiver<SearchWorkerCommand>,
+    metrics: &SearchWorkerMetrics,
+) -> Option<SearchPageJob> {
+    let mut latest = match first {
+        SearchWorkerCommand::Search(job) => Some(job),
+        SearchWorkerCommand::Cancel => None,
+    };
+    for command in receiver.try_iter() {
+        match command {
+            SearchWorkerCommand::Search(job) => {
+                if latest.replace(job).is_some() {
+                    metrics.coalesced.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+            SearchWorkerCommand::Cancel => {
+                if latest.take().is_some() {
+                    metrics.coalesced.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+        }
+    }
+    latest
+}
+
 impl SearchPageCoordinator {
     pub(crate) fn new(open_config: OpenConfig, runtime: SearchRuntimeProvider) -> Self {
-        Self {
-            open_config,
-            runtime,
-        }
+        let worker = SearchWorkerService::new(Arc::new(move |request, runtime, cancelled| {
+            sleep_search_delay(request.delay, cancelled)?;
+            execute_search_page_with_cancel(
+                &open_config,
+                &request.query,
+                request.offset,
+                runtime.page_size,
+                runtime.excluded_tags,
+                request.cache_policy,
+                cancelled,
+            )
+        }));
+        Self { runtime, worker }
     }
 
     pub(crate) fn launch<C>(
@@ -95,38 +332,33 @@ impl SearchPageCoordinator {
     ) where
         C: FnOnce(SearchPageResponse) + 'static,
     {
+        let generation = request.generation;
         let select_first = request.select_first;
-        let offset = request.offset;
-        let cache_policy = request.cache_policy;
-        let open_config = self.open_config.clone();
-        let runtime = self.runtime.clone();
-        search_bar::launch_worker(
-            SearchWorkerRequest {
-                query: request.query,
-                generation: request.generation,
-                select_first,
-                delay: request.delay,
-            },
-            cancellation_message,
-            move |query| {
-                let runtime = runtime();
-                execute_search_page(
-                    &open_config,
-                    query,
-                    offset,
-                    runtime.page_size,
-                    runtime.excluded_tags,
-                    cache_policy,
-                )
-            },
-            move |generation, result| {
-                complete(SearchPageResponse {
+        let response = self.worker.submit(request, (self.runtime)());
+        let mut complete = Some(complete);
+        gtk::glib::timeout_add_local(SEARCH_WORKER_POLL_INTERVAL, move || {
+            let response = match response.try_recv() {
+                Ok(response) => response,
+                Err(mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => SearchPageResponse {
                     generation,
                     select_first,
-                    result,
-                });
-            },
-        );
+                    result: Err(anyhow::anyhow!(cancellation_message)),
+                },
+            };
+            if let Some(complete) = complete.take() {
+                complete(response);
+            }
+            gtk::glib::ControlFlow::Break
+        });
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.worker.cancel();
+    }
+
+    pub(crate) fn worker_snapshot(&self) -> SearchWorkerSnapshot {
+        self.worker.snapshot()
     }
 }
 
@@ -454,10 +686,40 @@ pub(crate) struct ThreadRowSnapshot {
     pub(crate) visual_selected: bool,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct ThreadModelSnapshot {
     pub(crate) len: usize,
     pub(crate) display: ThreadListDisplay,
     pub(crate) marked_indices: BTreeSet<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ThreadModelRuntimeSnapshot {
+    pub(crate) generation: u64,
+    pub(crate) busy: bool,
+    pub(crate) model_len: usize,
+    pub(crate) max_rows_per_update: usize,
+    pub(crate) peak_rows_per_iteration: usize,
+    pub(crate) last_rows_applied: usize,
+    pub(crate) completed: usize,
+    pub(crate) cancelled: usize,
+}
+
+#[derive(Debug, Default)]
+struct ThreadModelUpdateMetrics {
+    busy: Cell<bool>,
+    peak_rows_per_iteration: Cell<usize>,
+    last_rows_applied: Cell<usize>,
+    completed: Cell<usize>,
+    cancelled: Cell<usize>,
+}
+
+impl ThreadModelUpdateMetrics {
+    fn record_iteration(&self, rows: usize) {
+        self.last_rows_applied.set(rows);
+        self.peak_rows_per_iteration
+            .set(self.peak_rows_per_iteration.get().max(rows));
+    }
 }
 
 pub(crate) type ThreadRowProvider = Rc<dyn Fn(usize) -> Option<ThreadRowSnapshot>>;
@@ -477,6 +739,9 @@ pub(crate) struct ThreadListController {
     selection: gtk::SingleSelection,
     selection_refreshing: Rc<Cell<bool>>,
     scroll_generation: Rc<Cell<u64>>,
+    model_update_generation: Rc<Cell<u64>>,
+    refresh_request_generation: Rc<Cell<u64>>,
+    model_update_metrics: Rc<ThreadModelUpdateMetrics>,
     result_label: gtk::Label,
     load_more_button: gtk::Button,
     scrolled: gtk::ScrolledWindow,
@@ -524,6 +789,9 @@ impl ThreadListController {
             selection,
             selection_refreshing: Rc::new(Cell::new(false)),
             scroll_generation: Rc::new(Cell::new(0)),
+            model_update_generation: Rc::new(Cell::new(0)),
+            refresh_request_generation: Rc::new(Cell::new(0)),
+            model_update_metrics: Rc::new(ThreadModelUpdateMetrics::default()),
             result_label,
             load_more_button,
             scrolled,
@@ -653,35 +921,42 @@ impl ThreadListController {
     }
 
     fn set_status_row(&self, message: &str, spinning: bool) {
-        self.clear_model();
-        self.model.append(&thread_status_token(message, spinning));
-        self.selection.set_selected(gtk::INVALID_LIST_POSITION);
-    }
-
-    pub(crate) fn clear_model(&self) {
-        let count = self.model.n_items();
-        if count > 0 {
-            self.model.splice(0, count, &[]);
-        }
-    }
-
-    pub(crate) fn replace_rows(&self, snapshot: &ThreadModelSnapshot) {
-        self.clear_model();
-        self.append_rows(snapshot, 0, snapshot.len);
-    }
-
-    pub(crate) fn append_rows(&self, snapshot: &ThreadModelSnapshot, start: usize, count: usize) {
-        let tokens = (start..start.saturating_add(count).min(snapshot.len))
-            .map(|index| {
-                thread_row_token(
-                    index,
-                    snapshot.marked_indices.contains(&index),
-                    snapshot.display,
-                )
-            })
-            .collect::<Vec<_>>();
-        let additions = tokens.iter().map(String::as_str).collect::<Vec<_>>();
-        self.model.splice(self.model.n_items(), 0, &additions);
+        self.cancel_model_update();
+        let generation = self.model_update_generation.get().saturating_add(1);
+        self.model_update_generation.set(generation);
+        self.model_update_metrics.busy.set(true);
+        let token = thread_status_token(message, spinning);
+        let model = self.model.clone();
+        let selection = self.selection.clone();
+        let selection_refreshing = self.selection_refreshing.clone();
+        let update_generation = self.model_update_generation.clone();
+        let metrics = self.model_update_metrics.clone();
+        gtk::glib::idle_add_local(move || {
+            if update_generation.get() != generation {
+                return gtk::glib::ControlFlow::Break;
+            }
+            let count = (model.n_items() as usize).min(THREAD_MODEL_ROWS_PER_UPDATE);
+            selection_refreshing.set(true);
+            if count > 0 {
+                model.splice(0, count as u32, &[]);
+            }
+            let finished = count == 0;
+            if finished {
+                model.append(&token);
+                selection.set_selected(gtk::INVALID_LIST_POSITION);
+            }
+            selection_refreshing.set(false);
+            metrics.record_iteration(count.max(usize::from(finished)));
+            if finished {
+                metrics.busy.set(false);
+                metrics
+                    .completed
+                    .set(metrics.completed.get().saturating_add(1));
+                gtk::glib::ControlFlow::Break
+            } else {
+                gtk::glib::ControlFlow::Continue
+            }
+        });
     }
 
     pub(crate) fn refresh_rows(
@@ -690,6 +965,39 @@ impl ThreadListController {
         indices: &[usize],
         force: bool,
     ) {
+        let refresh_generation = self.refresh_request_generation.get().saturating_add(1);
+        self.refresh_request_generation.set(refresh_generation);
+        if self.model_update_metrics.busy.get() {
+            let model_generation = self.model_update_generation.get();
+            let controller = self.clone();
+            let snapshot = snapshot.clone();
+            let indices = indices.to_vec();
+            gtk::glib::idle_add_local(move || {
+                if controller.refresh_request_generation.get() != refresh_generation
+                    || controller.model_update_generation.get() != model_generation
+                {
+                    return gtk::glib::ControlFlow::Break;
+                }
+                if controller.model_update_metrics.busy.get() {
+                    return gtk::glib::ControlFlow::Continue;
+                }
+                controller.refresh_rows_ready(&snapshot, &indices, force);
+                gtk::glib::ControlFlow::Break
+            });
+            return;
+        }
+        self.refresh_rows_ready(snapshot, indices, force);
+    }
+
+    fn refresh_rows_ready(&self, snapshot: &ThreadModelSnapshot, indices: &[usize], force: bool) {
+        if indices.len() > THREAD_MODEL_ROWS_PER_UPDATE {
+            self.refresh_rows_bounded(snapshot, indices, force);
+            return;
+        }
+        self.refresh_rows_now(snapshot, indices, force);
+    }
+
+    fn refresh_rows_now(&self, snapshot: &ThreadModelSnapshot, indices: &[usize], force: bool) {
         let selected = self.selected_position();
         self.selection_refreshing.set(true);
         for index in indices
@@ -727,18 +1035,218 @@ impl ThreadListController {
         self.selection_refreshing.set(false);
     }
 
+    fn refresh_rows_bounded(&self, snapshot: &ThreadModelSnapshot, indices: &[usize], force: bool) {
+        self.cancel_model_update();
+        let generation = self.model_update_generation.get().saturating_add(1);
+        self.model_update_generation.set(generation);
+        self.model_update_metrics.busy.set(true);
+        self.model_update_metrics.last_rows_applied.set(0);
+        let snapshot = snapshot.clone();
+        let indices = indices
+            .iter()
+            .copied()
+            .filter(|index| *index < snapshot.len)
+            .collect::<Vec<_>>();
+        let model = self.model.clone();
+        let selection = self.selection.clone();
+        let selection_refreshing = self.selection_refreshing.clone();
+        let update_generation = self.model_update_generation.clone();
+        let metrics = self.model_update_metrics.clone();
+        let selected = self.selected_position();
+        let mut next = 0_usize;
+        gtk::glib::idle_add_local(move || {
+            if update_generation.get() != generation {
+                return gtk::glib::ControlFlow::Break;
+            }
+            let end = next
+                .saturating_add(THREAD_MODEL_ROWS_PER_UPDATE)
+                .min(indices.len());
+            selection_refreshing.set(true);
+            for index in indices[next..end].iter().copied() {
+                let position = index as u32;
+                if position >= model.n_items() {
+                    continue;
+                }
+                let token = thread_row_token(
+                    index,
+                    snapshot.marked_indices.contains(&index),
+                    snapshot.display,
+                );
+                if force
+                    || model
+                        .string(position)
+                        .is_none_or(|current| current.as_str() != token)
+                {
+                    model.splice(position, 1, &[token.as_str()]);
+                }
+            }
+            if let Some(position) = selected
+                && position < model.n_items()
+                && selection.selected() != position
+            {
+                selection.set_selected(position);
+            }
+            selection_refreshing.set(false);
+            metrics.record_iteration(end.saturating_sub(next));
+            next = end;
+            if next < indices.len() {
+                gtk::glib::ControlFlow::Continue
+            } else {
+                metrics.busy.set(false);
+                metrics
+                    .completed
+                    .set(metrics.completed.get().saturating_add(1));
+                gtk::glib::ControlFlow::Break
+            }
+        });
+    }
+
     pub(crate) fn apply_model_update(
         &self,
         snapshot: &ThreadModelSnapshot,
         update: ThreadModelUpdate,
     ) {
-        match update {
-            ThreadModelUpdate::Replace => self.replace_rows(snapshot),
-            ThreadModelUpdate::Append { start, count } => {
-                self.append_rows(snapshot, start, count);
-                let indices = (0..snapshot.len).collect::<Vec<_>>();
-                self.refresh_rows(snapshot, &indices, false);
+        self.apply_model_update_then(snapshot, update, |_| {});
+    }
+
+    pub(crate) fn apply_model_update_then<F>(
+        &self,
+        snapshot: &ThreadModelSnapshot,
+        update: ThreadModelUpdate,
+        complete: F,
+    ) where
+        F: FnOnce(bool) + 'static,
+    {
+        self.cancel_model_update();
+        let generation = self.model_update_generation.get().saturating_add(1);
+        self.model_update_generation.set(generation);
+        self.model_update_metrics.busy.set(true);
+        self.model_update_metrics.last_rows_applied.set(0);
+
+        let replacing = matches!(update, ThreadModelUpdate::Replace);
+        let (mut next_add, end_add, refresh_end) = match update {
+            ThreadModelUpdate::Replace => (0, snapshot.len, 0),
+            ThreadModelUpdate::Append { start, count } => (
+                start,
+                start.saturating_add(count).min(snapshot.len),
+                start.min(snapshot.len),
+            ),
+        };
+        let snapshot = snapshot.clone();
+        let model = self.model.clone();
+        let selection = self.selection.clone();
+        let selection_refreshing = self.selection_refreshing.clone();
+        let selected = (!replacing).then(|| self.selected_position()).flatten();
+        let update_generation = self.model_update_generation.clone();
+        let metrics = self.model_update_metrics.clone();
+        let mut removing = replacing;
+        let mut next_refresh = 0_usize;
+        let mut complete = Some(complete);
+        gtk::glib::idle_add_local(move || {
+            if update_generation.get() != generation {
+                if let Some(complete) = complete.take() {
+                    complete(false);
+                }
+                return gtk::glib::ControlFlow::Break;
             }
+
+            let mut budget = THREAD_MODEL_ROWS_PER_UPDATE;
+            let mut applied = 0_usize;
+            selection_refreshing.set(true);
+            if removing && budget > 0 {
+                let count = (model.n_items() as usize).min(budget);
+                if count > 0 {
+                    model.splice(0, count as u32, &[]);
+                    applied = applied.saturating_add(count);
+                    budget -= count;
+                }
+                removing = model.n_items() > 0;
+            }
+
+            if !removing && next_add < end_add && budget > 0 {
+                let end = next_add.saturating_add(budget).min(end_add);
+                let tokens = (next_add..end)
+                    .map(|index| {
+                        thread_row_token(
+                            index,
+                            snapshot.marked_indices.contains(&index),
+                            snapshot.display,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let additions = tokens.iter().map(String::as_str).collect::<Vec<_>>();
+                model.splice(model.n_items(), 0, &additions);
+                let count = end.saturating_sub(next_add);
+                next_add = end;
+                applied = applied.saturating_add(count);
+                budget -= count;
+            }
+
+            while !removing && next_add >= end_add && next_refresh < refresh_end && budget > 0 {
+                let index = next_refresh;
+                next_refresh += 1;
+                budget -= 1;
+                applied = applied.saturating_add(1);
+                let position = index as u32;
+                if position >= model.n_items() {
+                    continue;
+                }
+                let token = thread_row_token(
+                    index,
+                    snapshot.marked_indices.contains(&index),
+                    snapshot.display,
+                );
+                if model
+                    .string(position)
+                    .is_none_or(|current| current.as_str() != token)
+                {
+                    model.splice(position, 1, &[token.as_str()]);
+                }
+            }
+            if let Some(position) = selected
+                && position < model.n_items()
+                && selection.selected() != position
+            {
+                selection.set_selected(position);
+            }
+            selection_refreshing.set(false);
+            metrics.record_iteration(applied);
+
+            if removing || next_add < end_add || next_refresh < refresh_end {
+                gtk::glib::ControlFlow::Continue
+            } else {
+                metrics.busy.set(false);
+                metrics
+                    .completed
+                    .set(metrics.completed.get().saturating_add(1));
+                if let Some(complete) = complete.take() {
+                    complete(true);
+                }
+                gtk::glib::ControlFlow::Break
+            }
+        });
+    }
+
+    pub(crate) fn cancel_model_update(&self) {
+        self.model_update_generation
+            .set(self.model_update_generation.get().saturating_add(1));
+        if self.model_update_metrics.busy.replace(false) {
+            self.model_update_metrics
+                .cancelled
+                .set(self.model_update_metrics.cancelled.get().saturating_add(1));
+        }
+    }
+
+    pub(crate) fn model_update_snapshot(&self) -> ThreadModelRuntimeSnapshot {
+        ThreadModelRuntimeSnapshot {
+            generation: self.model_update_generation.get(),
+            busy: self.model_update_metrics.busy.get(),
+            model_len: self.model_len(),
+            max_rows_per_update: THREAD_MODEL_ROWS_PER_UPDATE,
+            peak_rows_per_iteration: self.model_update_metrics.peak_rows_per_iteration.get(),
+            last_rows_applied: self.model_update_metrics.last_rows_applied.get(),
+            completed: self.model_update_metrics.completed.get(),
+            cancelled: self.model_update_metrics.cancelled.get(),
         }
     }
 
@@ -892,6 +1400,7 @@ impl ThreadListController {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn execute_search_page(
     open_config: &OpenConfig,
     query: &str,
@@ -900,13 +1409,39 @@ pub(crate) fn execute_search_page(
     excluded_tags: Vec<String>,
     cache_policy: SearchCachePolicy,
 ) -> anyhow::Result<SearchData> {
-    let limit = limit.max(1);
+    let cancelled = AtomicBool::new(false);
+    execute_search_page_with_cancel(
+        open_config,
+        query,
+        offset,
+        limit,
+        excluded_tags,
+        cache_policy,
+        &cancelled,
+    )
+}
+
+fn execute_search_page_with_cancel(
+    open_config: &OpenConfig,
+    query: &str,
+    offset: usize,
+    limit: usize,
+    excluded_tags: Vec<String>,
+    cache_policy: SearchCachePolicy,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<SearchData> {
+    anyhow::ensure!(
+        (1..=MAX_SEARCH_PAGE_SIZE).contains(&limit),
+        "search page size must be between 1 and {MAX_SEARCH_PAGE_SIZE}; got {limit}"
+    );
     let excluded_tags = canonical_excluded_tags(excluded_tags);
+    ensure_search_not_cancelled(cancelled)?;
     // Capture the epoch before opening the database. A mutation that commits
     // afterward bumps the epoch, so this worker cannot publish its older
     // snapshot under the post-mutation cache generation.
     let cache_epoch = CACHE_EPOCH.load(Ordering::Acquire);
     let db = Database::open(open_config, DatabaseMode::ReadOnly)?;
+    ensure_search_not_cancelled(cancelled)?;
     let revision = db.revision();
     let db_path = db.path();
     let key = search_cache_key(
@@ -924,12 +1459,15 @@ pub(crate) fn execute_search_page(
             cache.get(&key).cloned()
         };
         if let Some(mut cached) = cached {
+            ensure_search_not_cancelled(cancelled)?;
             cached.cached = true;
             return Ok(cached);
         }
     }
 
-    let tags = db.all_tags();
+    let mut tags = db.all_tags();
+    ensure_search_not_cancelled(cancelled)?;
+    tags.truncate(MAX_VISIBLE_SEARCH_TAGS);
     let options = QueryOptions {
         limit,
         offset,
@@ -937,20 +1475,25 @@ pub(crate) fn execute_search_page(
         excluded_tags: excluded_tags.clone(),
     };
     let threads = db.search_threads(query, &options)?;
+    ensure_search_not_cancelled(cancelled)?;
     let count = match cache_policy {
         SearchCachePolicy::Use => db
             .count_threads(query, &options)
             .unwrap_or(threads.len() as u32),
         SearchCachePolicy::Bypass => db.count_threads(query, &options)?,
     };
+    ensure_search_not_cancelled(cancelled)?;
     let completed_revision = db.revision();
+    ensure_search_not_cancelled(cancelled)?;
     if cache_policy == SearchCachePolicy::Bypass {
         anyhow::ensure!(
             completed_revision == revision,
             "database revision changed while loading an authoritative search page"
         );
     }
-    let details = thread_details_for_threads(&db, &db_path, &revision, &threads, cache_epoch);
+    let details =
+        thread_details_for_threads(&db, &db_path, &revision, &threads, cache_epoch, cancelled)?;
+    ensure_search_not_cancelled(cancelled)?;
     let data = SearchData {
         query: query.to_string(),
         excluded_tags,
@@ -964,13 +1507,32 @@ pub(crate) fn execute_search_page(
         revision,
         cached: false,
     };
+    ensure_search_not_cancelled(cancelled)?;
     if cache_policy == SearchCachePolicy::Use {
-        search_cache()
-            .lock()
-            .expect("search cache lock")
-            .insert(key, data.clone());
+        let mut cache = search_cache().lock().expect("search cache lock");
+        ensure_search_not_cancelled(cancelled)?;
+        cache.insert(key, data.clone());
     }
     Ok(data)
+}
+
+fn ensure_search_not_cancelled(cancelled: &AtomicBool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !cancelled.load(Ordering::Acquire),
+        "search preparation was cancelled"
+    );
+    Ok(())
+}
+
+fn sleep_search_delay(delay: Duration, cancelled: &AtomicBool) -> anyhow::Result<()> {
+    let mut remaining = delay;
+    while !remaining.is_zero() {
+        ensure_search_not_cancelled(cancelled)?;
+        let chunk = remaining.min(SEARCH_CANCELLATION_POLL_INTERVAL);
+        thread::sleep(chunk);
+        remaining = remaining.saturating_sub(chunk);
+    }
+    ensure_search_not_cancelled(cancelled)
 }
 
 pub(crate) fn canonical_excluded_tags(mut excluded_tags: Vec<String>) -> Vec<String> {
@@ -1403,9 +1965,12 @@ fn thread_details_for_threads(
     revision: &Revision,
     threads: &[ThreadSummary],
     cache_epoch: u64,
-) -> BTreeMap<String, ThreadUiDetails> {
+    cancelled: &AtomicBool,
+) -> anyhow::Result<BTreeMap<String, ThreadUiDetails>> {
     let mut out = BTreeMap::new();
+    let mut missing = Vec::new();
     for thread in threads {
+        ensure_search_not_cancelled(cancelled)?;
         let key = thread_detail_cache_key(database_path, revision, &thread.thread_id, cache_epoch);
         let cached = {
             let mut cache = thread_detail_cache()
@@ -1417,18 +1982,60 @@ fn thread_details_for_threads(
             out.insert(thread.thread_id.clone(), detail);
             continue;
         }
-        let detail = match db.thread_messages_bounded(&thread.thread_id, MAX_THREAD_DETAIL_MESSAGES)
+        missing.push((thread, key));
+    }
+
+    let thread_ids = missing
+        .iter()
+        .map(|(thread, _)| thread.thread_id.clone())
+        .collect::<Vec<_>>();
+    ensure_search_not_cancelled(cancelled)?;
+    let messages_by_thread = match db.thread_messages_for_threads_bounded(
+        &thread_ids,
+        MAX_THREAD_DETAIL_MESSAGES,
+        THREAD_DETAIL_BATCH_MESSAGE_LIMIT,
+    ) {
+        Ok(messages) => messages,
+        Err(error) => {
+            for (thread, key) in missing {
+                ensure_search_not_cancelled(cancelled)?;
+                let detail = unavailable_thread_detail(&error);
+                thread_detail_cache()
+                    .lock()
+                    .expect("thread detail cache lock")
+                    .insert(key, detail.clone());
+                out.insert(thread.thread_id.clone(), detail);
+            }
+            return Ok(out);
+        }
+    };
+    ensure_search_not_cancelled(cancelled)?;
+    for (thread, key) in missing {
+        ensure_search_not_cancelled(cancelled)?;
+        let detail = messages_by_thread
+            .get(&thread.thread_id)
+            .map(|outcome| match outcome {
+                BoundedThreadMessages::Loaded(messages) => {
+                    compute_thread_detail(messages, cancelled)
+                }
+                BoundedThreadMessages::ThreadLimitExceeded { .. }
+                | BoundedThreadMessages::BatchLimitExceeded { .. } => {
+                    Ok(unavailable_thread_detail(outcome))
+                }
+            })
+            .transpose()?
+            .unwrap_or_default();
+        ensure_search_not_cancelled(cancelled)?;
         {
-            Ok(messages) => compute_thread_detail(db, &messages),
-            Err(error) => unavailable_thread_detail(&error),
-        };
-        thread_detail_cache()
-            .lock()
-            .expect("thread detail cache lock")
-            .insert(key, detail.clone());
+            let mut cache = thread_detail_cache()
+                .lock()
+                .expect("thread detail cache lock");
+            ensure_search_not_cancelled(cancelled)?;
+            cache.insert(key, detail.clone());
+        }
         out.insert(thread.thread_id.clone(), detail);
     }
-    out
+    Ok(out)
 }
 
 fn unavailable_thread_detail(error: &impl std::fmt::Display) -> ThreadUiDetails {
@@ -1439,24 +2046,61 @@ fn unavailable_thread_detail(error: &impl std::fmt::Display) -> ThreadUiDetails 
 }
 
 fn compute_thread_detail(
-    db: &Database,
-    messages: &[notm_notmuch::MessageSummary],
-) -> ThreadUiDetails {
+    messages: &[MessageSummary],
+    cancelled: &AtomicBool,
+) -> anyhow::Result<ThreadUiDetails> {
+    compute_thread_detail_with_reader(messages, cancelled, read_thread_detail_source)
+}
+
+fn compute_thread_detail_with_reader<F>(
+    messages: &[MessageSummary],
+    cancelled: &AtomicBool,
+    mut read: F,
+) -> anyhow::Result<ThreadUiDetails>
+where
+    F: FnMut(&Path) -> anyhow::Result<Vec<u8>>,
+{
     let mut detail = ThreadUiDetails::default();
     for message in messages {
-        let Ok(source) = db.open_message_file(message) else {
-            continue;
-        };
-        if let Ok(parsed) = notm_mail::mime::parse_reader(source) {
-            detail.has_encrypted |= parsed.classification.has_encrypted();
-            detail.has_signed |= parsed.classification.has_signed();
-            detail.has_attachment |= !parsed.attachments.is_empty();
-            if detail.preview.is_empty() {
-                detail.preview = body_preview(&parsed.safe_body);
+        ensure_search_not_cancelled(cancelled)?;
+        for filename in &message.filenames {
+            ensure_search_not_cancelled(cancelled)?;
+            let bytes = match read(Path::new(filename)) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    ensure_search_not_cancelled(cancelled)?;
+                    continue;
+                }
+            };
+            ensure_search_not_cancelled(cancelled)?;
+            if let Ok(parsed) = notm_mail::mime::parse_rfc5322(&bytes) {
+                ensure_search_not_cancelled(cancelled)?;
+                detail.has_encrypted |= parsed.classification.has_encrypted();
+                detail.has_signed |= parsed.classification.has_signed();
+                detail.has_attachment |= !parsed.attachments.is_empty();
+                if detail.preview.is_empty() {
+                    detail.preview = body_preview(&parsed.safe_body);
+                }
             }
+            ensure_search_not_cancelled(cancelled)?;
+            break;
         }
     }
-    detail
+    Ok(detail)
+}
+
+fn read_thread_detail_source(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let limit = u64::try_from(THREAD_DETAIL_SOURCE_MAX_BYTES)
+        .unwrap_or(u64::MAX - 1)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(THREAD_DETAIL_SOURCE_MAX_BYTES.min(256 * 1024));
+    file.take(limit).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= THREAD_DETAIL_SOURCE_MAX_BYTES,
+        "thread detail source exceeds the {THREAD_DETAIL_SOURCE_MAX_BYTES}-byte responsive preview limit"
+    );
+    Ok(bytes)
 }
 
 fn body_preview(body: &str) -> String {
@@ -1515,7 +2159,7 @@ fn thread_detail_cache_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::{fs, time::Instant};
 
     fn test_revision(uuid: &str, revision: u64) -> Revision {
         Revision {
@@ -1539,6 +2183,20 @@ mod tests {
         }
     }
 
+    fn test_message(id: &str, filenames: Vec<&str>) -> MessageSummary {
+        MessageSummary {
+            message_id: id.to_string(),
+            thread_id: "thread-1".to_string(),
+            date: 0,
+            from: String::new(),
+            to: String::new(),
+            cc: String::new(),
+            subject: String::new(),
+            tags: Vec::new(),
+            filenames: filenames.into_iter().map(str::to_string).collect(),
+        }
+    }
+
     fn test_search_data(query: &str, offset: usize, ids: &[&str], count: u32) -> SearchData {
         SearchData {
             query: query.to_string(),
@@ -1556,6 +2214,118 @@ mod tests {
             revision: test_revision("database", 7),
             cached: false,
         }
+    }
+
+    #[test]
+    fn search_service_coalesces_stale_work_and_never_runs_pages_concurrently() {
+        let started_slow = Arc::new(AtomicBool::new(false));
+        let observed_started = started_slow.clone();
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let observed_executed = executed.clone();
+        let service = SearchWorkerService::new(Arc::new(move |request, _, cancelled| {
+            observed_executed
+                .lock()
+                .expect("executed mutex")
+                .push(request.query.clone());
+            if request.query == "slow" {
+                observed_started.store(true, Ordering::Release);
+                while !cancelled.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                anyhow::bail!("cancelled slow search");
+            }
+            Ok(test_search_data(
+                &request.query,
+                request.offset,
+                &["latest"],
+                1,
+            ))
+        }));
+        let request = |generation, query: &str| SearchPageRequest {
+            query: query.to_string(),
+            generation,
+            offset: 0,
+            select_first: true,
+            delay: Duration::ZERO,
+            cache_policy: SearchCachePolicy::Use,
+        };
+        let runtime = SearchRuntimeSnapshot {
+            page_size: 100,
+            excluded_tags: Vec::new(),
+        };
+        let slow = service.submit(request(1, "slow"), runtime.clone());
+        let wait_started = Instant::now();
+        while !started_slow.load(Ordering::Acquire) {
+            assert!(wait_started.elapsed() < Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(1));
+        }
+        let middle = service.submit(request(2, "middle"), runtime.clone());
+        let latest = service.submit(request(3, "latest"), runtime);
+
+        let latest = latest
+            .recv_timeout(Duration::from_secs(1))
+            .expect("latest response");
+        assert_eq!(latest.generation, 3);
+        assert_eq!(latest.result.expect("latest result").query, "latest");
+        assert!(slow.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(middle.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!(
+            *executed.lock().expect("executed mutex"),
+            vec!["slow".to_string(), "latest".to_string()]
+        );
+        let snapshot = service.snapshot();
+        assert_eq!(snapshot.active_preparations, 0);
+        assert_eq!(snapshot.peak_active_preparations, 1);
+        assert!(snapshot.cancelled >= 2);
+        assert!(snapshot.coalesced >= 1);
+    }
+
+    #[test]
+    fn search_delay_is_interruptible_without_waiting_for_the_full_fixture_delay() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_from_thread = cancelled.clone();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            cancel_from_thread.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let error = sleep_search_delay(Duration::from_secs(2), &cancelled)
+            .expect_err("cancelled fixture delay should stop early");
+        canceller.join().expect("canceller");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn search_page_size_is_rejected_before_database_work_when_above_the_hard_limit() {
+        let error = execute_search_page(
+            &OpenConfig::default(),
+            "*",
+            0,
+            MAX_SEARCH_PAGE_SIZE + 1,
+            Vec::new(),
+            SearchCachePolicy::Use,
+        )
+        .expect_err("oversized page must fail before opening a database");
+        assert!(error.to_string().contains("between 1 and 1000"));
+    }
+
+    #[test]
+    fn cancellation_is_checked_between_thread_detail_file_reads() {
+        let cancelled = AtomicBool::new(false);
+        let reads = Cell::new(0_usize);
+        let error = compute_thread_detail_with_reader(
+            &[test_message("message-1", vec!["one", "two"])],
+            &cancelled,
+            |_| {
+                reads.set(reads.get().saturating_add(1));
+                cancelled.store(true, Ordering::Release);
+                Ok(b"From: sender@example.test\n\nbody".to_vec())
+            },
+        )
+        .expect_err("cancellation must stop before the second detail file");
+        assert_eq!(reads.get(), 1);
+        assert!(error.to_string().contains("cancelled"));
     }
 
     #[test]

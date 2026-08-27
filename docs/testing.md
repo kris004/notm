@@ -157,6 +157,19 @@ compositor. CI also runs the link-hint fixture under Xvfb as a narrow GTK and
 WebKitGTK X11-backend check without repeating the complete UI suite. The older
 `live` value remains an alias for `provided`.
 
+The standalone-message WebKit lifecycle has a required-display regression
+smoke. It rapidly replaces a long HTML document, checks generation-scoped
+readiness and event-driven scrolling while the GTK heartbeat advances, and
+opens enough standalone windows to prove oldest-window eviction at the
+four-window prepared-thread cache cap:
+
+```sh
+NOTM_REQUIRE_GTK_DISPLAY=1 \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
+  fixture_standalone_html_replacements_and_scroll_are_generation_safe \
+  -- --exact --nocapture --test-threads=1
+```
+
 Use fixture data first when validating UI behavior. Start the app with the local
 developer test harness:
 
@@ -191,10 +204,12 @@ means the composed snapshot was queued, not that sending finished. Poll
 `last_send_report`, `last_error`, or send-related file changes.
 
 Tag commands are also asynchronous. A successful scheduling response includes
-`pending: true`; poll `tag_status` until `in_progress` is false before checking
-tags, filenames, undo history, or path-based message actions. An incomplete
-batch forces a search reconciliation and remains unavailable for another tag
-mutation until that refresh succeeds. `tag_status.paths_uncertain = true`
+`pending: true`; poll `tag_status` until `in_progress` is false for writer
+completion. The result may then start an authoritative reconciliation search;
+if `search_status.loading` is true, poll it until false before checking final
+rows, filenames, undo history, or path-based message actions. An incomplete
+batch forces this search reconciliation and remains unavailable for another
+tag mutation until that refresh succeeds. `tag_status.paths_uncertain = true`
 means the worker could not prove retained message or draft filenames safe (for
 example, after a close/commit failure); verify the warning and restart the
 isolated app before attempting another path, draft, tag, send, or sync action.
@@ -211,6 +226,72 @@ on the corresponding worker, so `health`, `search_status`, and `tag_status`
 must remain responsive while work is outstanding. A disposable non-fixture
 tag-race harness may use the same delay only when
 `automation.allow_live_tag_test = true`; other non-fixture runs reject it.
+
+Thread/message preparation exposes the same latency seam through
+`set_fixture_thread_delay`; it is fixture-only except in a disposable
+non-fixture tag-race harness with `automation.allow_live_tag_test = true`.
+Message-derived reply/forward/draft preparation and draft persistence expose
+fixture-only seams through `set_fixture_composer_preparation_delay` and
+`set_fixture_draft_delay`; attachment writes and composer attachment caching use
+`set_fixture_attachment_delay`. `fail_next_draft_write` and
+`fail_next_attachment_write` inject one draft or attachment write failure,
+respectively. Poll `thread_load_status`, `composer_preparation_status`,
+`draft_autosave_status`, `draft_io_status`, `recovery_load_status`, or
+`attachment_io_status` for
+completion. Compare the
+`gtk_heartbeat` values returned by two `health` requests while work is pending
+to assert that the GTK loop is still processing requests and timers. These
+delay and failure-injection controls are rejected outside fixture mode; the
+read-only status commands remain available to a non-fixture harness.
+
+The fixture-only `refresh_named_drafts` command schedules an explicit bounded
+list refresh (and, with `migrate_legacy: true`, legacy migration) and returns a
+generation. Poll `draft_io_status.list_busy` until it is false. Do not use an
+older list snapshot as proof that a scheduled refresh completed.
+
+`thread_load_status` also reports the prepared message/attachment counts,
+estimated retained bytes, and active/peak preparation workers. The peak must
+remain one during rapid switching. For the attachment-heavy fixture only,
+`NOTM_FIXTURE_TEST_LARGE_ATTACHMENT_BYTES=<bytes>` expands its first attachment
+(capped at 8 MiB), allowing a clean-XDG smoke to prove the decoded payload is
+not retained by the prepared thread and that the later attachment action
+extracts the requested payload without stopping the GTK heartbeat.
+
+`search_status` reports the persistent search worker's active/peak,
+submitted, cancelled, and coalesced counts plus the incremental thread-model
+update state. Search preparation must peak at one worker, and
+`peak_rows_per_iteration` must not exceed `max_rows_per_update`.
+`NOTM_FIXTURE_TEST_SEARCH_THREADS=<count>` adds up to 256 small, separately
+threaded messages tagged `search-stress`; the required-display
+`fixture_rapid_searches_coalesce_and_apply_large_pages_incrementally` smoke uses
+144 of them to exercise both a 100-row replacement and a 44-row append while
+rapid delayed searches are cancelled/coalesced and the GTK heartbeat advances.
+
+`fixture_closing_last_window_waits_for_atomic_attachment_save` verifies that
+closing the primary window does not release an outstanding attachment worker's
+application hold. The process must remain alive until the worker atomically
+publishes the complete file, without replacing an existing destination or
+leaving a temporary artifact. It runs as part of the complete required-Weston
+desktop UI suite above.
+
+`NOTM_FIXTURE_TEST_HUGE_BODY_BYTES=<bytes>` adds one opt-in HTML message whose
+body is capped just below the 4 MiB responsive rendering limit. The
+`fixture_near_limit_html_preparation_and_rendering_keep_gtk_responsive` smoke
+uses it to time the bounded GTK text update, supersede an in-flight WebKit load,
+reject stale lifecycle completion, process scroll input, and verify that the
+GTK heartbeat advances throughout. Run this smoke through the private Weston
+wrapper from the complete delivery gate; a display skip is not a pass.
+
+To delay the recovery worker that starts before a harness request can be sent,
+launch a fixture harness with
+`NOTM_FIXTURE_TEST_STARTUP_RECOVERY_DELAY_MS=<milliseconds>`. The value is
+capped at 5000 and ignored unless fixture mode and the test harness are both
+enabled. Recovery ordering tests may also preseed an isolated path through
+`NOTM_FIXTURE_TEST_RECOVERY_PATH` and hold the worker off the GTK thread until
+`NOTM_FIXTURE_TEST_STARTUP_RECOVERY_GATE` exists. The gate wait is bounded at
+30 seconds, and both controls are likewise fixture-harness-only. Keep XDG
+homes isolated and poll `recovery_load_status`; a printed display `SKIP` is
+not a passing responsiveness run.
 
 For a bug fix, capture or reproduce the symptom first, then rerun the same
 fixture/live path after the change and confirm the symptom is gone. Rust compile,
@@ -249,7 +330,8 @@ drives the real modal through `pending_confirmation` and
 `respond_confirmation`, covers reject and accept paths, blocks harness
 mutations while a modal is pending, and compares compose, active-draft,
 recovery-file, and persisted-draft state across a rejection. Those controls are
-fixture-only except for the narrowly gated saved-draft Send flow documented in
+fixture-only except for narrowly gated saved-draft Send and close-flush flows
+in a disposable non-fixture harness, as documented in
 `docs/automation/README.md`:
 
 ```sh

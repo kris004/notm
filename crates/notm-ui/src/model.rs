@@ -32,6 +32,13 @@ pub const MAX_LOADED_THREAD_MESSAGES: usize = notm_notmuch::MAX_THREAD_TAG_MESSA
 /// [`MAX_LOADED_THREAD_MESSAGES`] limit.
 pub const MAX_THREAD_DETAIL_MESSAGES: usize = 256;
 
+/// Largest supported Notmuch thread page.
+///
+/// Search results are applied to GTK incrementally, but a hard page bound is
+/// still required so configuration cannot request an arbitrarily large
+/// database result, detail-preparation pass, or in-memory list model.
+pub const MAX_SEARCH_PAGE_SIZE: usize = 1_000;
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemePreference {
