@@ -85,7 +85,7 @@ def main() -> int:
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(PROJECT_ROOT / relative, destination)
 
-        baseline = run_verifier(pristine, "--expected-version", "0.1.1")
+        baseline = run_verifier(pristine, "--expected-version", "0.1.2")
         if baseline.returncode != 0:
             raise AssertionError(f"baseline metadata failed:\n{baseline.stderr}")
 
@@ -93,29 +93,29 @@ def main() -> int:
             (
                 "lock-version",
                 "Cargo.lock",
-                'name = "notm-app"\nversion = "0.1.1"',
+                'name = "notm-app"\nversion = "0.1.2"',
                 'name = "notm-app"\nversion = "9.9.9"',
                 "Cargo.lock version mismatch for notm-app",
             ),
             (
                 "changelog-version",
                 "CHANGELOG.md",
-                "## [0.1.1] - 2026-08-24",
-                "## [9.9.9] - 2026-08-24",
+                "## [0.1.2] - 2026-08-28",
+                "## [9.9.9] - 2026-08-28",
                 "latest changelog version mismatch",
             ),
             (
                 "man-version",
                 "docs/man/notm.1",
-                '"notm 0.1.1"',
+                '"notm 0.1.2"',
                 '"notm 9.9.9"',
                 "docs/man/notm.1 version mismatch",
             ),
             (
                 "appstream-version",
                 "packaging/io.github.kris004.notm.metainfo.xml",
-                '<release version="0.1.1" date="2026-08-24">',
-                '<release version="9.9.9" date="2026-08-24">',
+                '<release version="0.1.2" date="2026-08-28">',
+                '<release version="9.9.9" date="2026-08-28">',
                 "latest AppStream version mismatch",
             ),
             (

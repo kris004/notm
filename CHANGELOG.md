@@ -4,6 +4,29 @@ Notable user-facing changes are recorded here.
 
 ## Unreleased
 
+## [0.1.2] - 2026-08-28
+
+- Move searches, message and MIME loading, attachment work, draft recovery,
+  autosave, and tag updates off the GTK main thread. Large searches and messages
+  now use bounded, generation-aware work so stale results cannot overwrite the
+  current view.
+- Add debounced, durable draft autosave with atomic replacement, last-good
+  preservation, restart recovery, explicit send/close flushing, and safer
+  handling of corrupt, oversized, or legacy named drafts.
+- Make attachment saves atomic, avoid overwriting an existing destination, and
+  keep the application alive until a save finishes after the last window closes.
+- Target tag operations by exact message and thread IDs, reject stale database
+  snapshots, preserve non-UTF-8 Maildir paths, reconcile renamed files across
+  open views, and publish undo state only after durable success.
+- Harden MIME parsing and outgoing mail interoperability with bounded legacy
+  input handling, standards-compliant header and attachment encoding, validation
+  of unsafe headers and embedded messages, and representable send timeouts.
+- Tighten Visual HTML privacy: remote images remain blocked by default, one-time
+  loading is scoped to the selected view, spoofable sender headers no longer
+  grant durable trust, and WebKit uses ephemeral sessions plus restrictive CSPs.
+- Add hardware-backed signed, immutable releases with exact-source archives,
+  deterministic bundles, checksum and provenance verification, and CodeQL gates.
+
 ## [0.1.1] - 2026-08-24
 
 - The installed desktop entry can act as the default `mailto` handler. RFC 6068
@@ -45,5 +68,7 @@ Notable user-facing changes are recorded here.
   message body while results refresh.
 - Sender-default view actions now use compact labels and the `V a` shortcut.
 
+[Unreleased]: https://github.com/kris004/notm/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/kris004/notm/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/kris004/notm/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/kris004/notm/releases/tag/v0.1.0
