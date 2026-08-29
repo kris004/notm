@@ -35,6 +35,14 @@
     <name>notm contributors</name>
   </developer>
   <releases>
+    <release version="0.1.2" date="2026-08-28">
+      <description>
+        <p>
+          Improve UI responsiveness, draft and attachment durability, MIME and
+          tag-operation correctness, Visual HTML privacy, and release integrity.
+        </p>
+      </description>
+    </release>
     <release version="0.1.1" date="2026-08-24">
       <description>
         <p>Add support for using notm as the default mailto handler.</p>
