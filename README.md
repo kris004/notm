@@ -114,6 +114,8 @@ cargo build --release --locked -p notm-app
 
 Remove a user installation with `make uninstall-user`. Packagers can override
 `PREFIX` and `DESTDIR`; see the [Makefile](Makefile) for the installed paths.
+For a sandboxed build with bundled Notmuch and SMTP tooling, see the
+[Flatpak build, permissions, and uninstall guide](docs/flatpak.md).
 
 ## Quick start
 
@@ -218,7 +220,7 @@ before reporting a vulnerability.
 
 - Linux is the only supported platform. The prebuilt x86_64 bundle targets
   Ubuntu 24.04 or a compatible GNU/Linux system; other systems should build
-  from source.
+  from source or use Flatpak.
 - Account setup, mail retrieval, and SMTP are intentionally delegated to
   Notmuch, Maildir tools, and user-configured helper commands.
 - The project has no formal minimum supported Rust version yet; CI tracks the
@@ -243,6 +245,7 @@ before reporting a vulnerability.
 - [Synchronization](docs/sync.md) — optional receive and index-update commands.
 - [`notm-config(5)`](docs/man/notm-config.5) — exhaustive installed reference.
 - [Architecture](docs/architecture.md) — crate layout and runtime model.
+- [Flatpak](docs/flatpak.md) — sandboxed build, permissions, and rollback.
 - [Testing](docs/testing.md) — fixture, integration, and GTK smoke tests.
 - [Developer test harness](docs/automation/README.md) — local UI-driving API.
 

@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2026 notm contributors -->
+<component type="desktop-application">
+  <id>io.github.kris004.notm</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>notm</name>
+  <summary>Read and manage mail in a Notmuch database</summary>
+  <description>
+    <p>
+      notm is a native GTK desktop mail client for existing Notmuch mail
+      stores. It provides a column-based, keyboard-friendly interface for
+      searching, reading, composing, and tagging mail while leaving storage
+      and synchronization under the user's control.
+    </p>
+    <p>
+      The Flatpak includes the Notmuch command-line tool and msmtp. An existing
+      Notmuch configuration, database, and mail store are required; consult the
+      Flatpak setup guide before first launch.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.kris004.notm.desktop</launchable>
+  <icon type="stock">io.github.kris004.notm</icon>
+  <categories>
+    <category>Network</category>
+    <category>Email</category>
+  </categories>
+  <provides>
+    <binary>notm</binary>
+    <mediatype>x-scheme-handler/mailto</mediatype>
+  </provides>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/kris004/notm/a4f90fcc642ef566af256d20390917a56a455373/docs/assets/notm.png</image>
+      <caption>Browsing a synthetic fixture inbox</caption>
+    </screenshot>
+  </screenshots>
+  <url type="homepage">https://github.com/kris004/notm</url>
+  <url type="bugtracker">https://github.com/kris004/notm/issues</url>
+  <developer id="io.github.kris004">
+    <name>notm contributors</name>
+  </developer>
+  <releases>
+    <release version="0.1.2" date="2026-08-28">
+      <description>
+        <p>
+          Improve UI responsiveness, draft and attachment durability, MIME and
+          tag-operation correctness, Visual HTML privacy, and release integrity.
+        </p>
+      </description>
+    </release>
+    <release version="0.1.1" date="2026-08-24">
+      <description>
+        <p>Add support for using notm as the default mailto handler.</p>
+      </description>
+    </release>
+    <release version="0.1.0" date="2026-08-20">
+      <description>
+        <p>Initial public release.</p>
+      </description>
+    </release>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>

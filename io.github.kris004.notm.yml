@@ -1,0 +1,187 @@
+id: io.github.kris004.notm
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.llvm20
+command: notm
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --filesystem=~/Mail
+  - --filesystem=~/.mail
+  - --filesystem=~/.notmuch-config:ro
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /share/aclocal
+  - /share/gir-1.0
+  - /share/vala
+  - '*.a'
+  - '*.la'
+modules:
+  - name: xapian-core
+    buildsystem: autotools
+    config-opts:
+      - --disable-static
+      - --enable-shared
+      - --disable-documentation
+    cleanup:
+      - /bin/copydatabase
+      - /bin/quest
+      - /bin/simpleexpand
+      - /bin/xapian-check
+      - /bin/xapian-compact
+      - /bin/xapian-config
+      - /bin/xapian-delve
+      - /bin/xapian-metadata
+      - /bin/xapian-pos
+      - /bin/xapian-progsrv
+      - /bin/xapian-replicate
+      - /bin/xapian-replicate-server
+      - /bin/xapian-tcpsrv
+      - /share/man/man1/copydatabase.1
+      - /share/man/man1/quest.1
+      - /share/man/man1/simpleexpand.1
+      - /share/man/man1/xapian-*.1
+    post-install:
+      - install -Dm644 COPYING /app/share/licenses/io.github.kris004.notm/xapian-core/COPYING
+    sources:
+      - type: archive
+        url: https://oligarchy.co.uk/xapian/1.4.32/xapian-core-1.4.32.tar.xz
+        sha256: c4fd64e81127311756adf5579268d14a79f285ce8ac4ead0930c96195897aece
+
+  - name: talloc
+    buildsystem: simple
+    build-options:
+      env:
+        PYTHON: python3
+        PYTHONHASHSEED: '1'
+    build-commands:
+      - >-
+        ./configure --prefix=/app --disable-python --disable-rpath-install
+      - ./buildtools/bin/waf build -j${FLATPAK_BUILDER_N_JOBS}
+      - ./buildtools/bin/waf install
+      - install -Dm644 LICENSE /app/share/licenses/io.github.kris004.notm/talloc/LICENSE
+    sources:
+      - type: archive
+        url: https://download.samba.org/pub/talloc/talloc-2.4.3.tar.gz
+        sha256: dc46c40b9f46bb34dd97fe41f548b0e8b247b77a918576733c528e83abd854dd
+
+  - name: gmime
+    buildsystem: autotools
+    config-opts:
+      - --disable-static
+      - --enable-shared
+      - --disable-gtk-doc
+      - --disable-introspection
+      - --disable-vala
+      - --without-libidn
+    cleanup:
+      - /bin/gmime-port-2-6-to-3-0
+      - /share/man/man1/gmime-port-2-6-to-3-0.1
+      - /share/gtk-doc
+    post-install:
+      - install -Dm644 COPYING /app/share/licenses/io.github.kris004.notm/gmime/COPYING
+    sources:
+      - type: archive
+        url: https://github.com/jstedfast/gmime/releases/download/3.2.15/gmime-3.2.15.tar.xz
+        sha256: 84cd2a481a27970ec39b5c95f72db026722904a2ccf3fdbd57b280cf2d02b5c4
+
+  - name: notmuch
+    buildsystem: simple
+    build-options:
+      env:
+        XAPIAN_CONFIG: /app/bin/xapian-config
+    build-commands:
+      - >-
+        ./configure --prefix=/app --libdir=/app/lib
+        --without-bash-completion --without-zsh-completion
+        --without-docs --without-api-docs --without-emacs
+        --without-desktop --without-ruby
+      - make -j${FLATPAK_BUILDER_N_JOBS}
+      - make install
+      - |
+        install -d /app/lib/pkgconfig
+        printf '%s\n' \
+          'prefix=/app' \
+          'exec_prefix=${prefix}' \
+          'libdir=${prefix}/lib' \
+          'includedir=${prefix}/include' \
+          '' \
+          'Name: notmuch' \
+          'Description: Thread-based email index, search, and tagging library' \
+          'Version: 0.40' \
+          'Libs: -L${libdir} -lnotmuch' \
+          'Cflags: -I${includedir}' \
+          > /app/lib/pkgconfig/notmuch.pc
+        test "$(pkg-config --modversion notmuch)" = 0.40
+        pkg-config --exists notmuch
+      - install -Dm644 COPYING /app/share/licenses/io.github.kris004.notm/notmuch/COPYING
+      - install -Dm644 COPYING-GPL-3 /app/share/licenses/io.github.kris004.notm/notmuch/COPYING-GPL-3
+    sources:
+      - type: archive
+        url: https://notmuchmail.org/releases/notmuch-0.40.tar.xz
+        sha256: 4b4314bbf1c2029fdf793637e6c7bb15c1b1730d22be9aa04803c98c5bbc446f
+
+  - name: msmtp
+    buildsystem: autotools
+    config-opts:
+      - --disable-dependency-tracking
+      - --disable-nls
+      - --disable-rpath
+      - --with-tls=gnutls
+      - --without-libgsasl
+      - --without-libidn
+      - --without-libsecret
+      - --without-macosx-keyring
+      - --without-msmtpd
+    post-install:
+      - install -Dm644 COPYING /app/share/licenses/io.github.kris004.notm/msmtp/COPYING
+    sources:
+      - type: archive
+        url: https://marlam.de/msmtp/releases/msmtp-1.8.33.tar.xz
+        sha256: 41c163ce2c4c8c3c326cda8d0abd9391a7323788f0a893f49bfbe7aff3d4f276
+
+  - name: notm
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin
+      env:
+        CARGO_HOME: /run/build/notm/cargo
+        CARGO_INCREMENTAL: '0'
+        CARGO_NET_OFFLINE: 'true'
+        LIBCLANG_PATH: /usr/lib/sdk/llvm20/lib
+        RUSTFLAGS: --remap-path-prefix=/run/build/notm=/usr/src/notm
+    build-commands:
+      - >-
+        test "$(sha256sum Cargo.lock | cut -d ' ' -f 1)" =
+        7b354555ea427eee1adbc1c347a0952547f5e5c351c7883bd663ad28a3b68089
+      - cargo build --frozen --release -p notm-app
+      - test "$(target/release/notm --version)" = "notm 0.1.2"
+      - install -Dm755 target/release/notm /app/bin/notm
+      - >-
+        install -Dm644 packaging/io.github.kris004.notm.desktop
+        /app/share/applications/io.github.kris004.notm.desktop
+      - install -Dm644 io.github.kris004.notm.metainfo.xml /app/share/metainfo/io.github.kris004.notm.metainfo.xml
+      - >-
+        install -Dm644
+        packaging/icons/hicolor/scalable/apps/io.github.kris004.notm.svg
+        /app/share/icons/hicolor/scalable/apps/io.github.kris004.notm.svg
+      - install -Dm644 docs/man/notm.1 /app/share/man/man1/notm.1
+      - install -Dm644 docs/man/notm-config.5 /app/share/man/man5/notm-config.5
+      - install -Dm644 docs/man/notm-test-harness.7 /app/share/man/man7/notm-test-harness.7
+      - install -Dm644 docs/man/notm-automation.7 /app/share/man/man7/notm-automation.7
+      - install -Dm644 LICENSE /app/share/licenses/io.github.kris004.notm/notm/LICENSE
+    sources:
+      - type: git
+        url: https://github.com/kris004/notm.git
+        tag: v0.1.2
+        commit: a4f90fcc642ef566af256d20390917a56a455373
+      - packaging/flatpak/cargo-sources.json
+      - type: file
+        path: packaging/flatpak/io.github.kris004.notm.metainfo.xml

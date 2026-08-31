@@ -77,7 +77,10 @@ cargo build --locked -p notm-app
 python3 -B tests/ui_text_focus_smoke.py --binary target/debug/notm
 
 actionlint
-shellcheck packaging/*.sh tests/*.sh
+shellcheck packaging/*.sh packaging/flatpak/*.sh tests/*.sh
+./tests/flatpak_builder_wrapper_smoke.sh
+python3 -B -m py_compile tests/distribution_e2e.py
+python3 -B tests/distribution_e2e_socket_smoke.py
 mandoc -Tlint \
   docs/man/notm.1 \
   docs/man/notm-config.5 \
@@ -87,6 +90,32 @@ desktop-file-validate packaging/io.github.kris004.notm.desktop
 appstreamcli validate --strict --pedantic --no-net \
   packaging/io.github.kris004.notm.metainfo.xml
 ```
+
+The standard distribution driver accepts only caller-supplied executable paths
+and creates disposable mail, Notmuch configuration/database state, drafts,
+attachments, and loopback SMTP capture beneath its work root. Flatpak has a
+separate hard gate that performs a clean offline rebuild, temporary
+installation, sandbox permission inspection, the same GUI/mail flow, restart,
+and delete-data uninstall:
+
+```sh
+test_root=$(mktemp -d "${TMPDIR:-/tmp}/notm-flatpak-e2e.XXXXXX")
+trap 'rm -rf "$test_root"' EXIT
+NOTM_TEST_DISPOSABLE_ROOT="$test_root" \
+  ./tests/run_with_headless_weston.sh \
+  ./tests/run_with_private_dbus.sh \
+  ./tests/flatpak_distribution_e2e.sh
+```
+
+Keep Weston outside the private D-Bus wrapper. This stops the document portal
+and releases its private runtime mount before Weston removes that runtime.
+
+The Flatpak gate requires `flatpak-builder`, configured GNOME/SDK dependencies,
+and the official Flathub linter. It refuses an interactive display, existing
+notm app data, or a non-disposable HOME mapping. See [Flatpak](flatpak.md) for
+the isolated Builder-app invocation, offline-cache contract, and evidence
+captured by the gate. An unavailable or skipped Flatpak distribution E2E is a
+delivery failure, not a pass.
 
 `tests/source_archive_smoke.sh` creates the exact source-archive form, confirms
 that it has no `.git`, verifies embedded commit and version provenance, and
