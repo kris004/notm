@@ -189,6 +189,9 @@ Press `?` in the application for searchable shortcut help. A few useful keys:
   as an attachment.
 - `F` labels every visible link in an HTML message; type a displayed label to
   open that link externally. `Esc` cancels the link-hint mode.
+- `I` opens the Images menu. `I m` loads remote images only for the current
+  message, and `I a` toggles the persistent exception for its exact sender
+  address.
 - `c` composes. In the composer, `A` adds an attachment, `S` saves the draft,
   `x` discards it, `D` deletes an opened local draft, and `Ctrl+Enter` sends.
 
@@ -200,11 +203,24 @@ and the same action removes a matching sender default.
 ## Security and privacy
 
 `notm` has no telemetry or hosted service. Visual HTML blocks remote content by
-default. **Load remote images once** permits sanitized remote images only in the
-current message view; navigating away or restarting blocks them again. A raw
-`From:` header is not authenticated and never grants durable image permission.
-Setting `ui.remote_images = true` is an explicit privacy override that permits
-remote images in every Visual HTML message. HTML sanitization, restrictive
+default. The fixed **Images** menu offers **Load for this message**, which
+permits sanitized remote images only in the current message view; navigating
+away or restarting blocks them again. **Always load from this sender** is a
+checked, reversible exception for the exact normalized mailbox in the
+message's `From:` header. It is persisted only after an atomic configuration
+write succeeds, and matching open views are refreshed when it changes.
+
+That exception is a convenience/privacy preference, **not authenticated sender
+identity**. `notm` cannot establish who sent a message from raw mail headers;
+`From:` can be forged, and a forged message claiming an allowed address will
+receive the same image permission. The Images menu shows this warning. Messages
+without exactly one valid `From:` mailbox can use one-shot loading but cannot
+receive persistent sender permission. The separate `ui.remote_images` setting
+remains an explicit global override and is off by default.
+
+Bounded raster images embedded in the message and referenced with `cid:` render
+locally; they do not require remote-image permission or contact a server. HTML
+sanitization, restrictive
 content security policies, and an ephemeral WebKit network session provide
 defense in depth. JavaScript and in-app navigation are disabled, and the local
 developer test harness is off unless explicitly enabled. Sending and

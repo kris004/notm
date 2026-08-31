@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, fs::File, io::Read, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::File,
+    io::Read,
+    path::Path,
+};
 
 use anyhow::Context;
 use mailparse::{DispositionType, MailHeaderMap, body::Body};
@@ -1242,6 +1247,34 @@ pub fn extract_attachments_detailed_with_limits(
     bytes: &[u8],
     limits: MimeLimits,
 ) -> anyhow::Result<AttachmentExtractionReport> {
+    extract_selected_attachments_detailed_with_limits(bytes, None, limits)
+}
+
+/// Extract only the requested stable attachment-part indexes.
+///
+/// Unselected parts are still traversed so indexes retain their ordinary
+/// depth-first meaning, but their payloads are not decoded or retained.
+pub fn extract_attachment_parts_detailed(
+    bytes: &[u8],
+    part_indexes: &[usize],
+) -> anyhow::Result<AttachmentExtractionReport> {
+    extract_attachment_parts_detailed_with_limits(bytes, part_indexes, MimeLimits::default())
+}
+
+pub fn extract_attachment_parts_detailed_with_limits(
+    bytes: &[u8],
+    part_indexes: &[usize],
+    limits: MimeLimits,
+) -> anyhow::Result<AttachmentExtractionReport> {
+    let selected = part_indexes.iter().copied().collect::<BTreeSet<_>>();
+    extract_selected_attachments_detailed_with_limits(bytes, Some(&selected), limits)
+}
+
+fn extract_selected_attachments_detailed_with_limits(
+    bytes: &[u8],
+    selected: Option<&BTreeSet<usize>>,
+    limits: MimeLimits,
+) -> anyhow::Result<AttachmentExtractionReport> {
     anyhow::ensure!(
         bytes.len() <= limits.max_message_bytes,
         "message exceeds the {}-byte safety limit",
@@ -1256,6 +1289,7 @@ pub fn extract_attachments_detailed_with_limits(
         &parsed,
         limits,
         false,
+        selected,
         &mut total_decoded_bytes,
         &mut next_part_index,
         &mut report,
@@ -1281,6 +1315,7 @@ fn collect_attachment_data(
     part: &mailparse::ParsedMail<'_>,
     limits: MimeLimits,
     named_body_allowed: bool,
+    selected: Option<&BTreeSet<usize>>,
     total_decoded_bytes: &mut usize,
     next_part_index: &mut usize,
     report: &mut AttachmentExtractionReport,
@@ -1294,6 +1329,7 @@ fn collect_attachment_data(
                 subpart,
                 limits,
                 child_named_body_allowed,
+                selected,
                 total_decoded_bytes,
                 next_part_index,
                 report,
@@ -1314,6 +1350,9 @@ fn collect_attachment_data(
     }
     let part_index = *next_part_index;
     *next_part_index += 1;
+    if selected.is_some_and(|selected| !selected.contains(&part_index)) {
+        return Ok(());
+    }
     let filename = filename.unwrap_or_else(|| fallback_attachment_filename(part));
     let description = part_description(&mimetype, Some(&filename), true);
     ensure_decode_may_fit(part, &description, limits.max_decoded_part_bytes)?;
@@ -1591,6 +1630,16 @@ mod tests {
         assert_eq!(report.attachments[0].part_index, 1);
         assert_eq!(report.attachments[0].filename, "good.txt");
         assert_eq!(report.attachments[0].bytes, b"good sibling");
+
+        let selected = extract_attachment_parts_detailed(&raw, &[1])
+            .expect("extract only the selected good attachment");
+        assert!(
+            selected.failures.is_empty(),
+            "an unselected malformed sibling was decoded: {selected:?}"
+        );
+        assert_eq!(selected.attachments.len(), 1);
+        assert_eq!(selected.attachments[0].part_index, 1);
+        assert_eq!(selected.attachments[0].bytes, b"good sibling");
 
         let strict_error = extract_attachments(&raw)
             .expect_err("strict extraction must reject any corrupt attachment");

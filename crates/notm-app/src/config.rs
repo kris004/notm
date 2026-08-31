@@ -207,11 +207,8 @@ pub struct UiConfig {
     pub show_keybind_hints: bool,
     #[serde(default)]
     pub remote_images: bool,
-    // Raw From headers are not authenticated by Notmuch. Keep accepting the
-    // former sender allow-list so existing configs still load, but never expose
-    // or serialize it as an effective permission.
-    #[serde(default, rename = "trusted_image_senders", skip_serializing)]
-    _legacy_trusted_image_senders: Vec<String>,
+    #[serde(default)]
+    pub trusted_image_senders: Vec<String>,
     #[serde(default = "default_html_mode")]
     pub html_mode: String,
     #[serde(default)]
@@ -256,7 +253,7 @@ impl Default for UiConfig {
             show_thread_preview: true,
             show_keybind_hints: true,
             remote_images: false,
-            _legacy_trusted_image_senders: Vec::new(),
+            trusted_image_senders: Vec::new(),
             html_mode: "sanitize_then_render_text_fallback".to_string(),
             message_view_preferences: BTreeMap::new(),
             sender_view_preferences: BTreeMap::new(),
@@ -865,10 +862,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_keys_and_arbitrary_send_environment_are_accepted_but_not_serialized() {
+    fn legacy_keys_are_omitted_but_sender_image_trust_round_trips() {
         let config = parse_validated(
             "[ui]\nconfirm_destructive_tag_actions = false\n\
-             trusted_image_senders = [\"SPOOFED@EXAMPLE.TEST\", \"not an address\"]\n\
+             trusted_image_senders = [\"sender@example.test\", \"other@example.test\"]\n\
              \n[send]\none_live_self_test_per_run = true\n\
              \n[send.env]\nNOTM_CUSTOM_VARIABLE = \"value\"\n\
              \n[sync]\nshow_manual_sync_button = true\n",
@@ -883,14 +880,17 @@ mod tests {
                 .map(String::as_str),
             Some("value")
         );
+        assert_eq!(
+            config.ui.trusted_image_senders,
+            ["sender@example.test", "other@example.test"]
+        );
         assert!(
             !config.ui.remote_images,
-            "ignored legacy sender entries must not broaden the global image policy"
+            "sender-scoped trust must not broaden the global image policy"
         );
         let serialized = toml::to_string(&config).expect("serialize configuration");
         for legacy_key in [
             "confirm_destructive_tag_actions",
-            "trusted_image_senders",
             "one_live_self_test_per_run",
             "show_manual_sync_button",
         ] {
@@ -899,6 +899,12 @@ mod tests {
                 "legacy key {legacy_key} leaked into serialized configuration:\n{serialized}"
             );
         }
+        let round_tripped: AppConfig =
+            toml::from_str(&serialized).expect("deserialize serialized configuration");
+        assert_eq!(
+            round_tripped.ui.trusted_image_senders,
+            ["sender@example.test", "other@example.test"]
+        );
     }
 
     #[test]

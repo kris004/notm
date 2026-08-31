@@ -18,7 +18,7 @@ use notm_mail::html_sanitize::sanitize_html;
 use notm_mail::{
     ComposedMessage, ExternalCommandTransport, FakeSendTransport, MailtoRequest, ReplyKind,
     SendTransport, TransportMode,
-    address::{dedupe_addresses, format_address, parse_address_list},
+    address::{dedupe_addresses, format_address, parse_address_list, parse_one},
     compose::Identity,
     parse_mailto_uri, send_timeout_duration, validate_send_timeout_seconds,
 };
@@ -88,7 +88,8 @@ use crate::{
         StandaloneOpenOptions, StandalonePolicyProvider, StandalonePolicySnapshot,
         StandalonePreferredView, StandaloneRememberView, StandaloneResponseAction,
         StandaloneResponseHandler, StandaloneResponseRequest, StandaloneSenderView,
-        StandaloneSourceRenderer, StandaloneTextRenderer, StandaloneToggleSenderView,
+        StandaloneSetSenderRemoteImages, StandaloneSourceRenderer, StandaloneTextRenderer,
+        StandaloneToggleSenderView,
     },
     widgets::thread_list::{
         self, AppendSearchOutcome, LoadMoreDecision, LocatePagePlan, ReplaceSearchOutcome,
@@ -178,6 +179,7 @@ pub struct LaunchOptions {
     pub show_keybind_hints: bool,
     pub layout: String,
     pub html_mode: String,
+    pub trusted_image_senders: Vec<String>,
     pub message_view_preferences: BTreeMap<String, MessageViewPreference>,
     pub sender_view_preferences: BTreeMap<String, MessageViewPreference>,
     pub hidden_tag_searches: Vec<String>,
@@ -252,6 +254,7 @@ impl Default for LaunchOptions {
             show_keybind_hints: true,
             layout: "auto".to_string(),
             html_mode: "sanitize_then_render_text_fallback".to_string(),
+            trusted_image_senders: Vec::new(),
             message_view_preferences: BTreeMap::new(),
             sender_view_preferences: BTreeMap::new(),
             hidden_tag_searches: Vec::new(),
@@ -601,7 +604,11 @@ struct Widgets {
     sender_view_preference_button: gtk::Button,
     active_message_view: Rc<Cell<MessageViewKind>>,
     html_lifecycle: HtmlViewLifecycle,
-    image_policy_button: gtk::Button,
+    image_policy_button: gtk::MenuButton,
+    image_policy_menu_box: gtk::Box,
+    load_images_once_button: gtk::Button,
+    always_load_sender_images_check: gtk::CheckButton,
+    image_policy_help: gtk::Label,
     html_policy_row: gtk::Box,
     html_policy_label: gtk::Label,
     message_header_box: gtk::Box,
@@ -980,7 +987,7 @@ const MESSAGE_HEADER_VALUE_LINES: i32 = 1;
 const KEYBOARD_CURSOR_CLASS: &str = "notm-keyboard-cursor";
 const STATUS_BAR_MAX_WIDTH_CHARS: i32 = 120;
 const HTML_LINK_STATUS_URI_MAX_CHARS: usize = 96;
-const HTML_DEFAULT_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; img-src http: https:; style-src 'unsafe-inline'; script-src 'none'; connect-src 'none'; frame-src 'none'; font-src 'none'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+const HTML_DEFAULT_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; img-src data: http: https:; style-src 'unsafe-inline'; script-src 'none'; connect-src 'none'; frame-src 'none'; font-src 'none'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 // Cache enough normalized content for visual preview limits without keying the
 // thread-detail cache by a presentation setting.
 const AUTO_STACKED_BELOW_WIDTH: i32 = 1280;
@@ -1054,6 +1061,7 @@ fn build_ui(
         sender_view_preferences: normalize_sender_view_preferences(
             &options.sender_view_preferences,
         ),
+        trusted_image_senders: normalize_sender_list(&options.trusted_image_senders),
         theme: settings::theme(&options.runtime_settings),
         thread_preview_lines: settings::thread_preview_lines(&options.runtime_settings),
         show_thread_numbers: options.show_thread_numbers,
@@ -1489,11 +1497,40 @@ fn build_ui(
     sender_view_preference_button.set_visible(false);
     view_menu_box.append(&sender_view_preference_button);
     let active_message_view = Rc::new(Cell::new(MessageViewKind::Text));
-    let image_policy_button = gtk::Button::with_label("Load remote images once");
-    image_policy_button.set_widget_name("notm-image-policy-button");
+    let (image_policy_button, image_policy_menu_box) =
+        menu_button_with_box("Images", "notm-image-policy-button", &state);
     image_policy_button.set_tooltip_text(Some(
-        "Remote images can reveal that you opened a message and expose your network address. This action applies only to the current message and resets when you leave it.",
+        "Choose whether to load remote images for this message or always for this sender.",
     ));
+    image_policy_button.set_valign(gtk::Align::Center);
+    let load_images_once_button = gtk::Button::with_label("Load for this message");
+    load_images_once_button.set_widget_name("notm-load-images-once-button");
+    load_images_once_button.set_tooltip_text(Some(
+        "Load remote images only for the currently selected message. Shortcut: I m.",
+    ));
+    let always_load_sender_images_check =
+        gtk::CheckButton::with_label("Always load from this sender");
+    always_load_sender_images_check.set_widget_name("notm-always-load-sender-images-check");
+    always_load_sender_images_check.set_tooltip_text(Some(
+        "Persist or revoke an exact From-address exception. Shortcut: I a.",
+    ));
+    image_policy_menu_box.append(&load_images_once_button);
+    image_policy_menu_box.append(&always_load_sender_images_check);
+    image_policy_menu_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    let image_policy_help = gtk::Label::new(Some(
+        "Warning: remote images can reveal that you opened a message and expose your network \
+         address. From addresses are not authenticated by notm and can be forged; a forged \
+         message claiming an allowed sender can also load tracking images.",
+    ));
+    image_policy_help.set_xalign(0.0);
+    image_policy_help.set_wrap(true);
+    image_policy_help.set_max_width_chars(44);
+    image_policy_help.add_css_class("dim-label");
+    image_policy_help.set_margin_top(6);
+    image_policy_help.set_margin_bottom(6);
+    image_policy_help.set_margin_start(8);
+    image_policy_help.set_margin_end(8);
+    image_policy_menu_box.append(&image_policy_help);
     let collapse_quotes_button = gtk::Button::with_label("Collapse quotes");
     collapse_quotes_button.set_widget_name("notm-collapse-quotes-button");
     let (copy_menu_button, copy_menu_box) =
@@ -1538,8 +1575,13 @@ fn build_ui(
     let html_policy_label = gtk::Label::new(None);
     html_policy_label.set_widget_name("notm-html-policy-label");
     html_policy_label.set_xalign(0.0);
-    html_policy_label.set_wrap(true);
     html_policy_label.set_hexpand(true);
+    html_policy_label.set_single_line_mode(true);
+    html_policy_label.set_width_chars(1);
+    html_policy_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    html_policy_label.set_tooltip_text(Some(
+        "Visual HTML is sanitized: scripts and in-app navigation are blocked, and links open externally. Use F for link hints.",
+    ));
     html_policy_label.add_css_class("dim-label");
     image_policy_button.set_halign(gtk::Align::End);
     html_policy_row.append(&html_policy_label);
@@ -1759,6 +1801,10 @@ fn build_ui(
         active_message_view,
         html_lifecycle,
         image_policy_button,
+        image_policy_menu_box,
+        load_images_once_button,
+        always_load_sender_images_check,
+        image_policy_help,
         html_policy_row,
         html_policy_label,
         message_header_box,
@@ -3725,9 +3771,24 @@ fn connect_message_actions(
     let opts = options.clone();
     let w = widgets.clone();
     let st = state.clone();
+    widgets.load_images_once_button.connect_clicked(move |_| {
+        activate_load_images_once(&opts, &w, &st);
+        w.image_policy_button.popdown();
+    });
+
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
     widgets
-        .image_policy_button
-        .connect_clicked(move |_| activate_image_policy_button(&opts, &w, &st));
+        .always_load_sender_images_check
+        .connect_toggled(move |check| {
+            let enabled = check.is_active();
+            if enabled == selected_image_sender_is_trusted(&st) {
+                return;
+            }
+            set_selected_sender_image_trust_from_control(&opts, &w, &st, enabled);
+            w.image_policy_button.popdown();
+        });
 
     let opts = options.clone();
     let w = widgets.clone();
@@ -5695,13 +5756,25 @@ fn update_button_binding_labels(widgets: &Widgets, state: &SharedState) {
         visible_binding(message_bindings, "y s"),
         state,
     );
-    let image_base = strip_binding_suffix(&widgets.image_policy_button.label().unwrap_or_default());
-    set_button_label(
+    set_menu_button_label(
         &widgets.image_policy_button,
-        &image_base,
+        "Images",
         visible_binding(message_bindings, "I"),
         state,
     );
+    set_button_label(
+        &widgets.load_images_once_button,
+        "Load for this message",
+        visible_binding(message_bindings, "I m"),
+        state,
+    );
+    widgets
+        .always_load_sender_images_check
+        .set_label(Some(&button_label(
+            "Always load from this sender",
+            visible_binding(message_bindings, "I a"),
+            state,
+        )));
     set_button_label(
         &widgets.composer.add_attachment_button(),
         "Add attachment…",
@@ -5878,6 +5951,7 @@ fn normal_text_focus_blocks_key(key: gtk::gdk::Key) -> bool {
                 | gtk::gdk::Key::g
                 | gtk::gdk::Key::G
                 | gtk::gdk::Key::i
+                | gtk::gdk::Key::I
                 | gtk::gdk::Key::slash
                 | gtk::gdk::Key::colon
                 | gtk::gdk::Key::comma
@@ -6187,6 +6261,7 @@ fn install_shortcuts(
     let pending_response = Rc::new(RefCell::new(false));
     let pending_view = Rc::new(RefCell::new(false));
     let pending_copy = Rc::new(RefCell::new(false));
+    let pending_images = Rc::new(RefCell::new(false));
     let pending_message_tag = Rc::new(RefCell::new(false));
     let pending_tag = Rc::new(RefCell::new(false));
     let pending_undo = Rc::new(RefCell::new(false));
@@ -6198,6 +6273,7 @@ fn install_shortcuts(
         pending_response.clone(),
         pending_view.clone(),
         pending_copy.clone(),
+        pending_images.clone(),
         pending_message_tag.clone(),
         pending_tag.clone(),
         pending_undo.clone(),
@@ -6211,6 +6287,7 @@ fn install_shortcuts(
             *pending_response.borrow_mut() = false;
             *pending_view.borrow_mut() = false;
             *pending_copy.borrow_mut() = false;
+            *pending_images.borrow_mut() = false;
             *pending_message_tag.borrow_mut() = false;
             *pending_tag.borrow_mut() = false;
             *pending_undo.borrow_mut() = false;
@@ -6218,6 +6295,7 @@ fn install_shortcuts(
             w.response_menu_button.popdown();
             w.view_menu_button.popdown();
             w.copy_menu_button.popdown();
+            w.image_policy_button.popdown();
             w.tag_menu_button.popdown();
             w.message_tag_menu_button.popdown();
             w.undo_tag_button.popdown();
@@ -6442,6 +6520,22 @@ fn install_shortcuts(
                 gtk::glib::Propagation::Proceed
             };
         }
+        if *pending_images.borrow() {
+            if !message_pane_shortcuts_available(&w) || compose_view_is_visible(&w) {
+                *pending_images.borrow_mut() = false;
+                w.image_policy_button.popdown();
+                return gtk::glib::Propagation::Proceed;
+            }
+            *pending_images.borrow_mut() = false;
+            w.image_policy_button.popdown();
+            clear_numeric_prefix(&numeric_prefix);
+            let handled = activate_image_sequence_key(&opts, &w, &st, key);
+            return if handled {
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            };
+        }
         if *pending_message_tag.borrow() {
             if !message_pane_shortcuts_available(&w) || compose_view_is_visible(&w) {
                 *pending_message_tag.borrow_mut() = false;
@@ -6510,6 +6604,15 @@ fn install_shortcuts(
         } else if key == gtk::gdk::Key::colon {
             clear_numeric_prefix(&numeric_prefix);
             show_command_palette(&opts, &w, &st, &undo);
+            true
+        } else if shifted_shortcut_key(key, mods, gtk::gdk::Key::i, gtk::gdk::Key::I)
+            && message_pane_shortcuts_available(&w)
+            && !compose_view_is_visible(&w)
+        {
+            clear_numeric_prefix(&numeric_prefix);
+            if open_image_policy_menu(&opts, &w, &st) {
+                *pending_images.borrow_mut() = true;
+            }
             true
         } else if key == gtk::gdk::Key::i {
             clear_numeric_prefix(&numeric_prefix);
@@ -6689,10 +6792,6 @@ fn install_shortcuts(
             w.status_label
                 .set_text("Copy: m message id, t thread id, f from, o to, c cc, s subject");
             true
-        } else if key == gtk::gdk::Key::I && message_pane_shortcuts_available(&w) {
-            clear_numeric_prefix(&numeric_prefix);
-            activate_image_policy_button(&opts, &w, &st);
-            true
         } else if key == gtk::gdk::Key::d {
             clear_numeric_prefix(&numeric_prefix);
             let visible = w.debug_view.is_visible();
@@ -6745,6 +6844,7 @@ fn connect_dropdown_sequence_keys(
     pending_response: Rc<RefCell<bool>>,
     pending_view: Rc<RefCell<bool>>,
     pending_copy: Rc<RefCell<bool>>,
+    pending_images: Rc<RefCell<bool>>,
     pending_message_tag: Rc<RefCell<bool>>,
     pending_tag: Rc<RefCell<bool>>,
     pending_undo: Rc<RefCell<bool>>,
@@ -6851,6 +6951,29 @@ fn connect_dropdown_sequence_keys(
         }
     });
     widgets.copy_menu_box.add_controller(controller);
+
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let opts = options.clone();
+    let w = widgets.clone();
+    let st = state.clone();
+    let pending = pending_images;
+    controller.connect_key_pressed(move |_, key, _, _| {
+        if !message_pane_shortcuts_available(&w) || compose_view_is_visible(&w) {
+            *pending.borrow_mut() = false;
+            w.image_policy_button.popdown();
+            return gtk::glib::Propagation::Proceed;
+        }
+        let handled = activate_image_sequence_key(&opts, &w, &st, key);
+        *pending.borrow_mut() = false;
+        w.image_policy_button.popdown();
+        if handled {
+            gtk::glib::Propagation::Stop
+        } else {
+            gtk::glib::Propagation::Proceed
+        }
+    });
+    widgets.image_policy_menu_box.add_controller(controller);
 
     let controller = gtk::EventControllerKey::new();
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -10377,11 +10500,71 @@ fn settings_application_block_reason(state: &UiState) -> Option<&'static str> {
     }
 }
 
-fn activate_image_policy_button(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
+fn open_image_policy_menu(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) -> bool {
+    if !ensure_message_file_actions_allowed(widgets, state) {
+        return false;
+    }
+    if compose_view_is_visible(widgets) || state.borrow().selected_message.is_none() {
+        widgets
+            .status_label
+            .set_text("Select a message before opening image permissions");
+        return false;
+    }
+    if !selected_message_has_html(widgets, state) {
+        widgets
+            .status_label
+            .set_text("The selected message has no Visual HTML images");
+        return false;
+    }
+    if !html_view_is_visible(widgets) {
+        show_visual_html_selected_message(options, widgets, state);
+        if state.borrow().last_error.is_some() {
+            return false;
+        }
+    }
+    update_message_action_buttons(options, widgets, state);
+    widgets.image_policy_button.popup();
+    widgets.status_label.set_text(
+        "Images: m load for this message, a always load from this sender (toggle to revoke)",
+    );
+    true
+}
+
+fn activate_image_sequence_key(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    key: gtk::gdk::Key,
+) -> bool {
+    if key == gtk::gdk::Key::m {
+        activate_load_images_once(options, widgets, state);
+        true
+    } else if key == gtk::gdk::Key::a {
+        if selected_image_sender_email(state).is_none() {
+            let error = "Always loading from this sender requires exactly one valid address in \
+                         the From header";
+            widgets.status_label.set_text(error);
+            state.borrow_mut().last_error = Some(error.to_string());
+            update_message_action_buttons(options, widgets, state);
+        } else {
+            widgets.always_load_sender_images_check.emit_activate();
+        }
+        true
+    } else {
+        false
+    }
+}
+
+fn activate_load_images_once(options: &LaunchOptions, widgets: &Widgets, state: &SharedState) {
     if !ensure_message_file_actions_allowed(widgets, state) {
         return;
     }
-    if settings::remote_images(&options.runtime_settings)
+    let configured_images_allowed = state
+        .borrow()
+        .selected_message
+        .clone()
+        .is_some_and(|message| message_allows_images(options, state, &message));
+    if configured_images_allowed
         || (html_view_is_visible(widgets) && html_view_images_allowed(widgets))
     {
         state.borrow_mut().last_error = None;
@@ -10391,24 +10574,123 @@ fn activate_image_policy_button(options: &LaunchOptions, widgets: &Widgets, stat
     show_visual_html_with_image_policy(options, widgets, state, ImagePolicy::Once);
 }
 
-fn reject_persistent_sender_image_trust(
+fn set_selected_sender_image_trust_from_control(
     options: &LaunchOptions,
     widgets: &Widgets,
     state: &SharedState,
-) -> serde_json::Value {
-    let error = "Persistent sender image trust is unavailable because email From headers are not authenticated; use Load remote images once for the current message";
-    widgets.status_label.set_text(error);
+    enabled: bool,
+) {
+    if !ensure_message_file_actions_allowed(widgets, state) {
+        update_message_action_buttons(options, widgets, state);
+        return;
+    }
+    let Some(sender) = selected_image_sender_email(state) else {
+        let error =
+            "Always loading from this sender requires exactly one valid address in the From header";
+        widgets.status_label.set_text(error);
+        {
+            let mut state = state.borrow_mut();
+            state.last_error = Some(error.to_string());
+            state.last_operation = Some("sender image permission was not changed".to_string());
+        }
+        update_message_action_buttons(options, widgets, state);
+        update_debug(widgets, state);
+        return;
+    };
+    if let Err(error) = apply_sender_image_trust(options, widgets, state, &sender, enabled) {
+        let status = if enabled {
+            format!("Could not always load images from {sender}: {error}")
+        } else {
+            format!("Could not stop always loading images from {sender}: {error}")
+        };
+        widgets.status_label.set_text(&status);
+        {
+            let mut state = state.borrow_mut();
+            state.last_error = Some(error.to_string());
+            state.last_operation = Some("sender image permission was not saved".to_string());
+        }
+        update_message_action_buttons(options, widgets, state);
+        update_debug(widgets, state);
+    }
+}
+
+fn apply_sender_image_trust(
+    options: &LaunchOptions,
+    widgets: &Widgets,
+    state: &SharedState,
+    sender: &str,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    let sender = normalize_image_sender(sender)
+        .ok_or_else(|| anyhow::anyhow!("sender address could not be parsed unambiguously"))?;
+    let current = normalize_sender_list(&state.borrow().trusted_image_senders);
+    let currently_enabled = current.binary_search(&sender).is_ok();
+    if currently_enabled == enabled {
+        update_message_action_buttons(options, widgets, state);
+        return Ok(());
+    }
+
+    let mut next = current;
+    if enabled {
+        next.push(sender.clone());
+    } else {
+        next.retain(|trusted| trusted != &sender);
+    }
+    next.sort();
+    next.dedup();
+
+    // This durable privacy permission must be on disk before it can affect a
+    // WebView. A failed write therefore leaves both runtime state and rendered
+    // documents unchanged.
+    settings::persist_trusted_image_senders(options.app_config_path.as_deref(), &next)?;
+    if !enabled {
+        widgets.link_hints.cancel_silent();
+        widgets.html_view.stop_loading();
+        set_html_image_loading(&widgets.html_view, false);
+    }
     {
         let mut state = state.borrow_mut();
-        state.last_error = Some(error.to_string());
-        state.last_operation = Some("rejected unsafe persistent sender image trust".to_string());
+        state.trusted_image_senders = next;
+        state.last_error = None;
     }
+    widgets
+        .standalone_messages
+        .refresh_sender_image_policy(&sender);
+
+    let selected_matches = selected_image_sender_email(state).as_deref() == Some(sender.as_str());
+    if selected_matches
+        && html_view_is_visible(widgets)
+        && selected_message_has_html(widgets, state)
+    {
+        show_visual_html_selected_message(options, widgets, state);
+    } else {
+        update_message_action_buttons(options, widgets, state);
+    }
+
+    if state.borrow().last_error.is_none() {
+        let status = if enabled {
+            format!(
+                "Always loading images from {sender}. Warning: From addresses can be forged; \
+                 spoofed mail claiming this address will receive the same permission."
+            )
+        } else if settings::remote_images(&options.runtime_settings) {
+            format!(
+                "Stopped the sender-specific exception for {sender}; the global remote-image \
+                 setting still allows images in all messages"
+            )
+        } else {
+            format!("Stopped always loading images from {sender}; remote images are blocked")
+        };
+        widgets.status_label.set_text(&status);
+    }
+    state.borrow_mut().last_operation = Some(if enabled {
+        format!("allowed remote images from sender {sender}")
+    } else {
+        format!("revoked remote images from sender {sender}")
+    });
+    update_message_action_buttons(options, widgets, state);
     update_debug(widgets, state);
-    json!({
-        "ok": false,
-        "error": error,
-        "html_view": html_view_state(options, widgets, state),
-    })
+    Ok(())
 }
 
 fn update_message_tag_controls(widgets: &Widgets, state: &SharedState) {
@@ -10616,46 +10898,78 @@ fn update_message_action_buttons_with_mime_refresh(
     widgets.copy_subject_button.set_sensitive(has_message);
     update_message_tag_controls(widgets, state);
     if html_visible && has_html {
-        let image_policy = if html_view_images_allowed(widgets) {
-            if settings::remote_images(&options.runtime_settings) {
-                "remote images allowed for all messages by settings"
-            } else {
-                "remote images loaded once for this message"
-            }
+        let image_policy = if settings::remote_images(&options.runtime_settings) {
+            "Remote images load automatically."
+        } else if selected_image_sender_is_trusted(state) {
+            "Remote images load automatically for this sender."
+        } else if html_view_images_allowed(widgets) {
+            "Remote images loaded for this message."
         } else {
-            "remote content blocked"
+            "Remote images blocked."
         };
-        widgets.html_policy_label.set_text(&format!(
-            "Privacy-protected HTML: {image_policy}; message scripts and in-app navigation are blocked; links open externally (F shows link hints)."
-        ));
+        widgets.html_policy_label.set_text(image_policy);
     }
 
     if !has_html {
-        widgets
-            .image_policy_button
-            .set_label("Load remote images once");
         widgets.image_policy_button.set_sensitive(false);
+        widgets.load_images_once_button.set_sensitive(false);
+        widgets.always_load_sender_images_check.set_sensitive(false);
+        // Updating the control must mirror policy rather than manufacture a
+        // user request. A trusted sender can still be selected while the
+        // current message has no Visual HTML; forcing this false would emit
+        // `toggled` and persist an unintended revocation.
+        widgets
+            .always_load_sender_images_check
+            .set_active(selected_image_sender_is_trusted(state));
+        widgets.image_policy_help.set_text(
+            "Warning: remote images can reveal that you opened a message and expose your network \
+             address. Sender permission is unavailable because this message has no Visual HTML.",
+        );
         update_button_binding_labels(widgets, state);
         return;
     }
 
-    if settings::remote_images(&options.runtime_settings) {
+    let global_remote_images = settings::remote_images(&options.runtime_settings);
+    let sender = selected_image_sender_email(state);
+    let sender_trusted = sender
+        .as_deref()
+        .is_some_and(|sender| image_sender_is_trusted(state, sender));
+    let configured_images_allowed = global_remote_images || sender_trusted;
+    let message_images_loaded =
+        html_visible && html_view_images_allowed(widgets) && !configured_images_allowed;
+    widgets
+        .image_policy_button
+        .set_sensitive(!tag_paths_blocked);
+    widgets
+        .load_images_once_button
+        .set_sensitive(!tag_paths_blocked && !configured_images_allowed && !message_images_loaded);
+    widgets
+        .always_load_sender_images_check
+        .set_active(sender_trusted);
+    widgets
+        .always_load_sender_images_check
+        .set_sensitive(!tag_paths_blocked && sender.is_some());
+    if let Some(sender) = sender {
+        widgets.image_policy_help.set_text(&format!(
+            "Warning: the From address {sender} is not authenticated by notm and can be spoofed. \
+             A forged message using this address will also be allowed to load remote images."
+        ));
         widgets
-            .image_policy_button
-            .set_label("Images allowed for all messages");
-        widgets.image_policy_button.set_sensitive(false);
-    } else if html_visible && html_view_images_allowed(widgets) {
-        widgets
-            .image_policy_button
-            .set_label("Images loaded once for this message");
-        widgets.image_policy_button.set_sensitive(false);
+            .always_load_sender_images_check
+            .set_tooltip_text(Some(&format!(
+                "Persist or revoke the exact From-address exception for {sender}. Shortcut: I a."
+            )));
     } else {
+        widgets.image_policy_help.set_text(
+            "Warning: remote images can reveal that you opened a message and expose your network \
+             address. Always loading from a sender is unavailable because the From header does \
+             not contain exactly one valid address.",
+        );
         widgets
-            .image_policy_button
-            .set_label("Load remote images once");
-        widgets
-            .image_policy_button
-            .set_sensitive(!tag_paths_blocked);
+            .always_load_sender_images_check
+            .set_tooltip_text(Some(
+                "Sender permission requires exactly one valid address in the From header.",
+            ));
     }
     update_button_binding_labels(widgets, state);
 }
@@ -10919,6 +11233,8 @@ fn configure_html_webview(view: &webkit6::WebView, allow_remote_images: bool) {
         settings.set_load_icons_ignoring_image_load_setting(false);
         settings.set_allow_file_access_from_file_urls(false);
         settings.set_allow_universal_access_from_file_urls(false);
+        // WebKitGTK still decodes message-local `data:` images while this is
+        // false, so retain the switch as defense in depth for remote content.
         settings.set_auto_load_images(allow_remote_images);
     }
 }
@@ -11060,11 +11376,12 @@ fn show_visual_html_with_image_policy(
         (|| -> anyhow::Result<PreparedVisualHtmlRender> {
             let message = message.ok_or_else(|| anyhow::anyhow!("no selected message"))?;
             let prepared = prepared_message(widgets, state, &message.message_id)?;
-            render_visual_html_for_message(options, &prepared, image_policy)
+            render_visual_html_for_message(options, state, &message, &prepared, image_policy)
         })()
     };
     match result {
         Ok(rendered) => {
+            widgets.html_view.stop_loading();
             set_html_image_loading(&widgets.html_view, rendered.allow_remote_images);
             widgets
                 .html_lifecycle
@@ -11104,11 +11421,13 @@ fn show_visual_html_with_image_policy(
 
 fn render_visual_html_for_message(
     options: &LaunchOptions,
+    state: &SharedState,
+    message: &notm_notmuch::MessageSummary,
     prepared: &PreparedMessage,
     image_policy: ImagePolicy,
 ) -> anyhow::Result<PreparedVisualHtmlRender> {
     let allow_remote_images = match image_policy {
-        ImagePolicy::Config => settings::remote_images(&options.runtime_settings),
+        ImagePolicy::Config => message_allows_images(options, state, message),
         ImagePolicy::Once => true,
     };
     let decode_warning_count = prepared.parsed()?.decode_warnings.len();
@@ -11136,7 +11455,7 @@ fn html_status_text(
             "Visual HTML rendered; remote images loaded once for this message".to_string()
         }
         ImagePolicy::Config if allow_remote_images => {
-            "Visual HTML rendered; remote images allowed for all messages by settings".to_string()
+            "Visual HTML rendered; remote images allowed by saved policy".to_string()
         }
         _ => "Visual HTML rendered; remote content and message scripts blocked".to_string(),
     };
@@ -11158,8 +11477,20 @@ fn selected_sender_email(state: &SharedState) -> Option<String> {
         .and_then(message_sender_email)
 }
 
+fn selected_image_sender_email(state: &SharedState) -> Option<String> {
+    state
+        .borrow()
+        .selected_message
+        .as_ref()
+        .and_then(message_image_sender_email)
+}
+
 fn message_sender_email(message: &notm_notmuch::MessageSummary) -> Option<String> {
     sender_email_from_header(&message.from)
+}
+
+fn message_image_sender_email(message: &notm_notmuch::MessageSummary) -> Option<String> {
+    normalize_image_sender(&message.from)
 }
 
 fn sender_email_from_header(value: &str) -> Option<String> {
@@ -11167,6 +11498,50 @@ fn sender_email_from_header(value: &str) -> Option<String> {
         .into_iter()
         .next()
         .map(|address| normalize_sender(&address.email))
+}
+
+fn normalize_image_sender(value: &str) -> Option<String> {
+    let address = parse_one(value)?;
+    let sender = normalize_sender(&address.email);
+    (!sender.is_empty()).then_some(sender)
+}
+
+fn normalize_sender_list(senders: &[String]) -> Vec<String> {
+    let mut normalized = senders
+        .iter()
+        .filter_map(|sender| normalize_image_sender(sender))
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+fn image_sender_is_trusted(state: &SharedState, sender: &str) -> bool {
+    let Some(sender) = normalize_image_sender(sender) else {
+        return false;
+    };
+    state
+        .borrow()
+        .trusted_image_senders
+        .iter()
+        .any(|trusted| trusted == &sender)
+}
+
+fn selected_image_sender_is_trusted(state: &SharedState) -> bool {
+    selected_image_sender_email(state)
+        .as_deref()
+        .is_some_and(|sender| image_sender_is_trusted(state, sender))
+}
+
+fn message_allows_images(
+    options: &LaunchOptions,
+    state: &SharedState,
+    message: &notm_notmuch::MessageSummary,
+) -> bool {
+    settings::remote_images(&options.runtime_settings)
+        || message_image_sender_email(message)
+            .as_deref()
+            .is_some_and(|sender| image_sender_is_trusted(state, sender))
 }
 
 fn normalize_message_id(message_id: &str) -> String {
@@ -11288,9 +11663,9 @@ fn strip_img_tags(html: &str) -> String {
 
 fn visual_html_document(body: &str, allow_remote_images: bool) -> String {
     let image_sources = if allow_remote_images {
-        "http: https:"
+        "data: http: https:"
     } else {
-        "'none'"
+        "data:"
     };
     format!(
         r#"<!doctype html>
@@ -11382,12 +11757,18 @@ fn html_view_state(
         Err(error) => (false, 0, 0, Some(error.to_string())),
     };
     let sender_email = selected_sender_email(state);
+    let selected_image_sender = selected_image_sender_email(state);
     let global_remote_images_allowed = settings::remote_images(&options.runtime_settings);
+    let sender_remote_images_allowed = selected_image_sender
+        .as_deref()
+        .is_some_and(|sender| image_sender_is_trusted(state, sender));
     let image_loading_allowed = WebViewExt::settings(&widgets.html_view)
         .map(|settings| settings.is_auto_load_images())
         .unwrap_or(false);
     let image_permission = if global_remote_images_allowed {
         "all_messages"
+    } else if sender_remote_images_allowed {
+        "sender"
     } else if visible_child == "html" && image_loading_allowed {
         "message_once"
     } else {
@@ -11406,15 +11787,47 @@ fn html_view_state(
         "html_bytes": html_len,
         "decode_warning_count": decode_warning_count,
         "status_text": widgets.status_label.text().to_string(),
+        "html_policy_text": widgets.html_policy_label.text().to_string(),
         "loading": widgets.html_view.is_loading(),
         "load_generation": lifecycle.generation,
         "completed_load_generation": lifecycle.completed_generation,
+        "images": lifecycle.images,
         "global_remote_images_allowed": global_remote_images_allowed,
         "sender_email": sender_email,
+        "selected_image_sender": selected_image_sender,
+        "sender_remote_images_allowed": sender_remote_images_allowed,
+        "trusted_image_senders": state.borrow().trusted_image_senders,
         "sender_identity_authenticated": false,
         "image_permission": image_permission,
         "image_loading_allowed": image_loading_allowed,
         "remote_images_allowed": image_loading_allowed,
+        "image_policy_button_label": widgets
+            .image_policy_button
+            .label()
+            .map(|label| label.to_string())
+            .unwrap_or_default(),
+        "image_policy_button_sensitive": widgets.image_policy_button.is_sensitive(),
+        "image_policy_button_width": widgets.image_policy_button.width(),
+        "image_policy_button_height": widgets.image_policy_button.height(),
+        "image_policy_row_height": widgets.html_policy_row.height(),
+        "image_policy_menu_visible": widgets
+            .image_policy_button
+            .popover()
+            .is_some_and(|popover| popover.is_visible()),
+        "load_images_once_label": widgets
+            .load_images_once_button
+            .label()
+            .map(|label| label.to_string())
+            .unwrap_or_default(),
+        "load_images_once_sensitive": widgets.load_images_once_button.is_sensitive(),
+        "sender_image_trust_label": widgets
+            .always_load_sender_images_check
+            .label()
+            .map(|label| label.to_string())
+            .unwrap_or_default(),
+        "sender_image_trust_active": widgets.always_load_sender_images_check.is_active(),
+        "sender_image_trust_sensitive": widgets.always_load_sender_images_check.is_sensitive(),
+        "sender_image_warning_text": widgets.image_policy_help.text().to_string(),
         "network_session_ephemeral": network_session_ephemeral,
         "default_content_security_policy": widgets
             .html_view
@@ -13486,6 +13899,7 @@ fn open_standalone_message_window(
         StandalonePolicySnapshot {
             collapse_quotes: policy_quote_collapse.get(),
             remote_images: settings::remote_images(&policy_options.runtime_settings),
+            trusted_image_senders: state.trusted_image_senders.clone(),
             show_keybind_hints: state.show_keybind_hints,
             normal_input_mode: state.input_mode == InputMode::Normal,
             response_sensitive: !state.send_in_progress && !tag_path_actions_blocked(&state),
@@ -13525,6 +13939,7 @@ fn open_standalone_message_window(
             .raw_shared()
     });
     let render_options = options.clone();
+    let render_state = state.clone();
     let render_contents = prepared_thread.clone();
     let render_html: StandaloneHtmlRenderer = Rc::new(move |message, policy| {
         let policy = match policy {
@@ -13535,7 +13950,13 @@ fn open_standalone_message_window(
             .message_contents
             .get(&message.message_id)
             .ok_or_else(|| anyhow::anyhow!("message content is still loading"))?;
-        let rendered = render_visual_html_for_message(&render_options, prepared, policy)?;
+        let rendered = render_visual_html_for_message(
+            &render_options,
+            &render_state,
+            message,
+            prepared,
+            policy,
+        )?;
         Ok(StandaloneHtmlRender {
             document: rendered.document,
             allow_remote_images: rendered.allow_remote_images,
@@ -13593,6 +14014,24 @@ fn open_standalone_message_window(
             .ok_or_else(|| anyhow::anyhow!("selected message sender could not be parsed"))?;
         toggle_sender_view_preference(&toggle_options, &toggle_state, &sender, preference)
     });
+    let remote_image_options = options.clone();
+    let remote_image_widgets = widgets.clone();
+    let remote_image_state = state.clone();
+    let set_sender_remote_images: StandaloneSetSenderRemoteImages = Rc::new(
+        move |message, enabled| {
+            let sender = message_image_sender_email(message)
+            .ok_or_else(|| anyhow::anyhow!(
+                "always loading from this sender requires exactly one valid address in the From header"
+            ))?;
+            apply_sender_image_trust(
+                &remote_image_options,
+                &remote_image_widgets,
+                &remote_image_state,
+                &sender,
+                enabled,
+            )
+        },
+    );
     let response_options = options.clone();
     let response_widgets = widgets.clone();
     let response_state = state.clone();
@@ -13627,6 +14066,7 @@ fn open_standalone_message_window(
         remember_view,
         sender_view,
         toggle_sender_view,
+        set_sender_remote_images,
     })
 }
 
@@ -18310,6 +18750,8 @@ fn handle_automation_request(
             "collapse_quotes": widgets.collapse_quotes_button.label().map(|label| label.to_string()),
             "copy": widgets.copy_menu_button.label().map(|label| label.to_string()),
             "image_policy": widgets.image_policy_button.label().map(|label| label.to_string()),
+            "load_images_once": widgets.load_images_once_button.label().map(|label| label.to_string()),
+            "always_load_sender_images": widgets.always_load_sender_images_check.label().map(|label| label.to_string()),
             "archive": widgets.archive_button.label().map(|label| label.to_string()),
         }),
         "layout_state" => layout_state_json(widgets, state),
@@ -18488,6 +18930,32 @@ fn handle_automation_request(
             match widgets.standalone_messages.show_visual_html(window_index) {
                 Some((ok, window)) => json!({"ok": ok, "window": window}),
                 None => json!({"ok": false, "error": "standalone window index not found"}),
+            }
+        }
+        "standalone_image_policy" => {
+            let window_index = req
+                .args
+                .get("window_index")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            let action = req
+                .args
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("load_once");
+            match widgets
+                .standalone_messages
+                .activate_image_action(window_index, action)
+            {
+                Ok(Some(window)) => json!({"ok": true, "window": window}),
+                Ok(None) => json!({"ok": false, "error": "standalone window index not found"}),
+                Err(error) => json!({
+                    "ok": false,
+                    "error": error.to_string(),
+                    "window": widgets
+                        .standalone_messages
+                        .window_snapshot(window_index),
+                }),
             }
         }
         "standalone_scroll_html_lines" => {
@@ -19160,15 +19628,38 @@ fn handle_automation_request(
             html_scroll_state(widgets)
         }
         "image_policy" => {
-            activate_image_policy_button(options, widgets, state);
+            update_message_action_buttons(options, widgets, state);
+            widgets.image_policy_button.popup();
+            spin_main_context_for(Duration::from_millis(50));
+            widgets.always_load_sender_images_check.emit_activate();
+            spin_main_context_for(Duration::from_millis(50));
+            widgets.image_policy_button.popdown();
             json!({
                 "ok": state.borrow().last_error.is_none(),
                 "html_view": html_view_state(options, widgets, state),
+                "trusted_image_senders": state.borrow().trusted_image_senders,
                 "last_error": state.borrow().last_error,
             })
         }
+        "image_policy_menu" => {
+            let visible = req
+                .args
+                .get("visible")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            if visible {
+                widgets.image_policy_button.popup();
+            } else {
+                widgets.image_policy_button.popdown();
+            }
+            spin_main_context_for(Duration::from_millis(50));
+            json!({
+                "ok": true,
+                "html_view": html_view_state(options, widgets, state),
+            })
+        }
         "load_images_once" | "show_visual_html_with_images" => {
-            show_visual_html_with_image_policy(options, widgets, state, ImagePolicy::Once);
+            widgets.load_images_once_button.emit_clicked();
             json!({
                 "ok": state.borrow().last_error.is_none(),
                 "html_view": html_view_state(options, widgets, state),
@@ -19176,15 +19667,35 @@ fn handle_automation_request(
             })
         }
         "trust_sender_images" | "always_load_sender_images" => {
-            reject_persistent_sender_image_trust(options, widgets, state)
+            update_message_action_buttons(options, widgets, state);
+            if !widgets.always_load_sender_images_check.is_active() {
+                widgets.image_policy_button.popup();
+                widgets.always_load_sender_images_check.emit_activate();
+                widgets.image_policy_button.popdown();
+            }
+            json!({
+                "ok": state.borrow().last_error.is_none(),
+                "html_view": html_view_state(options, widgets, state),
+                "trusted_image_senders": state.borrow().trusted_image_senders,
+                "last_error": state.borrow().last_error,
+            })
+        }
+        "untrust_sender_images" => {
+            update_message_action_buttons(options, widgets, state);
+            if widgets.always_load_sender_images_check.is_active() {
+                widgets.image_policy_button.popup();
+                widgets.always_load_sender_images_check.emit_activate();
+                widgets.image_policy_button.popdown();
+            }
+            json!({
+                "ok": state.borrow().last_error.is_none(),
+                "html_view": html_view_state(options, widgets, state),
+                "trusted_image_senders": state.borrow().trusted_image_senders,
+                "last_error": state.borrow().last_error,
+            })
         }
         "trusted_image_senders" => {
-            json!({
-                "ok": true,
-                "trusted_image_senders": [],
-                "retired": true,
-                "reason": "raw From headers are not authenticated",
-            })
+            json!({"ok": true, "trusted_image_senders": state.borrow().trusted_image_senders})
         }
         "html_view_state" => html_view_state(options, widgets, state),
         "view_preference_state" => view_preference_state_json(widgets, state),
@@ -19940,7 +20451,13 @@ fn ensure_automation_request_allowed(
         | "view_preference_state"
         | "click_sender_view_preference"
         | "standalone_show_visual_html"
+        | "standalone_image_policy"
         | "standalone_scroll_html_lines"
+        | "image_policy"
+        | "image_policy_menu"
+        | "trust_sender_images"
+        | "always_load_sender_images"
+        | "untrust_sender_images"
         | "send_key" => Some(AutomationOperation::FixtureOnly),
         "pending_confirmation" | "respond_confirmation" => {
             Some(AutomationOperation::ConfirmationControl)
@@ -20018,6 +20535,10 @@ fn automation_named_command_operation(command: &str) -> Option<AutomationOperati
         "archive" | "mark_read" | "mark read" | "mark_unread" | "mark unread" | "flag"
         | "unflag" | "trash" | "undo_last_tag" | "undo" => Some(AutomationOperation::Tag),
         "sync" | "manual_sync" | "run_manual_sync" => Some(AutomationOperation::ExternalSync),
+        "image_policy"
+        | "trust_sender_images"
+        | "always_load_sender_images"
+        | "untrust_sender_images" => Some(AutomationOperation::FixtureOnly),
         _ => None,
     }
 }
@@ -20273,10 +20794,12 @@ fn run_named_command(
             })
         }
         "image_policy" => {
-            activate_image_policy_button(options, widgets, state);
+            update_message_action_buttons(options, widgets, state);
+            widgets.always_load_sender_images_check.emit_activate();
             json!({
                 "ok": state.borrow().last_error.is_none(),
                 "html_view": html_view_state(options, widgets, state),
+                "trusted_image_senders": state.borrow().trusted_image_senders,
                 "last_error": state.borrow().last_error,
             })
         }
@@ -20289,7 +20812,28 @@ fn run_named_command(
             })
         }
         "trust_sender_images" | "always_load_sender_images" => {
-            reject_persistent_sender_image_trust(options, widgets, state)
+            update_message_action_buttons(options, widgets, state);
+            if !widgets.always_load_sender_images_check.is_active() {
+                widgets.always_load_sender_images_check.emit_activate();
+            }
+            json!({
+                "ok": state.borrow().last_error.is_none(),
+                "html_view": html_view_state(options, widgets, state),
+                "trusted_image_senders": state.borrow().trusted_image_senders,
+                "last_error": state.borrow().last_error,
+            })
+        }
+        "untrust_sender_images" => {
+            update_message_action_buttons(options, widgets, state);
+            if widgets.always_load_sender_images_check.is_active() {
+                widgets.always_load_sender_images_check.emit_activate();
+            }
+            json!({
+                "ok": state.borrow().last_error.is_none(),
+                "html_view": html_view_state(options, widgets, state),
+                "trusted_image_senders": state.borrow().trusted_image_senders,
+                "last_error": state.borrow().last_error,
+            })
         }
         "toggle_quote_collapse" | "collapse_quotes" => {
             toggle_quote_collapse(options, widgets, state);
@@ -20556,6 +21100,8 @@ fn command_name_candidates() -> &'static [&'static str] {
         "link_hints",
         "image_policy",
         "load_images_once",
+        "trust_sender_images",
+        "untrust_sender_images",
         "collapse_quotes",
         "nu",
         "nonu",
@@ -21152,8 +21698,13 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
         },
         HelpEntry {
             section: "Message actions",
-            key: "I",
-            description: "Load remote images once for the current HTML message.",
+            key: "I m",
+            description: "Load remote images for the current message only.",
+        },
+        HelpEntry {
+            section: "Message actions",
+            key: "I a",
+            description: "Toggle always loading remote images for the exact From address; notm warns because that address can be forged.",
         },
         HelpEntry {
             section: "Message actions",
@@ -21358,12 +21909,17 @@ fn command_help_entries() -> &'static [HelpEntry] {
         HelpEntry {
             section: "Message view commands",
             key: ":image_policy",
-            description: "Load remote images once for the current HTML message.",
+            description: "Toggle always loading remote images for the current sender.",
         },
         HelpEntry {
             section: "Message view commands",
             key: ":load_images_once",
-            description: "Load remote images once for the current HTML message.",
+            description: "Load remote images for the current HTML message only.",
+        },
+        HelpEntry {
+            section: "Message view commands",
+            key: ":trust_sender_images / :untrust_sender_images",
+            description: "Persist or revoke the current sender's remote-image exception.",
         },
         HelpEntry {
             section: "Message view commands",
@@ -23402,6 +23958,25 @@ mod tests {
     }
 
     #[test]
+    fn durable_image_policy_harness_action_is_fixture_only() {
+        let live_options = LaunchOptions::default();
+        for (command, args) in [
+            ("image_policy", json!({})),
+            ("trust_sender_images", json!({})),
+            ("untrust_sender_images", json!({})),
+            ("run_command", json!({"command": ":image_policy"})),
+            ("run_command", json!({"command": ":trust_sender_images"})),
+            ("run_command", json!({"command": ":untrust_sender_images"})),
+        ] {
+            let error = ensure_automation_request_allowed(&live_options, command, &args)
+                .expect_err("a harness action that can persist sender trust must be gated");
+            assert!(error.to_string().contains("available only in fixture mode"));
+        }
+        ensure_automation_request_allowed(&live_options, "load_images_once", &json!({}))
+            .expect("the explicitly transient one-shot command remains read-only");
+    }
+
+    #[test]
     fn custom_tag_entry_harness_commands_keep_their_stable_names_and_tag_gate() {
         assert_eq!(
             [
@@ -23739,20 +24314,20 @@ mod tests {
         let document = visual_html_document("<p>Hello</p>", false);
 
         assert!(document.contains(r#"<meta name="color-scheme" content="light">"#));
-        assert!(document.contains("default-src 'none'; img-src 'none'"));
+        assert!(document.contains("default-src 'none'; img-src data:"));
         assert!(document.contains("background: #ffffff;"));
         assert!(document.contains("color: #111111;"));
         assert!(!document.contains("CanvasText"));
     }
 
     #[test]
-    fn visual_html_document_only_opens_http_images_for_explicit_image_loading() {
+    fn visual_html_document_only_opens_remote_images_for_explicit_image_loading() {
         let blocked = visual_html_document("<p>Blocked</p>", false);
         let allowed = visual_html_document("<p>Allowed once</p>", true);
 
-        assert!(blocked.contains("img-src 'none'"));
-        assert!(!blocked.contains("img-src http: https:"));
-        assert!(allowed.contains("img-src http: https:"));
+        assert!(blocked.contains("img-src data:"));
+        assert!(!blocked.contains("img-src data: http: https:"));
+        assert!(allowed.contains("img-src data: http: https:"));
         for document in [&blocked, &allowed] {
             assert!(document.contains("script-src 'none'"));
             assert!(document.contains("connect-src 'none'"));
@@ -23761,6 +24336,40 @@ mod tests {
             assert!(document.contains("base-uri 'none'"));
             assert!(document.contains("form-action 'none'"));
         }
+    }
+
+    #[test]
+    fn sender_image_permission_requires_one_unambiguous_mailbox() {
+        assert_eq!(
+            normalize_image_sender("Sender Example <Sender@Example.Test>"),
+            Some("sender@example.test".to_string())
+        );
+        for unavailable in [
+            "",
+            "not an address",
+            "one@example.test, two@example.test",
+            "Friends: one@example.test;",
+            "Undisclosed recipients:;",
+        ] {
+            assert_eq!(
+                normalize_image_sender(unavailable),
+                None,
+                "ambiguous From value unexpectedly became a permission key: {unavailable}"
+            );
+        }
+    }
+
+    #[test]
+    fn sender_image_permission_list_is_normalized_sorted_and_deduplicated() {
+        assert_eq!(
+            normalize_sender_list(&[
+                " Zeta@Example.Test ".to_string(),
+                "alpha@example.test".to_string(),
+                "Alpha <ALPHA@example.test>".to_string(),
+                "not an address".to_string(),
+            ]),
+            ["alpha@example.test", "zeta@example.test"]
+        );
     }
 
     #[test]

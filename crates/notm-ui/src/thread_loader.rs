@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error as StdError,
     fmt, fs,
     io::Read,
@@ -14,9 +14,15 @@ use std::{
 };
 
 use anyhow::Context as _;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use mailparse::{MailHeaderMap as _, parse_content_disposition, parse_content_type, parse_headers};
-use notm_mail::{ParsedMessage, html_sanitize::sanitize_html, mime::parse_rfc5322};
+use notm_mail::{
+    ParsedMessage,
+    html_sanitize::sanitize_html_with_cid_images,
+    mime::{MimeLimits, extract_attachment_parts_detailed_with_limits, parse_rfc5322},
+};
 use notm_notmuch::{Database, DatabaseMode, MessagePathState, MessageSummary, OpenConfig};
+use regex::Regex;
 
 use crate::model::MAX_LOADED_THREAD_MESSAGES;
 
@@ -36,6 +42,10 @@ const MAX_TEXT_VIEW_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RAW_VIEW_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HEADER_VIEW_BYTES: usize = 1024 * 1024;
 const MAX_MIME_NESTING_DEPTH: usize = 64;
+const MAX_INLINE_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TOTAL_INLINE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_INLINE_IMAGE_REFERENCES: usize = 2_048;
+const MAX_INLINE_IMAGE_HTML_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 struct PreparationLimits {
@@ -1358,7 +1368,7 @@ where
             let (text, html) = match &parsed {
                 Ok(parsed) => (
                     prepare_text(parsed, MAX_TEXT_VIEW_BYTES),
-                    prepare_html(parsed, limits.html_bytes),
+                    prepare_html(parsed, &bytes, limits.html_bytes),
                 ),
                 Err(error) => (
                     prepare_parse_failure_text(error, MAX_TEXT_VIEW_BYTES),
@@ -1768,7 +1778,7 @@ fn strip_trailing_crlf(bytes: &[u8], start: usize, mut end: usize) -> usize {
     end
 }
 
-fn prepare_html(parsed: &ParsedMessage, max_bytes: usize) -> PreparedHtml {
+fn prepare_html(parsed: &ParsedMessage, source: &[u8], max_bytes: usize) -> PreparedHtml {
     let Some(html) = parsed
         .html_body
         .as_deref()
@@ -1786,19 +1796,178 @@ fn prepare_html(parsed: &ParsedMessage, max_bytes: usize) -> PreparedHtml {
         };
     }
 
-    let sanitized = sanitize_html(html);
+    let sanitized = sanitize_html_with_cid_images(html);
+    let sanitized = resolve_inline_cid_images(&sanitized, parsed, source);
     // These documents intentionally remain distinct even when the sanitized
-    // body contains no image markup. Their CSPs encode different authority:
-    // the default document blocks every image request, while the one-shot
-    // document permits only HTTP(S) image fetches.
+    // body contains no remote image markup. Their CSPs encode different
+    // authority: both may display bounded message-local MIME images, while
+    // only the one-shot document permits HTTP(S) image fetches.
     let images_allowed = Arc::<str>::from(visual_html_document(&sanitized, true));
-    let blocked_body = strip_img_tags(&sanitized);
+    let blocked_body = strip_remote_img_tags(&sanitized);
     let images_blocked = Arc::<str>::from(visual_html_document(&blocked_body, false));
     PreparedHtml::Ready {
         original_len: html.len(),
         images_allowed,
         images_blocked,
     }
+}
+
+fn resolve_inline_cid_images(html: &str, parsed: &ParsedMessage, source: &[u8]) -> String {
+    let cid_source = Regex::new(r#"(?i)\bsrc="cid:([^"]+)""#).expect("valid cid source regex");
+    let referenced = cid_source
+        .captures_iter(html)
+        .map(|captures| normalize_content_id(&captures[1]))
+        .filter(|content_id| !content_id.is_empty())
+        .collect::<BTreeSet<_>>();
+    let selected_part_indexes = parsed
+        .attachments
+        .iter()
+        .filter(|attachment| {
+            attachment.content_id.is_some()
+                && attachment.decode_error.is_none()
+                && inline_image_content_type_is_safe(&attachment.content_type)
+                && attachment
+                    .content_id
+                    .as_deref()
+                    .map(normalize_content_id)
+                    .is_some_and(|content_id| referenced.contains(&content_id))
+        })
+        .map(|attachment| attachment.part_index)
+        .collect::<Vec<_>>();
+    if referenced.is_empty() {
+        return html.to_string();
+    }
+
+    let extraction_limits = MimeLimits {
+        max_decoded_part_bytes: MAX_INLINE_IMAGE_BYTES,
+        max_total_decoded_bytes: MAX_TOTAL_INLINE_IMAGE_BYTES,
+        ..MimeLimits::default()
+    };
+    let resources = if selected_part_indexes.is_empty() {
+        BTreeMap::new()
+    } else {
+        extract_attachment_parts_detailed_with_limits(
+            source,
+            &selected_part_indexes,
+            extraction_limits,
+        )
+        .map(|report| {
+            let mut total_bytes = 0_usize;
+            let mut resources = BTreeMap::<String, String>::new();
+            for attachment in report.attachments {
+                let Some(content_id) = attachment.content_id.as_deref() else {
+                    continue;
+                };
+                if !inline_image_content_type_is_safe(&attachment.content_type)
+                    || attachment.bytes.is_empty()
+                    || attachment.bytes.len() > MAX_INLINE_IMAGE_BYTES
+                {
+                    continue;
+                }
+                let content_id = normalize_content_id(content_id);
+                if !referenced.contains(&content_id) || resources.contains_key(&content_id) {
+                    continue;
+                }
+                let Some(next_total) = total_bytes.checked_add(attachment.bytes.len()) else {
+                    continue;
+                };
+                if next_total > MAX_TOTAL_INLINE_IMAGE_BYTES {
+                    continue;
+                }
+                total_bytes = next_total;
+                resources.insert(
+                    content_id,
+                    format!(
+                        "data:{};base64,{}",
+                        attachment.content_type,
+                        BASE64_STANDARD.encode(&attachment.bytes)
+                    ),
+                );
+            }
+            resources
+        })
+        .unwrap_or_default()
+    };
+
+    replace_cid_sources_bounded(
+        html,
+        &cid_source,
+        &resources,
+        MAX_INLINE_IMAGE_HTML_BYTES,
+        MAX_INLINE_IMAGE_REFERENCES,
+    )
+}
+
+fn replace_cid_sources_bounded(
+    html: &str,
+    cid_source: &Regex,
+    resources: &BTreeMap<String, String>,
+    max_output_bytes: usize,
+    max_resolved_references: usize,
+) -> String {
+    // Resolve only when the sanitized base document fits the output budget,
+    // then track projected final length before copying each data URI so
+    // repeated references cannot amplify one bounded MIME part without limit.
+    let resolution_fits_base_document = html.len() <= max_output_bytes;
+    let effective_output_limit = max_output_bytes.max(html.len());
+    let mut projected_len = html.len();
+    let mut resolved_references = 0_usize;
+    let mut last_end = 0_usize;
+    let mut output = String::with_capacity(html.len());
+
+    for captures in cid_source.captures_iter(html) {
+        let Some(source) = captures.get(0) else {
+            continue;
+        };
+        output.push_str(&html[last_end..source.start()]);
+        let content_id = normalize_content_id(&captures[1]);
+        let resource = resources.get(&content_id);
+        let replacement_len = resource.map_or(r#"src="""#.len(), |resource| {
+            r#"src="""#.len().saturating_add(resource.len())
+        });
+        let candidate_len = projected_len
+            .saturating_sub(source.as_str().len())
+            .saturating_add(replacement_len);
+        let resolve = resource.is_some()
+            && resolution_fits_base_document
+            && resolved_references < max_resolved_references
+            && candidate_len <= effective_output_limit;
+
+        if resolve {
+            let resource = resource.expect("checked resource");
+            output.push_str(r#"src=""#);
+            output.push_str(resource);
+            output.push('"');
+            projected_len = candidate_len;
+            resolved_references += 1;
+        } else {
+            output.push_str(r#"src="""#);
+            projected_len = projected_len
+                .saturating_sub(source.as_str().len())
+                .saturating_add(r#"src="""#.len());
+        }
+        last_end = source.end();
+    }
+    output.push_str(&html[last_end..]);
+    debug_assert_eq!(output.len(), projected_len);
+    debug_assert!(!resolution_fits_base_document || output.len() <= max_output_bytes);
+    output
+}
+
+fn inline_image_content_type_is_safe(content_type: &str) -> bool {
+    matches!(
+        content_type.trim().to_ascii_lowercase().as_str(),
+        "image/avif" | "image/gif" | "image/jpeg" | "image/png" | "image/webp"
+    )
+}
+
+fn normalize_content_id(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim()
+        .to_ascii_lowercase()
 }
 
 fn render_parsed_message_text(parsed: &ParsedMessage, collapse_quotes: bool) -> String {
@@ -1865,7 +2034,7 @@ fn render_body_with_quote_collapse(body: &str, collapse_quotes: bool) -> String 
     }
 }
 
-fn strip_img_tags(html: &str) -> String {
+fn strip_remote_img_tags(html: &str) -> String {
     let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len());
     let mut pos = 0;
@@ -1883,8 +2052,14 @@ fn strip_img_tags(html: &str) -> String {
         }
         out.push_str(&html[pos..start]);
         if let Some(relative_end) = lower[start..].find('>') {
-            out.push_str("<span class=\"notm-blocked-image\">[image blocked]</span>");
-            pos = start + relative_end + 1;
+            let end = start + relative_end + 1;
+            let tag = &html[start..end];
+            if tag.to_ascii_lowercase().contains(r#"src="data:image/"#) {
+                out.push_str(tag);
+            } else {
+                out.push_str("<span class=\"notm-blocked-image\">[image blocked]</span>");
+            }
+            pos = end;
         } else {
             pos = html.len();
             break;
@@ -1896,9 +2071,9 @@ fn strip_img_tags(html: &str) -> String {
 
 fn visual_html_document(body: &str, allow_remote_images: bool) -> String {
     let image_sources = if allow_remote_images {
-        "http: https:"
+        "data: http: https:"
     } else {
-        "'none'"
+        "data:"
     };
     format!(
         r#"<!doctype html>
@@ -2072,6 +2247,7 @@ fn attachment_manifest_bytes(attachment: &AttachmentManifest) -> usize {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         fmt::Write as _,
         path::{Path, PathBuf},
         sync::{
@@ -2082,6 +2258,7 @@ mod tests {
     };
 
     use notm_notmuch::{Database, MessageSummary, OpenConfig};
+    use regex::Regex;
 
     use super::{
         DEFAULT_PREPARATION_LIMITS, MAX_CANDIDATE_THREAD_IDS, MessageSource, MimePreflightLimits,
@@ -2089,6 +2266,7 @@ mod tests {
         ThreadLoaderService, load_thread, load_thread_with_reader, preflight_mime,
         prepare_message_with_parser, prepare_thread, prepare_thread_with_cancel,
         prepare_thread_with_limits, prepare_thread_with_resolution, read_bounded,
+        replace_cid_sources_bounded,
     };
 
     fn notmuch_fixture_config(temp: &tempfile::TempDir) -> (OpenConfig, PathBuf) {
@@ -2153,6 +2331,45 @@ mod tests {
             .expect("write padded attachment fixture");
         }
         source.push_str("--x-- \t");
+        source.into_bytes()
+    }
+
+    fn related_html_with_inline_jpegs(count: usize) -> Vec<u8> {
+        const TINY_JPEG: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAACAAIDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD3+iiigD//2Q==";
+        let mut source = String::from(
+            "MIME-Version: 1.0\r\n\
+             From: not a valid mailbox ???\r\n\
+             Subject: Inline image fixture\r\n\
+             Content-Type: multipart/related; boundary=related\r\n\r\n\
+             --related\r\n\
+             Content-Type: multipart/alternative; boundary=alternative\r\n\r\n\
+             --alternative\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\r\n\
+             Inline image fixture.\r\n\
+             --alternative\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\r\n\
+             <p>Inline images:</p>",
+        );
+        for index in 0..count {
+            source.push_str(&format!(
+                "<img src=\"cid:scan-{index}@example.test\" alt=\"scan {index}\">"
+            ));
+        }
+        source.push_str(
+            "<img src=\"https://remote.example.test/tracker.jpg\" alt=\"remote\">\r\n\
+             --alternative--\r\n",
+        );
+        for index in 0..count {
+            source.push_str(&format!(
+                "--related\r\n\
+                 Content-Type: image/jpeg; name=scan-{index}.jpg\r\n\
+                 Content-Disposition: inline; filename=scan-{index}.jpg\r\n\
+                 Content-ID: <scan-{index}@example.test>\r\n\
+                 Content-Transfer-Encoding: base64\r\n\r\n\
+                 {TINY_JPEG}\r\n"
+            ));
+        }
+        source.push_str("--related--\r\n");
         source.into_bytes()
     }
 
@@ -2560,9 +2777,9 @@ Content-Type: text/html; charset=utf-8\n\n\
         let blocked = content.html_document(false).expect("blocked document");
         let allowed = content.html_document(true).expect("one-shot document");
         assert!(!Arc::ptr_eq(&blocked, &allowed));
-        assert!(blocked.contains("default-src 'none'; img-src 'none'"));
-        assert!(!blocked.contains("img-src http: https:"));
-        assert!(allowed.contains("default-src 'none'; img-src http: https:"));
+        assert!(blocked.contains("default-src 'none'; img-src data:"));
+        assert!(!blocked.contains("img-src data: http: https:"));
+        assert!(allowed.contains("default-src 'none'; img-src data: http: https:"));
         for document in [&blocked, &allowed] {
             assert!(document.contains("script-src 'none'"));
             assert!(document.contains("connect-src 'none'"));
@@ -3172,6 +3389,62 @@ signature\r\n"
                 .to_string()
                 .contains("responsive rendering limit is 16 bytes")
         );
+    }
+
+    #[test]
+    fn related_cid_images_render_locally_without_remote_image_permission() {
+        let source = related_html_with_inline_jpegs(7);
+        let prepared = prepare_thread(
+            "thread-1".to_string(),
+            vec![message("message-1", "/fixture/related")],
+            None,
+            move |_, _| Ok(source.clone()),
+        )
+        .expect("prepare related message");
+        let content = &prepared.message_contents["message-1"];
+
+        let blocked = content.html_document(false).expect("blocked HTML");
+        assert!(blocked.contains("img-src data:"), "{blocked}");
+        assert_eq!(blocked.matches("data:image/jpeg;base64,").count(), 7);
+        assert!(blocked.contains("alt=\"scan 6\""), "{blocked}");
+        assert!(!blocked.contains("remote.example.test"), "{blocked}");
+
+        let allowed = content.html_document(true).expect("allowed HTML");
+        assert!(allowed.contains("img-src data: http: https:"), "{allowed}");
+        assert_eq!(allowed.matches("data:image/jpeg;base64,").count(), 7);
+        assert!(allowed.contains("https://remote.example.test/tracker.jpg"));
+        assert!(!allowed.contains("cid:"), "{allowed}");
+    }
+
+    #[test]
+    fn repeated_cid_references_are_bounded_by_count_and_generated_bytes() {
+        let html = (0..32)
+            .map(|_| r#"<img src="cid:shared@example.test">"#)
+            .collect::<String>();
+        let cid_source = Regex::new(r#"(?i)\bsrc="cid:([^"]+)""#).expect("valid cid source regex");
+        let resource = format!("data:image/png;base64,{}", "A".repeat(400));
+        let resources = BTreeMap::from([("shared@example.test".to_string(), resource)]);
+
+        let count_limited =
+            replace_cid_sources_bounded(&html, &cid_source, &resources, usize::MAX, 3);
+        assert_eq!(count_limited.matches("data:image/png;base64,").count(), 3);
+        assert!(!count_limited.contains("cid:"), "{count_limited}");
+        assert!(count_limited.contains(r#"src="""#), "{count_limited}");
+
+        let byte_limit = html.len() + 500;
+        let byte_limited =
+            replace_cid_sources_bounded(&html, &cid_source, &resources, byte_limit, usize::MAX);
+        assert!(byte_limited.len() <= byte_limit);
+        assert!(
+            byte_limited.matches("data:image/png;base64,").count() < 32,
+            "{byte_limited}"
+        );
+        assert!(!byte_limited.contains("cid:"), "{byte_limited}");
+
+        let oversized_base =
+            replace_cid_sources_bounded(&html, &cid_source, &resources, html.len() - 1, usize::MAX);
+        assert_eq!(oversized_base.matches("data:image/png;base64,").count(), 0);
+        assert!(!oversized_base.contains("cid:"), "{oversized_base}");
     }
 
     #[test]

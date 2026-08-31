@@ -1234,6 +1234,7 @@ name = "notm-ui"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "gtk4",
  "mailparse",

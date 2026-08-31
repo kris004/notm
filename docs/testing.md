@@ -437,31 +437,41 @@ NOTM_REQUIRE_GTK_DISPLAY=1 \
 
 Remote-image privacy has an indexed, clean-XDG GTK smoke under a private Weston
 Wayland compositor and D-Bus session. It starts a temporary loopback HTTP
-tracker and verifies default blocking, exactly one selected-message load,
-spoofed and malformed `From:` isolation, navigation and restart reset,
-legacy-entry retirement, redirects, CSS URLs, `srcset`, and nested resource
-markup. No live user mail or settings and no external tracking service are
-used:
+tracker and verifies seven message-local `cid:` JPEGs render while network
+content is blocked, a selected-message one-shot resets on navigation, the
+fixed **Images (I)** menu remains compact across every state, `I m` loads once,
+and `I a` persistently grants and revokes an exact normalized sender exception.
+It verifies a different or malformed `From:` remains blocked, while a forged
+message claiming the exact allowed address necessarily inherits the permission
+and the visible warning says so. Redirects, CSS URLs, `srcset`, and nested
+resource markup remain covered. Persistence failures must leave the permission
+and rendered generation unchanged. The test asserts the
+allocated **Images** menu-button width and height plus the policy-row height
+remain stable across one-shot, sender-enabled, revoked, and re-enabled states.
+No live user mail or settings and no external tracking service are used:
 
 ```sh
 WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 \
   tests/run_with_headless_weston.sh dbus-run-session -- \
   cargo test --locked -p notm-app --test desktop_ui_smoke \
-  indexed_remote_images_are_blocked_except_for_one_selected_message_load \
+  indexed_cid_and_remote_images_follow_message_and_sender_policy \
   -- --exact --nocapture --test-threads=1
 ```
 
 A second loopback-only smoke opens Visual HTML in two simultaneously live
-standalone message windows while the global override is enabled, disables it
-through the real Settings dialog, and verifies that both existing WebViews are
-immediately re-rendered with remote content blocked and no additional tracker
-requests:
+standalone message windows for the same allowed sender. It revokes and restores
+the exception by activating the checked item in the real standalone **Images**
+popover and verifies the persisted list. The matching main and standalone
+WebViews must advance and complete a fresh generation after each transition;
+revocation blocks remote content with no escaped request. Their compact
+menu-button and policy-row geometry must remain stable. The separate global
+Settings override is also checked without erasing sender exceptions:
 
 ```sh
 WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 \
   tests/run_with_headless_weston.sh dbus-run-session -- \
   cargo test --locked -p notm-app --test desktop_ui_smoke \
-  standalone_remote_images_are_revoked_when_settings_disable_them \
+  sender_image_revocation_refreshes_main_and_two_standalone_windows \
   -- --exact --nocapture --test-threads=1
 ```
 

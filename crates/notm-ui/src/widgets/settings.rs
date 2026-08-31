@@ -513,9 +513,9 @@ impl SettingsController {
         );
         let remote_images = settings_check_row(
             &form,
-            "Always load remote images in all messages",
+            "Always load remote images",
             seed.runtime.remote_images,
-            "Global privacy override. If enabled, every Visual HTML message may contact remote servers automatically. Keep this off to block remote content by default and use Load remote images once per message.",
+            "Global privacy override. If enabled, every Visual HTML message may contact remote servers automatically. Keep this off to block remote content by default and use Images > Load for this message.",
         );
         let hidden_tag_searches = settings_entry_row(
             &form,
@@ -1687,10 +1687,6 @@ fn persist_settings_values(path: Option<&Path>, values: &SettingsValues) -> anyh
     set_bool(root, "ui", "start_maximized", values.start_maximized);
     set_bool(root, "ui", "show_debug_panel", values.show_debug_panel);
     set_bool(root, "ui", "remote_images", values.remote_images);
-    // Sender addresses in raw mail headers are unauthenticated. Drop the
-    // retired allow-list on the next successful all-settings save rather than
-    // carrying an unsafe permission forward.
-    table_entry(root, "ui").remove("trusted_image_senders");
     set_string_array(
         root,
         "ui",
@@ -1893,7 +1889,6 @@ pub fn persist_basic_settings(
     );
     persist_read_only_notmuch_invariant(root);
     let ui = table_entry(root, "ui");
-    ui.remove("trusted_image_senders");
     ui.insert(
         "page_size".to_string(),
         toml::Value::Integer(page_size as i64),
@@ -1918,8 +1913,43 @@ pub fn persist_ui_value(
     };
     let mut value = read_settings_toml_for_update(path)?;
     let ui = table_entry(value.as_table_mut().expect("value is table"), "ui");
-    ui.remove("trusted_image_senders");
     ui.insert(key.to_string(), setting);
+    persist_private_settings_toml(path, &value)
+}
+
+/// Persist the advanced global remote-image override.
+///
+/// Unlike transient UI preferences, this must have a real config destination
+/// and must not report success when the override cannot survive a restart.
+pub fn persist_global_remote_images(path: Option<&Path>, enabled: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        path.is_some(),
+        "global remote-image permission cannot be saved because no app config path is available"
+    );
+    persist_ui_value(path, "remote_images", toml::Value::Boolean(enabled))
+}
+
+/// Persist the durable sender-scoped remote-image permissions.
+///
+/// Callers must supply their already-normalized, sorted, and deduplicated
+/// sender list. This helper preserves that deterministic ordering and requires
+/// a real config destination so a successful trust action survives restart.
+pub fn persist_trusted_image_senders(
+    path: Option<&Path>,
+    trusted_senders: &[String],
+) -> anyhow::Result<()> {
+    let Some(path) = path else {
+        anyhow::bail!(
+            "trusted image senders cannot be saved because no app config path is available"
+        );
+    };
+    let mut value = read_settings_toml_for_update(path)?;
+    set_string_array(
+        value.as_table_mut().expect("value is table"),
+        "ui",
+        "trusted_image_senders",
+        trusted_senders.to_vec(),
+    );
     persist_private_settings_toml(path, &value)
 }
 
@@ -2106,7 +2136,7 @@ mod tests {
         std::fs::write(
             &path,
             "[unrelated]\nkeep = \"yes\"\n\n[ui]\nshow_sidebar = true\n\
-             trusted_image_senders = [\"spoofable@example.test\"]\n",
+             trusted_image_senders = [\"sender@example.test\"]\n",
         )
         .expect("seed settings");
         #[cfg(unix)]
@@ -2131,9 +2161,10 @@ mod tests {
         assert_eq!(value["unrelated"]["keep"].as_str(), Some("yes"));
         assert_eq!(value["ui"]["show_sidebar"].as_bool(), Some(true));
         assert_eq!(value["ui"]["hidden_tag_searches"][0].as_str(), Some("sent"));
-        assert!(
-            value["ui"].get("trusted_image_senders").is_none(),
-            "a successful atomic UI save must retire the unsafe legacy sender allow-list"
+        assert_eq!(
+            value["ui"]["trusted_image_senders"][0].as_str(),
+            Some("sender@example.test"),
+            "an unrelated UI save removed the sender image permissions"
         );
         #[cfg(unix)]
         {
@@ -2163,6 +2194,121 @@ mod tests {
             entries.len(),
             1,
             "atomic save must remove its temporary file"
+        );
+    }
+
+    #[test]
+    fn basic_settings_persistence_retains_trusted_image_senders() {
+        let directory = tempfile::tempdir().expect("temporary settings directory");
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[ui]\ntrusted_image_senders = [\"sender@example.test\"]\n",
+        )
+        .expect("seed settings");
+
+        persist_basic_settings(Some(&path), "tag:inbox", 50, "")
+            .expect("persist unrelated basic settings");
+
+        let value = std::fs::read_to_string(&path)
+            .expect("read settings")
+            .parse::<toml::Value>()
+            .expect("parse settings");
+        assert_eq!(
+            value["ui"]["trusted_image_senders"][0].as_str(),
+            Some("sender@example.test"),
+            "a basic settings save removed the sender image permissions"
+        );
+        assert_eq!(value["ui"]["page_size"].as_integer(), Some(50));
+    }
+
+    #[test]
+    fn durable_remote_image_permission_requires_a_config_path() {
+        let error = persist_global_remote_images(None, true)
+            .expect_err("an always permission without a config path must fail closed");
+
+        assert!(error.to_string().contains("no app config path"), "{error}");
+    }
+
+    #[test]
+    fn durable_trusted_image_senders_require_a_config_path() {
+        let error = persist_trusted_image_senders(None, &["sender@example.test".to_string()])
+            .expect_err("sender trust without a config path must fail closed");
+
+        assert!(error.to_string().contains("no app config path"), "{error}");
+    }
+
+    #[test]
+    fn durable_trusted_image_senders_round_trip_without_reordering_or_data_loss() {
+        let directory = tempfile::tempdir().expect("temporary settings directory");
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[unrelated]\nkeep = \"yes\"\n\n[ui]\nremote_images = false\n\
+             trusted_image_senders = [\"old@example.test\"]\n",
+        )
+        .expect("seed settings");
+        let trusted_senders = vec![
+            "zeta@example.test".to_string(),
+            "Alpha@Example.Test".to_string(),
+        ];
+
+        persist_trusted_image_senders(Some(&path), &trusted_senders)
+            .expect("persist sender image permissions");
+
+        let value = std::fs::read_to_string(&path)
+            .expect("read settings")
+            .parse::<toml::Value>()
+            .expect("parse settings");
+        assert_eq!(value["unrelated"]["keep"].as_str(), Some("yes"));
+        assert_eq!(value["ui"]["remote_images"].as_bool(), Some(false));
+        assert_eq!(
+            value["ui"]["trusted_image_senders"]
+                .as_array()
+                .expect("trusted sender array")
+                .iter()
+                .map(|sender| sender.as_str().expect("trusted sender string"))
+                .collect::<Vec<_>>(),
+            ["zeta@example.test", "Alpha@Example.Test"]
+        );
+
+        persist_trusted_image_senders(Some(&path), &[])
+            .expect("persist sender image permission revocation");
+        let revoked = std::fs::read_to_string(&path)
+            .expect("read revoked settings")
+            .parse::<toml::Value>()
+            .expect("parse revoked settings");
+        assert!(
+            revoked["ui"]["trusted_image_senders"]
+                .as_array()
+                .is_some_and(|senders| senders.is_empty()),
+            "revoking the final sender did not persist an empty trust list: {revoked}"
+        );
+        assert_eq!(revoked["unrelated"]["keep"].as_str(), Some("yes"));
+    }
+
+    #[test]
+    fn durable_trusted_image_senders_reject_malformed_config_without_overwriting_it() {
+        let directory = tempfile::tempdir().expect("temporary settings directory");
+        let path = directory.path().join("config.toml");
+        let malformed = b"[ui\ntrusted_image_senders = []\n";
+        std::fs::write(&path, malformed).expect("seed malformed settings");
+
+        let error =
+            persist_trusted_image_senders(Some(&path), &["sender@example.test".to_string()])
+                .expect_err("malformed settings must reject sender trust");
+
+        assert!(error.to_string().contains("parsing existing app config"));
+        assert_eq!(
+            std::fs::read(&path).expect("read rejected settings"),
+            malformed
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .expect("list settings directory")
+                .count(),
+            1,
+            "a rejected sender-trust save left a temporary file"
         );
     }
 
