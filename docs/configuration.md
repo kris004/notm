@@ -88,6 +88,7 @@ show_keybind_hints = true
 start_maximized = false
 
 remote_images = false
+trusted_image_senders = []
 html_mode = "sanitize_then_render_text_fallback"
 
 custom_saved_searches = [
@@ -102,15 +103,34 @@ and `thread_preview_lines` accepts 1 through 20. `html_mode` accepts
 `sanitize_then_render_text_fallback` or `visual_html_preferred`.
 
 `remote_images` defaults to `false`, which blocks remote content in Visual HTML.
-**Load remote images once** permits sanitized remote images only for the current
-message view; navigating away or restarting restores blocking. Setting
-`remote_images = true` is an explicit global privacy override that permits
-remote images in every message.
+The **Images** menu's **Load for this message** action permits sanitized remote
+images only for the current message view; navigating away or restarting
+restores blocking. Its checked **Always load from this sender** action adds or
+removes the exact normalized mailbox from `trusted_image_senders`. The
+configuration is written atomically before the running permission changes;
+failed writes leave the checkbox, rendered views, and network policy unchanged.
+Changing an entry refreshes matching main and standalone HTML views.
 
-Raw `From:` headers are not authenticated by Notmuch and cannot grant durable
-remote-image permission. The retired `trusted_image_senders` key is accepted
-when reading an older configuration but ignored. A later successful Settings
-write removes it rather than converting it into a broader permission.
+`remote_images = true` remains a separate global privacy override in Settings
+and applies to every Visual HTML message. It does not replace the sender action
+in the Images menu and defaults to `false`.
+
+Raster images embedded as bounded `multipart/related` MIME parts and referenced
+through `cid:` render locally under either policy. They are not remote content.
+Resolution is capped at 4 MiB per image, 8 MiB of decoded images per message,
+2,048 resolved references, and 16 MiB of generated inline-image HTML.
+
+`trusted_image_senders` is application-managed. Entries are normalized to
+lowercase exact mailbox addresses, sorted, and deduplicated at runtime.
+Persistent sender permission requires exactly one valid mailbox in `From:`;
+missing, malformed, grouped, or multi-mailbox values remain blocked and can
+only use the one-message action.
+
+Raw `From:` headers are not authenticated by Notmuch. The sender exception is
+therefore a convenience/privacy preference, not proof of identity: a forged
+message claiming a listed address will also load remote images. `notm` does not
+accept message-supplied `Authentication-Results` or related routing headers as
+a trusted authentication boundary, and the Images menu displays this warning.
 
 The additional visibility keys `show_sidebar`, `show_message_list`,
 `show_message_view`, and `show_debug_panel` control startup state. They default

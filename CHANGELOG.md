@@ -4,6 +4,15 @@ Notable user-facing changes are recorded here.
 
 ## Unreleased
 
+- Render bounded raster images referenced through `cid:` from the message's own
+  `multipart/related` MIME parts without granting remote-network permission.
+- Replace the relabeling remote-image button with a fixed, compact **Images**
+  menu and add keyboard-first `I m` and `I a` actions. One item loads only the
+  current message; the other persistently grants or revokes the exact normalized
+  `From:` mailbox and refreshes matching open views. The menu warns that
+  `From:` is unauthenticated and spoofable, so forged mail claiming an allowed
+  address inherits the exception.
+
 ## [0.1.2] - 2026-08-28
 
 - Move searches, message and MIME loading, attachment work, draft recovery,

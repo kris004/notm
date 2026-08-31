@@ -15,6 +15,17 @@ const SCROLL_OBSERVER_SCRIPT: &str = r#"
   const handler = window.webkit?.messageHandlers?.notm_html_scroll;
   if (!handler) return;
   let queued = false;
+  const imageMetrics = () => {
+    const images = Array.from(document.images || []);
+    const loaded = images.filter(image => image.complete && image.naturalWidth > 0).length;
+    const failed = images.filter(image => image.complete && image.naturalWidth === 0).length;
+    return {
+      total: images.length,
+      loaded,
+      failed,
+      pending: images.length - loaded - failed
+    };
+  };
   const report = () => {
     queued = false;
     const e = document.scrollingElement || document.documentElement || document.body;
@@ -23,7 +34,8 @@ const SCROLL_OBSERVER_SCRIPT: &str = r#"
       ready: document.readyState === "complete",
       y: e?.scrollTop || 0,
       h: e?.scrollHeight || 0,
-      c: e?.clientHeight || 0
+      c: e?.clientHeight || 0,
+      images: imageMetrics()
     }));
   };
   const queueReport = () => {
@@ -68,6 +80,15 @@ impl HtmlScrollMetrics {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct HtmlImageMetrics {
+    pub(crate) total: u64,
+    pub(crate) loaded: u64,
+    pub(crate) failed: u64,
+    pub(crate) pending: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct HtmlViewLifecycleSnapshot {
     pub(crate) generation: u64,
@@ -77,6 +98,7 @@ pub(crate) struct HtmlViewLifecycleSnapshot {
     pub(crate) evaluation_pending: bool,
     pub(crate) pending_restore: Option<f64>,
     pub(crate) scroll: Option<HtmlScrollMetrics>,
+    pub(crate) images: Option<HtmlImageMetrics>,
     #[serde(rename = "error")]
     pub(crate) last_error: Option<String>,
 }
@@ -88,6 +110,8 @@ struct ScrollReport {
     y: f64,
     h: f64,
     c: f64,
+    #[serde(default)]
+    images: HtmlImageMetrics,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +140,7 @@ struct LifecycleState {
     completed_generation: u64,
     ready_generation: Option<u64>,
     metrics: Option<HtmlScrollMetrics>,
+    image_metrics: Option<HtmlImageMetrics>,
     pending_restore: Option<PendingRestore>,
     restore_in_flight: Option<u64>,
     next_evaluation_id: u64,
@@ -128,6 +153,7 @@ impl LifecycleState {
         self.generation = self.generation.checked_add(1).unwrap_or(1);
         self.ready_generation = None;
         self.metrics = None;
+        self.image_metrics = None;
         self.pending_restore = None;
         self.restore_in_flight = None;
         // Completion callbacks retain their own generation token, so keeping
@@ -178,6 +204,7 @@ impl LifecycleState {
             self.completed_generation = report.generation;
         }
         self.metrics = Some(HtmlScrollMetrics::from_report(report));
+        self.image_metrics = Some(report.images);
         self.last_error = None;
         true
     }
@@ -207,6 +234,7 @@ impl LifecycleState {
             self.completed_generation = report.generation;
         }
         self.metrics = Some(HtmlScrollMetrics::from_report(report));
+        self.image_metrics = Some(report.images);
         self.last_error = None;
         if evaluation.kind == EvaluationKind::Restore && report.ready {
             self.pending_restore = None;
@@ -228,6 +256,7 @@ impl LifecycleState {
                 .filter(|pending| pending.generation == self.generation)
                 .map(|pending| pending.fraction),
             scroll: self.metrics,
+            images: self.image_metrics,
             last_error: self.last_error.clone(),
         }
     }
@@ -412,13 +441,22 @@ fn scroll_evaluation_script(generation: u64, operation: &str) -> String {
         r#"(() => {{
   const actual = Number(document.documentElement?.dataset?.notmGeneration || "0");
   const e = document.scrollingElement || document.documentElement || document.body;
+  const images = Array.from(document.images || []);
+  const loaded = images.filter(image => image.complete && image.naturalWidth > 0).length;
+  const failed = images.filter(image => image.complete && image.naturalWidth === 0).length;
   if (actual === {generation} && document.readyState === "complete") {{ {operation} }}
   return JSON.stringify({{
     generation: actual,
     ready: actual === {generation} && document.readyState === "complete",
     y: e?.scrollTop || 0,
     h: e?.scrollHeight || 0,
-    c: e?.clientHeight || 0
+    c: e?.clientHeight || 0,
+    images: {{
+      total: images.length,
+      loaded,
+      failed,
+      pending: images.length - loaded - failed
+    }}
   }});
 }})()"#
     )
@@ -450,6 +488,19 @@ mod tests {
             y,
             h: 1_000.0,
             c: 200.0,
+            images: HtmlImageMetrics::default(),
+        }
+    }
+
+    fn report_with_images(
+        generation: u64,
+        ready: bool,
+        y: f64,
+        images: HtmlImageMetrics,
+    ) -> ScrollReport {
+        ScrollReport {
+            images,
+            ..report(generation, ready, y)
         }
     }
 
@@ -485,6 +536,54 @@ mod tests {
         assert_eq!(snapshot.completed_generation, 0);
         assert!(!snapshot.ready);
         assert!(snapshot.scroll.is_none());
+        assert!(snapshot.images.is_none());
+    }
+
+    #[test]
+    fn image_metrics_are_generation_scoped_and_reset_for_a_new_load() {
+        let mut state = LifecycleState::default();
+        let first = state.begin_load();
+        let first_metrics = HtmlImageMetrics {
+            total: 7,
+            loaded: 5,
+            failed: 1,
+            pending: 1,
+        };
+        assert!(state.record_report(report_with_images(first, true, 0.0, first_metrics)));
+        assert_eq!(state.snapshot().images, Some(first_metrics));
+
+        let second = state.begin_load();
+        assert!(state.snapshot().images.is_none());
+        assert!(!state.record_report(report_with_images(
+            first,
+            true,
+            0.0,
+            HtmlImageMetrics {
+                total: 99,
+                loaded: 99,
+                failed: 0,
+                pending: 0,
+            }
+        )));
+        assert!(state.snapshot().images.is_none());
+
+        let second_metrics = HtmlImageMetrics {
+            total: 4,
+            loaded: 3,
+            failed: 1,
+            pending: 0,
+        };
+        assert!(state.record_report(report_with_images(second, true, 0.0, second_metrics)));
+        assert_eq!(state.snapshot().images, Some(second_metrics));
+    }
+
+    #[test]
+    fn legacy_reports_default_missing_image_metrics_to_zero() {
+        let report: ScrollReport =
+            serde_json::from_str(r#"{"generation":1,"ready":true,"y":0,"h":100,"c":50}"#)
+                .expect("legacy lifecycle report");
+
+        assert_eq!(report.images, HtmlImageMetrics::default());
     }
 
     #[test]

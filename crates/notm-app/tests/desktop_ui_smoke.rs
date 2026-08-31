@@ -1875,6 +1875,31 @@ fn live_harness_denies_ungated_mutations_and_reports_reply_noops() -> anyhow::Re
             "tag gate error did not name the opt-in: {response}"
         );
     }
+    for (command, args) in [
+        ("image_policy", json!({})),
+        ("run_command", json!({"command": ":image_policy"})),
+        ("trust_sender_images", json!({})),
+        ("untrust_sender_images", json!({})),
+        ("run_command", json!({"command": ":trust_sender_images"})),
+        ("run_command", json!({"command": ":untrust_sender_images"})),
+        ("image_policy_menu", json!({"visible": true})),
+        (
+            "standalone_image_policy",
+            json!({"window_index": 0, "action": "sender_off"}),
+        ),
+    ] {
+        let response = driver.command(command, args)?;
+        assert_eq!(
+            response["ok"], false,
+            "live harness exposed fixture-only remote-image control {command}: {response}"
+        );
+        ensure!(
+            response["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("available only in fixture mode")),
+            "fixture-only remote-image gate returned an unclear error for {command}: {response}"
+        );
+    }
     let tags_after = message_tags(&driver.command("app_state", json!({}))?)?;
     assert_eq!(
         tags_after, tags_before,
@@ -6053,54 +6078,16 @@ fn fixture_malformed_text_shows_a_decode_warning() -> anyhow::Result<()> {
 
 #[cfg(unix)]
 #[test]
-fn indexed_remote_images_are_blocked_except_for_one_selected_message_load() -> anyhow::Result<()> {
+fn indexed_cid_and_remote_images_follow_message_and_sender_policy() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP indexed_remote_images_are_blocked_except_for_one_selected_message_load: no GUI test display is available"
+            "SKIP indexed_cid_and_remote_images_follow_message_and_sender_policy: no GUI test display is available"
         );
         return Ok(());
     };
-    eprintln!("running remote-image privacy desktop UI smoke with {display}");
+    eprintln!("running message/sender remote-image desktop UI smoke with {display}");
 
     let tracker = LocalHttpTracker::start()?;
-    let fixture = notm_test_support::FixtureDatabase::create()?;
-    index_remote_html_message(
-        &fixture,
-        "remote-image-load-once@fixture.test",
-        "Account Security <Shared@Example.Test>",
-        "Remote image load once",
-        &remote_image_adversarial_html(&tracker),
-    )?;
-    index_remote_html_message(
-        &fixture,
-        "remote-image-spoofed-peer@fixture.test",
-        "ACCOUNT SECURITY <shared@example.test>",
-        "Same spoofable From",
-        &format!(
-            "<html><body><p>Same raw sender identity.</p><img src=\"{}\" alt=\"tracked\"></body></html>",
-            tracker.url("/spoofed-peer")
-        ),
-    )?;
-    index_remote_html_message(
-        &fixture,
-        "remote-image-malformed-from@fixture.test",
-        "not a valid mailbox ???",
-        "Malformed From remote image",
-        &format!(
-            "<html><body><p>Malformed sender.</p><img src=\"{}\" alt=\"tracked\"></body></html>",
-            tracker.url("/malformed-from")
-        ),
-    )?;
-    index_remote_html_message(
-        &fixture,
-        "remote-image-redirect@fixture.test",
-        "Redirect Sender <redirect@example.test>",
-        "Blocked remote image redirect",
-        &format!(
-            "<html><body><p>Redirect target.</p><img src=\"{}\" alt=\"tracked\"></body></html>",
-            tracker.url("/redirect")
-        ),
-    )?;
     let run_id = unique_run_id()?;
     let test_root = tempfile::Builder::new()
         .prefix("notm-remote-image-ui-")
@@ -6110,61 +6097,176 @@ fn indexed_remote_images_are_blocked_except_for_one_selected_message_load() -> a
     let config_path = work_dir.join("notm.toml");
     fs::write(
         &config_path,
-        format!(
-            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
-             \n[identity]\nname = \"Fixture User\"\nprimary_email = \"fixture@example.test\"\n\
-             \n[ui]\nremote_images = false\ntrusted_image_senders = [\"shared@example.test\", \"not a valid mailbox ???\"]\n",
-            toml_path(&fixture.root),
-            toml_path(&fixture.config_path),
+        "[ui]\nremote_images = false\ntrusted_image_senders = []\nshow_keybind_hints = true\n",
+    )?;
+    let initial_seed_config = fs::read(&config_path)?;
+
+    let token = format!("notm-remote-image-ui-{run_id}");
+    let mut app = FixtureApp::spawn_fixture_with_config(work_dir.clone(), &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+
+    let fixture_config_path = fixture_app_config_path(&mut driver)?;
+    let fixture_database_path = fixture_config_path
+        .parent()
+        .context("fixture config path had no database parent")?;
+    let fixture_notmuch_config = fixture_database_path
+        .parent()
+        .context("fixture database path had no temporary parent")?
+        .join("notmuch-config");
+    // Fixture mode deliberately redirects app-configuration writes away from the
+    // supplied path. Seed that fixture-database destination so every durable
+    // permission mutation remains outside the supplied seed and live config.
+    ensure!(
+        fixture_config_path != config_path
+            && fixture_config_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some(".notm-fixture-config.toml"),
+        "fixture app did not redirect mutable settings to its fixture database: seed={}, mutable={}",
+        config_path.display(),
+        fixture_config_path.display()
+    );
+    fs::copy(&config_path, &fixture_config_path)?;
+    index_related_cid_message(fixture_database_path, &fixture_notmuch_config, &tracker)?;
+    index_remote_html_message(
+        fixture_database_path,
+        &fixture_notmuch_config,
+        "remote-image-load-once@fixture.test",
+        "Account Security <Shared@Example.Test>",
+        "Remote image load once",
+        &remote_image_adversarial_html(&tracker),
+    )?;
+    index_remote_html_message(
+        fixture_database_path,
+        &fixture_notmuch_config,
+        "remote-image-spoofed-peer@fixture.test",
+        "ACCOUNT SECURITY <shared@example.test>",
+        "Same spoofable From",
+        &format!(
+            "<html><body><p>Same raw sender identity.</p><img src=\"{}\" alt=\"tracked\"></body></html>",
+            tracker.url("/spoofed-peer")
+        ),
+    )?;
+    index_remote_html_message(
+        fixture_database_path,
+        &fixture_notmuch_config,
+        "remote-image-different-sender@fixture.test",
+        "Different Sender <different@example.test>",
+        "Different sender remote image",
+        &format!(
+            "<html><body><p>Different sender.</p><img src=\"{}\" alt=\"tracked\"></body></html>",
+            tracker.url("/different-sender")
+        ),
+    )?;
+    index_remote_html_message(
+        fixture_database_path,
+        &fixture_notmuch_config,
+        "remote-image-malformed-from@fixture.test",
+        "not a valid mailbox ???",
+        "Malformed From remote image",
+        &format!(
+            "<html><body><p>Malformed sender.</p><img src=\"{}\" alt=\"tracked\"></body></html>",
+            tracker.url("/malformed-from")
+        ),
+    )?;
+    index_remote_html_message(
+        fixture_database_path,
+        &fixture_notmuch_config,
+        "remote-image-ambiguous-from@fixture.test",
+        "Shared <shared@example.test>, Attacker <attacker@example.test>",
+        "Ambiguous From remote image",
+        &format!(
+            "<html><body><p>Ambiguous sender.</p><img src=\"{}\" alt=\"tracked\"></body></html>",
+            tracker.url("/ambiguous-from")
         ),
     )?;
 
-    let token = format!("notm-remote-image-ui-{run_id}");
-    let mut app = FixtureApp::spawn_with_config(work_dir.clone(), &token, &config_path)?;
-    let mut driver = app.connect(&token)?;
+    select_first_thread(&mut driver, "id:remote-image-related-cid@fixture.test")?;
+    let cid_view = show_visual_html_and_wait(&mut driver, false)?;
+    assert_remote_images_blocked(&cid_view)?;
+    assert_loaded_image_metrics(&cid_view, 7)?;
+    tracker.ensure_stable(&[], Duration::from_millis(250))?;
 
     select_first_thread(&mut driver, "id:remote-image-load-once@fixture.test")?;
     let blocked = show_visual_html_and_wait(&mut driver, false)?;
     assert_remote_images_blocked(&blocked)?;
+    assert_eq!(blocked["html_policy_text"], "Remote images blocked.");
+    assert_eq!(blocked["selected_image_sender"], "shared@example.test");
+    assert_eq!(blocked["sender_remote_images_allowed"], false);
+    assert_eq!(blocked["trusted_image_senders"], json!([]));
+    assert_sender_image_warning(&blocked, "shared@example.test")?;
+    let compact_geometry = assert_image_menu_state(&blocked, true, false, true)?;
     tracker.ensure_stable(&[], Duration::from_millis(250))?;
 
-    for deprecated_command in ["trust_sender_images", "always_load_sender_images"] {
-        let rejected = driver.command(deprecated_command, json!({}))?;
-        assert_eq!(
-            rejected["ok"], false,
-            "deprecated sender trust unexpectedly succeeded: {rejected}"
-        );
-        ensure!(
-            rejected["error"].as_str().is_some_and(|error| {
-                let error = error.to_ascii_lowercase();
-                (error.contains("unavailable") || error.contains("support"))
-                    && error.contains("not authenticated")
-                    && error.contains("once")
-            }),
-            "deprecated sender trust did not explain its unsafe semantics and replacement: {rejected}"
-        );
-        tracker.ensure_stable(&[], Duration::from_millis(100))?;
-    }
+    let image_prefix = driver.command("send_key", json!({"key": "i", "modifiers": ["shift"]}))?;
+    assert_eq!(
+        image_prefix["handled"], true,
+        "physical Shift+I did not open the Images shortcut namespace: {image_prefix}"
+    );
+    ensure!(
+        image_prefix["status_text"]
+            .as_str()
+            .is_some_and(|status| status.contains("m load for this message")
+                && status.contains("a always load from this sender")),
+        "Images shortcut prompt did not describe both actions: {image_prefix}"
+    );
+    let opened_menu = driver.command("html_view_state", json!({}))?;
+    assert_eq!(
+        opened_menu["image_policy_menu_visible"], true,
+        "I did not open the fixed Images menu: {opened_menu}"
+    );
+    tracker.ensure_stable(&[], Duration::from_millis(100))?;
+    let escaped = driver.command("send_key", json!({"key": "Escape"}))?;
+    assert_eq!(
+        escaped["handled"], true,
+        "Escape did not cancel the Images shortcut namespace: {escaped}"
+    );
+    let escaped_view = driver.command("html_view_state", json!({}))?;
+    assert_eq!(
+        escaped_view["image_policy_menu_visible"], false,
+        "Escape left the Images menu open: {escaped_view}"
+    );
+    assert_eq!(escaped_view["image_permission"], "blocked");
+    tracker.ensure_stable(&[], Duration::from_millis(100))?;
 
-    let loaded = driver.command("load_images_once", json!({}))?;
-    assert_eq!(loaded["ok"], true, "one-shot image load failed: {loaded}");
-    let loaded_view = wait_for_html_view(&mut driver, true, Some(&loaded["html_view"]))?;
+    let image_prefix = driver.command("send_key", json!({"key": "i", "modifiers": ["shift"]}))?;
+    assert_eq!(image_prefix["handled"], true, "{image_prefix}");
+    let loaded = driver.command("send_key", json!({"key": "m"}))?;
+    assert_eq!(
+        loaded["handled"], true,
+        "I m did not load images for the selected message: {loaded}"
+    );
+    let loaded_view =
+        wait_for_html_view_permission(&mut driver, ExpectedImagePermission::MessageOnce, None)?;
     assert_remote_images_once(&loaded_view)?;
+    assert_eq!(
+        loaded_view["html_policy_text"],
+        "Remote images loaded for this message."
+    );
+    let loaded_geometry = assert_image_menu_state(&loaded_view, false, false, true)?;
+    assert_image_menu_geometry_stable(compact_geometry, loaded_geometry, "one-shot loading")?;
+    assert_eq!(loaded_view["image_policy_menu_visible"], false);
+    assert_eq!(loaded_view["trusted_image_senders"], json!([]));
     tracker.wait_for_requests(&["/load-once"], STARTUP_TIMEOUT)?;
     tracker.ensure_stable(&["/load-once"], Duration::from_millis(250))?;
 
     for (message_id, context) in [
         (
             "remote-image-spoofed-peer@fixture.test",
-            "a second message with the same case-varied spoofable From",
+            "an as-yet untrusted message with the same case-varied spoofable From",
+        ),
+        (
+            "remote-image-different-sender@fixture.test",
+            "a message with a different sender",
         ),
         (
             "remote-image-malformed-from@fixture.test",
-            "a malformed From value present in the legacy trust list",
+            "a malformed From value",
         ),
         (
-            "remote-image-redirect@fixture.test",
-            "an unapproved redirecting image",
+            "remote-image-ambiguous-from@fixture.test",
+            "an ambiguous multi-mailbox From value",
         ),
         (
             "remote-image-load-once@fixture.test",
@@ -6180,17 +6282,265 @@ fn indexed_remote_images_are_blocked_except_for_one_selected_message_load() -> a
             .with_context(|| format!("remote request escaped through {context}"))?;
     }
 
-    let persisted: toml::Value = fs::read_to_string(&config_path)?.parse()?;
+    let returned_blocked = driver.command("html_view_state", json!({}))?;
+    assert_eq!(returned_blocked["image_permission"], "blocked");
+    let returned_geometry = assert_image_menu_state(&returned_blocked, true, false, true)?;
+    assert_image_menu_geometry_stable(
+        compact_geometry,
+        returned_geometry,
+        "navigating away from a one-shot load",
+    )?;
+
+    let image_prefix = driver.command("send_key", json!({"key": "i", "modifiers": ["shift"]}))?;
+    assert_eq!(image_prefix["handled"], true, "{image_prefix}");
+    let always = driver.command("send_key", json!({"key": "a"}))?;
     assert_eq!(
-        persisted["ui"]["remote_images"].as_bool(),
+        always["handled"], true,
+        "I a did not persist sender-scoped image permission: {always}"
+    );
+    let sender_view =
+        wait_for_html_view_permission(&mut driver, ExpectedImagePermission::Sender, None)?;
+    assert_eq!(
+        sender_view["image_policy_menu_visible"], false,
+        "the Images menu did not close after trusting the sender: {sender_view}"
+    );
+    assert_eq!(
+        sender_view["html_policy_text"],
+        "Remote images load automatically for this sender."
+    );
+    assert_eq!(sender_view["global_remote_images_allowed"], false);
+    assert_eq!(sender_view["sender_remote_images_allowed"], true);
+    assert_eq!(
+        sender_view["trusted_image_senders"],
+        json!(["shared@example.test"])
+    );
+    assert_eq!(sender_view["sender_identity_authenticated"], false);
+    assert_sender_image_warning(&sender_view, "shared@example.test")?;
+    let sender_geometry = assert_image_menu_state(&sender_view, false, true, true)?;
+    assert_image_menu_geometry_stable(
+        compact_geometry,
+        sender_geometry,
+        "enabling sender-scoped loading",
+    )?;
+    tracker.wait_for_requests(&["/load-once", "/load-once"], STARTUP_TIMEOUT)?;
+
+    let persisted_sender_bytes = fs::read(&fixture_config_path)?;
+    let persisted_sender: toml::Value =
+        String::from_utf8(persisted_sender_bytes.clone())?.parse()?;
+    assert_eq!(
+        persisted_sender["ui"]["remote_images"].as_bool(),
         Some(false),
-        "one-shot loading broadened the global remote-image policy: {persisted}"
+        "sender trust unexpectedly enabled global remote images: {persisted_sender}"
     );
     assert_eq!(
-        persisted["ui"].get("trusted_image_senders"),
-        None,
-        "successful preference persistence did not retire the unsafe legacy trust list: {persisted}"
+        persisted_sender["ui"]["trusted_image_senders"]
+            .as_array()
+            .map(|values| values
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>()),
+        Some(vec!["shared@example.test"]),
+        "sender trust was not persisted as one exact normalized mailbox: {persisted_sender}"
     );
+    assert_eq!(
+        fs::read(&config_path)?,
+        initial_seed_config,
+        "fixture sender permission mutated the supplied seed config instead of its isolated writable config"
+    );
+
+    select_first_thread(&mut driver, "id:remote-image-spoofed-peer@fixture.test")?;
+    let spoofed =
+        ensure_visual_html_and_wait_permission(&mut driver, ExpectedImagePermission::Sender, None)?;
+    assert_eq!(
+        spoofed["selected_image_sender"], "shared@example.test",
+        "case/display-name normalization did not resolve the exact trusted mailbox: {spoofed}"
+    );
+    assert_eq!(spoofed["sender_identity_authenticated"], false);
+    assert_sender_image_warning(&spoofed, "shared@example.test")?;
+    let spoofed_geometry = assert_image_menu_state(&spoofed, false, true, true)?;
+    assert_image_menu_geometry_stable(
+        compact_geometry,
+        spoofed_geometry,
+        "rendering mail that merely claims the trusted From address",
+    )?;
+    tracker.wait_for_requests(
+        &["/load-once", "/load-once", "/spoofed-peer"],
+        STARTUP_TIMEOUT,
+    )?;
+
+    for (message_id, sender_sensitive, context) in [
+        (
+            "remote-image-different-sender@fixture.test",
+            true,
+            "a different sender",
+        ),
+        (
+            "remote-image-malformed-from@fixture.test",
+            false,
+            "a malformed From value",
+        ),
+        (
+            "remote-image-ambiguous-from@fixture.test",
+            false,
+            "an ambiguous multi-mailbox From value",
+        ),
+    ] {
+        select_first_thread(&mut driver, &format!("id:{message_id}"))?;
+        let unrelated = ensure_visual_html_and_wait_permission(
+            &mut driver,
+            ExpectedImagePermission::Blocked,
+            None,
+        )?;
+        assert_remote_images_blocked(&unrelated)?;
+        assert_eq!(unrelated["sender_remote_images_allowed"], false);
+        let geometry = assert_image_menu_state(&unrelated, true, false, sender_sensitive)?;
+        assert_image_menu_geometry_stable(compact_geometry, geometry, context)?;
+        if !sender_sensitive {
+            assert_eq!(unrelated["selected_image_sender"], Value::Null);
+            ensure!(
+                unrelated["sender_image_warning_text"].as_str().is_some_and(
+                    |warning| warning.contains("does not contain exactly one valid address")
+                ),
+                "invalid From warning did not explain why sender trust is unavailable: {unrelated}"
+            );
+            let prefix = driver.command("send_key", json!({"key": "i", "modifiers": ["shift"]}))?;
+            assert_eq!(prefix["handled"], true, "{prefix}");
+            let rejected = driver.command("send_key", json!({"key": "a"}))?;
+            assert_eq!(
+                rejected["handled"], true,
+                "I a was not consumed for invalid From: {rejected}"
+            );
+            ensure!(
+                rejected["status_text"]
+                    .as_str()
+                    .is_some_and(|status| status.contains("exactly one valid address")),
+                "invalid From sender action returned no clear error: {rejected}"
+            );
+        }
+        tracker.ensure_stable(
+            &["/load-once", "/load-once", "/spoofed-peer"],
+            Duration::from_millis(250),
+        )?;
+    }
+
+    select_first_thread(&mut driver, "id:remote-image-load-once@fixture.test")?;
+    let trusted_original =
+        ensure_visual_html_and_wait_permission(&mut driver, ExpectedImagePermission::Sender, None)?;
+    tracker.wait_for_requests(
+        &["/load-once", "/load-once", "/spoofed-peer", "/load-once"],
+        STARTUP_TIMEOUT,
+    )?;
+    let trusted_generation = html_load_generation(&trusted_original)?;
+    let prefix = driver.command("send_key", json!({"key": "i", "modifiers": ["shift"]}))?;
+    assert_eq!(prefix["handled"], true, "{prefix}");
+    let revoked = driver.command("send_key", json!({"key": "a"}))?;
+    assert_eq!(
+        revoked["handled"], true,
+        "I a could not revoke sender-scoped image permission: {revoked}"
+    );
+    let revoked_view = wait_for_html_view_permission(
+        &mut driver,
+        ExpectedImagePermission::Blocked,
+        Some(trusted_generation),
+    )?;
+    assert_remote_images_blocked(&revoked_view)?;
+    assert_eq!(revoked_view["trusted_image_senders"], json!([]));
+    let revoked_geometry = assert_image_menu_state(&revoked_view, true, false, true)?;
+    assert_image_menu_geometry_stable(
+        compact_geometry,
+        revoked_geometry,
+        "revoking sender-scoped loading",
+    )?;
+    tracker.ensure_stable(
+        &["/load-once", "/load-once", "/spoofed-peer", "/load-once"],
+        Duration::from_millis(500),
+    )?;
+    let revoked_config_bytes = fs::read(&fixture_config_path)?;
+    let revoked_config: toml::Value = String::from_utf8(revoked_config_bytes.clone())?.parse()?;
+    assert_eq!(revoked_config["ui"]["remote_images"].as_bool(), Some(false));
+    assert_eq!(
+        revoked_config["ui"]["trusted_image_senders"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "sender revocation was not persisted exactly: {revoked_config}"
+    );
+
+    fs::write(&fixture_config_path, "[ui\nremote_images = false\n")?;
+    let rejected_generation = html_load_generation(&revoked_view)?;
+    let rejected = driver.command("trust_sender_images", json!({}))?;
+    assert_eq!(
+        rejected["ok"], false,
+        "sender trust reported success after its atomic persistence failed: {rejected}"
+    );
+    ensure!(
+        rejected["last_error"].as_str().is_some(),
+        "failed sender trust returned no persistence error: {rejected}"
+    );
+    assert_eq!(
+        rejected["html_view"]["sender_image_trust_active"], false,
+        "failed sender trust did not roll the checkbox back: {rejected}"
+    );
+    assert_eq!(
+        rejected["html_view"]["sender_remote_images_allowed"], false,
+        "failed sender trust changed runtime policy: {rejected}"
+    );
+    assert_eq!(
+        html_load_generation(&rejected["html_view"])?,
+        rejected_generation,
+        "failed sender trust unexpectedly re-rendered the WebView"
+    );
+    tracker.ensure_stable(
+        &["/load-once", "/load-once", "/spoofed-peer", "/load-once"],
+        Duration::from_millis(250),
+    )?;
+    fs::write(&fixture_config_path, &revoked_config_bytes)?;
+
+    let prefix = driver.command("send_key", json!({"key": "i", "modifiers": ["shift"]}))?;
+    assert_eq!(prefix["handled"], true, "{prefix}");
+    let reenabled = driver.command("send_key", json!({"key": "a"}))?;
+    assert_eq!(reenabled["handled"], true, "{reenabled}");
+    let reenabled_view =
+        wait_for_html_view_permission(&mut driver, ExpectedImagePermission::Sender, None)?;
+    tracker.wait_for_requests(
+        &[
+            "/load-once",
+            "/load-once",
+            "/spoofed-peer",
+            "/load-once",
+            "/load-once",
+        ],
+        STARTUP_TIMEOUT,
+    )?;
+    let reenabled_geometry = assert_image_menu_state(&reenabled_view, false, true, true)?;
+    assert_image_menu_geometry_stable(
+        compact_geometry,
+        reenabled_geometry,
+        "re-enabling sender-scoped loading",
+    )?;
+
+    let persisted_bytes = fs::read(&fixture_config_path)?;
+    let persisted: toml::Value = String::from_utf8(persisted_bytes.clone())?.parse()?;
+    assert_eq!(persisted["ui"]["remote_images"].as_bool(), Some(false));
+    assert_eq!(
+        persisted["ui"]["trusted_image_senders"][0].as_str(),
+        Some("shared@example.test")
+    );
+
+    let lowercase_insert = driver.command("send_key", json!({"key": "i"}))?;
+    assert_eq!(
+        lowercase_insert["handled"], true,
+        "plain lowercase i no longer enters Insert mode: {lowercase_insert}"
+    );
+    assert_eq!(
+        lowercase_insert["input_mode"], "Insert",
+        "plain lowercase i was captured by the Images namespace: {lowercase_insert}"
+    );
+
+    // The fixture database is intentionally process-scoped. Carry only the
+    // persisted app preference into a fresh fixture process for the restart
+    // assertion below; no fixture mail or Notmuch state escapes.
+    fs::write(&config_path, persisted_bytes)?;
 
     let closed = driver.command("close_main_window", json!({}))?;
     assert_eq!(closed["ok"], true, "could not close first app: {closed}");
@@ -6206,57 +6556,129 @@ fn indexed_remote_images_are_blocked_except_for_one_selected_message_load() -> a
     prepare_fixture_work_dir_for_restart(&work_dir)?;
 
     let restart_token = format!("{token}-restart");
-    let mut restarted = FixtureApp::spawn_with_config(work_dir, &restart_token, &config_path)?;
+    let mut restarted =
+        FixtureApp::spawn_fixture_with_config(work_dir, &restart_token, &config_path)?;
     let mut restarted_driver = restarted.connect(&restart_token)?;
+    restarted_driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let restarted_config_path = fixture_app_config_path(&mut restarted_driver)?;
+    let restarted_database_path = restarted_config_path
+        .parent()
+        .context("restarted fixture config path had no database parent")?;
+    let restarted_notmuch_config = restarted_database_path
+        .parent()
+        .context("restarted fixture database path had no temporary parent")?
+        .join("notmuch-config");
+    index_remote_html_message(
+        restarted_database_path,
+        &restarted_notmuch_config,
+        "remote-image-spoofed-peer@fixture.test",
+        "ACCOUNT SECURITY <shared@example.test>",
+        "Same spoofable From",
+        &format!(
+            "<html><body><p>Same raw sender identity.</p><img src=\"{}\" alt=\"tracked\"></body></html>",
+            tracker.url("/spoofed-peer")
+        ),
+    )?;
     select_first_thread(
         &mut restarted_driver,
-        "id:remote-image-load-once@fixture.test",
+        "id:remote-image-spoofed-peer@fixture.test",
     )?;
-    let restarted_view = show_visual_html_and_wait(&mut restarted_driver, false)?;
-    assert_remote_images_blocked(&restarted_view)?;
-    tracker.ensure_stable(&["/load-once"], Duration::from_millis(250))?;
+    let mut restarted = restarted_driver.command("html_view_state", json!({}))?;
+    if restarted["html_visible"] != true {
+        restarted = restarted_driver.command("show_visual_html", json!({}))?;
+        restarted = restarted["html_view"].clone();
+    }
+    let restarted_view = wait_for_html_view_permission_with_initial(
+        &mut restarted_driver,
+        ExpectedImagePermission::Sender,
+        Some(&restarted),
+        None,
+    )?;
+    assert_eq!(
+        restarted_view["image_permission"], "sender",
+        "sender-scoped remote-image permission did not survive restart: {restarted_view}"
+    );
+    assert_eq!(restarted_view["global_remote_images_allowed"], false);
+    assert_eq!(
+        restarted_view["trusted_image_senders"],
+        json!(["shared@example.test"])
+    );
+    assert_eq!(restarted_view["sender_identity_authenticated"], false);
+    assert_sender_image_warning(&restarted_view, "shared@example.test")?;
+    tracker.wait_for_requests(
+        &[
+            "/load-once",
+            "/load-once",
+            "/spoofed-peer",
+            "/load-once",
+            "/load-once",
+            "/spoofed-peer",
+        ],
+        STARTUP_TIMEOUT,
+    )?;
 
     Ok(())
 }
 
 #[cfg(unix)]
 #[test]
-fn standalone_remote_images_are_revoked_when_settings_disable_them() -> anyhow::Result<()> {
+fn sender_image_revocation_refreshes_main_and_two_standalone_windows() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP standalone_remote_images_are_revoked_when_settings_disable_them: no GUI test display is available"
+            "SKIP sender_image_revocation_refreshes_main_and_two_standalone_windows: no GUI test display is available"
         );
         return Ok(());
     };
-    eprintln!("running standalone remote-image revocation UI smoke with {display}");
+    eprintln!("running main/standalone sender-image revocation UI smoke with {display}");
 
     let tracker = LocalHttpTracker::start()?;
     let run_id = unique_run_id()?;
     let test_root = tempfile::Builder::new()
-        .prefix("notm-standalone-remote-policy-ui-")
+        .prefix("notm-standalone-sender-image-ui-")
         .tempdir()?;
     let work_dir = test_root.path().join("app");
     fs::create_dir_all(&work_dir)?;
     let config_path = work_dir.join("notm.toml");
     fs::write(
         &config_path,
-        "[ui]\nremote_images = true\nhtml_mode = \"visual_html_preferred\"\nshow_message_view = false\n",
+        "[ui]\nremote_images = false\ntrusted_image_senders = [\"policy@example.test\"]\nshow_keybind_hints = true\n",
     )?;
+    let seed_config = fs::read(&config_path)?;
 
-    let token = format!("notm-standalone-remote-policy-ui-{run_id}");
-    let mut app = FixtureApp::spawn_fixture_with_config(work_dir, &token, &config_path)?;
+    let token = format!("notm-standalone-sender-image-ui-{run_id}");
+    let mut app = FixtureApp::spawn_fixture_with_config(work_dir.clone(), &token, &config_path)?;
     let mut driver = app.connect(&token)?;
     driver.wait_for_search(STARTUP_TIMEOUT)?;
 
     let initial_settings = driver.command("settings_test_state", json!({}))?;
     assert_eq!(
-        initial_settings["remote_images"], true,
-        "isolated fixture did not start with global remote images enabled: {initial_settings}"
+        initial_settings["remote_images"], false,
+        "isolated fixture unexpectedly started with global remote images enabled: {initial_settings}"
+    );
+    let initial_sender_policy = driver.command("trusted_image_senders", json!({}))?;
+    assert_eq!(
+        initial_sender_policy["trusted_image_senders"],
+        json!(["policy@example.test"]),
+        "fixture did not load the exact sender permission from its supplied seed config: {initial_sender_policy}"
     );
     let fixture_config_path = initial_settings["app_config_path"]
         .as_str()
         .map(PathBuf::from)
         .with_context(|| format!("fixture did not expose its config path: {initial_settings}"))?;
+    ensure!(
+        fixture_config_path != config_path
+            && fixture_config_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some(".notm-fixture-config.toml"),
+        "standalone fixture did not isolate mutable config: seed={}, mutable={}",
+        config_path.display(),
+        fixture_config_path.display()
+    );
+    // Fixture mode loads the supplied seed but redirects every later settings
+    // write into the disposable database. Seed that destination so sender
+    // trust mutations preserve the rest of the isolated configuration.
+    fs::copy(&config_path, &fixture_config_path)?;
     let fixture_database_path = fixture_config_path
         .parent()
         .context("fixture config path had no database parent")?;
@@ -6269,45 +6691,46 @@ fn standalone_remote_images_are_revoked_when_settings_disable_them() -> anyhow::
         &fixture_notmuch_config,
         &tracker,
     )?;
+    index_remote_html_message(
+        fixture_database_path,
+        &fixture_notmuch_config,
+        "standalone-policy-unrelated-main@fixture.test",
+        "Unrelated Main <unrelated-main@example.test>",
+        "Unrelated main one-shot images",
+        &format!(
+            "<html><body><p>Unrelated main message.</p><img src=\"{}\" alt=\"tracked\"></body></html>",
+            tracker.url("/unrelated-main-once")
+        ),
+    )?;
 
-    let visibility = driver.command("pane_visibility", json!({}))?;
-    assert_eq!(
-        visibility["message_view"], false,
-        "isolated fixture did not hide the inline message pane: {visibility}"
-    );
     select_first_thread(&mut driver, "id:standalone-policy-html-root@fixture.test")?;
-    tracker.ensure_stable(&[], Duration::from_millis(250))?;
-
-    let opened = driver.command("open_selected_thread", json!({}))?;
+    let selected = driver.command("select_message_by_index", json!({"index": 0}))?;
     assert_eq!(
-        opened["ok"], true,
-        "remote-image fixture thread did not open standalone: {opened}"
+        selected["ok"], true,
+        "could not select standalone fixture HTML root in main view: {selected}"
     );
-    let standalone = driver.command("standalone_message_windows", json!({}))?;
-    let windows = json_array_at(&standalone, &["windows"])?;
-    ensure!(
-        windows.len() == 1,
-        "expected one standalone fixture window: {standalone}"
-    );
-    assert_eq!(windows[0]["message_count"], 2, "{standalone}");
+    let hidden = driver.command(
+        "set_pane_visibility",
+        json!({"pane": "message", "visible": false}),
+    )?;
     assert_eq!(
-        windows[0]["selected_message"]["message_id"], "standalone-policy-text-reply@fixture.test",
-        "standalone fixture did not start on its request-free text reply: {standalone}"
+        hidden["ok"], true,
+        "message pane could not be hidden before opening standalone windows: {hidden}"
     );
-    assert_eq!(windows[0]["view"], "text", "{standalone}");
-    tracker.ensure_stable(&[], Duration::from_millis(250))?;
-
-    let opened_second = driver.command("open_selected_thread", json!({}))?;
-    assert_eq!(
-        opened_second["ok"], true,
-        "second standalone fixture window did not open: {opened_second}"
-    );
-    let two_windows = driver.command("standalone_message_windows", json!({}))?;
-    ensure!(
-        json_array_at(&two_windows, &["windows"])?.len() == 2,
-        "expected two simultaneously live standalone windows: {two_windows}"
-    );
-
+    for expected_count in 1..=2 {
+        let opened = driver.command("open_selected_thread", json!({}))?;
+        assert_eq!(
+            opened["ok"], true,
+            "standalone fixture window {expected_count} did not open: {opened}"
+        );
+        wait_for_standalone_window_count(&mut driver, expected_count)?;
+        let sender_policy = driver.command("trusted_image_senders", json!({}))?;
+        assert_eq!(
+            sender_policy["trusted_image_senders"],
+            json!(["policy@example.test"]),
+            "opening standalone window {expected_count} changed sender trust: {sender_policy}"
+        );
+    }
     for window_index in 0..2 {
         let selected = driver.command(
             "standalone_select_message",
@@ -6317,94 +6740,287 @@ fn standalone_remote_images_are_revoked_when_settings_disable_them() -> anyhow::
             selected["ok"], true,
             "standalone window {window_index} could not select the HTML root: {selected}"
         );
-    }
-    let expected_requests = ["/standalone-policy", "/standalone-policy"];
-    tracker.wait_for_requests(&expected_requests, STARTUP_TIMEOUT)?;
-    let allowed = wait_for_standalone_remote_policy(&mut driver, true, 2)?;
-    for (window_index, window) in allowed.iter().enumerate() {
         assert_eq!(
-            window["image_permission"], "all_messages",
-            "window {window_index}: {window}"
+            selected["window"]["selected_message"]["message_id"],
+            "standalone-policy-html-root@fixture.test",
+            "standalone window {window_index} selected the wrong message: {selected}"
         );
         assert_eq!(
-            window["image_policy_button_label"], "Images allowed for all messages",
-            "standalone window {window_index} exposed an ambiguous all-messages permission: {window}"
-        );
-        assert_eq!(
-            window["image_policy_button_sensitive"], false,
-            "global policy unexpectedly exposed a one-shot action in window {window_index}: {window}"
-        );
-        ensure!(
-            window["html_policy_text"].as_str().is_some_and(|text| text
-                .to_ascii_lowercase()
-                .contains("allowed for all messages")),
-            "window {window_index} did not explain the global permission: {window}"
+            selected["window"]["view"], "text",
+            "standalone root loaded HTML before the explicit view action: {selected}"
         );
     }
-    tracker.ensure_stable(&expected_requests, Duration::from_millis(250))?;
+    tracker.ensure_stable(&[], Duration::from_millis(250))?;
 
-    let opened_settings = driver.command("open_settings", json!({}))?;
-    assert_eq!(
-        opened_settings["ok"], true,
-        "Settings dialog did not open: {opened_settings}"
-    );
-    let settings = driver.command("settings_test_state", json!({}))?;
-    assert_eq!(settings["dialog"]["visible"], true, "{settings}");
-    assert_eq!(settings["dialog"]["remote_images"], true, "{settings}");
-    let applied = driver.command(
-        "respond_settings",
-        json!({"response": "apply", "remote_images": false}),
+    let shown = driver.command(
+        "set_pane_visibility",
+        json!({"pane": "message", "visible": true}),
     )?;
     assert_eq!(
-        applied["ok"], true,
-        "disabling remote images through Settings failed: {applied}"
+        shown["ok"], true,
+        "message pane could not be restored beside standalone windows: {shown}"
     );
+    let selected = driver.command("select_message_by_index", json!({"index": 0}))?;
+    assert_eq!(selected["ok"], true, "{selected}");
+    let sender_policy = driver.command("trusted_image_senders", json!({}))?;
     assert_eq!(
-        applied["state"]["remote_images"], false,
-        "Settings Apply did not update the runtime image policy: {applied}"
+        sender_policy["trusted_image_senders"],
+        json!(["policy@example.test"]),
+        "restoring the main message pane changed sender trust: {sender_policy}"
     );
+    let main_allowed =
+        ensure_visual_html_and_wait_permission(&mut driver, ExpectedImagePermission::Sender, None)?;
+    assert_eq!(main_allowed["selected_image_sender"], "policy@example.test");
+    assert_eq!(main_allowed["global_remote_images_allowed"], false);
+    assert_sender_image_warning(&main_allowed, "policy@example.test")?;
+    let main_allowed_geometry = assert_image_menu_state(&main_allowed, false, true, true)?;
+    tracker.wait_for_requests(&["/standalone-policy"], STARTUP_TIMEOUT)?;
 
-    let blocked = wait_for_standalone_remote_policy(&mut driver, false, 2)?;
-    for (window_index, window) in blocked.iter().enumerate() {
+    let opened_windows = wait_for_standalone_window_count(&mut driver, 2)?;
+    for (window_index, window) in opened_windows.iter().enumerate() {
         assert_eq!(
-            window["image_permission"], "blocked",
-            "window {window_index}: {window}"
+            window["selected_message"]["message_id"], "standalone-policy-html-root@fixture.test",
+            "standalone window {window_index} did not retain the selected HTML root: {window}"
         );
-        assert_eq!(
-            window["image_policy_button_label"], "Load remote images once",
-            "revoked window {window_index} did not expose a scoped recovery action: {window}"
-        );
-        assert_eq!(
-            window["image_policy_button_sensitive"], true,
-            "revoked one-shot action was unavailable in window {window_index}: {window}"
-        );
-        ensure!(
-            window["html_policy_text"]
-                .as_str()
-                .is_some_and(|text| text.to_ascii_lowercase().contains("remote content blocked")),
-            "revoked policy was not explained in window {window_index}: {window}"
-        );
-    }
-    tracker.ensure_stable(&expected_requests, Duration::from_millis(500))?;
-
-    for window_index in 0..2 {
-        let rerendered = driver.command(
-            "standalone_select_message",
-            json!({"window_index": window_index, "message_index": 0}),
+        let shown = driver.command(
+            "standalone_show_visual_html",
+            json!({"window_index": window_index}),
         )?;
         assert_eq!(
-            rerendered["ok"], true,
-            "window {window_index} could not re-render its selected message: {rerendered}"
+            shown["ok"], true,
+            "standalone window {window_index} could not show Visual HTML: {shown}"
         );
     }
-    let rerendered = wait_for_standalone_remote_policy(&mut driver, false, 2)?;
-    ensure!(
-        rerendered
-            .iter()
-            .all(|window| window["image_permission"] == "blocked"),
-        "same-message re-render did not stay blocked in every window: {rerendered:?}"
+
+    let expected_allowed_requests = [
+        "/standalone-policy",
+        "/standalone-policy",
+        "/standalone-policy",
+    ];
+    tracker.wait_for_requests(&expected_allowed_requests, STARTUP_TIMEOUT)?;
+    let allowed =
+        wait_for_standalone_remote_policy(&mut driver, ExpectedImagePermission::Sender, 2, None)?;
+    let allowed_generations = standalone_html_generations(&allowed)?;
+    let mut allowed_geometries = Vec::new();
+    for (window_index, window) in allowed.iter().enumerate() {
+        assert_eq!(
+            window["selected_image_sender"], "policy@example.test",
+            "window {window_index}: {window}"
+        );
+        assert_eq!(window["global_remote_images_allowed"], false);
+        assert_sender_image_warning(window, "policy@example.test")?;
+        allowed_geometries.push(assert_image_menu_state(window, false, true, true)?);
+    }
+    tracker.ensure_stable(&expected_allowed_requests, Duration::from_millis(250))?;
+
+    select_first_thread(
+        &mut driver,
+        "id:standalone-policy-unrelated-main@fixture.test",
+    )?;
+    let unrelated_blocked =
+        show_visual_html_and_wait_permission(&mut driver, ExpectedImagePermission::Blocked, None)?;
+    assert_eq!(
+        unrelated_blocked["selected_image_sender"],
+        "unrelated-main@example.test"
     );
-    tracker.ensure_stable(&expected_requests, Duration::from_millis(500))?;
+    assert_remote_images_blocked(&unrelated_blocked)?;
+    let unrelated_blocked_generation = html_load_generation(&unrelated_blocked)?;
+    tracker.ensure_stable(&expected_allowed_requests, Duration::from_millis(250))?;
+
+    let loaded_once = driver.command("load_images_once", json!({}))?;
+    assert_eq!(
+        loaded_once["ok"], true,
+        "unrelated main message could not load images once: {loaded_once}"
+    );
+    let unrelated_once = wait_for_html_view_permission(
+        &mut driver,
+        ExpectedImagePermission::MessageOnce,
+        Some(unrelated_blocked_generation),
+    )?;
+    assert_remote_images_once(&unrelated_once)?;
+    let unrelated_once_generation = html_load_generation(&unrelated_once)?;
+    let requests_with_unrelated_once = [
+        "/standalone-policy",
+        "/standalone-policy",
+        "/standalone-policy",
+        "/unrelated-main-once",
+    ];
+    tracker.wait_for_requests(&requests_with_unrelated_once, STARTUP_TIMEOUT)?;
+    tracker.ensure_stable(&requests_with_unrelated_once, Duration::from_millis(250))?;
+
+    let revoked = driver.command(
+        "standalone_image_policy",
+        json!({"window_index": 0, "action": "sender_off"}),
+    )?;
+    assert_eq!(
+        revoked["ok"], true,
+        "standalone Images menu could not revoke sender trust: {revoked}"
+    );
+    assert_eq!(
+        revoked["window"]["image_policy_menu_visible"], false,
+        "standalone Images menu remained open after revocation: {revoked}"
+    );
+
+    let unrelated_after_revocation = driver.command("html_view_state", json!({}))?;
+    assert_eq!(
+        unrelated_after_revocation["selected_image_sender"],
+        "unrelated-main@example.test"
+    );
+    assert_eq!(
+        unrelated_after_revocation["image_permission"], "message_once",
+        "revoking an unrelated standalone sender changed the main message's one-shot permission: {unrelated_after_revocation}"
+    );
+    assert_eq!(
+        unrelated_after_revocation["image_loading_allowed"], true,
+        "revoking an unrelated standalone sender disabled main WebKit image loading: {unrelated_after_revocation}"
+    );
+    assert_eq!(
+        html_load_generation(&unrelated_after_revocation)?,
+        unrelated_once_generation,
+        "revoking an unrelated standalone sender re-rendered the main WebView"
+    );
+    assert_eq!(
+        unrelated_after_revocation["trusted_image_senders"],
+        json!([])
+    );
+
+    let blocked = wait_for_standalone_remote_policy(
+        &mut driver,
+        ExpectedImagePermission::Blocked,
+        2,
+        Some(&allowed_generations),
+    )?;
+    let blocked_generations = standalone_html_generations(&blocked)?;
+    for (window_index, window) in blocked.iter().enumerate() {
+        assert_eq!(window["sender_remote_images_allowed"], false);
+        assert_eq!(window["html_policy_text"], "Remote images blocked.");
+        assert_image_menu_geometry_stable(
+            allowed_geometries[window_index],
+            assert_image_menu_state(window, true, false, true)?,
+            "revoking sender trust across standalone windows",
+        )?;
+    }
+    tracker.ensure_stable(&requests_with_unrelated_once, Duration::from_millis(500))?;
+
+    let revoked_config_bytes = fs::read(&fixture_config_path)?;
+    let revoked_config: toml::Value = String::from_utf8(revoked_config_bytes.clone())?.parse()?;
+    assert_eq!(revoked_config["ui"]["remote_images"].as_bool(), Some(false));
+    assert_eq!(
+        revoked_config["ui"]["trusted_image_senders"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "standalone revocation was not persisted exactly: {revoked_config}"
+    );
+    assert_eq!(
+        fs::read(&config_path)?,
+        seed_config,
+        "standalone sender revocation mutated the supplied seed config"
+    );
+
+    select_first_thread(&mut driver, "id:standalone-policy-html-root@fixture.test")?;
+    let selected = driver.command("select_message_by_index", json!({"index": 0}))?;
+    assert_eq!(
+        selected["ok"], true,
+        "could not restore the policy sender in the main view: {selected}"
+    );
+    let main_blocked = ensure_visual_html_and_wait_permission(
+        &mut driver,
+        ExpectedImagePermission::Blocked,
+        Some(unrelated_once_generation),
+    )?;
+    assert_remote_images_blocked(&main_blocked)?;
+    assert_image_menu_geometry_stable(
+        main_allowed_geometry,
+        assert_image_menu_state(&main_blocked, true, false, true)?,
+        "showing the revoked sender again in the main window",
+    )?;
+    tracker.ensure_stable(&requests_with_unrelated_once, Duration::from_millis(250))?;
+
+    let reenabled = driver.command("trust_sender_images", json!({}))?;
+    assert_eq!(
+        reenabled["ok"], true,
+        "main Images control could not restore sender trust: {reenabled}"
+    );
+    assert_eq!(
+        reenabled["trusted_image_senders"],
+        json!(["policy@example.test"]),
+        "main Images control reported success without restoring exact sender trust: {reenabled}"
+    );
+    assert_eq!(
+        reenabled["html_view"]["sender_remote_images_allowed"], true,
+        "main Images control reported success before applying sender trust: {reenabled}"
+    );
+    let main_reenabled = wait_for_html_view_permission(
+        &mut driver,
+        ExpectedImagePermission::Sender,
+        Some(html_load_generation(&main_blocked)?),
+    )?;
+    let allowed_again = wait_for_standalone_remote_policy(
+        &mut driver,
+        ExpectedImagePermission::Sender,
+        2,
+        Some(&blocked_generations),
+    )?;
+    let allowed_again_generations = standalone_html_generations(&allowed_again)?;
+    let repeated_requests = [
+        "/standalone-policy",
+        "/standalone-policy",
+        "/standalone-policy",
+        "/unrelated-main-once",
+        "/standalone-policy",
+        "/standalone-policy",
+        "/standalone-policy",
+    ];
+    tracker.wait_for_requests(&repeated_requests, STARTUP_TIMEOUT)?;
+
+    let valid_fixture_config = fs::read(&fixture_config_path)?;
+    fs::write(&fixture_config_path, "[ui\nremote_images = false\n")?;
+    let rejected = driver.command(
+        "standalone_image_policy",
+        json!({"window_index": 1, "action": "sender_off"}),
+    )?;
+    assert_eq!(
+        rejected["ok"], false,
+        "standalone sender revocation reported success after persistence failed: {rejected}"
+    );
+    ensure!(
+        rejected["error"].as_str().is_some(),
+        "failed standalone sender revocation returned no error: {rejected}"
+    );
+    assert_eq!(
+        rejected["window"]["sender_image_trust_active"], true,
+        "failed standalone revocation did not roll its checkbox back: {rejected}"
+    );
+    assert_eq!(
+        rejected["window"]["image_policy_menu_visible"], false,
+        "failed standalone revocation left its menu open: {rejected}"
+    );
+
+    let unchanged_main = driver.command("html_view_state", json!({}))?;
+    assert_eq!(unchanged_main["image_permission"], "sender");
+    assert_eq!(
+        html_load_generation(&unchanged_main)?,
+        html_load_generation(&main_reenabled)?,
+        "failed standalone revocation unexpectedly re-rendered the main WebView"
+    );
+    let unchanged = driver.command("standalone_message_windows", json!({}))?;
+    let unchanged_windows = json_array_at(&unchanged, &["windows"])?;
+    ensure!(
+        unchanged_windows.iter().all(|window| {
+            window["image_permission"] == "sender"
+                && window["sender_image_trust_active"] == true
+                && window["image_policy_menu_visible"] == false
+        }),
+        "failed standalone revocation did not roll every sender control back: {unchanged}"
+    );
+    assert_eq!(
+        standalone_html_generations(unchanged_windows)?,
+        allowed_again_generations,
+        "failed standalone revocation unexpectedly re-rendered an open WebView"
+    );
+    tracker.ensure_stable(&repeated_requests, Duration::from_millis(300))?;
+    fs::write(&fixture_config_path, valid_fixture_config)?;
 
     Ok(())
 }
@@ -12791,16 +13407,16 @@ fn wait_for_tag(driver: &mut UiDriver, timeout: Duration) -> anyhow::Result<Valu
 
 #[cfg(unix)]
 fn index_remote_html_message(
-    fixture: &notm_test_support::FixtureDatabase,
+    database_path: &Path,
+    notmuch_config_path: &Path,
     message_id: &str,
     from: &str,
     subject: &str,
     html: &str,
 ) -> anyhow::Result<()> {
     let filename = message_id.replace(['@', '<', '>'], "-");
-    let path = fixture
-        .maildir
-        .join("cur")
+    let path = database_path
+        .join("account.fixture/cur")
         .join(format!("remote-image-{filename}-{}:2,S", unique_run_id()?));
     let raw = format!(
         "From: {from}\r\nTo: fixture@example.test\r\nSubject: {subject}\r\n\
@@ -12809,10 +13425,75 @@ fn index_remote_html_message(
     );
     fs::write(&path, raw)
         .with_context(|| format!("writing remote-image fixture {}", path.display()))?;
-    fixture
-        .open_readwrite()?
+    let open = notm_notmuch::OpenConfig {
+        database_path: Some(database_path.to_path_buf()),
+        config_path: Some(notmuch_config_path.to_path_buf()),
+        profile: None,
+    };
+    notm_notmuch::Database::open(&open, notm_notmuch::DatabaseMode::ReadWrite)?
         .index_file_with_tags(&path, &["inbox"])
         .with_context(|| format!("indexing remote-image fixture {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn index_related_cid_message(
+    database_path: &Path,
+    notmuch_config_path: &Path,
+    tracker: &LocalHttpTracker,
+) -> anyhow::Result<()> {
+    const TINY_JPEG: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAACAAIDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD3+iiigD//2Q==";
+    let path = database_path
+        .join("account.fixture/cur")
+        .join(format!("remote-image-related-cid-{}:2,S", unique_run_id()?));
+    let mut raw = String::from(
+        "From: not a valid mailbox ???\r\n\
+         To: fixture@example.test\r\n\
+         Subject: Related CID image scans\r\n\
+         Date: Tue, 25 Aug 2026 11:59:00 -0600\r\n\
+         Message-ID: <remote-image-related-cid@fixture.test>\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: multipart/related; boundary=related\r\n\r\n\
+         --related\r\n\
+         Content-Type: multipart/alternative; boundary=alternative\r\n\r\n\
+         --alternative\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\r\n\
+         Seven message-local scans.\r\n\
+         --alternative\r\n\
+         Content-Type: text/html; charset=utf-8\r\n\r\n\
+         <html><body><p>Seven message-local scans.</p>",
+    );
+    for index in 0..7 {
+        raw.push_str(&format!(
+            "<img src=\"cid:scan-{index}@fixture.test\" alt=\"scan {index}\">"
+        ));
+    }
+    raw.push_str(&format!(
+        "<img src=\"{}\" alt=\"remote tracker\"></body></html>\r\n\
+         --alternative--\r\n",
+        tracker.url("/cid-remote")
+    ));
+    for index in 0..7 {
+        raw.push_str(&format!(
+            "--related\r\n\
+             Content-Type: image/jpeg; name=scan-{index}.jpg\r\n\
+             Content-Disposition: inline; filename=scan-{index}.jpg\r\n\
+             Content-ID: <scan-{index}@fixture.test>\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\n\
+             {TINY_JPEG}\r\n"
+        ));
+    }
+    raw.push_str("--related--\r\n");
+    fs::write(&path, raw)
+        .with_context(|| format!("writing related CID fixture {}", path.display()))?;
+    let open = notm_notmuch::OpenConfig {
+        database_path: Some(database_path.to_path_buf()),
+        config_path: Some(notmuch_config_path.to_path_buf()),
+        profile: None,
+    };
+    notm_notmuch::Database::open(&open, notm_notmuch::DatabaseMode::ReadWrite)?
+        .index_file_with_tags(&path, &["inbox"])
+        .with_context(|| format!("indexing related CID fixture {}", path.display()))?;
     Ok(())
 }
 
@@ -12906,16 +13587,90 @@ fn remote_image_adversarial_html(tracker: &LocalHttpTracker) -> String {
 
 #[cfg(unix)]
 fn show_visual_html_and_wait(driver: &mut UiDriver, images_allowed: bool) -> anyhow::Result<Value> {
-    let shown = driver.command("show_visual_html", json!({}))?;
-    assert_eq!(shown["ok"], true, "visual HTML render failed: {shown}");
-    wait_for_html_view(driver, images_allowed, Some(&shown["html_view"]))
+    let expected = if images_allowed {
+        ExpectedImagePermission::MessageOnce
+    } else {
+        ExpectedImagePermission::Blocked
+    };
+    show_visual_html_and_wait_permission(driver, expected, None)
 }
 
 #[cfg(unix)]
-fn wait_for_html_view(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpectedImagePermission {
+    Blocked,
+    MessageOnce,
+    Sender,
+    AllMessages,
+}
+
+#[cfg(unix)]
+impl ExpectedImagePermission {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::MessageOnce => "message_once",
+            Self::Sender => "sender",
+            Self::AllMessages => "all_messages",
+        }
+    }
+
+    fn images_allowed(self) -> bool {
+        self != Self::Blocked
+    }
+}
+
+#[cfg(unix)]
+fn show_visual_html_and_wait_permission(
     driver: &mut UiDriver,
-    images_allowed: bool,
+    expected: ExpectedImagePermission,
+    previous_generation: Option<u64>,
+) -> anyhow::Result<Value> {
+    let shown = driver.command("show_visual_html", json!({}))?;
+    assert_eq!(shown["ok"], true, "visual HTML render failed: {shown}");
+    wait_for_html_view_permission_with_initial(
+        driver,
+        expected,
+        Some(&shown["html_view"]),
+        previous_generation,
+    )
+}
+
+#[cfg(unix)]
+fn ensure_visual_html_and_wait_permission(
+    driver: &mut UiDriver,
+    expected: ExpectedImagePermission,
+    previous_generation: Option<u64>,
+) -> anyhow::Result<Value> {
+    let mut initial = driver.command("html_view_state", json!({}))?;
+    if initial["html_visible"] != true {
+        let shown = driver.command("show_visual_html", json!({}))?;
+        assert_eq!(shown["ok"], true, "visual HTML render failed: {shown}");
+        initial = shown["html_view"].clone();
+    }
+    wait_for_html_view_permission_with_initial(
+        driver,
+        expected,
+        Some(&initial),
+        previous_generation,
+    )
+}
+
+#[cfg(unix)]
+fn wait_for_html_view_permission(
+    driver: &mut UiDriver,
+    expected: ExpectedImagePermission,
+    previous_generation: Option<u64>,
+) -> anyhow::Result<Value> {
+    wait_for_html_view_permission_with_initial(driver, expected, None, previous_generation)
+}
+
+#[cfg(unix)]
+fn wait_for_html_view_permission_with_initial(
+    driver: &mut UiDriver,
+    expected: ExpectedImagePermission,
     initial: Option<&Value>,
+    previous_generation: Option<u64>,
 ) -> anyhow::Result<Value> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     let mut next = initial.cloned();
@@ -12930,20 +13685,23 @@ fn wait_for_html_view(
             "selected HTML message was not visible: {view}"
         );
         assert_eq!(
-            view["global_remote_images_allowed"], false,
-            "isolated privacy fixture unexpectedly enabled global remote images: {view}"
+            view["global_remote_images_allowed"],
+            expected == ExpectedImagePermission::AllMessages,
+            "global remote-image state did not match the expected policy: {view}"
         );
         assert_eq!(
-            view["image_loading_allowed"], images_allowed,
+            view["sender_remote_images_allowed"],
+            expected == ExpectedImagePermission::Sender,
+            "sender remote-image state did not match the expected policy: {view}"
+        );
+        assert_eq!(
+            view["image_loading_allowed"],
+            expected.images_allowed(),
             "WebKit image loading did not match the selected-message policy: {view}"
         );
         assert_eq!(
             view["image_permission"],
-            if images_allowed {
-                "message_once"
-            } else {
-                "blocked"
-            },
+            expected.label(),
             "HTML view exposed an ambiguous image permission: {view}"
         );
         assert_eq!(
@@ -12963,26 +13721,50 @@ fn wait_for_html_view(
             load_generation > 0,
             "HTML view did not schedule the requested document load: {view}"
         );
-        if !loading && completed_load_generation == load_generation {
+        let generation_advanced =
+            previous_generation.is_none_or(|previous| load_generation > previous);
+        if !loading && completed_load_generation == load_generation && generation_advanced {
             return Ok(view);
         }
         ensure!(
             Instant::now() < deadline,
-            "HTML view did not complete a deterministic load cycle: {view}"
+            "HTML view did not advance and complete a deterministic load cycle from {previous_generation:?}: {view}"
         );
         thread::sleep(STARTUP_POLL_INTERVAL);
     }
 }
 
 #[cfg(unix)]
+fn html_load_generation(view: &Value) -> anyhow::Result<u64> {
+    view["load_generation"]
+        .as_u64()
+        .with_context(|| format!("HTML view exposed no load generation: {view}"))
+}
+
+#[cfg(unix)]
 fn assert_remote_images_blocked(view: &Value) -> anyhow::Result<()> {
-    let status = view["status_text"]
+    let policy = view["html_policy_text"]
         .as_str()
-        .with_context(|| format!("blocked HTML view had no status text: {view}"))?
+        .with_context(|| format!("blocked HTML view had no policy text: {view}"))?
         .to_ascii_lowercase();
     ensure!(
-        status.contains("remote") && status.contains("blocked"),
+        policy.contains("remote") && policy.contains("blocked"),
         "blocked HTML view did not explain its remote-content state: {view}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn assert_loaded_image_metrics(view: &Value, expected: u64) -> anyhow::Result<()> {
+    let images = view
+        .get("images")
+        .with_context(|| format!("HTML view exposed no DOM image metrics: {view}"))?;
+    ensure!(
+        images["total"].as_u64() == Some(expected)
+            && images["loaded"].as_u64() == Some(expected)
+            && images["failed"].as_u64() == Some(0)
+            && images["pending"].as_u64() == Some(0),
+        "HTML view did not render all {expected} expected images: {view}"
     );
     Ok(())
 }
@@ -13003,11 +13785,133 @@ fn assert_remote_images_once(view: &Value) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-fn wait_for_standalone_remote_policy(
+fn assert_sender_image_warning(view: &Value, sender: &str) -> anyhow::Result<()> {
+    let warning = view["sender_image_warning_text"]
+        .as_str()
+        .with_context(|| format!("Images menu exposed no sender warning: {view}"))?
+        .to_ascii_lowercase();
+    ensure!(
+        warning.contains(&sender.to_ascii_lowercase())
+            && warning.contains("from address")
+            && (warning.contains("not authenticated") || warning.contains("cannot authenticate"))
+            && warning.contains("forged message")
+            && warning.contains("load remote images"),
+        "sender image warning did not clearly describe the spoofing boundary for {sender}: {view}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn assert_image_menu_state(
+    view: &Value,
+    load_once_sensitive: bool,
+    sender_active: bool,
+    sender_sensitive: bool,
+) -> anyhow::Result<(i64, i64, i64)> {
+    assert_eq!(
+        view["image_policy_button_label"], "Images (I)",
+        "remote-image menu label must remain compact and state-independent: {view}"
+    );
+    assert_eq!(
+        view["image_policy_button_sensitive"], true,
+        "remote-image menu must remain available so sender permission can be revoked: {view}"
+    );
+    assert_eq!(
+        view["load_images_once_label"], "Load for this message (I m)",
+        "one-shot action label changed unexpectedly: {view}"
+    );
+    assert_eq!(
+        view["load_images_once_sensitive"], load_once_sensitive,
+        "one-shot action sensitivity did not match the rendered policy: {view}"
+    );
+    assert_eq!(
+        view["sender_image_trust_label"], "Always load from this sender (I a)",
+        "sender image toggle label changed unexpectedly: {view}"
+    );
+    assert_eq!(
+        view["sender_image_trust_active"], sender_active,
+        "sender image toggle did not expose its current state: {view}"
+    );
+    assert_eq!(
+        view["sender_image_trust_sensitive"], sender_sensitive,
+        "sender image toggle sensitivity did not match the exact From mailbox: {view}"
+    );
+
+    let width = view["image_policy_button_width"]
+        .as_i64()
+        .with_context(|| format!("image menu exposed no allocated width: {view}"))?;
+    let height = view["image_policy_button_height"]
+        .as_i64()
+        .with_context(|| format!("image menu exposed no allocated height: {view}"))?;
+    let row_height = view["image_policy_row_height"]
+        .as_i64()
+        .with_context(|| format!("image policy row exposed no allocated height: {view}"))?;
+    ensure!(
+        width > 0 && height > 0 && row_height > 0,
+        "image policy controls were not allocated: {view}"
+    );
+    ensure!(
+        height <= 64,
+        "compact Images menu grew to an implausible multi-line height: {view}"
+    );
+    ensure!(
+        row_height <= 64,
+        "single-line image policy row grew to an implausible multi-line height: {view}"
+    );
+    Ok((width, height, row_height))
+}
+
+#[cfg(unix)]
+fn assert_image_menu_geometry_stable(
+    expected: (i64, i64, i64),
+    observed: (i64, i64, i64),
+    context: &str,
+) -> anyhow::Result<()> {
+    let stable = [expected.0, expected.1, expected.2]
+        .into_iter()
+        .zip([observed.0, observed.1, observed.2])
+        .all(|(before, after)| (before - after).abs() <= 1);
+    ensure!(
+        stable,
+        "image menu geometry changed after {context}: expected {expected:?}, observed {observed:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn wait_for_standalone_window_count(
     driver: &mut UiDriver,
-    images_allowed: bool,
     expected_windows: usize,
 ) -> anyhow::Result<Vec<Value>> {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let state = driver.command("standalone_message_windows", json!({}))?;
+        let windows = json_array_at(&state, &["windows"])?;
+        if windows.len() == expected_windows {
+            return Ok(windows.to_vec());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "expected {expected_windows} standalone windows: {state}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_standalone_remote_policy(
+    driver: &mut UiDriver,
+    expected: ExpectedImagePermission,
+    expected_windows: usize,
+    previous_generations: Option<&[u64]>,
+) -> anyhow::Result<Vec<Value>> {
+    if let Some(previous_generations) = previous_generations {
+        ensure!(
+            previous_generations.len() == expected_windows,
+            "expected {expected_windows} prior standalone generations, got {}",
+            previous_generations.len()
+        );
+    }
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         let state = driver.command("standalone_message_windows", json!({}))?;
@@ -13022,27 +13926,66 @@ fn wait_for_standalone_remote_policy(
                 "standalone HTML message was not visible: {state}"
             );
             assert_eq!(
-                window["global_remote_images_allowed"], images_allowed,
-                "standalone runtime image policy did not match Settings: {state}"
+                window["global_remote_images_allowed"],
+                expected == ExpectedImagePermission::AllMessages,
+                "standalone global image policy did not match the expected permission: {state}"
             );
             assert_eq!(
-                window["image_loading_allowed"], images_allowed,
-                "standalone WebKit image loading did not match Settings: {state}"
+                window["sender_remote_images_allowed"],
+                expected == ExpectedImagePermission::Sender,
+                "standalone sender image policy did not match the expected permission: {state}"
+            );
+            assert_eq!(
+                window["image_loading_allowed"],
+                expected.images_allowed(),
+                "standalone WebKit image loading did not match its resolved permission: {state}"
+            );
+            assert_eq!(
+                window["image_permission"],
+                expected.label(),
+                "standalone window exposed an ambiguous image permission: {state}"
             );
             assert_eq!(
                 window["network_session_ephemeral"], true,
                 "standalone HTML did not use an ephemeral WebKit network session: {state}"
             );
         }
-        if windows.iter().all(|window| window["loading"] == false) {
+        let completed_expected_loads = windows.iter().enumerate().all(|(window_index, window)| {
+            let generation = window["html_lifecycle"]["generation"].as_u64();
+            let completed = window["html_lifecycle"]["completed_generation"].as_u64();
+            generation.is_some_and(|generation| {
+                generation > 0
+                    && completed == Some(generation)
+                    && previous_generations
+                        .is_none_or(|previous| generation > previous[window_index])
+            })
+        });
+        if windows.iter().all(|window| window["loading"] == false) && completed_expected_loads {
             return Ok(windows.to_vec());
         }
         ensure!(
             Instant::now() < deadline,
-            "standalone HTML load did not complete under its expected image policy: {state}"
+            "standalone HTML load did not advance and complete under its expected image policy: previous_generations={previous_generations:?}, state={state}"
         );
         thread::sleep(STARTUP_POLL_INTERVAL);
     }
+}
+
+#[cfg(unix)]
+fn standalone_html_generations(windows: &[Value]) -> anyhow::Result<Vec<u64>> {
+    windows
+        .iter()
+        .enumerate()
+        .map(|(window_index, window)| {
+            window["html_lifecycle"]["generation"]
+                .as_u64()
+                .with_context(|| {
+                    format!(
+                        "standalone window {window_index} exposed no HTML load generation: {window}"
+                    )
+                })
+        })
+        .collect()
 }
 
 #[cfg(unix)]

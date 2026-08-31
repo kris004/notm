@@ -134,10 +134,10 @@ fn print_config_distinguishes_missing_explicit_and_default_paths() -> anyhow::Re
 }
 
 #[test]
-fn print_config_accepts_but_omits_legacy_keys() -> anyhow::Result<()> {
+fn print_config_omits_legacy_keys_but_preserves_sender_image_trust() -> anyhow::Result<()> {
     let config = PrivateConfig::create(
         "[ui]\nconfirm_destructive_tag_actions = false\n\
-         trusted_image_senders = [\"SPOOFED@EXAMPLE.TEST\", \"malformed sender\"]\n\
+         trusted_image_senders = [\"sender@example.test\", \"other@example.test\"]\n\
          \n[send]\none_live_self_test_per_run = true\n\
          \n[send.env]\nNOTM_CUSTOM_VARIABLE = \"custom value\"\n\
          \n[sync]\nshow_manual_sync_button = true\n",
@@ -159,7 +159,6 @@ fn print_config_accepts_but_omits_legacy_keys() -> anyhow::Result<()> {
     );
     for (section, legacy_key) in [
         ("ui", "confirm_destructive_tag_actions"),
-        ("ui", "trusted_image_senders"),
         ("send", "one_live_self_test_per_run"),
         ("sync", "show_manual_sync_button"),
     ] {
@@ -169,8 +168,12 @@ fn print_config_accepts_but_omits_legacy_keys() -> anyhow::Result<()> {
         );
     }
     assert_eq!(
+        printed["ui"]["trusted_image_senders"],
+        serde_json::json!(["sender@example.test", "other@example.test"])
+    );
+    assert_eq!(
         printed["ui"]["remote_images"], false,
-        "ignored legacy sender entries broadened the effective image policy"
+        "sender-scoped trust broadened the global image policy"
     );
     Ok(())
 }

@@ -1,12 +1,31 @@
 use std::collections::HashSet;
 
 pub fn sanitize_html(html: &str) -> String {
+    sanitize_html_with_policy(html, false)
+}
+
+/// Sanitize HTML while retaining `cid:` image references for a caller that
+/// resolves them to message-local MIME resources before rendering.
+///
+/// `cid:` remains restricted to `<img src>`; it is not accepted for links or
+/// any other resource-bearing attribute.
+pub fn sanitize_html_with_cid_images(html: &str) -> String {
+    sanitize_html_with_policy(html, true)
+}
+
+fn sanitize_html_with_policy(html: &str, allow_cid_images: bool) -> String {
     let mut builder = ammonia::Builder::default();
+    let mut url_schemes = ["http", "https", "mailto"]
+        .into_iter()
+        .collect::<HashSet<_>>();
+    if allow_cid_images {
+        url_schemes.insert("cid");
+    }
     builder
         .rm_tags(&[
             "script", "style", "iframe", "object", "embed", "link", "meta",
         ])
-        .url_schemes(["http", "https", "mailto"].into_iter().collect())
+        .url_schemes(url_schemes)
         .add_tags(&["font"])
         .add_generic_attributes(&["style"])
         .add_tag_attributes("font", &["size"])
@@ -27,8 +46,10 @@ pub fn sanitize_html(html: &str) -> String {
         .add_tag_attributes("tr", &["width", "height", "bgcolor", "valign"])
         .add_tag_attributes("td", &["width", "height", "bgcolor", "valign"])
         .add_tag_attributes("th", &["width", "height", "bgcolor", "valign"])
-        .attribute_filter(|element, attr, value| {
-            if (attr == "style" && style_value_looks_dangerous(value))
+        .attribute_filter(move |element, attr, value| {
+            if (value.trim().to_ascii_lowercase().starts_with("cid:")
+                && !(allow_cid_images && element == "img" && attr == "src"))
+                || (attr == "style" && style_value_looks_dangerous(value))
                 || (element == "font" && attr == "size" && !font_size_value_is_safe(value))
             {
                 None
@@ -120,7 +141,7 @@ fn font_size_value_is_safe(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{html_to_safe_text, sanitize_html};
+    use super::{html_to_safe_text, sanitize_html, sanitize_html_with_cid_images};
 
     #[test]
     fn html_to_text_handles_rowspan_with_empty_rows() {
@@ -176,5 +197,20 @@ mod tests {
 
         assert!(sanitized.contains("<font>Huge</font>"));
         assert!(!sanitized.contains("999999"));
+    }
+
+    #[test]
+    fn cid_references_are_retained_only_for_explicit_inline_image_resolution() {
+        let html = r#"<a href="cid:link"><img src="cid:scan@example.test" alt="scan"></a>"#;
+
+        let ordinary = sanitize_html(html);
+        assert!(!ordinary.contains("cid:"), "{ordinary}");
+
+        let inline = sanitize_html_with_cid_images(html);
+        assert!(
+            inline.contains(r#"src="cid:scan@example.test""#),
+            "{inline}"
+        );
+        assert!(!inline.contains(r#"href="cid:link""#), "{inline}");
     }
 }
