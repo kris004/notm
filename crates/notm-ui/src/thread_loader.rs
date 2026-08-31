@@ -17,9 +17,11 @@ use anyhow::Context as _;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use mailparse::{MailHeaderMap as _, parse_content_disposition, parse_content_type, parse_headers};
 use notm_mail::{
-    ParsedMessage,
+    Attachment, ParsedMessage,
     html_sanitize::sanitize_html_with_cid_images,
-    mime::{MimeLimits, extract_attachment_parts_detailed_with_limits, parse_rfc5322},
+    mime::{
+        HtmlCidPartScope, MimeLimits, extract_attachment_parts_detailed_with_limits, parse_rfc5322,
+    },
 };
 use notm_notmuch::{Database, DatabaseMode, MessagePathState, MessageSummary, OpenConfig};
 use regex::Regex;
@@ -1778,6 +1780,13 @@ fn strip_trailing_crlf(bytes: &[u8], start: usize, mut end: usize) -> usize {
     end
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PreparedHtmlCidPartScope<'a> {
+    start: usize,
+    end: usize,
+    part_indexes: Option<&'a [usize]>,
+}
+
 fn prepare_html(parsed: &ParsedMessage, source: &[u8], max_bytes: usize) -> PreparedHtml {
     let Some(html) = parsed
         .html_body
@@ -1796,8 +1805,9 @@ fn prepare_html(parsed: &ParsedMessage, source: &[u8], max_bytes: usize) -> Prep
         };
     }
 
-    let sanitized = sanitize_html_with_cid_images(html);
-    let sanitized = resolve_inline_cid_images(&sanitized, parsed, source);
+    let (sanitized, sanitized_cid_scopes) =
+        sanitize_html_with_cid_part_scopes(html, &parsed.html_cid_part_scopes);
+    let sanitized = resolve_inline_cid_images(&sanitized, &sanitized_cid_scopes, parsed, source);
     // These documents intentionally remain distinct even when the sanitized
     // body contains no remote image markup. Their CSPs encode different
     // authority: both may display bounded message-local MIME images, while
@@ -1812,9 +1822,36 @@ fn prepare_html(parsed: &ParsedMessage, source: &[u8], max_bytes: usize) -> Prep
     }
 }
 
-fn resolve_inline_cid_images(html: &str, parsed: &ParsedMessage, source: &[u8]) -> String {
-    resolve_inline_cid_images_with_limits(
+fn sanitize_html_with_cid_part_scopes<'a>(
+    html: &str,
+    scopes: &'a [HtmlCidPartScope],
+) -> (String, Vec<PreparedHtmlCidPartScope<'a>>) {
+    let source_scopes = prepared_html_cid_part_scopes(html, scopes);
+
+    let mut sanitized = String::with_capacity(html.len());
+    let mut sanitized_scopes = Vec::with_capacity(source_scopes.len());
+    for scope in source_scopes {
+        let fragment = sanitize_html_with_cid_images(&html[scope.start..scope.end]);
+        let start = sanitized.len();
+        sanitized.push_str(&fragment);
+        sanitized_scopes.push(PreparedHtmlCidPartScope {
+            start,
+            end: sanitized.len(),
+            part_indexes: scope.part_indexes,
+        });
+    }
+    (sanitized, sanitized_scopes)
+}
+
+fn resolve_inline_cid_images(
+    html: &str,
+    cid_scopes: &[PreparedHtmlCidPartScope<'_>],
+    parsed: &ParsedMessage,
+    source: &[u8],
+) -> String {
+    resolve_inline_cid_images_scoped_with_limits(
         html,
+        cid_scopes,
         parsed,
         source,
         MAX_INLINE_IMAGE_BYTES,
@@ -1822,8 +1859,113 @@ fn resolve_inline_cid_images(html: &str, parsed: &ParsedMessage, source: &[u8]) 
     )
 }
 
+#[cfg(test)]
 fn resolve_inline_cid_images_with_limits(
     html: &str,
+    parsed: &ParsedMessage,
+    source: &[u8],
+    max_inline_image_bytes: usize,
+    max_total_inline_image_bytes: usize,
+) -> String {
+    let cid_scopes = prepared_html_cid_part_scopes(html, &parsed.html_cid_part_scopes);
+    resolve_inline_cid_images_scoped_with_limits(
+        html,
+        &cid_scopes,
+        parsed,
+        source,
+        max_inline_image_bytes,
+        max_total_inline_image_bytes,
+    )
+}
+
+fn prepared_html_cid_part_scopes<'a>(
+    html: &str,
+    scopes: &'a [HtmlCidPartScope],
+) -> Vec<PreparedHtmlCidPartScope<'a>> {
+    let valid_scopes = !scopes.is_empty()
+        && scopes.iter().try_fold(0_usize, |expected_start, scope| {
+            (scope.start == expected_start
+                && scope.end >= scope.start
+                && scope.end <= html.len()
+                && html.is_char_boundary(scope.start)
+                && html.is_char_boundary(scope.end))
+            .then_some(scope.end)
+        }) == Some(html.len());
+    if valid_scopes {
+        scopes
+            .iter()
+            .map(|scope| PreparedHtmlCidPartScope {
+                start: scope.start,
+                end: scope.end,
+                part_indexes: scope.part_indexes.as_deref(),
+            })
+            .collect()
+    } else {
+        // A missing scope is the backwards-compatible message-wide form.
+        // Malformed nonempty metadata is an internal provenance failure and
+        // must not widen CID lookup.
+        vec![PreparedHtmlCidPartScope {
+            start: 0,
+            end: html.len(),
+            part_indexes: (!scopes.is_empty()).then_some([].as_slice()),
+        }]
+    }
+}
+
+#[derive(Debug)]
+struct InlineCidSegmentSelection {
+    start: usize,
+    end: usize,
+    part_indexes_by_content_id: BTreeMap<String, usize>,
+}
+
+#[derive(Debug)]
+struct InlineCidResource {
+    content_id: String,
+    data_uri: String,
+}
+
+fn select_inline_cid_segment_candidates<'a>(
+    candidates: impl IntoIterator<Item = &'a Attachment>,
+    referenced: &BTreeSet<String>,
+    selected_part_indexes: &mut BTreeSet<usize>,
+    selected_total_bytes: &mut usize,
+    max_inline_image_bytes: usize,
+    max_total_inline_image_bytes: usize,
+) -> BTreeMap<String, usize> {
+    let mut selected = BTreeMap::new();
+    for attachment in candidates {
+        let Some(content_id) = attachment.content_id.as_deref().map(normalize_content_id) else {
+            continue;
+        };
+        if content_id.is_empty()
+            || attachment.decode_error.is_some()
+            || !inline_image_content_type_is_safe(&attachment.content_type)
+            || !referenced.contains(&content_id)
+            || selected.contains_key(&content_id)
+            || attachment.size == 0
+            || attachment.size > max_inline_image_bytes
+        {
+            continue;
+        }
+        if !selected_part_indexes.contains(&attachment.part_index) {
+            let Some(next_total) = selected_total_bytes.checked_add(attachment.size) else {
+                continue;
+            };
+            if next_total > max_total_inline_image_bytes {
+                continue;
+            }
+            *selected_total_bytes = next_total;
+            selected_part_indexes.insert(attachment.part_index);
+        }
+        selected.insert(content_id, attachment.part_index);
+    }
+    selected
+}
+
+fn resolve_inline_cid_images_scoped_with_limits(
+    html: &str,
+    cid_scopes: &[PreparedHtmlCidPartScope<'_>],
     parsed: &ParsedMessage,
     source: &[u8],
     max_inline_image_bytes: usize,
@@ -1833,62 +1975,66 @@ fn resolve_inline_cid_images_with_limits(
     if !cid_source.is_match(html) {
         return html.to_string();
     }
-    let referenced = cid_source
-        .captures_iter(html)
-        .filter_map(|captures| decode_cid_url_content_id(&captures[1]))
-        .filter(|content_id| !content_id.is_empty())
-        .collect::<BTreeSet<_>>();
 
     // Parsed attachment metadata comes from decoding this exact bounded source
     // and therefore carries authoritative decoded sizes and stable part
-    // indexes. Select only parts that fit both image budgets before the
-    // batched extraction. An oversized candidate is skipped without making a
-    // later valid sibling disappear, while the extractor retains the same
-    // limits as defense in depth. When MIME body selection chose one or more
-    // multipart/related roots, apply that provenance before duplicate
-    // suppression so an unrelated same-CID part cannot win by appearing first.
-    let cid_part_scope = parsed
-        .html_cid_part_indexes
-        .as_ref()
-        .map(|indexes| indexes.iter().copied().collect::<BTreeSet<_>>());
-    let mut selected_content_ids = BTreeSet::new();
-    let mut selected_total_bytes = 0_usize;
-    let selected_part_indexes = parsed
+    // indexes. Each selected HTML body keeps its ordered related-container
+    // provenance, while decoded-byte accounting and extraction stay global.
+    // An oversized candidate is skipped without making a later fitting
+    // sibling disappear.
+    let attachments_by_part_index = parsed
         .attachments
         .iter()
-        .filter_map(|attachment| {
-            let content_id = attachment.content_id.as_deref().map(normalize_content_id)?;
-            if content_id.is_empty()
-                || attachment.decode_error.is_some()
-                || !inline_image_content_type_is_safe(&attachment.content_type)
-                || !referenced.contains(&content_id)
-                || cid_part_scope
-                    .as_ref()
-                    .is_some_and(|scope| !scope.contains(&attachment.part_index))
-                || selected_content_ids.contains(&content_id)
-                || attachment.size == 0
-                || attachment.size > max_inline_image_bytes
-            {
-                return None;
-            }
-            let next_total = selected_total_bytes.checked_add(attachment.size)?;
-            if next_total > max_total_inline_image_bytes {
-                return None;
-            }
-            selected_total_bytes = next_total;
-            selected_content_ids.insert(content_id);
-            Some(attachment.part_index)
-        })
-        .collect::<Vec<_>>();
+        .map(|attachment| (attachment.part_index, attachment))
+        .collect::<BTreeMap<_, _>>();
+    let mut selected_part_indexes = BTreeSet::new();
+    let mut selected_total_bytes = 0_usize;
+    let mut segment_selections = Vec::with_capacity(cid_scopes.len());
+    for scope in cid_scopes {
+        let Some(segment) = html.get(scope.start..scope.end) else {
+            continue;
+        };
+        let referenced = cid_source
+            .captures_iter(segment)
+            .filter_map(|captures| decode_cid_url_content_id(&captures[1]))
+            .collect::<BTreeSet<_>>();
+        let part_indexes_by_content_id = if let Some(part_indexes) = scope.part_indexes {
+            select_inline_cid_segment_candidates(
+                part_indexes
+                    .iter()
+                    .filter_map(|index| attachments_by_part_index.get(index).copied()),
+                &referenced,
+                &mut selected_part_indexes,
+                &mut selected_total_bytes,
+                max_inline_image_bytes,
+                max_total_inline_image_bytes,
+            )
+        } else {
+            select_inline_cid_segment_candidates(
+                &parsed.attachments,
+                &referenced,
+                &mut selected_part_indexes,
+                &mut selected_total_bytes,
+                max_inline_image_bytes,
+                max_total_inline_image_bytes,
+            )
+        };
+        segment_selections.push(InlineCidSegmentSelection {
+            start: scope.start,
+            end: scope.end,
+            part_indexes_by_content_id,
+        });
+    }
 
     let extraction_limits = MimeLimits {
         max_decoded_part_bytes: max_inline_image_bytes,
         max_total_decoded_bytes: max_total_inline_image_bytes,
         ..MimeLimits::default()
     };
-    let resources = if selected_part_indexes.is_empty() {
+    let resources_by_part_index = if selected_part_indexes.is_empty() {
         BTreeMap::new()
     } else {
+        let selected_part_indexes = selected_part_indexes.iter().copied().collect::<Vec<_>>();
         extract_attachment_parts_detailed_with_limits(
             source,
             &selected_part_indexes,
@@ -1896,7 +2042,7 @@ fn resolve_inline_cid_images_with_limits(
         )
         .map(|report| {
             let mut total_bytes = 0_usize;
-            let mut resources = BTreeMap::<String, String>::new();
+            let mut resources = BTreeMap::<usize, InlineCidResource>::new();
             for attachment in report.attachments {
                 let Some(content_id) = attachment.content_id.as_deref() else {
                     continue;
@@ -1908,7 +2054,7 @@ fn resolve_inline_cid_images_with_limits(
                     continue;
                 }
                 let content_id = normalize_content_id(content_id);
-                if !referenced.contains(&content_id) || resources.contains_key(&content_id) {
+                if content_id.is_empty() || resources.contains_key(&attachment.part_index) {
                     continue;
                 }
                 let Some(next_total) = total_bytes.checked_add(attachment.bytes.len()) else {
@@ -1919,12 +2065,15 @@ fn resolve_inline_cid_images_with_limits(
                 }
                 total_bytes = next_total;
                 resources.insert(
-                    content_id,
-                    format!(
-                        "data:{};base64,{}",
-                        attachment.content_type,
-                        BASE64_STANDARD.encode(&attachment.bytes)
-                    ),
+                    attachment.part_index,
+                    InlineCidResource {
+                        content_id,
+                        data_uri: format!(
+                            "data:{};base64,{}",
+                            attachment.content_type,
+                            BASE64_STANDARD.encode(&attachment.bytes)
+                        ),
+                    },
                 );
             }
             resources
@@ -1932,21 +2081,53 @@ fn resolve_inline_cid_images_with_limits(
         .unwrap_or_default()
     };
 
-    replace_cid_sources_bounded(
+    let mut segment_index = 0_usize;
+    replace_cid_sources_bounded_by(
         html,
         &cid_source,
-        &resources,
         MAX_INLINE_IMAGE_HTML_BYTES,
         MAX_INLINE_IMAGE_REFERENCES,
+        |start, end, content_id| {
+            while segment_selections
+                .get(segment_index)
+                .is_some_and(|segment| start >= segment.end)
+            {
+                segment_index = segment_index.saturating_add(1);
+            }
+            let segment = segment_selections.get(segment_index)?;
+            if start < segment.start || end > segment.end {
+                return None;
+            }
+            let part_index = segment.part_indexes_by_content_id.get(content_id)?;
+            let resource = resources_by_part_index.get(part_index)?;
+            (resource.content_id == content_id).then_some(resource.data_uri.as_str())
+        },
     )
 }
 
+#[cfg(test)]
 fn replace_cid_sources_bounded(
     html: &str,
     cid_source: &Regex,
     resources: &BTreeMap<String, String>,
     max_output_bytes: usize,
     max_resolved_references: usize,
+) -> String {
+    replace_cid_sources_bounded_by(
+        html,
+        cid_source,
+        max_output_bytes,
+        max_resolved_references,
+        |_, _, content_id| resources.get(content_id).map(String::as_str),
+    )
+}
+
+fn replace_cid_sources_bounded_by<'a>(
+    html: &str,
+    cid_source: &Regex,
+    max_output_bytes: usize,
+    max_resolved_references: usize,
+    mut resource_for: impl FnMut(usize, usize, &str) -> Option<&'a str>,
 ) -> String {
     // Resolve only when the sanitized base document fits the output budget,
     // then track projected final length before copying each data URI so
@@ -1966,7 +2147,7 @@ fn replace_cid_sources_bounded(
         let content_id = decode_cid_url_content_id(&captures[1]);
         let resource = content_id
             .as_ref()
-            .and_then(|content_id| resources.get(content_id));
+            .and_then(|content_id| resource_for(source.start(), source.end(), content_id));
         let replacement_len = resource.map_or(r#"src="""#.len(), |resource| {
             r#"src="""#.len().saturating_add(resource.len())
         });
@@ -2275,9 +2456,18 @@ fn parsed_message_bytes(parsed: &ParsedMessage) -> usize {
                 .fold(0_usize, |total, value| total.saturating_add(value.len())),
         )
         .saturating_add(parsed.html_body.as_ref().map(String::len).unwrap_or(0))
-        .saturating_add(parsed.html_cid_part_indexes.as_ref().map_or(0, |indexes| {
-            indexes.len().saturating_mul(std::mem::size_of::<usize>())
-        }))
+        .saturating_add(
+            parsed
+                .html_cid_part_scopes
+                .iter()
+                .fold(0_usize, |total, scope| {
+                    total
+                        .saturating_add(std::mem::size_of_val(scope))
+                        .saturating_add(scope.part_indexes.as_ref().map_or(0, |indexes| {
+                            indexes.len().saturating_mul(std::mem::size_of::<usize>())
+                        }))
+                }),
+        )
         .saturating_add(parsed.headers.iter().fold(0_usize, |total, (key, value)| {
             total
                 .saturating_add(std::mem::size_of::<(String, String)>())
@@ -2570,6 +2760,66 @@ mod tests {
           --selected-related--\r\n\
           --alternative--\r\n\
           --outer--\r\n"
+            .to_vec()
+    }
+
+    fn appended_related_html_with_reused_cid() -> Vec<u8> {
+        b"MIME-Version: 1.0\r\n\
+          Content-Type: multipart/mixed; boundary=mixed\r\n\r\n\
+          --mixed\r\n\
+          Content-Type: multipart/related; boundary=first-related\r\n\r\n\
+          --first-related\r\n\
+          Content-Type: text/html; charset=utf-8\r\n\r\n\
+          <img src=\"cid:shared@example.test\" alt=\"first\">\r\n\
+          --first-related\r\n\
+          Content-Type: image/png; name=first.png\r\n\
+          Content-Disposition: inline; filename=first.png\r\n\
+          Content-ID: <shared@example.test>\r\n\
+          Content-Transfer-Encoding: base64\r\n\r\n\
+          RklSU1Q=\r\n\
+          --first-related--\r\n\
+          --mixed\r\n\
+          Content-Type: multipart/related; boundary=second-related; \
+            start=\"<second-root@example.test>\"\r\n\r\n\
+          --second-related\r\n\
+          Content-Type: image/png; name=second.png\r\n\
+          Content-Disposition: inline; filename=second.png\r\n\
+          Content-ID: <shared@example.test>\r\n\
+          Content-Transfer-Encoding: base64\r\n\r\n\
+          U0VDT05E\r\n\
+          --second-related\r\n\
+          Content-Type: text/html; charset=utf-8\r\n\
+          Content-ID: <second-root@example.test>\r\n\r\n\
+          <img src=\"cid:shared@example.test\" alt=\"second\">\r\n\
+          --second-related--\r\n\
+          --mixed--\r\n"
+            .to_vec()
+    }
+
+    fn nested_related_html_with_duplicate_cid() -> Vec<u8> {
+        b"MIME-Version: 1.0\r\n\
+          Content-Type: multipart/related; boundary=outer-related; \
+            start=\"<outer-root@example.test>\"\r\n\r\n\
+          --outer-related\r\n\
+          Content-Type: image/png; name=outer.png\r\n\
+          Content-Disposition: inline; filename=outer.png\r\n\
+          Content-ID: <shared@example.test>\r\n\
+          Content-Transfer-Encoding: base64\r\n\r\n\
+          T1VURVI=\r\n\
+          --outer-related\r\n\
+          Content-Type: multipart/related; boundary=inner-related\r\n\
+          Content-ID: <outer-root@example.test>\r\n\r\n\
+          --inner-related\r\n\
+          Content-Type: text/html; charset=utf-8\r\n\r\n\
+          <img src=\"cid:shared@example.test\" alt=\"nested\">\r\n\
+          --inner-related\r\n\
+          Content-Type: image/png; name=inner.png\r\n\
+          Content-Disposition: inline; filename=inner.png\r\n\
+          Content-ID: <shared@example.test>\r\n\
+          Content-Transfer-Encoding: base64\r\n\r\n\
+          SU5ORVI=\r\n\
+          --inner-related--\r\n\
+          --outer-related--\r\n"
             .to_vec()
     }
 
@@ -3621,8 +3871,12 @@ signature\r\n"
         let source = selected_related_html_with_duplicate_cid_siblings();
         let parsed = parse_rfc5322(&source).expect("parse duplicate CID fixture");
         assert_eq!(
-            parsed.html_cid_part_indexes.as_deref(),
-            Some([2].as_slice())
+            parsed
+                .html_cid_part_scopes
+                .iter()
+                .map(|scope| scope.part_indexes.as_deref())
+                .collect::<Vec<_>>(),
+            [Some([2].as_slice())]
         );
         let html = parsed.html_body.as_deref().expect("selected HTML body");
 
@@ -3634,6 +3888,82 @@ signature\r\n"
         );
         assert!(!resolved.contains("V1JPTkc="), "{resolved}");
         assert!(!resolved.contains("T0xE"), "{resolved}");
+        assert!(!resolved.contains("cid:"), "{resolved}");
+    }
+
+    #[test]
+    fn appended_related_html_bodies_resolve_reused_cids_in_their_own_scopes() {
+        let source = appended_related_html_with_reused_cid();
+        let parsed = parse_rfc5322(&source).expect("parse appended related fixture");
+        assert_eq!(
+            parsed
+                .html_cid_part_scopes
+                .iter()
+                .map(|scope| scope.part_indexes.as_deref())
+                .collect::<Vec<_>>(),
+            [Some([0].as_slice()), Some([1].as_slice())]
+        );
+
+        let prepared = prepare_thread(
+            "thread-1".to_string(),
+            vec![message("message-1", "/fixture/appended-related")],
+            None,
+            move |_, _| Ok(source.clone()),
+        )
+        .expect("prepare appended related fixture");
+        let blocked = prepared.message_contents["message-1"]
+            .html_document(false)
+            .expect("blocked HTML");
+        let first = blocked
+            .find("data:image/png;base64,RklSU1Q=")
+            .expect("first related resource");
+        let second = blocked
+            .find("data:image/png;base64,U0VDT05E")
+            .expect("second related resource");
+
+        assert!(first < second, "{blocked}");
+        assert_eq!(blocked.matches("data:image/png;base64,").count(), 2);
+        assert!(!blocked.contains("cid:"), "{blocked}");
+    }
+
+    #[test]
+    fn appended_related_html_bodies_share_the_decoded_byte_budget() {
+        let source = appended_related_html_with_reused_cid();
+        let parsed = parse_rfc5322(&source).expect("parse appended related fixture");
+        let html = parsed.html_body.as_deref().expect("selected HTML bodies");
+
+        let resolved = resolve_inline_cid_images_with_limits(html, &parsed, &source, 16, 5);
+
+        assert!(
+            resolved.contains("data:image/png;base64,RklSU1Q="),
+            "{resolved}"
+        );
+        assert!(!resolved.contains("U0VDT05E"), "{resolved}");
+        assert_eq!(resolved.matches("data:image/png;base64,").count(), 1);
+        assert!(!resolved.contains("cid:"), "{resolved}");
+    }
+
+    #[test]
+    fn nested_related_html_prefers_the_nearest_duplicate_cid_resource() {
+        let source = nested_related_html_with_duplicate_cid();
+        let parsed = parse_rfc5322(&source).expect("parse nested related fixture");
+        assert_eq!(
+            parsed
+                .html_cid_part_scopes
+                .iter()
+                .map(|scope| scope.part_indexes.as_deref())
+                .collect::<Vec<_>>(),
+            [Some([1, 0].as_slice())]
+        );
+        let html = parsed.html_body.as_deref().expect("selected HTML body");
+
+        let resolved = resolve_inline_cid_images_with_limits(html, &parsed, &source, 1024, 4096);
+
+        assert!(
+            resolved.contains("data:image/png;base64,SU5ORVI="),
+            "{resolved}"
+        );
+        assert!(!resolved.contains("T1VURVI="), "{resolved}");
         assert!(!resolved.contains("cid:"), "{resolved}");
     }
 
