@@ -1813,34 +1813,68 @@ fn prepare_html(parsed: &ParsedMessage, source: &[u8], max_bytes: usize) -> Prep
 }
 
 fn resolve_inline_cid_images(html: &str, parsed: &ParsedMessage, source: &[u8]) -> String {
+    resolve_inline_cid_images_with_limits(
+        html,
+        parsed,
+        source,
+        MAX_INLINE_IMAGE_BYTES,
+        MAX_TOTAL_INLINE_IMAGE_BYTES,
+    )
+}
+
+fn resolve_inline_cid_images_with_limits(
+    html: &str,
+    parsed: &ParsedMessage,
+    source: &[u8],
+    max_inline_image_bytes: usize,
+    max_total_inline_image_bytes: usize,
+) -> String {
     let cid_source = Regex::new(r#"(?i)\bsrc="cid:([^"]+)""#).expect("valid cid source regex");
     let referenced = cid_source
         .captures_iter(html)
         .map(|captures| normalize_content_id(&captures[1]))
         .filter(|content_id| !content_id.is_empty())
         .collect::<BTreeSet<_>>();
-    let selected_part_indexes = parsed
-        .attachments
-        .iter()
-        .filter(|attachment| {
-            attachment.content_id.is_some()
-                && attachment.decode_error.is_none()
-                && inline_image_content_type_is_safe(&attachment.content_type)
-                && attachment
-                    .content_id
-                    .as_deref()
-                    .map(normalize_content_id)
-                    .is_some_and(|content_id| referenced.contains(&content_id))
-        })
-        .map(|attachment| attachment.part_index)
-        .collect::<Vec<_>>();
     if referenced.is_empty() {
         return html.to_string();
     }
 
+    // Parsed attachment metadata comes from decoding this exact bounded source
+    // and therefore carries authoritative decoded sizes and stable part
+    // indexes. Select only parts that fit both image budgets before the
+    // batched extraction. An oversized candidate is skipped without making a
+    // later valid sibling disappear, while the extractor retains the same
+    // limits as defense in depth.
+    let mut selected_content_ids = BTreeSet::new();
+    let mut selected_total_bytes = 0_usize;
+    let selected_part_indexes = parsed
+        .attachments
+        .iter()
+        .filter_map(|attachment| {
+            let content_id = attachment.content_id.as_deref().map(normalize_content_id)?;
+            if content_id.is_empty()
+                || attachment.decode_error.is_some()
+                || !inline_image_content_type_is_safe(&attachment.content_type)
+                || !referenced.contains(&content_id)
+                || selected_content_ids.contains(&content_id)
+                || attachment.size == 0
+                || attachment.size > max_inline_image_bytes
+            {
+                return None;
+            }
+            let next_total = selected_total_bytes.checked_add(attachment.size)?;
+            if next_total > max_total_inline_image_bytes {
+                return None;
+            }
+            selected_total_bytes = next_total;
+            selected_content_ids.insert(content_id);
+            Some(attachment.part_index)
+        })
+        .collect::<Vec<_>>();
+
     let extraction_limits = MimeLimits {
-        max_decoded_part_bytes: MAX_INLINE_IMAGE_BYTES,
-        max_total_decoded_bytes: MAX_TOTAL_INLINE_IMAGE_BYTES,
+        max_decoded_part_bytes: max_inline_image_bytes,
+        max_total_decoded_bytes: max_total_inline_image_bytes,
         ..MimeLimits::default()
     };
     let resources = if selected_part_indexes.is_empty() {
@@ -1860,7 +1894,7 @@ fn resolve_inline_cid_images(html: &str, parsed: &ParsedMessage, source: &[u8]) 
                 };
                 if !inline_image_content_type_is_safe(&attachment.content_type)
                     || attachment.bytes.is_empty()
-                    || attachment.bytes.len() > MAX_INLINE_IMAGE_BYTES
+                    || attachment.bytes.len() > max_inline_image_bytes
                 {
                     continue;
                 }
@@ -1871,7 +1905,7 @@ fn resolve_inline_cid_images(html: &str, parsed: &ParsedMessage, source: &[u8]) 
                 let Some(next_total) = total_bytes.checked_add(attachment.bytes.len()) else {
                     continue;
                 };
-                if next_total > MAX_TOTAL_INLINE_IMAGE_BYTES {
+                if next_total > max_total_inline_image_bytes {
                     continue;
                 }
                 total_bytes = next_total;
@@ -2263,10 +2297,10 @@ mod tests {
     use super::{
         DEFAULT_PREPARATION_LIMITS, MAX_CANDIDATE_THREAD_IDS, MessageSource, MimePreflightLimits,
         PreparationLimits, TargetMessageNotFound, ThreadLoadCoordinator, ThreadLoadRequest,
-        ThreadLoaderService, load_thread, load_thread_with_reader, preflight_mime,
+        ThreadLoaderService, load_thread, load_thread_with_reader, parse_rfc5322, preflight_mime,
         prepare_message_with_parser, prepare_thread, prepare_thread_with_cancel,
         prepare_thread_with_limits, prepare_thread_with_resolution, read_bounded,
-        replace_cid_sources_bounded,
+        replace_cid_sources_bounded, resolve_inline_cid_images_with_limits,
     };
 
     fn notmuch_fixture_config(temp: &tempfile::TempDir) -> (OpenConfig, PathBuf) {
@@ -2368,6 +2402,37 @@ mod tests {
                  Content-Transfer-Encoding: base64\r\n\r\n\
                  {TINY_JPEG}\r\n"
             ));
+        }
+        source.push_str("--related--\r\n");
+        source.into_bytes()
+    }
+
+    fn related_html_with_inline_base64_payloads(payloads: &[&str]) -> Vec<u8> {
+        let mut source = String::from(
+            "MIME-Version: 1.0\r\n\
+             Content-Type: multipart/related; boundary=related\r\n\r\n\
+             --related\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\r\n",
+        );
+        for index in 0..payloads.len() {
+            write!(
+                source,
+                "<img src=\"cid:image-{index}@example.test\" alt=\"image {index}\">"
+            )
+            .expect("write HTML CID reference");
+        }
+        source.push_str("\r\n");
+        for (index, payload) in payloads.iter().enumerate() {
+            write!(
+                source,
+                "--related\r\n\
+                 Content-Type: image/png; name=image-{index}.png\r\n\
+                 Content-Disposition: inline; filename=image-{index}.png\r\n\
+                 Content-ID: <image-{index}@example.test>\r\n\
+                 Content-Transfer-Encoding: base64\r\n\r\n\
+                 {payload}\r\n"
+            )
+            .expect("write inline image fixture");
         }
         source.push_str("--related--\r\n");
         source.into_bytes()
@@ -3414,6 +3479,54 @@ signature\r\n"
         assert_eq!(allowed.matches("data:image/jpeg;base64,").count(), 7);
         assert!(allowed.contains("https://remote.example.test/tracker.jpg"));
         assert!(!allowed.contains("cid:"), "{allowed}");
+    }
+
+    #[test]
+    fn oversized_cid_part_does_not_remove_valid_siblings() {
+        // Decoded sizes are 2, 5, and 1 bytes. With a four-byte per-part
+        // limit, the middle image must be omitted without losing either
+        // fitting sibling.
+        let source = related_html_with_inline_base64_payloads(&["QUI=", "QUJDREU=", "Wg=="]);
+        let parsed = parse_rfc5322(&source).expect("parse related CID fixture");
+        let html = parsed.html_body.as_deref().expect("fixture HTML body");
+
+        let resolved = resolve_inline_cid_images_with_limits(html, &parsed, &source, 4, 4);
+
+        assert_eq!(resolved.matches("data:image/png;base64,").count(), 2);
+        assert!(
+            resolved.contains("data:image/png;base64,QUI="),
+            "{resolved}"
+        );
+        assert!(
+            resolved.contains("data:image/png;base64,Wg=="),
+            "{resolved}"
+        );
+        assert!(!resolved.contains("QUJDREU="), "{resolved}");
+        assert!(!resolved.contains("cid:"), "{resolved}");
+    }
+
+    #[test]
+    fn cid_part_crossing_total_budget_does_not_remove_later_fitting_sibling() {
+        // Decoded sizes are 3, 3, and 1 bytes. The second candidate would
+        // cross the four-byte aggregate limit; skipping it leaves room for the
+        // final one-byte sibling.
+        let source = related_html_with_inline_base64_payloads(&["QUJD", "REVG", "Rw=="]);
+        let parsed = parse_rfc5322(&source).expect("parse related CID fixture");
+        let html = parsed.html_body.as_deref().expect("fixture HTML body");
+
+        let resolved = resolve_inline_cid_images_with_limits(html, &parsed, &source, 4, 4);
+
+        assert_eq!(resolved.matches("data:image/png;base64,").count(), 2);
+        assert!(
+            resolved.contains("data:image/png;base64,QUJD"),
+            "{resolved}"
+        );
+        assert!(
+            resolved.contains("data:image/png;base64,Rw=="),
+            "{resolved}"
+        );
+        assert!(!resolved.contains("REVG"), "{resolved}");
+        assert!(!resolved.contains("cid:"), "{resolved}");
     }
 
     #[test]
