@@ -10638,12 +10638,13 @@ fn apply_sender_image_trust(
     }
     next.sort();
     next.dedup();
+    let selected_matches = selected_image_sender_matches(state, &sender);
 
     // This durable privacy permission must be on disk before it can affect a
     // WebView. A failed write therefore leaves both runtime state and rendered
     // documents unchanged.
     settings::persist_trusted_image_senders(options.app_config_path.as_deref(), &next)?;
-    if !enabled {
+    if !enabled && selected_matches {
         widgets.link_hints.cancel_silent();
         widgets.html_view.stop_loading();
         set_html_image_loading(&widgets.html_view, false);
@@ -10657,7 +10658,6 @@ fn apply_sender_image_trust(
         .standalone_messages
         .refresh_sender_image_policy(&sender);
 
-    let selected_matches = selected_image_sender_email(state).as_deref() == Some(sender.as_str());
     if selected_matches
         && html_view_is_visible(widgets)
         && selected_message_has_html(widgets, state)
@@ -11531,6 +11531,10 @@ fn selected_image_sender_is_trusted(state: &SharedState) -> bool {
     selected_image_sender_email(state)
         .as_deref()
         .is_some_and(|sender| image_sender_is_trusted(state, sender))
+}
+
+fn selected_image_sender_matches(state: &SharedState, sender: &str) -> bool {
+    selected_image_sender_email(state).as_deref() == Some(sender)
 }
 
 fn message_allows_images(
@@ -24369,6 +24373,30 @@ mod tests {
                 "not an address".to_string(),
             ]),
             ["alpha@example.test", "zeta@example.test"]
+        );
+    }
+
+    #[test]
+    fn sender_image_policy_change_only_targets_the_matching_main_message() {
+        let state: SharedState = Rc::new(RefCell::new(UiState {
+            selected_message: Some(notm_notmuch::MessageSummary {
+                message_id: "main-message@example.test".to_string(),
+                thread_id: "main-thread".to_string(),
+                date: 0,
+                from: "Main Sender <main@example.test>".to_string(),
+                to: String::new(),
+                cc: String::new(),
+                subject: String::new(),
+                tags: Vec::new(),
+                filenames: Vec::new(),
+            }),
+            ..UiState::default()
+        }));
+
+        assert!(selected_image_sender_matches(&state, "main@example.test"));
+        assert!(
+            !selected_image_sender_matches(&state, "standalone@example.test"),
+            "changing an unrelated standalone sender policy targeted the main message"
         );
     }
 

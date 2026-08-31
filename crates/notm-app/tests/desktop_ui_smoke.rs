@@ -6691,6 +6691,17 @@ fn sender_image_revocation_refreshes_main_and_two_standalone_windows() -> anyhow
         &fixture_notmuch_config,
         &tracker,
     )?;
+    index_remote_html_message(
+        fixture_database_path,
+        &fixture_notmuch_config,
+        "standalone-policy-unrelated-main@fixture.test",
+        "Unrelated Main <unrelated-main@example.test>",
+        "Unrelated main one-shot images",
+        &format!(
+            "<html><body><p>Unrelated main message.</p><img src=\"{}\" alt=\"tracked\"></body></html>",
+            tracker.url("/unrelated-main-once")
+        ),
+    )?;
 
     select_first_thread(&mut driver, "id:standalone-policy-html-root@fixture.test")?;
     let selected = driver.command("select_message_by_index", json!({"index": 0}))?;
@@ -6790,7 +6801,6 @@ fn sender_image_revocation_refreshes_main_and_two_standalone_windows() -> anyhow
     let allowed =
         wait_for_standalone_remote_policy(&mut driver, ExpectedImagePermission::Sender, 2, None)?;
     let allowed_generations = standalone_html_generations(&allowed)?;
-    let main_allowed_generation = html_load_generation(&main_allowed)?;
     let mut allowed_geometries = Vec::new();
     for (window_index, window) in allowed.iter().enumerate() {
         assert_eq!(
@@ -6802,6 +6812,41 @@ fn sender_image_revocation_refreshes_main_and_two_standalone_windows() -> anyhow
         allowed_geometries.push(assert_image_menu_state(window, false, true, true)?);
     }
     tracker.ensure_stable(&expected_allowed_requests, Duration::from_millis(250))?;
+
+    select_first_thread(
+        &mut driver,
+        "id:standalone-policy-unrelated-main@fixture.test",
+    )?;
+    let unrelated_blocked =
+        show_visual_html_and_wait_permission(&mut driver, ExpectedImagePermission::Blocked, None)?;
+    assert_eq!(
+        unrelated_blocked["selected_image_sender"],
+        "unrelated-main@example.test"
+    );
+    assert_remote_images_blocked(&unrelated_blocked)?;
+    let unrelated_blocked_generation = html_load_generation(&unrelated_blocked)?;
+    tracker.ensure_stable(&expected_allowed_requests, Duration::from_millis(250))?;
+
+    let loaded_once = driver.command("load_images_once", json!({}))?;
+    assert_eq!(
+        loaded_once["ok"], true,
+        "unrelated main message could not load images once: {loaded_once}"
+    );
+    let unrelated_once = wait_for_html_view_permission(
+        &mut driver,
+        ExpectedImagePermission::MessageOnce,
+        Some(unrelated_blocked_generation),
+    )?;
+    assert_remote_images_once(&unrelated_once)?;
+    let unrelated_once_generation = html_load_generation(&unrelated_once)?;
+    let requests_with_unrelated_once = [
+        "/standalone-policy",
+        "/standalone-policy",
+        "/standalone-policy",
+        "/unrelated-main-once",
+    ];
+    tracker.wait_for_requests(&requests_with_unrelated_once, STARTUP_TIMEOUT)?;
+    tracker.ensure_stable(&requests_with_unrelated_once, Duration::from_millis(250))?;
 
     let revoked = driver.command(
         "standalone_image_policy",
@@ -6816,18 +6861,28 @@ fn sender_image_revocation_refreshes_main_and_two_standalone_windows() -> anyhow
         "standalone Images menu remained open after revocation: {revoked}"
     );
 
-    let main_blocked = wait_for_html_view_permission(
-        &mut driver,
-        ExpectedImagePermission::Blocked,
-        Some(main_allowed_generation),
-    )?;
-    assert_eq!(main_blocked["trusted_image_senders"], json!([]));
-    assert_remote_images_blocked(&main_blocked)?;
-    assert_image_menu_geometry_stable(
-        main_allowed_geometry,
-        assert_image_menu_state(&main_blocked, true, false, true)?,
-        "revoking sender trust in the main window",
-    )?;
+    let unrelated_after_revocation = driver.command("html_view_state", json!({}))?;
+    assert_eq!(
+        unrelated_after_revocation["selected_image_sender"],
+        "unrelated-main@example.test"
+    );
+    assert_eq!(
+        unrelated_after_revocation["image_permission"], "message_once",
+        "revoking an unrelated standalone sender changed the main message's one-shot permission: {unrelated_after_revocation}"
+    );
+    assert_eq!(
+        unrelated_after_revocation["image_loading_allowed"], true,
+        "revoking an unrelated standalone sender disabled main WebKit image loading: {unrelated_after_revocation}"
+    );
+    assert_eq!(
+        html_load_generation(&unrelated_after_revocation)?,
+        unrelated_once_generation,
+        "revoking an unrelated standalone sender re-rendered the main WebView"
+    );
+    assert_eq!(
+        unrelated_after_revocation["trusted_image_senders"],
+        json!([])
+    );
 
     let blocked = wait_for_standalone_remote_policy(
         &mut driver,
@@ -6845,7 +6900,7 @@ fn sender_image_revocation_refreshes_main_and_two_standalone_windows() -> anyhow
             "revoking sender trust across standalone windows",
         )?;
     }
-    tracker.ensure_stable(&expected_allowed_requests, Duration::from_millis(500))?;
+    tracker.ensure_stable(&requests_with_unrelated_once, Duration::from_millis(500))?;
 
     let revoked_config_bytes = fs::read(&fixture_config_path)?;
     let revoked_config: toml::Value = String::from_utf8(revoked_config_bytes.clone())?.parse()?;
@@ -6862,6 +6917,25 @@ fn sender_image_revocation_refreshes_main_and_two_standalone_windows() -> anyhow
         seed_config,
         "standalone sender revocation mutated the supplied seed config"
     );
+
+    select_first_thread(&mut driver, "id:standalone-policy-html-root@fixture.test")?;
+    let selected = driver.command("select_message_by_index", json!({"index": 0}))?;
+    assert_eq!(
+        selected["ok"], true,
+        "could not restore the policy sender in the main view: {selected}"
+    );
+    let main_blocked = ensure_visual_html_and_wait_permission(
+        &mut driver,
+        ExpectedImagePermission::Blocked,
+        Some(unrelated_once_generation),
+    )?;
+    assert_remote_images_blocked(&main_blocked)?;
+    assert_image_menu_geometry_stable(
+        main_allowed_geometry,
+        assert_image_menu_state(&main_blocked, true, false, true)?,
+        "showing the revoked sender again in the main window",
+    )?;
+    tracker.ensure_stable(&requests_with_unrelated_once, Duration::from_millis(250))?;
 
     let reenabled = driver.command("trust_sender_images", json!({}))?;
     assert_eq!(
@@ -6893,6 +6967,7 @@ fn sender_image_revocation_refreshes_main_and_two_standalone_windows() -> anyhow
         "/standalone-policy",
         "/standalone-policy",
         "/standalone-policy",
+        "/unrelated-main-once",
         "/standalone-policy",
         "/standalone-policy",
         "/standalone-policy",
