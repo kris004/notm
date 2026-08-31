@@ -168,6 +168,31 @@ def check_attachment_completion_compatibility() -> None:
         timeout=0.1,
     )
 
+    missing_terminal = AttachmentHarness(
+        [
+            {
+                "ok": True,
+                "busy": False,
+                "last_completion": {
+                    "generation": 6,
+                    "request_id": 10,
+                    "action": "prepare_open",
+                    "applied": True,
+                    "path": "/private/open",
+                    "error": "Unable to find terminal required for application",
+                },
+            }
+        ]
+    )
+    missing_terminal.wait_for_attachment_completion(
+        {"ok": True, "pending": True, "generation": 6, "request_id": 10},
+        "async open without a terminal",
+        require_path=False,
+        expected_action="prepare_open",
+        allowed_errors=("Unable to find terminal required for application",),
+        timeout=0.1,
+    )
+
     legacy_allowed_error = AttachmentHarness([])
     legacy_allowed_error.wait_for_attachment_completion(
         {"ok": False, "error": "not supported by legacy opener"},

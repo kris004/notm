@@ -779,7 +779,11 @@ def exercise_first_run(app: AppProcess, work_root: Path) -> tuple[str, Path]:
         "attachment OpenURI request",
         require_path=False,
         expected_action="prepare_open",
-        allowed_errors=("No application is registered", "not supported"),
+        allowed_errors=(
+            "No application is registered",
+            "not supported",
+            "Unable to find terminal required for application",
+        ),
     )
 
     harness.request("open_compose")
