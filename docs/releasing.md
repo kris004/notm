@@ -48,27 +48,51 @@ The non-publishing packaging dry run is:
 gh workflow run release-linux.yml --repo kris004/notm --ref main
 ```
 
-It must produce one `release-assets` workflow artifact containing exactly:
+It must produce one canonical `release-assets` workflow artifact containing
+exactly:
 
 - `notm-vVERSION-x86_64-unknown-linux-gnu.tar.gz`
+- `notm-vVERSION-aarch64-unknown-linux-gnu.tar.gz`
 - `notm-vVERSION-src.tar.gz`
 - `SHA256SUMS`
 
-The binary is a dynamically linked x86-64 GNU/Linux build produced on Ubuntu
-24.04. In the production Git-checkout path, the source archive extracts to
-`notm-VERSION/` and must equal `git archive` of the direct tag target. Git
-records that target in the tar PAX header, and `.git_archival.txt` carries the
-same commit into the extracted tree through `export-subst`. When the builder is
-itself run from that extracted tree without `.git`, it instead creates a
-deterministic tar from the archive contents and preserves the embedded commit
-in the PAX header. The standalone verifier validates either path, the complete
-artifact set, checksums, binary version, build information, and release
-metadata without needing a `.git` directory:
+ARM delivery is split across two independent native build jobs and a separate
+comparison job. The comparison job downloads build A and build B by exact
+artifact ID and requires their extracted stripped binaries and
+`binary.sha256`, `archive.sha256`, and `reproducibility-evidence.txt` evidence
+to match exactly. Build B runs the packaged application under WebKitGTK's normal
+sandbox on a native `ubuntu-24.04-arm` runner. A skipped or unavailable native
+execution gate is a release failure. The comparison job runs only after both
+native jobs succeed and re-uploads the verified ARM fragment for aggregation.
+
+The x86_64/source and compared ARM64 fragments are also downloaded by exact
+artifact ID. Their source commit, version, names, checksums, and embedded build
+identity must agree before the aggregator creates the canonical four-file
+`release-assets` artifact. Intermediate fragments are never attested,
+published, or selected by artifact name; attestation and publication consume
+only the aggregator's exact artifact ID.
+
+Both binaries are dynamically linked GNU/Linux builds produced on native
+Ubuntu 24.04 runners for their named architecture. In the production
+Git-checkout path, the source archive extracts to `notm-VERSION/` and must equal
+`git archive` of the direct tag target. Git records that target in the tar PAX
+header, and `.git_archival.txt` carries the same commit into the extracted tree
+through `export-subst`. When the builder is itself run from that extracted tree
+without `.git`, it instead creates a deterministic tar from the archive
+contents and preserves the embedded commit in the PAX header. The standalone
+x86_64/source verifier validates its pre-aggregation three-file fragment,
+checksums, binary version, build information, and release metadata without
+needing a `.git` directory:
 
 ```sh
 packaging/verify-linux-release.sh \
   dist VERSION x86_64-unknown-linux-gnu FULL_SOURCE_COMMIT
 ```
+
+`tests/arm64_release_smoke.sh` statically exercises deterministic ARM assembly,
+fragment verification, and canonical aggregation on any supported host. Its
+fixture executable is not native ARM execution evidence; the reusable
+`release-linux-arm64.yml` workflow supplies that evidence.
 
 `tests/source_archive_smoke.sh` additionally compiles and tests a clean
 extraction with `--locked`, runs its fixture and packaging suites, and proves
@@ -171,9 +195,11 @@ The tag push runs `.github/workflows/release-linux.yml`. It rejects an annotated
 tag unless GitHub reports a direct commit target with a valid signature, the
 target is reachable from the default branch, and both required checks succeeded.
 It tests and builds the production binary, packages it once, independently
-rebuilds and tests the extracted source archive, attests the exact uploaded
-workflow artifact, and gives those same files to a release creation command
-with explicit `--repo "$GITHUB_REPOSITORY"` context.
+rebuilds and tests the extracted source archive, waits for both independent
+native ARM builds and their exact comparison, and forms one canonical four-file
+artifact from exact artifact IDs. It attests that exact aggregator artifact and
+gives those same files to a release creation command with explicit
+`--repo "$GITHUB_REPOSITORY"` context.
 
 After publication, verify the repository-specific artifact set:
 

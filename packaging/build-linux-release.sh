@@ -4,6 +4,11 @@
 
 set -eu
 
+# Release payload and artifact modes must not depend on a caller's private
+# umask. Inputs are installed with explicit modes below; use the conventional
+# public archive baseline for generated directories and files as well.
+umask 022
+
 usage() {
   printf '%s\n' \
     "usage: $0 SOURCE_ROOT VERSION TARGET BINARY BUILD_INFO OUTPUT_DIR" >&2
@@ -62,6 +67,11 @@ BUILD_INFO=$(
   cd -- "$(dirname -- "$BUILD_INFO")"
   printf '%s/%s\n' "$(pwd)" "$(basename -- "$BUILD_INFO")"
 )
+if [ -L "$OUTPUT_DIR" ]; then
+  printf 'release output directory must not be a symlink: %s\n' \
+    "$OUTPUT_DIR" >&2
+  exit 2
+fi
 mkdir -p -- "$OUTPUT_DIR"
 OUTPUT_DIR=$(
   CDPATH=''

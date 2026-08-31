@@ -4,6 +4,10 @@
 
 set -eu
 
+# Exercise the release assembler from the private gate environment that
+# exposed caller-umask-dependent payload modes.
+umask 077
+
 PROJECT_ROOT=$(
   CDPATH=''
   cd -- "$(dirname -- "$0")/.."
@@ -18,9 +22,12 @@ BUILD_INFO="$WORK_ROOT/build-info.txt"
 DIST_DIR="$WORK_ROOT/dist"
 SECOND_DIST_DIR="$WORK_ROOT/dist-second"
 WRONG_DIST_DIR="$WORK_ROOT/dist-wrong-version"
+SYMLINK_DIST_TARGET="$WORK_ROOT/dist-symlink-target"
+SYMLINK_DIST="$WORK_ROOT/dist-symlink"
 EXTRACT_DIR="$WORK_ROOT/extract"
 readonly \
-  FAKE_BINARY BUILD_INFO DIST_DIR SECOND_DIST_DIR WRONG_DIST_DIR EXTRACT_DIR
+  FAKE_BINARY BUILD_INFO DIST_DIR SECOND_DIST_DIR WRONG_DIST_DIR \
+  SYMLINK_DIST_TARGET SYMLINK_DIST EXTRACT_DIR
 
 cleanup() {
   rm -rf -- "$WORK_ROOT"
@@ -121,8 +128,10 @@ cmp "$source_archive" "$second_source_archive"
 cmp "$DIST_DIR/SHA256SUMS" "$SECOND_DIST_DIR/SHA256SUMS"
 test "$(wc -l < "$DIST_DIR/SHA256SUMS")" -eq 2
 mkdir -p -- "$EXTRACT_DIR"
-tar -xzf "$archive" -C "$EXTRACT_DIR"
-tar -xzf "$source_archive" -C "$EXTRACT_DIR"
+# The gate runs with a private umask. Preserve the archive's declared modes so
+# the assertions below test the release payload rather than the caller's umask.
+tar --same-permissions -xzf "$archive" -C "$EXTRACT_DIR"
+tar --same-permissions -xzf "$source_archive" -C "$EXTRACT_DIR"
 
 test -x "$bundle/bin/notm"
 test -f "$bundle/INSTALL.md"
@@ -147,7 +156,17 @@ test -x "$source_bundle/tests/release_tag_smoke.sh"
 test ! -e "$source_bundle/.git"
 
 test "$(stat -c '%a' "$bundle/bin/notm")" = 755
+test "$(stat -c '%a' "$bundle")" = 755
+test "$(stat -c '%a' "$bundle/bin")" = 755
+test "$(stat -c '%a' "$bundle/share")" = 755
+test "$(stat -c '%a' "$bundle/share/applications")" = 755
 test "$(stat -c '%a' "$bundle/LICENSE")" = 644
+test "$(stat -c '%a' "$bundle/INSTALL.md")" = 644
+test "$(stat -c '%a' "$bundle/BUILD-INFO.txt")" = 644
+test "$(stat -c '%a' "$bundle/share/applications/io.github.kris004.notm.desktop")" = 644
+test "$(stat -c '%a' "$bundle/share/icons/hicolor/scalable/apps/io.github.kris004.notm.svg")" = 644
+test "$(stat -c '%a' "$bundle/share/metainfo/io.github.kris004.notm.metainfo.xml")" = 644
+test "$(stat -c '%a' "$bundle/share/man/man1/notm.1")" = 644
 test "$("$bundle/bin/notm" --version)" = "notm $VERSION"
 gzip -dc "$source_archive" > "$WORK_ROOT/source.tar"
 gzip -dc "$second_source_archive" > "$WORK_ROOT/source-second.tar"
@@ -195,5 +214,23 @@ if SOURCE_DATE_EPOCH=0 \
 fi
 grep -F 'release version does not match verified metadata:' \
   "$WORK_ROOT/wrong-version.out" >/dev/null
+
+mkdir "$SYMLINK_DIST_TARGET"
+ln -s "$SYMLINK_DIST_TARGET" "$SYMLINK_DIST"
+if SOURCE_DATE_EPOCH=$DETERMINISTIC_EPOCH \
+  SOURCE_REF="$SOURCE_COMMIT" \
+  "$SOURCE_ROOT/packaging/build-linux-release.sh" \
+    "$SOURCE_ROOT" \
+    "$VERSION" \
+    "$TARGET" \
+    "$FAKE_BINARY" \
+    "$BUILD_INFO" \
+    "$SYMLINK_DIST" >"$WORK_ROOT/symlink-output.out" 2>&1; then
+  printf '%s\n' 'release packaging accepted a symlink output directory' >&2
+  exit 1
+fi
+grep -F 'release output directory must not be a symlink:' \
+  "$WORK_ROOT/symlink-output.out" >/dev/null
+test -z "$(find "$SYMLINK_DIST_TARGET" -mindepth 1 -print -quit)"
 
 printf '%s\n' 'release_bundle_smoke ok'

@@ -1,0 +1,609 @@
+name: Linux ARM64 delivery
+
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Optional exact branch or commit; callers should pass a commit
+        required: false
+        type: string
+    outputs:
+      artifact_id:
+        description: Exact artifact ID containing the verified ARM64 release fragment
+        value: ${{ jobs.compare.outputs.artifact_id }}
+      archive_name:
+        description: ARM64 release archive filename
+        value: ${{ jobs.compare.outputs.archive_name }}
+      archive_sha256:
+        description: SHA-256 digest of the ARM64 release archive
+        value: ${{ jobs.compare.outputs.archive_sha256 }}
+      checksum_name:
+        description: Architecture-specific checksum filename
+        value: ${{ jobs.compare.outputs.checksum_name }}
+      source_commit:
+        description: Exact commit built by both native jobs
+        value: ${{ jobs.compare.outputs.source_commit }}
+      version:
+        description: notm version packaged by the workflow
+        value: ${{ jobs.compare.outputs.version }}
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Optional exact branch or commit to check out
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-linux-arm64-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  RUST_TOOLCHAIN: "1.98.0"
+  TARGET: aarch64-unknown-linux-gnu
+
+jobs:
+  build_a:
+    name: Independent native ARM64 build A
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    outputs:
+      release_artifact_id: ${{ steps.upload_release.outputs.artifact-id }}
+      evidence_artifact_id: ${{ steps.upload_evidence.outputs.artifact-id }}
+      binary_sha256: ${{ steps.package.outputs.binary_sha256 }}
+      archive_sha256: ${{ steps.package.outputs.archive_sha256 }}
+      source_commit: ${{ steps.source.outputs.source_commit }}
+      source_date_epoch: ${{ steps.source.outputs.source_date_epoch }}
+      cargo_lock_sha256: ${{ steps.source.outputs.cargo_lock_sha256 }}
+      version: ${{ steps.source.outputs.version }}
+
+    steps:
+      - name: Check out the exact requested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ inputs.source_ref || github.event.pull_request.head.sha || github.sha }}
+
+      - name: Record initial capacity and native identity
+        shell: bash
+        run: |
+          set -euxo pipefail
+          df -B1 / "$RUNNER_TEMP"
+          test "$RUNNER_ARCH" = ARM64
+          test "$(uname -m)" = aarch64
+          test "$(dpkg --print-architecture)" = arm64
+          test "$(id -u)" -ne 0
+          . /etc/os-release
+          test "$ID" = ubuntu
+          test "$VERSION_ID" = 24.04
+          uname -a
+          lscpu
+          cat /etc/os-release
+
+      - name: Install native build and packaging dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            appstream \
+            binutils \
+            build-essential \
+            clang \
+            desktop-file-utils \
+            file \
+            libclang-dev \
+            libgtk-4-dev \
+            libgtksourceview-5-dev \
+            libnotmuch-dev \
+            libwebkitgtk-6.0-dev \
+            pkg-config
+          sudo apt-get clean
+          df -B1 / "$RUNNER_TEMP"
+
+      - name: Select exact Rust toolchain
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" \
+            --profile minimal \
+            --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | awk '{print $2}')" = "$RUST_TOOLCHAIN"
+          test "$(cargo --version | awk '{print $2}')" = "$RUST_TOOLCHAIN"
+          rustc --version --verbose
+          cargo --version --verbose
+          rustc --version --verbose | grep -Fx "host: $TARGET"
+
+      - name: Identify and validate the source
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_commit="$(git rev-parse HEAD)"
+          version="$(packaging/verify-release-metadata.py --print-version .)"
+          source_date_epoch="$(git show -s --format=%ct "$source_commit")"
+          cargo_lock_sha256="$(sha256sum Cargo.lock | awk '{print $1}')"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$source_date_epoch" =~ ^[0-9]+$ ]]
+          [[ "$cargo_lock_sha256" =~ ^[0-9a-f]{64}$ ]]
+          test -z "$(git status --short)"
+          {
+            printf 'source_commit=%s\n' "$source_commit"
+            printf 'source_date_epoch=%s\n' "$source_date_epoch"
+            printf 'cargo_lock_sha256=%s\n' "$cargo_lock_sha256"
+            printf 'version=%s\n' "$version"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Fetch the locked dependency graph
+        run: cargo fetch --locked --target "$TARGET"
+
+      - name: Require capacity for one clean release target
+        shell: bash
+        run: |
+          set -euxo pipefail
+          available="$(df -B1 --output=avail "$RUNNER_TEMP" | tail -n 1)"
+          available="${available//[[:space:]]/}"
+          [[ "$available" =~ ^[0-9]+$ ]]
+          test "$available" -ge 6000000000
+          printf 'available bytes before native build A: %s\n' "$available"
+
+      - name: Build and package clean native release A
+        id: package
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+          VERSION: ${{ steps.source.outputs.version }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          release_dir="$RUNNER_TEMP/arm64-release-a"
+          evidence_dir="$RUNNER_TEMP/arm64-evidence-a"
+          target_dir="$RUNNER_TEMP/arm64-release-target-a"
+          test ! -e "$target_dir"
+          SOURCE_REF="$SOURCE_COMMIT" \
+            SOURCE_REPOSITORY="https://github.com/${GITHUB_REPOSITORY}" \
+            BUILD_RUNNER_LABEL=ubuntu-24.04-arm \
+            NOTM_ARM64_RELEASE_TARGET_DIR="$target_dir" \
+            packaging/arm64/build-native-release.sh \
+              . "$VERSION" "$SOURCE_COMMIT" \
+              "$release_dir" "$evidence_dir"
+          binary_sha256="$(awk 'NR == 1 { print $1 }' "$evidence_dir/binary.sha256")"
+          archive_sha256="$(awk 'NR == 1 { print $1 }' "$evidence_dir/archive.sha256")"
+          [[ "$binary_sha256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$archive_sha256" =~ ^[0-9a-f]{64}$ ]]
+          {
+            printf 'binary_sha256=%s\n' "$binary_sha256"
+            printf 'archive_sha256=%s\n' "$archive_sha256"
+          } >>"$GITHUB_OUTPUT"
+          df -B1 / "$RUNNER_TEMP"
+
+      - name: Upload native release fragment A
+        id: upload_release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arm64-release-a-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/arm64-release-a/*.tar.gz
+            ${{ runner.temp }}/arm64-release-a/SHA256SUMS-aarch64
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload native evidence A
+        id: upload_evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arm64-evidence-a-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/arm64-evidence-a/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Remove compiled output A
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf -- "$RUNNER_TEMP/arm64-release-target-a"
+          df -B1 / "$RUNNER_TEMP"
+
+      - name: Verify Cargo.lock is unchanged
+        if: always()
+        env:
+          EXPECTED_SHA256: ${{ steps.source.outputs.cargo_lock_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$EXPECTED_SHA256"
+          packaging/verify-cargo-lock.sh Cargo.lock "$EXPECTED_SHA256"
+
+  build_b:
+    name: Independent native ARM64 build B and packaged E2E
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    outputs:
+      release_artifact_id: ${{ steps.upload_release.outputs.artifact-id }}
+      evidence_artifact_id: ${{ steps.upload_evidence.outputs.artifact-id }}
+      binary_sha256: ${{ steps.package.outputs.binary_sha256 }}
+      archive_sha256: ${{ steps.package.outputs.archive_sha256 }}
+      source_commit: ${{ steps.source.outputs.source_commit }}
+      source_date_epoch: ${{ steps.source.outputs.source_date_epoch }}
+      cargo_lock_sha256: ${{ steps.source.outputs.cargo_lock_sha256 }}
+      version: ${{ steps.source.outputs.version }}
+
+    steps:
+      - name: Independently check out the exact requested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ inputs.source_ref || github.event.pull_request.head.sha || github.sha }}
+
+      - name: Record initial capacity and native identity
+        shell: bash
+        run: |
+          set -euxo pipefail
+          df -B1 / "$RUNNER_TEMP"
+          test "$RUNNER_ARCH" = ARM64
+          test "$(uname -m)" = aarch64
+          test "$(dpkg --print-architecture)" = arm64
+          test "$(id -u)" -ne 0
+          . /etc/os-release
+          test "$ID" = ubuntu
+          test "$VERSION_ID" = 24.04
+          uname -a
+          lscpu
+          cat /etc/os-release
+
+      - name: Install native test, build, and packaging dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            appstream \
+            binutils \
+            build-essential \
+            clang \
+            dbus-daemon \
+            desktop-file-utils \
+            file \
+            libclang-dev \
+            libgtk-4-dev \
+            libgtksourceview-5-dev \
+            libnotmuch-dev \
+            libwebkitgtk-6.0-dev \
+            msmtp \
+            notmuch \
+            pkg-config \
+            python3 \
+            weston
+          sudo apt-get clean
+          df -B1 / "$RUNNER_TEMP"
+
+      - name: Select exact Rust toolchain
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" \
+            --profile minimal \
+            --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+          rustup component add --toolchain "$RUST_TOOLCHAIN" clippy rustfmt
+          test "$(rustc --version | awk '{print $2}')" = "$RUST_TOOLCHAIN"
+          test "$(cargo --version | awk '{print $2}')" = "$RUST_TOOLCHAIN"
+          rustc --version --verbose | grep -Fx "host: $TARGET"
+          cargo --version --verbose
+
+      - name: Independently identify and validate the source
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_commit="$(git rev-parse HEAD)"
+          version="$(packaging/verify-release-metadata.py --print-version .)"
+          source_date_epoch="$(git show -s --format=%ct "$source_commit")"
+          cargo_lock_sha256="$(sha256sum Cargo.lock | awk '{print $1}')"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$source_date_epoch" =~ ^[0-9]+$ ]]
+          [[ "$cargo_lock_sha256" =~ ^[0-9a-f]{64}$ ]]
+          test -z "$(git status --short)"
+          {
+            printf 'source_commit=%s\n' "$source_commit"
+            printf 'source_date_epoch=%s\n' "$source_date_epoch"
+            printf 'cargo_lock_sha256=%s\n' "$cargo_lock_sha256"
+            printf 'version=%s\n' "$version"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Fetch the locked dependency graph
+        run: cargo fetch --locked --target "$TARGET"
+
+      - name: Require capacity for the serialized check target
+        shell: bash
+        run: |
+          set -euxo pipefail
+          available="$(df -B1 --output=avail "$RUNNER_TEMP" | tail -n 1)"
+          available="${available//[[:space:]]/}"
+          [[ "$available" =~ ^[0-9]+$ ]]
+          test "$available" -ge 6000000000
+          printf 'available bytes before native checks B: %s\n' "$available"
+
+      - name: Run frozen native checks and tests
+        shell: bash
+        run: |
+          set -euxo pipefail
+          check_target="$RUNNER_TEMP/arm64-check-target-b"
+          test ! -e "$check_target"
+          cargo fmt --all -- --check
+          CARGO_TARGET_DIR="$check_target" \
+            cargo clippy --locked --frozen \
+              --target "$TARGET" \
+              --workspace --all-targets --all-features -- \
+              -D warnings
+          test -z "${WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS:-}"
+          CARGO_TARGET_DIR="$check_target" \
+            tests/run_with_headless_weston.sh \
+              dbus-run-session -- \
+              cargo test --locked --frozen \
+                --target "$TARGET" \
+                --workspace --all-targets --all-features -- \
+                --test-threads=1
+          CARGO_TARGET_DIR="$check_target" \
+            cargo run --locked --frozen \
+              --target "$TARGET" \
+              -p notm-app -- fixture-smoke
+          tests/arm64_release_smoke.sh
+          rm -rf -- "$check_target"
+          df -B1 / "$RUNNER_TEMP"
+          available="$(df -B1 --output=avail "$RUNNER_TEMP" | tail -n 1)"
+          available="${available//[[:space:]]/}"
+          [[ "$available" =~ ^[0-9]+$ ]]
+          test "$available" -ge 6000000000
+          printf 'available bytes before native release build B: %s\n' \
+            "$available"
+
+      - name: Build and package clean native release B
+        id: package
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+          VERSION: ${{ steps.source.outputs.version }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          release_dir="$RUNNER_TEMP/arm64-release-b"
+          evidence_dir="$RUNNER_TEMP/arm64-evidence-b"
+          target_dir="$RUNNER_TEMP/arm64-release-target-b"
+          test ! -e "$target_dir"
+          SOURCE_REF="$SOURCE_COMMIT" \
+            SOURCE_REPOSITORY="https://github.com/${GITHUB_REPOSITORY}" \
+            BUILD_RUNNER_LABEL=ubuntu-24.04-arm \
+            NOTM_ARM64_RELEASE_TARGET_DIR="$target_dir" \
+            packaging/arm64/build-native-release.sh \
+              . "$VERSION" "$SOURCE_COMMIT" \
+              "$release_dir" "$evidence_dir"
+          binary_sha256="$(awk 'NR == 1 { print $1 }' "$evidence_dir/binary.sha256")"
+          archive_sha256="$(awk 'NR == 1 { print $1 }' "$evidence_dir/archive.sha256")"
+          [[ "$binary_sha256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$archive_sha256" =~ ^[0-9a-f]{64}$ ]]
+          {
+            printf 'binary_sha256=%s\n' "$binary_sha256"
+            printf 'archive_sha256=%s\n' "$archive_sha256"
+          } >>"$GITHUB_OUTPUT"
+          df -B1 / "$RUNNER_TEMP"
+
+      - name: Run packaged ARM64 distribution E2E with normal WebKit sandbox
+        env:
+          VERSION: ${{ steps.source.outputs.version }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -z "${WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS:-}"
+          archive="$RUNNER_TEMP/arm64-release-b/notm-v${VERSION}-${TARGET}.tar.gz"
+          extract_root="$RUNNER_TEMP/notm-arm64-distribution-e2e"
+          mkdir -p "$extract_root"
+          tar --same-permissions -xzf "$archive" -C "$extract_root"
+          notm_binary="$extract_root/notm-v${VERSION}-${TARGET}/bin/notm"
+          before_sha256="$(sha256sum "$notm_binary" | awk '{print $1}')"
+          env -u WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS \
+            tests/run_with_headless_weston.sh \
+              dbus-run-session -- \
+              python3 tests/distribution_e2e.py \
+                --notm "$notm_binary" \
+                --notmuch /usr/bin/notmuch \
+                --smtp-command /usr/bin/msmtp \
+                --require-display
+          test "$(sha256sum "$notm_binary" | awk '{print $1}')" = \
+            "$before_sha256"
+
+      - name: Upload native release fragment B
+        id: upload_release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arm64-release-b-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/arm64-release-b/*.tar.gz
+            ${{ runner.temp }}/arm64-release-b/SHA256SUMS-aarch64
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload native evidence B
+        id: upload_evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arm64-evidence-b-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/arm64-evidence-b/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Remove compiled output B
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf -- \
+            "$RUNNER_TEMP/arm64-check-target-b" \
+            "$RUNNER_TEMP/arm64-release-target-b"
+          df -B1 / "$RUNNER_TEMP"
+
+      - name: Verify Cargo.lock is unchanged
+        if: always()
+        env:
+          EXPECTED_SHA256: ${{ steps.source.outputs.cargo_lock_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$EXPECTED_SHA256"
+          packaging/verify-cargo-lock.sh Cargo.lock "$EXPECTED_SHA256"
+
+  compare:
+    name: Compare independent ARM64 builds
+    needs: [build_a, build_b]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload_release.outputs.artifact-id }}
+      archive_name: ${{ steps.identity.outputs.archive_name }}
+      archive_sha256: ${{ steps.identity.outputs.archive_sha256 }}
+      checksum_name: ${{ steps.identity.outputs.checksum_name }}
+      source_commit: ${{ needs.build_a.outputs.source_commit }}
+      version: ${{ needs.build_a.outputs.version }}
+
+    steps:
+      - name: Check out the exact compared source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ needs.build_a.outputs.source_commit }}
+
+      - name: Download exact release fragment A
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build_a.outputs.release_artifact_id }}
+          path: ${{ runner.temp }}/arm64-inputs/release-a
+
+      - name: Download exact evidence A
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build_a.outputs.evidence_artifact_id }}
+          path: ${{ runner.temp }}/arm64-inputs/evidence-a
+
+      - name: Download exact release fragment B
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build_b.outputs.release_artifact_id }}
+          path: ${{ runner.temp }}/arm64-inputs/release-b
+
+      - name: Download exact evidence B
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build_b.outputs.evidence_artifact_id }}
+          path: ${{ runner.temp }}/arm64-inputs/evidence-b
+
+      - name: Compare source, environment, binaries, and archives
+        id: identity
+        env:
+          SOURCE_COMMIT: ${{ needs.build_a.outputs.source_commit }}
+          VERSION: ${{ needs.build_a.outputs.version }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          artifact_ids=(
+            '${{ needs.build_a.outputs.release_artifact_id }}'
+            '${{ needs.build_a.outputs.evidence_artifact_id }}'
+            '${{ needs.build_b.outputs.release_artifact_id }}'
+            '${{ needs.build_b.outputs.evidence_artifact_id }}'
+          )
+          for artifact_id in "${artifact_ids[@]}"; do
+            [[ "$artifact_id" =~ ^[0-9]+$ ]]
+          done
+          test "$(printf '%s\n' "${artifact_ids[@]}" | sort -u | wc -l)" -eq 4
+          test '${{ needs.build_a.outputs.source_commit }}' = \
+            '${{ needs.build_b.outputs.source_commit }}'
+          test '${{ needs.build_a.outputs.version }}' = \
+            '${{ needs.build_b.outputs.version }}'
+          test '${{ needs.build_a.outputs.source_date_epoch }}' = \
+            '${{ needs.build_b.outputs.source_date_epoch }}'
+          test '${{ needs.build_a.outputs.cargo_lock_sha256 }}' = \
+            '${{ needs.build_b.outputs.cargo_lock_sha256 }}'
+          test "${{ needs.build_a.outputs.binary_sha256 }}" = \
+            "${{ needs.build_b.outputs.binary_sha256 }}"
+          test "${{ needs.build_a.outputs.archive_sha256 }}" = \
+            "${{ needs.build_b.outputs.archive_sha256 }}"
+          compare_log="$RUNNER_TEMP/arm64-compare-evidence/ARM64-REPRODUCIBILITY.txt"
+          mkdir -p "$(dirname "$compare_log")"
+          packaging/arm64/compare-native-builds.sh \
+            . "$VERSION" "$SOURCE_COMMIT" \
+            "$RUNNER_TEMP/arm64-inputs/release-a" \
+            "$RUNNER_TEMP/arm64-inputs/evidence-a" \
+            "$RUNNER_TEMP/arm64-inputs/release-b" \
+            "$RUNNER_TEMP/arm64-inputs/evidence-b" | tee "$compare_log"
+          verified="$RUNNER_TEMP/verified-arm64-release"
+          mkdir "$verified"
+          install -m 0644 \
+            "$RUNNER_TEMP/arm64-inputs/release-b/notm-v${VERSION}-${TARGET}.tar.gz" \
+            "$RUNNER_TEMP/arm64-inputs/release-b/SHA256SUMS-aarch64" \
+            "$verified/"
+          test "$(find "$verified" -mindepth 1 -maxdepth 1 | wc -l)" -eq 2
+          archive_name="notm-v${VERSION}-${TARGET}.tar.gz"
+          archive_sha256="$(sha256sum "$verified/$archive_name" | awk '{print $1}')"
+          test "$archive_sha256" = "${{ needs.build_b.outputs.archive_sha256 }}"
+          (cd "$verified" && sha256sum --check --strict SHA256SUMS-aarch64)
+          {
+            printf 'archive_name=%s\n' "$archive_name"
+            printf 'archive_sha256=%s\n' "$archive_sha256"
+            printf 'checksum_name=SHA256SUMS-aarch64\n'
+          } >>"$GITHUB_OUTPUT"
+          {
+            printf '\nRelease artifact A ID: %s\n' \
+              '${{ needs.build_a.outputs.release_artifact_id }}'
+            printf 'Evidence artifact A ID: %s\n' \
+              '${{ needs.build_a.outputs.evidence_artifact_id }}'
+            printf 'Release artifact B ID: %s\n' \
+              '${{ needs.build_b.outputs.release_artifact_id }}'
+            printf 'Evidence artifact B ID: %s\n' \
+              '${{ needs.build_b.outputs.evidence_artifact_id }}'
+            printf 'Verified archive SHA-256: %s\n' "$archive_sha256"
+          } >>"$compare_log"
+
+      - name: Upload verified ARM64 release fragment
+        id: upload_release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/verified-arm64-release/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload ARM64 reproducibility evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arm64-reproducibility-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/arm64-compare-evidence/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
