@@ -1830,14 +1830,14 @@ fn resolve_inline_cid_images_with_limits(
     max_total_inline_image_bytes: usize,
 ) -> String {
     let cid_source = Regex::new(r#"(?i)\bsrc="cid:([^"]+)""#).expect("valid cid source regex");
-    let referenced = cid_source
-        .captures_iter(html)
-        .map(|captures| normalize_content_id(&captures[1]))
-        .filter(|content_id| !content_id.is_empty())
-        .collect::<BTreeSet<_>>();
-    if referenced.is_empty() {
+    if !cid_source.is_match(html) {
         return html.to_string();
     }
+    let referenced = cid_source
+        .captures_iter(html)
+        .filter_map(|captures| decode_cid_url_content_id(&captures[1]))
+        .filter(|content_id| !content_id.is_empty())
+        .collect::<BTreeSet<_>>();
 
     // Parsed attachment metadata comes from decoding this exact bounded source
     // and therefore carries authoritative decoded sizes and stable part
@@ -1954,8 +1954,10 @@ fn replace_cid_sources_bounded(
             continue;
         };
         output.push_str(&html[last_end..source.start()]);
-        let content_id = normalize_content_id(&captures[1]);
-        let resource = resources.get(&content_id);
+        let content_id = decode_cid_url_content_id(&captures[1]);
+        let resource = content_id
+            .as_ref()
+            .and_then(|content_id| resources.get(content_id));
         let replacement_len = resource.map_or(r#"src="""#.len(), |resource| {
             r#"src="""#.len().saturating_add(resource.len())
         });
@@ -1993,6 +1995,69 @@ fn inline_image_content_type_is_safe(content_type: &str) -> bool {
         content_type.trim().to_ascii_lowercase().as_str(),
         "image/avif" | "image/gif" | "image/jpeg" | "image/png" | "image/webp"
     )
+}
+
+fn decode_cid_url_content_id(value: &str) -> Option<String> {
+    // Ammonia parses the source attribute through html5ever and serializes its
+    // DOM value back into double-quoted HTML. Decode exactly the entities that
+    // serializer emits, once, to recover the CID URL before applying RFC 2392
+    // percent decoding. Unknown entity-looking text remains literal.
+    let value = decode_sanitized_attribute_entities(value);
+    let source = value.as_bytes();
+    let mut decoded = Vec::with_capacity(source.len());
+    let mut index = 0;
+    while index < source.len() {
+        if source[index] != b'%' {
+            decoded.push(source[index]);
+            index += 1;
+            continue;
+        }
+        let high = source.get(index + 1).and_then(|byte| hex_value(*byte))?;
+        let low = source.get(index + 2).and_then(|byte| hex_value(*byte))?;
+        decoded.push((high << 4) | low);
+        index += 3;
+    }
+    if decoded.iter().any(u8::is_ascii_control) {
+        return None;
+    }
+    let decoded = String::from_utf8(decoded).ok()?;
+    let content_id = normalize_content_id(&decoded);
+    (!content_id.is_empty()).then_some(content_id)
+}
+
+fn decode_sanitized_attribute_entities(value: &str) -> String {
+    let mut decoded = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        let remainder = &value[index..];
+        let (replacement, consumed) = if remainder.starts_with("&amp;") {
+            ("&", "&amp;".len())
+        } else if remainder.starts_with("&quot;") {
+            ("\"", "&quot;".len())
+        } else if remainder.starts_with("&nbsp;") {
+            ("\u{00a0}", "&nbsp;".len())
+        } else {
+            let character = remainder
+                .chars()
+                .next()
+                .expect("nonempty attribute remainder");
+            decoded.push(character);
+            index += character.len_utf8();
+            continue;
+        };
+        decoded.push_str(replacement);
+        index += consumed;
+    }
+    decoded
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn normalize_content_id(value: &str) -> String {
@@ -2297,10 +2362,10 @@ mod tests {
     use super::{
         DEFAULT_PREPARATION_LIMITS, MAX_CANDIDATE_THREAD_IDS, MessageSource, MimePreflightLimits,
         PreparationLimits, TargetMessageNotFound, ThreadLoadCoordinator, ThreadLoadRequest,
-        ThreadLoaderService, load_thread, load_thread_with_reader, parse_rfc5322, preflight_mime,
-        prepare_message_with_parser, prepare_thread, prepare_thread_with_cancel,
-        prepare_thread_with_limits, prepare_thread_with_resolution, read_bounded,
-        replace_cid_sources_bounded, resolve_inline_cid_images_with_limits,
+        ThreadLoaderService, decode_cid_url_content_id, load_thread, load_thread_with_reader,
+        parse_rfc5322, preflight_mime, prepare_message_with_parser, prepare_thread,
+        prepare_thread_with_cancel, prepare_thread_with_limits, prepare_thread_with_resolution,
+        read_bounded, replace_cid_sources_bounded, resolve_inline_cid_images_with_limits,
     };
 
     fn notmuch_fixture_config(temp: &tempfile::TempDir) -> (OpenConfig, PathBuf) {
@@ -2436,6 +2501,22 @@ mod tests {
         }
         source.push_str("--related--\r\n");
         source.into_bytes()
+    }
+
+    fn related_html_with_encoded_cid_url() -> Vec<u8> {
+        b"MIME-Version: 1.0\r\n\
+          Content-Type: multipart/related; boundary=related\r\n\r\n\
+          --related\r\n\
+          Content-Type: text/html; charset=utf-8\r\n\r\n\
+          <img src=\"cid:scan%2F1&amp;part@example.test\" alt=\"encoded CID\">\r\n\
+          --related\r\n\
+          Content-Type: image/png; name=scan.png\r\n\
+          Content-Disposition: inline; filename=scan.png\r\n\
+          Content-ID: <scan/1&part@example.test>\r\n\
+          Content-Transfer-Encoding: base64\r\n\r\n\
+          QQ==\r\n\
+          --related--\r\n"
+            .to_vec()
     }
 
     fn message_with_tiny_calendars(count: usize) -> Vec<u8> {
@@ -3479,6 +3560,84 @@ signature\r\n"
         assert_eq!(allowed.matches("data:image/jpeg;base64,").count(), 7);
         assert!(allowed.contains("https://remote.example.test/tracker.jpg"));
         assert!(!allowed.contains("cid:"), "{allowed}");
+    }
+
+    #[test]
+    fn cid_url_decoding_is_strict_and_single_pass() {
+        assert_eq!(
+            decode_cid_url_content_id("Scan%2f1&amp;Part@Example.Test"),
+            Some("scan/1&part@example.test".to_string())
+        );
+        assert_eq!(
+            decode_cid_url_content_id("literal+plus@example.test"),
+            Some("literal+plus@example.test".to_string())
+        );
+        assert_eq!(
+            decode_cid_url_content_id("literal%2Bplus@example.test"),
+            Some("literal+plus@example.test".to_string())
+        );
+        assert_eq!(
+            decode_cid_url_content_id("literal&amp;amp;entity@example.test"),
+            Some("literal&amp;entity@example.test".to_string())
+        );
+        assert_eq!(
+            decode_cid_url_content_id("literal%26amp%3Bentity@example.test"),
+            Some("literal&amp;entity@example.test".to_string())
+        );
+        assert_eq!(
+            decode_cid_url_content_id("literal%252Fpath@example.test"),
+            Some("literal%2fpath@example.test".to_string())
+        );
+        assert_eq!(
+            decode_cid_url_content_id("%C3%A9@example.test"),
+            Some("é@example.test".to_string())
+        );
+        for malformed in [
+            "bad%",
+            "bad%2",
+            "bad%zz",
+            "%ff@example.test",
+            "%00@example.test",
+            "%0a@example.test",
+            "%0D@example.test",
+            "%7f@example.test",
+        ] {
+            assert_eq!(decode_cid_url_content_id(malformed), None, "{malformed}");
+        }
+    }
+
+    #[test]
+    fn malformed_cid_urls_are_removed_without_valid_siblings() {
+        let source = b"MIME-Version: 1.0\r\n\
+                       Content-Type: text/html; charset=utf-8\r\n\r\n\
+                       <img src=\"cid:bad%\"><img src=\"cid:%ff@example.test\">";
+        let parsed = parse_rfc5322(source).expect("parse malformed CID fixture");
+        let html = parsed.html_body.as_deref().expect("fixture HTML body");
+
+        let resolved = resolve_inline_cid_images_with_limits(html, &parsed, source, 1024, 4096);
+
+        assert_eq!(resolved.matches(r#"src="""#).count(), 2, "{resolved}");
+        assert!(!resolved.contains("cid:"), "{resolved}");
+        assert!(!resolved.contains("bad%"), "{resolved}");
+    }
+
+    #[test]
+    fn percent_encoded_and_html_serialized_cid_url_resolves_locally() {
+        let source = related_html_with_encoded_cid_url();
+        let prepared = prepare_thread(
+            "thread-1".to_string(),
+            vec![message("message-1", "/fixture/encoded-cid")],
+            None,
+            move |_, _| Ok(source.clone()),
+        )
+        .expect("prepare encoded CID fixture");
+
+        let blocked = prepared.message_contents["message-1"]
+            .html_document(false)
+            .expect("blocked HTML");
+        assert!(blocked.contains("data:image/png;base64,QQ=="), "{blocked}");
+        assert!(!blocked.contains("cid:"), "{blocked}");
+        assert!(!blocked.contains("scan%2F1"), "{blocked}");
     }
 
     #[test]
