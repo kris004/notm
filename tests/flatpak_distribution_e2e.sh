@@ -125,6 +125,7 @@ for command in \
   desktop-file-validate \
   file \
   flatpak \
+  gio \
   git \
   python3 \
   readelf \
@@ -445,14 +446,12 @@ ACTIVATION_ENVIRONMENT=(
   XDG_DATA_DIRS
   XDG_RUNTIME_DIR
   FLATPAK_USER_DIR
+  PATH
   NOTM_FLATPAK_DISPOSABLE_ROOT
   NOTM_FLATPAK_SOURCE_ROOT
   NOTM_FLATPAK_FORBIDDEN_HOME_ENTRY
   NOTM_TEST_HARNESS_APPLICATION_ID
 )
-if [[ $DISABLE_SESSION_P11 == 1 ]]; then
-  ACTIVATION_ENVIRONMENT+=(PATH)
-fi
 if [[ -n ${WAYLAND_DISPLAY:-} ]]; then
   ACTIVATION_ENVIRONMENT+=(WAYLAND_DISPLAY)
 fi
@@ -786,7 +785,10 @@ update-desktop-database "$FLATPAK_HOME/exports/share/applications"
 # while an automation-enabled process intentionally uses an isolated test ID.
 # After validating the installed production entry unchanged above, shadow only
 # the disposable session's generated export so a mailto activation can use that
-# same test ID and route back into the observable fixture process.
+# same test ID and route back into the observable fixture process. Normalize
+# the generated launcher through /usr/bin/env: a relocatable Flatpak binary can
+# otherwise embed a build-time prefix in the export, and GIO correctly rejects
+# the desktop entry when that launcher is absent on the test host.
 readonly EXPORTED_DESKTOP="$FLATPAK_HOME/exports/share/applications/$APP_ID.desktop"
 readonly TEST_APPLICATIONS_DIR="$XDG_DATA_HOME/applications"
 readonly TEST_DESKTOP="$TEST_APPLICATIONS_DIR/$APP_ID.desktop"
@@ -798,6 +800,18 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 contents = path.read_text(encoding="utf-8")
+exec_lines = [line for line in contents.splitlines() if line.startswith("Exec=")]
+if len(exec_lines) != 1:
+    raise SystemExit("generated Flatpak desktop entry must contain exactly one Exec")
+exec_line = exec_lines[0]
+launcher, separator, arguments = exec_line.removeprefix("Exec=").partition(" run ")
+if not launcher or not separator or not arguments:
+    raise SystemExit("generated Flatpak desktop Exec has an unexpected launcher")
+contents = contents.replace(
+    exec_line,
+    f"Exec=/usr/bin/env flatpak run {arguments}",
+    1,
+)
 production = " launch @@u %u @@"
 instrumented = " launch --test-harness --fixture @@u %u @@"
 if contents.count(production) != 1:
@@ -809,6 +823,14 @@ update-desktop-database "$TEST_APPLICATIONS_DIR"
 xdg-mime default "$APP_ID.desktop" x-scheme-handler/mailto
 if [[ $(xdg-mime query default x-scheme-handler/mailto) != "$APP_ID.desktop" ]]; then
   printf '%s\n' 'error: disposable session mailto handler is not the installed notm desktop entry' >&2
+  exit 1
+fi
+GIO_MAILTO_INFO=$(LC_ALL=C gio mime x-scheme-handler/mailto)
+printf '%s\n' "$GIO_MAILTO_INFO"
+GIO_DEFAULT_LINE=${GIO_MAILTO_INFO%%$'\n'*}
+if [[ $GIO_DEFAULT_LINE != *": $APP_ID.desktop" ]]; then
+  printf '%s\n' \
+    'error: GIO rejected the disposable notm desktop entry as the mailto handler' >&2
   exit 1
 fi
 dbus-update-activation-environment "${ACTIVATION_ENVIRONMENT[@]}"
