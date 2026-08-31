@@ -1844,7 +1844,13 @@ fn resolve_inline_cid_images_with_limits(
     // indexes. Select only parts that fit both image budgets before the
     // batched extraction. An oversized candidate is skipped without making a
     // later valid sibling disappear, while the extractor retains the same
-    // limits as defense in depth.
+    // limits as defense in depth. When MIME body selection chose one or more
+    // multipart/related roots, apply that provenance before duplicate
+    // suppression so an unrelated same-CID part cannot win by appearing first.
+    let cid_part_scope = parsed
+        .html_cid_part_indexes
+        .as_ref()
+        .map(|indexes| indexes.iter().copied().collect::<BTreeSet<_>>());
     let mut selected_content_ids = BTreeSet::new();
     let mut selected_total_bytes = 0_usize;
     let selected_part_indexes = parsed
@@ -1856,6 +1862,9 @@ fn resolve_inline_cid_images_with_limits(
                 || attachment.decode_error.is_some()
                 || !inline_image_content_type_is_safe(&attachment.content_type)
                 || !referenced.contains(&content_id)
+                || cid_part_scope
+                    .as_ref()
+                    .is_some_and(|scope| !scope.contains(&attachment.part_index))
                 || selected_content_ids.contains(&content_id)
                 || attachment.size == 0
                 || attachment.size > max_inline_image_bytes
@@ -2266,6 +2275,9 @@ fn parsed_message_bytes(parsed: &ParsedMessage) -> usize {
                 .fold(0_usize, |total, value| total.saturating_add(value.len())),
         )
         .saturating_add(parsed.html_body.as_ref().map(String::len).unwrap_or(0))
+        .saturating_add(parsed.html_cid_part_indexes.as_ref().map_or(0, |indexes| {
+            indexes.len().saturating_mul(std::mem::size_of::<usize>())
+        }))
         .saturating_add(parsed.headers.iter().fold(0_usize, |total, (key, value)| {
             total
                 .saturating_add(std::mem::size_of::<(String, String)>())
@@ -2516,6 +2528,48 @@ mod tests {
           Content-Transfer-Encoding: base64\r\n\r\n\
           QQ==\r\n\
           --related--\r\n"
+            .to_vec()
+    }
+
+    fn selected_related_html_with_duplicate_cid_siblings() -> Vec<u8> {
+        b"MIME-Version: 1.0\r\n\
+          Content-Type: multipart/mixed; boundary=outer\r\n\r\n\
+          --outer\r\n\
+          Content-Type: image/png; name=unrelated.png\r\n\
+          Content-Disposition: attachment; filename=unrelated.png\r\n\
+          Content-ID: <shared@example.test>\r\n\
+          Content-Transfer-Encoding: base64\r\n\r\n\
+          V1JPTkc=\r\n\
+          --outer\r\n\
+          Content-Type: multipart/alternative; boundary=alternative\r\n\r\n\
+          --alternative\r\n\
+          Content-Type: multipart/related; boundary=old-related\r\n\r\n\
+          --old-related\r\n\
+          Content-Type: text/html; charset=utf-8\r\n\r\n\
+          <p>Unselected HTML</p>\r\n\
+          --old-related\r\n\
+          Content-Type: image/png; name=old.png\r\n\
+          Content-Disposition: inline; filename=old.png\r\n\
+          Content-ID: <shared@example.test>\r\n\
+          Content-Transfer-Encoding: base64\r\n\r\n\
+          T0xE\r\n\
+          --old-related--\r\n\
+          --alternative\r\n\
+          Content-Type: multipart/related; boundary=selected-related; \
+            start=\"<selected-root@example.test>\"\r\n\r\n\
+          --selected-related\r\n\
+          Content-Type: image/png; name=selected.png\r\n\
+          Content-Disposition: inline; filename=selected.png\r\n\
+          Content-ID: <shared@example.test>\r\n\
+          Content-Transfer-Encoding: base64\r\n\r\n\
+          UklHSFQ=\r\n\
+          --selected-related\r\n\
+          Content-Type: text/html; charset=utf-8\r\n\
+          Content-ID: <selected-root@example.test>\r\n\r\n\
+          <img src=\"cid:shared@example.test\" alt=\"selected\">\r\n\
+          --selected-related--\r\n\
+          --alternative--\r\n\
+          --outer--\r\n"
             .to_vec()
     }
 
@@ -3560,6 +3614,27 @@ signature\r\n"
         assert_eq!(allowed.matches("data:image/jpeg;base64,").count(), 7);
         assert!(allowed.contains("https://remote.example.test/tracker.jpg"));
         assert!(!allowed.contains("cid:"), "{allowed}");
+    }
+
+    #[test]
+    fn selected_related_cid_scope_excludes_unrelated_duplicate_ids() {
+        let source = selected_related_html_with_duplicate_cid_siblings();
+        let parsed = parse_rfc5322(&source).expect("parse duplicate CID fixture");
+        assert_eq!(
+            parsed.html_cid_part_indexes.as_deref(),
+            Some([2].as_slice())
+        );
+        let html = parsed.html_body.as_deref().expect("selected HTML body");
+
+        let resolved = resolve_inline_cid_images_with_limits(html, &parsed, &source, 1024, 4096);
+
+        assert!(
+            resolved.contains("data:image/png;base64,UklHSFQ="),
+            "{resolved}"
+        );
+        assert!(!resolved.contains("V1JPTkc="), "{resolved}");
+        assert!(!resolved.contains("T0xE"), "{resolved}");
+        assert!(!resolved.contains("cid:"), "{resolved}");
     }
 
     #[test]
