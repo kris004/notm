@@ -10,6 +10,21 @@ PROJECT_ROOT=$(
   pwd -P
 )
 readonly PROJECT_ROOT
+ARM_WORKFLOW="$PROJECT_ROOT/.github/workflows/release-linux-arm64.yml"
+readonly ARM_WORKFLOW
+grep -F "            apparmor-profiles \\" "$ARM_WORKFLOW" >/dev/null
+grep -F \
+  'profile=/usr/share/apparmor/extra-profiles/bwrap-userns-restrict' \
+  "$ARM_WORKFLOW" >/dev/null
+grep -F "sudo apparmor_parser --replace \"\$profile\"" \
+  "$ARM_WORKFLOW" >/dev/null
+grep -F "          bwrap \\" "$ARM_WORKFLOW" >/dev/null
+if grep -F 'WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1' \
+  "$ARM_WORKFLOW" >/dev/null; then
+  printf '%s\n' 'ARM64 workflow must not disable the WebKit sandbox' >&2
+  exit 1
+fi
+
 WORK_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/notm-arm64-smoke.XXXXXX")
 FAKE_BINARY="$WORK_ROOT/notm"
 BUILD_INFO="$WORK_ROOT/BUILD-INFO.txt"
@@ -28,13 +43,14 @@ AGGREGATE_DIST="$WORK_ROOT/dist-aggregate"
 BAD_ARM64_DIST="$WORK_ROOT/dist-bad-arm64"
 SYMLINK_OUTPUT="$WORK_ROOT/dist-symlink"
 SYMLINK_OUTPUT_TARGET="$WORK_ROOT/dist-symlink-target"
+NON_HEAD_REPO="$WORK_ROOT/non-head-repository"
 EXTRACT_ROOT="$WORK_ROOT/extract"
 readonly \
   WORK_ROOT FAKE_BINARY BUILD_INFO BAD_BUILD_INFO DIST_ONE DIST_TWO \
   EVIDENCE_ONE EVIDENCE_TWO MISMATCH_EVIDENCE BAD_DIGEST_EVIDENCE \
   BAD_SOURCE_EVIDENCE EXTRA_EVIDENCE EXTRA_RELEASE X86_64_DIST \
   AGGREGATE_DIST BAD_ARM64_DIST SYMLINK_OUTPUT SYMLINK_OUTPUT_TARGET \
-  EXTRACT_ROOT
+  NON_HEAD_REPO EXTRACT_ROOT
 
 cleanup() {
   rm -rf -- "$WORK_ROOT"
@@ -120,10 +136,16 @@ test -z "$(find "$SYMLINK_OUTPUT_TARGET" -mindepth 1 -maxdepth 1 -print)"
   "$BUILD_INFO" \
   "$DIST_TWO" >/dev/null
 
-OTHER_SOURCE_COMMIT=$(git -C "$PROJECT_ROOT" rev-parse HEAD^)
+git init --quiet --initial-branch=main "$NON_HEAD_REPO"
+git -C "$NON_HEAD_REPO" config user.name 'notm ARM64 smoke'
+git -C "$NON_HEAD_REPO" config user.email 'release@example.invalid'
+git -C "$NON_HEAD_REPO" config commit.gpgsign false
+git -C "$NON_HEAD_REPO" commit --quiet --allow-empty -m 'first'
+OTHER_SOURCE_COMMIT=$(git -C "$NON_HEAD_REPO" rev-parse HEAD)
 readonly OTHER_SOURCE_COMMIT
+git -C "$NON_HEAD_REPO" commit --quiet --allow-empty -m 'second'
 if "$PROJECT_ROOT/packaging/arm64/verify-release.sh" \
-  "$PROJECT_ROOT" \
+  "$NON_HEAD_REPO" \
   "$VERSION" \
   "$OTHER_SOURCE_COMMIT" \
   "$DIST_ONE/$ARCHIVE_NAME" \

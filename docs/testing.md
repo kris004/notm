@@ -110,7 +110,9 @@ to match exactly before re-uploading the verified ARM fragment. Build B also
 runs the locked workspace suite under required Weston and the packaged-bundle
 distribution E2E natively with a required display and WebKitGTK's normal
 sandbox: it has no sandbox-disable waiver, and an unavailable or skipped run is
-a failure rather than a pass.
+a failure rather than a pass. The ephemeral runner loads Ubuntu's packaged
+`bwrap-userns-restrict` AppArmor profile and requires a successful unprivileged
+Bubblewrap probe before either WebKitGTK gate starts.
 
 The standard distribution driver accepts only caller-supplied executable paths
 and creates disposable mail, Notmuch configuration/database state, drafts,

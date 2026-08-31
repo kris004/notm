@@ -61,9 +61,12 @@ comparison job. The comparison job downloads build A and build B by exact
 artifact ID and requires their extracted stripped binaries and
 `binary.sha256`, `archive.sha256`, and `reproducibility-evidence.txt` evidence
 to match exactly. Build B runs the packaged application under WebKitGTK's normal
-sandbox on a native `ubuntu-24.04-arm` runner. A skipped or unavailable native
-execution gate is a release failure. The comparison job runs only after both
-native jobs succeed and re-uploads the verified ARM fragment for aggregation.
+sandbox on a native `ubuntu-24.04-arm` runner. It loads Ubuntu's packaged
+`bwrap-userns-restrict` AppArmor profile and proves that an unprivileged
+Bubblewrap user namespace works before starting the test suite; it does not set
+WebKitGTK's sandbox-disable variable. A skipped or unavailable native execution
+gate is a release failure. The comparison job runs only after both native jobs
+succeed and re-uploads the verified ARM fragment for aggregation.
 
 The x86_64/source and compared ARM64 fragments are also downloaded by exact
 artifact ID. Their source commit, version, names, checksums, and embedded build

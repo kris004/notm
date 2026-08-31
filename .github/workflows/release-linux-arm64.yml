@@ -279,8 +279,11 @@ jobs:
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes \
+            apparmor \
+            apparmor-profiles \
             appstream \
             binutils \
+            bubblewrap \
             build-essential \
             clang \
             dbus-daemon \
@@ -298,6 +301,21 @@ jobs:
             weston
           sudo apt-get clean
           df -B1 / "$RUNNER_TEMP"
+
+      - name: Enable and verify the native WebKit sandbox
+        shell: bash
+        run: |
+          set -euxo pipefail
+          profile=/usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          test -f "$profile"
+          sudo apparmor_parser --replace "$profile"
+          test -z "${WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS:-}"
+          bwrap \
+            --unshare-user \
+            --uid 0 \
+            --gid 0 \
+            --ro-bind / / \
+            /usr/bin/true
 
       - name: Select exact Rust toolchain
         shell: bash
