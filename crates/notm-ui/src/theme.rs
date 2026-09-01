@@ -328,9 +328,23 @@ pub fn css() -> &'static str {
         opacity: 1;
     }
     #notm-command-palette {
-        padding: 0;
-        border-radius: 8px;
-        box-shadow: 0 8px 24px alpha(black, .35);
+        padding: 12px;
+        border: 1px solid alpha(@theme_selected_bg_color, .70);
+        border-radius: 10px;
+        background-color: @theme_bg_color;
+        color: @theme_fg_color;
+        box-shadow: 0 12px 32px alpha(black, .45);
+    }
+    #notm-command-palette-entry {
+        min-height: 32px;
+        border: 1px solid alpha(@theme_selected_bg_color, .85);
+        background-color: @theme_bg_color;
+        color: @theme_fg_color;
+        caret-color: @theme_fg_color;
+    }
+    #notm-command-palette-entry selection {
+        background-color: @theme_selected_bg_color;
+        color: @theme_selected_fg_color;
     }
     #notm-settings-dialog .notm-settings-section {
         font-size: 1.08em;
@@ -400,5 +414,56 @@ mod tests {
         );
         assert_eq!(super::provider_scheme_nick(ThemePreference::Light), "light");
         assert_eq!(super::provider_scheme_nick(ThemePreference::Dark), "dark");
+    }
+
+    #[test]
+    fn command_palette_css_defines_a_readable_surface() {
+        let stylesheet = super::css();
+        let panel = css_rule(stylesheet, "#notm-command-palette");
+        for declaration in [
+            "background-color: @theme_bg_color;",
+            "color: @theme_fg_color;",
+        ] {
+            assert!(
+                panel.contains(declaration),
+                "command-palette panel CSS is missing {declaration:?}"
+            );
+        }
+
+        let entry = css_rule(stylesheet, "#notm-command-palette-entry");
+        for declaration in [
+            "background-color: @theme_bg_color;",
+            "color: @theme_fg_color;",
+            "caret-color: @theme_fg_color;",
+        ] {
+            assert!(
+                entry.contains(declaration),
+                "command-palette entry CSS is missing {declaration:?}"
+            );
+        }
+
+        let selection = css_rule(stylesheet, "#notm-command-palette-entry selection");
+        for declaration in [
+            "background-color: @theme_selected_bg_color;",
+            "color: @theme_selected_fg_color;",
+        ] {
+            assert!(
+                selection.contains(declaration),
+                "command-palette selection CSS is missing {declaration:?}"
+            );
+        }
+    }
+
+    fn css_rule<'a>(stylesheet: &'a str, selector: &str) -> &'a str {
+        let rule = stylesheet
+            .split_once(selector)
+            .unwrap_or_else(|| panic!("stylesheet is missing selector {selector:?}"))
+            .1;
+        rule.split_once('{')
+            .unwrap_or_else(|| panic!("selector {selector:?} has no declaration block"))
+            .1
+            .split_once('}')
+            .unwrap_or_else(|| panic!("selector {selector:?} has no closing brace"))
+            .0
     }
 }
