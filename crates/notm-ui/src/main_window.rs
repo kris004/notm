@@ -12752,6 +12752,12 @@ fn refresh_thread_model_rows(widgets: &Widgets, state: &SharedState, indices: &[
         .refresh_rows(&thread_model_snapshot(state), indices, true);
 }
 
+fn refresh_thread_selection_rows(widgets: &Widgets, state: &SharedState, indices: &[usize]) {
+    widgets
+        .thread_list
+        .refresh_rows(&thread_model_snapshot(state), indices, false);
+}
+
 fn toggle_visual_select_mode(widgets: &Widgets, state: &SharedState) {
     if state.borrow().visual_select_mode {
         clear_visual_selection(widgets, state);
@@ -12866,7 +12872,7 @@ fn toggle_multi_selected_thread_index(widgets: &Widgets, state: &SharedState, in
         };
         (thread_id, state.multi_selected_threads.len(), selected)
     };
-    refresh_thread_model_rows(widgets, state, &[index]);
+    refresh_thread_selection_rows(widgets, state, &[index]);
     widgets.status_label.set_text(&format!(
         "{} thread `{}`; {} selected",
         if selected { "Selected" } else { "Unselected" },
@@ -12881,7 +12887,7 @@ fn clear_multi_selection(widgets: &Widgets, state: &SharedState) {
         state.multi_selected_threads.clear();
         state.multi_selected_thread_snapshots.clear();
     }
-    update_visual_selection_rows_with_force(widgets, state, true);
+    update_visual_selection_rows(widgets, state);
     widgets.status_label.set_text("Multi-selection cleared");
 }
 
@@ -13243,13 +13249,9 @@ fn validate_database_visual_search_fingerprint(
 }
 
 fn update_visual_selection_rows(widgets: &Widgets, state: &SharedState) {
-    update_visual_selection_rows_with_force(widgets, state, false);
-}
-
-fn update_visual_selection_rows_with_force(widgets: &Widgets, state: &SharedState, force: bool) {
     let snapshot = thread_model_snapshot(state);
     let indices = (0..snapshot.len).collect::<Vec<_>>();
-    widgets.thread_list.refresh_rows(&snapshot, &indices, force);
+    widgets.thread_list.refresh_rows(&snapshot, &indices, false);
 }
 
 fn set_thread_numbers_visible(widgets: &Widgets, state: &SharedState, visible: bool) {

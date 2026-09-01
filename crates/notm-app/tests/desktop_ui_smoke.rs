@@ -1009,10 +1009,10 @@ fn fixture_rapid_searches_coalesce_and_apply_large_pages_incrementally() -> anyh
 }
 
 #[test]
-fn fixture_visual_selection_navigation_keeps_thread_list_responsive() -> anyhow::Result<()> {
+fn fixture_visual_selection_navigation_matches_normal_viewport() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
-            "SKIP fixture_visual_selection_navigation_keeps_thread_list_responsive: no GUI test display is available"
+            "SKIP fixture_visual_selection_navigation_matches_normal_viewport: no GUI test display is available"
         );
         return Ok(());
     };
@@ -1023,8 +1023,9 @@ fn fixture_visual_selection_navigation_keeps_thread_list_responsive() -> anyhow:
     let token = format!("notm-visual-select-ui-{run_id}");
     let mut app = FixtureApp::spawn(work_dir, &token)?;
     let mut driver = app.connect(&token)?;
+    driver.command("resize_window", json!({"width": 1000, "height": 700}))?;
 
-    let scheduled = driver.command("run_search", json!({"query": "tag:inbox"}))?;
+    let scheduled = driver.command("run_search", json!({"query": "*"}))?;
     assert_eq!(
         scheduled["scheduled"], true,
         "visual-selection fixture search was not scheduled: {scheduled}"
@@ -1032,11 +1033,48 @@ fn fixture_visual_selection_navigation_keeps_thread_list_responsive() -> anyhow:
     let initial = driver.wait_for_search(STARTUP_TIMEOUT)?;
     let rows = json_array_at(&initial, &["state", "thread_list_items"])?;
     ensure!(
-        rows.len() >= 2,
-        "visual-selection smoke needs at least two fixture threads: {initial}"
+        rows.len() >= 4,
+        "visual-selection smoke needs at least four fixture threads: {initial}"
     );
     let selected = driver.command("select_thread_by_index", json!({"index": 0}))?;
     assert_eq!(selected["ok"], true, "initial selection failed: {selected}");
+    thread::sleep(Duration::from_millis(350));
+    let initial_viewport = driver.command("thread_selection_view_state", json!({}))?;
+    ensure!(
+        initial_viewport["scroll_upper"]
+            .as_f64()
+            .unwrap_or_default()
+            > initial_viewport["scroll_page_size"]
+                .as_f64()
+                .unwrap_or_default(),
+        "visual-selection smoke needs a scrollable thread list: {initial_viewport}"
+    );
+    let mut fully_visible_rows = 0_usize;
+    for index in 0..rows.len() {
+        let layout = driver.command("thread_row_layout", json!({"index": index}))?;
+        if layout["row"]["fully_visible"] == true {
+            fully_visible_rows += 1;
+        } else {
+            break;
+        }
+    }
+    ensure!(
+        fully_visible_rows > 0 && fully_visible_rows + 1 < rows.len(),
+        "visual-selection smoke could not find a cursor target just below the viewport: visible={fully_visible_rows}, rows={}, viewport={initial_viewport}",
+        rows.len()
+    );
+    let movement_steps = fully_visible_rows + 1;
+
+    for _ in 0..movement_steps {
+        driver.command("select_relative_thread", json!({"delta": 1}))?;
+        thread::sleep(Duration::from_millis(250));
+    }
+    let normal_viewport = (
+        driver.command("thread_selection_view_state", json!({}))?,
+        driver.command("thread_row_layout", json!({"index": 0}))?,
+    );
+    driver.command("select_thread_by_index", json!({"index": 0}))?;
+    thread::sleep(Duration::from_millis(350));
 
     let entered = driver
         .command("run_command", json!({"command": "visual_select"}))
@@ -1047,17 +1085,47 @@ fn fixture_visual_selection_navigation_keeps_thread_list_responsive() -> anyhow:
         "visual select did not become active: {entered}"
     );
 
-    let moved = driver
-        .command("select_relative_thread", json!({"delta": 1}))
-        .context("moving the visual-selection cursor wedged the GTK main loop")?;
+    let mut moved = serde_json::Value::Null;
+    for _ in 0..movement_steps {
+        moved = driver
+            .command("select_relative_thread", json!({"delta": 1}))
+            .context("moving the visual-selection cursor wedged the GTK main loop")?;
+        thread::sleep(Duration::from_millis(250));
+    }
+    let visual_viewport = (
+        driver.command("thread_selection_view_state", json!({}))?,
+        driver.command("thread_row_layout", json!({"index": 0}))?,
+    );
     assert_eq!(moved["ok"], true, "visual selection move failed: {moved}");
     assert_eq!(
-        moved["selected_thread_index"], 1,
+        moved["selected_thread_index"], movement_steps,
         "visual selection did not move to the next thread: {moved}"
     );
     assert_eq!(
-        moved["state"]["visual_select_cursor"], 1,
+        moved["state"]["visual_select_cursor"], movement_steps,
         "visual selection cursor did not follow the selected row: {moved}"
+    );
+    ensure!(
+        normal_viewport.0["row_visible"] == true && visual_viewport.0["row_visible"] == true,
+        "normal or visual selection left the cursor outside the viewport: normal={normal_viewport:?}, visual={visual_viewport:?}"
+    );
+    assert_eq!(
+        normal_viewport.1["row_visual_selected"], false,
+        "normal navigation unexpectedly decorated the anchor: {normal_viewport:?}"
+    );
+    assert_eq!(
+        visual_viewport.1["row_visual_selected"], true,
+        "visual selection did not decorate the anchor in place: {visual_viewport:?}"
+    );
+    let normal_anchor_y = normal_viewport.1["row"]["y"]
+        .as_f64()
+        .with_context(|| format!("normal viewport lost the anchor row: {normal_viewport:?}"))?;
+    let visual_anchor_y = visual_viewport.1["row"]["y"]
+        .as_f64()
+        .with_context(|| format!("visual viewport lost the anchor row: {visual_viewport:?}"))?;
+    ensure!(
+        (visual_anchor_y - normal_anchor_y).abs() <= 1.0,
+        "visual selection moved the list differently from normal selection: normal={normal_viewport:?}, visual={visual_viewport:?}"
     );
 
     let health = driver

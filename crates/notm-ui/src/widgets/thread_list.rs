@@ -990,6 +990,7 @@ impl ThreadListController {
     }
 
     fn refresh_rows_ready(&self, snapshot: &ThreadModelSnapshot, indices: &[usize], force: bool) {
+        update_realized_thread_row_visual_selection(&self.list, &snapshot.marked_indices);
         if indices.len() > THREAD_MODEL_ROWS_PER_UPDATE {
             self.refresh_rows_bounded(snapshot, indices, force);
             return;
@@ -1007,15 +1008,12 @@ impl ThreadListController {
         {
             let position = index as u32;
             if position < self.model.n_items() {
-                let token = thread_row_token(
-                    index,
-                    snapshot.marked_indices.contains(&index),
-                    snapshot.display,
-                );
+                let token = thread_row_token(index, snapshot.display);
                 // Visual-selection refresh can run from `notify::selected`. Preserve
-                // unchanged item identities there: splicing every row makes
-                // GtkListView and GtkSingleSelection rebuild the model while they
-                // are handling the selection change.
+                // item identities there: selection decoration is applied directly
+                // to realized rows instead of being encoded into the model token.
+                // Replacing a model item makes GtkListView re-anchor its variable
+                // height viewport while GtkSingleSelection is changing.
                 if force
                     || self
                         .model
@@ -1067,11 +1065,7 @@ impl ThreadListController {
                 if position >= model.n_items() {
                     continue;
                 }
-                let token = thread_row_token(
-                    index,
-                    snapshot.marked_indices.contains(&index),
-                    snapshot.display,
-                );
+                let token = thread_row_token(index, snapshot.display);
                 if force
                     || model
                         .string(position)
@@ -1132,6 +1126,7 @@ impl ThreadListController {
                 start.min(snapshot.len),
             ),
         };
+        update_realized_thread_row_visual_selection(&self.list, &snapshot.marked_indices);
         let snapshot = snapshot.clone();
         let model = self.model.clone();
         let selection = self.selection.clone();
@@ -1166,13 +1161,7 @@ impl ThreadListController {
             if !removing && next_add < end_add && budget > 0 {
                 let end = next_add.saturating_add(budget).min(end_add);
                 let tokens = (next_add..end)
-                    .map(|index| {
-                        thread_row_token(
-                            index,
-                            snapshot.marked_indices.contains(&index),
-                            snapshot.display,
-                        )
-                    })
+                    .map(|index| thread_row_token(index, snapshot.display))
                     .collect::<Vec<_>>();
                 let additions = tokens.iter().map(String::as_str).collect::<Vec<_>>();
                 model.splice(model.n_items(), 0, &additions);
@@ -1191,11 +1180,7 @@ impl ThreadListController {
                 if position >= model.n_items() {
                     continue;
                 }
-                let token = thread_row_token(
-                    index,
-                    snapshot.marked_indices.contains(&index),
-                    snapshot.display,
-                );
+                let token = thread_row_token(index, snapshot.display);
                 if model
                     .string(position)
                     .is_none_or(|current| current.as_str() != token)
@@ -1385,12 +1370,16 @@ impl ThreadListController {
         let viewport_width = self.scrolled.width().max(0) as f64;
         let relative_to = self.scrolled.clone().upcast::<gtk::Widget>();
         let root = self.list.clone().upcast::<gtk::Widget>();
+        let row_name = format!("notm-thread-row-{index}");
+        let row_visual_selected = find_widget_by_name(&root, &row_name)
+            .map(|row| row.has_css_class("notm-visual-selected"));
         json!({
             "ok": true,
             "index": index,
             "viewport_width": viewport_width,
             "viewport_height": viewport_height,
-            "row": named_widget_bounds_json(&root, &relative_to, &format!("notm-thread-row-{index}"), viewport_width, viewport_height),
+            "row_visual_selected": row_visual_selected,
+            "row": named_widget_bounds_json(&root, &relative_to, &row_name, viewport_width, viewport_height),
             "number": named_widget_bounds_json(&root, &relative_to, &format!("notm-thread-number-{index}"), viewport_width, viewport_height),
             "title": named_widget_bounds_json(&root, &relative_to, &format!("notm-thread-title-{index}"), viewport_width, viewport_height),
             "date": named_widget_bounds_json(&root, &relative_to, &format!("notm-thread-date-{index}"), viewport_width, viewport_height),
@@ -1816,12 +1805,42 @@ fn thread_status_widget(message: &str, spinning: bool) -> gtk::Box {
     box_
 }
 
-fn thread_row_token(index: usize, visual_selected: bool, display: ThreadListDisplay) -> String {
-    format!(
-        "{THREAD_ROW_PREFIX}|{index}|{}|{}",
-        if visual_selected { 1 } else { 0 },
-        display.token_bits()
-    )
+fn thread_row_token(index: usize, display: ThreadListDisplay) -> String {
+    format!("{THREAD_ROW_PREFIX}|{index}|{}", display.token_bits())
+}
+
+fn update_realized_thread_row_visual_selection(
+    list: &gtk::ListView,
+    marked_indices: &BTreeSet<usize>,
+) {
+    let root = list.clone().upcast::<gtk::Widget>();
+    update_realized_thread_row_visual_selection_in_subtree(&root, marked_indices);
+}
+
+fn update_realized_thread_row_visual_selection_in_subtree(
+    widget: &gtk::Widget,
+    marked_indices: &BTreeSet<usize>,
+) {
+    if let Some(index) = widget
+        .widget_name()
+        .strip_prefix("notm-thread-row-")
+        .and_then(|index| index.parse::<usize>().ok())
+    {
+        let visual_selected = marked_indices.contains(&index);
+        for class in ["notm-visual-selected", "notm-multi-selected"] {
+            if visual_selected {
+                widget.add_css_class(class);
+            } else {
+                widget.remove_css_class(class);
+            }
+        }
+        return;
+    }
+    let mut child = widget.first_child();
+    while let Some(widget) = child {
+        update_realized_thread_row_visual_selection_in_subtree(&widget, marked_indices);
+        child = widget.next_sibling();
+    }
 }
 
 fn thread_status_token(message: &str, spinning: bool) -> String {
