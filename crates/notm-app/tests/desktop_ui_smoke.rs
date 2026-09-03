@@ -10130,17 +10130,11 @@ fn indexed_maildir_multiselect_refresh_race_updates_filenames_and_persists_after
         String::from_utf8_lossy(&fs::read(&opened_attachment_path)?).contains("attached text"),
         "attachment Open did not extract the expected bytes"
     );
-    let opener_deadline = Instant::now() + Duration::from_secs(5);
-    while !opener_marker.is_file() {
-        ensure!(
-            Instant::now() < opener_deadline,
-            "private standard-user attachment handler was not invoked: {attachment_opened}"
-        );
-        thread::sleep(STARTUP_POLL_INTERVAL);
-    }
+    let opener_call = wait_for_file_text(&opener_marker, STARTUP_TIMEOUT)?;
     ensure!(
-        fs::read_to_string(&opener_marker)?.contains("note.txt"),
-        "private attachment handler received the wrong target"
+        opener_call.contains(&opened_attachment_path.display().to_string()),
+        "private attachment handler received the wrong target: expected={}, actual={opener_call:?}",
+        opened_attachment_path.display()
     );
 
     let main_reply = driver.command("reply_selected", json!({}))?;

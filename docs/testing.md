@@ -77,7 +77,15 @@ cargo build --locked -p notm-app
 python3 -B tests/ui_text_focus_smoke.py --binary target/debug/notm
 
 actionlint
-shellcheck packaging/*.sh tests/*.sh
+shellcheck \
+  packaging/*.sh \
+  packaging/arm64/*.sh \
+  packaging/flatpak/*.sh \
+  tests/*.sh
+./tests/arm64_release_smoke.sh
+./tests/flatpak_builder_wrapper_smoke.sh
+python3 -B -m py_compile tests/distribution_e2e.py
+python3 -B tests/distribution_e2e_socket_smoke.py
 mandoc -Tlint \
   docs/man/notm.1 \
   docs/man/notm-config.5 \
@@ -87,6 +95,50 @@ desktop-file-validate packaging/io.github.kris004.notm.desktop
 appstreamcli validate --strict --pedantic --no-net \
   packaging/io.github.kris004.notm.metainfo.xml
 ```
+
+`tests/arm64_release_smoke.sh` validates deterministic ARM64 bundle assembly,
+layout, metadata, checksum-fragment aggregation, and negative cases on the
+current host. Its fixture executable is a shell script, so this smoke is
+deliberately **not** evidence that the AArch64 ELF executes.
+
+`.github/workflows/release-linux-arm64.yml` is the reusable genuine-execution
+gate. Two independent build jobs run on native GitHub-hosted
+`ubuntu-24.04-arm` runners. A separate comparison job downloads the two outputs
+by exact artifact ID and requires their extracted release binaries and the
+`binary.sha256`, `archive.sha256`, and `reproducibility-evidence.txt` evidence
+to match exactly before re-uploading the verified ARM fragment. Build B also
+runs the locked workspace suite under required Weston and the packaged-bundle
+distribution E2E natively with a required display and WebKitGTK's normal
+sandbox: it has no sandbox-disable waiver, and an unavailable or skipped run is
+a failure rather than a pass. The ephemeral runner loads Ubuntu's packaged
+`bwrap-userns-restrict` AppArmor profile and requires a successful unprivileged
+Bubblewrap probe before either WebKitGTK gate starts.
+
+The standard distribution driver accepts only caller-supplied executable paths
+and creates disposable mail, Notmuch configuration/database state, drafts,
+attachments, and loopback SMTP capture beneath its work root. Flatpak has a
+separate hard gate that performs a clean offline rebuild, temporary
+installation, sandbox permission inspection, the same GUI/mail flow, restart,
+and delete-data uninstall:
+
+```sh
+test_root=$(mktemp -d "${TMPDIR:-/tmp}/notm-flatpak-e2e.XXXXXX")
+trap 'rm -rf "$test_root"' EXIT
+NOTM_TEST_DISPOSABLE_ROOT="$test_root" \
+  ./tests/run_with_headless_weston.sh \
+  ./tests/run_with_private_dbus.sh \
+  ./tests/flatpak_distribution_e2e.sh
+```
+
+Keep Weston outside the private D-Bus wrapper. This stops the document portal
+and releases its private runtime mount before Weston removes that runtime.
+
+The Flatpak gate requires `flatpak-builder`, configured GNOME/SDK dependencies,
+and the official Flathub linter. It refuses an interactive display, existing
+notm app data, or a non-disposable HOME mapping. See [Flatpak](flatpak.md) for
+the isolated Builder-app invocation, offline-cache contract, and evidence
+captured by the gate. An unavailable or skipped Flatpak distribution E2E is a
+delivery failure, not a pass.
 
 `tests/source_archive_smoke.sh` creates the exact source-archive form, confirms
 that it has no `.git`, verifies embedded commit and version provenance, and

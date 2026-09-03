@@ -14,7 +14,34 @@ command -v weston >/dev/null 2>&1 || {
   exit 69
 }
 
-WORK_ROOT=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/notm-weston.XXXXXX")
+if [ -n "${NOTM_TEST_DISPOSABLE_ROOT:-}" ]; then
+  case $NOTM_TEST_DISPOSABLE_ROOT in
+    /*) ;;
+    *)
+      printf 'error: NOTM_TEST_DISPOSABLE_ROOT must be absolute: %s\n' \
+        "$NOTM_TEST_DISPOSABLE_ROOT" >&2
+      exit 73
+      ;;
+  esac
+  if [ ! -d "$NOTM_TEST_DISPOSABLE_ROOT" ] || [ -L "$NOTM_TEST_DISPOSABLE_ROOT" ]; then
+    printf 'error: NOTM_TEST_DISPOSABLE_ROOT is not a real directory: %s\n' \
+      "$NOTM_TEST_DISPOSABLE_ROOT" >&2
+    exit 73
+  fi
+  DISPOSABLE_ROOT=$(cd -- "$NOTM_TEST_DISPOSABLE_ROOT" && pwd -P)
+  readonly DISPOSABLE_ROOT
+  WORK_ROOT="$DISPOSABLE_ROOT/headless-weston"
+  if [ -e "$WORK_ROOT" ] || [ -L "$WORK_ROOT" ]; then
+    printf 'error: private Weston work directory already exists: %s\n' \
+      "$WORK_ROOT" >&2
+    exit 73
+  fi
+  mkdir -m 700 -- "$WORK_ROOT"
+else
+  WORK_ROOT=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/notm-weston.XXXXXX")
+  DISPOSABLE_ROOT=$WORK_ROOT
+  readonly DISPOSABLE_ROOT
+fi
 readonly WORK_ROOT
 RUNTIME_DIR="$WORK_ROOT/runtime"
 readonly RUNTIME_DIR
@@ -85,6 +112,7 @@ if [ ! -S "$RUNTIME_DIR/$WAYLAND_SOCKET" ]; then
 fi
 
 env -u DISPLAY -u SWAYSOCK \
+  NOTM_TEST_DISPOSABLE_ROOT="$DISPOSABLE_ROOT" \
   XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   GDK_BACKEND=wayland \

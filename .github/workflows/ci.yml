@@ -165,7 +165,11 @@ jobs:
         run: |
           set -euxo pipefail
           actionlint
-          shellcheck packaging/*.sh tests/*.sh
+          shellcheck \
+            packaging/*.sh \
+            packaging/arm64/*.sh \
+            packaging/flatpak/*.sh \
+            tests/*.sh
           mandoc -Tlint \
             docs/man/notm.1 \
             docs/man/notm-config.5 \
@@ -176,7 +180,11 @@ jobs:
             packaging/io.github.kris004.notm.metainfo.xml
 
       - name: Validate install and release packaging
-        run: make check-packaging
+        run: |
+          make check-packaging
+          ./tests/arm64_release_smoke.sh
+          ./tests/flatpak_builder_wrapper_smoke.sh
+          python3 -B tests/distribution_e2e_socket_smoke.py
 
       - name: Build and test a clean source archive
         run: ./tests/source_archive_smoke.sh

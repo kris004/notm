@@ -164,7 +164,7 @@ def policy_paths() -> list[Path]:
     paths.extend(sorted((PROJECT_ROOT / "docs").rglob("*.md")))
     paths.extend(sorted((PROJECT_ROOT / ".github" / "workflows").glob("*.yml")))
     paths.extend(sorted((PROJECT_ROOT / ".github" / "workflows").glob("*.yaml")))
-    paths.extend(sorted((PROJECT_ROOT / "packaging").glob("*.sh")))
+    paths.extend(sorted((PROJECT_ROOT / "packaging").rglob("*.sh")))
     paths.extend(sorted((PROJECT_ROOT / "tests").glob("*.sh")))
     paths.extend(sorted((PROJECT_ROOT / "tests").glob("*.rs")))
     return sorted(set(paths))

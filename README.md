@@ -68,18 +68,22 @@ Package names differ on other distributions.
 
 ## Build and install
 
-GitHub releases include a prebuilt `x86_64-unknown-linux-gnu` bundle produced on
-Ubuntu 24.04, an archive of the exact tagged source, and `SHA256SUMS` covering
-both archives. The binary bundle is dynamically linked rather than fully
-portable; its `INSTALL.md` lists the required runtime libraries and user-install
-command.
+The release workflow produces prebuilt `x86_64-unknown-linux-gnu` and
+`aarch64-unknown-linux-gnu` bundles in native Ubuntu 24.04 environments, an
+archive of the exact tagged source, and one canonical `SHA256SUMS` covering all
+three archives. The binary bundles are dynamically linked rather than fully
+portable; each `INSTALL.md` lists the required runtime libraries and
+user-install command. Choose the bundle matching `uname -m`.
 
-Download all three assets before verifying them:
+Download the canonical four-file asset set before verifying it:
 
 ```sh
 sha256sum --check SHA256SUMS
 gh attestation verify \
   notm-vVERSION-x86_64-unknown-linux-gnu.tar.gz \
+  --repo kris004/notm
+gh attestation verify \
+  notm-vVERSION-aarch64-unknown-linux-gnu.tar.gz \
   --repo kris004/notm
 gh attestation verify \
   notm-vVERSION-src.tar.gz \
@@ -114,6 +118,8 @@ cargo build --release --locked -p notm-app
 
 Remove a user installation with `make uninstall-user`. Packagers can override
 `PREFIX` and `DESTDIR`; see the [Makefile](Makefile) for the installed paths.
+For a sandboxed build with bundled Notmuch and SMTP tooling, see the
+[Flatpak build, permissions, and uninstall guide](docs/flatpak.md).
 
 ## Quick start
 
@@ -232,9 +238,9 @@ before reporting a vulnerability.
 
 ## Current limitations
 
-- Linux is the only supported platform. The prebuilt x86_64 bundle targets
-  Ubuntu 24.04 or a compatible GNU/Linux system; other systems should build
-  from source.
+- Linux is the only supported platform. The prebuilt x86_64 and ARM64 bundles
+  target Ubuntu 24.04 or compatible GNU/Linux systems on the matching
+  architecture; other systems should build from source or use Flatpak.
 - Account setup, mail retrieval, and SMTP are intentionally delegated to
   Notmuch, Maildir tools, and user-configured helper commands.
 - The project has no formal minimum supported Rust version yet; CI tracks the
@@ -259,6 +265,7 @@ before reporting a vulnerability.
 - [Synchronization](docs/sync.md) — optional receive and index-update commands.
 - [`notm-config(5)`](docs/man/notm-config.5) — exhaustive installed reference.
 - [Architecture](docs/architecture.md) — crate layout and runtime model.
+- [Flatpak](docs/flatpak.md) — sandboxed build, permissions, and rollback.
 - [Testing](docs/testing.md) — fixture, integration, and GTK smoke tests.
 - [Developer test harness](docs/automation/README.md) — local UI-driving API.
 
