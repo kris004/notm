@@ -606,7 +606,10 @@ class AppProcess:
             return f"<cannot read {self.log_path}: {error}>"
 
     def close(self) -> None:
-        if self.process.poll() is not None:
+        status = self.process.poll()
+        if status is not None:
+            if status != 0:
+                raise E2EFailure(f"notm exited with {status}\n{self.logs()}")
             return
         self.harness.request("close_main_window")
         try:

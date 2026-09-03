@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 from distribution_e2e import (
+    AppProcess,
     E2EFailure,
     Harness,
     LINUX_UNIX_SOCKET_PATH_MAX,
@@ -32,6 +33,35 @@ class AttachmentHarness(Harness):
             raise AssertionError(f"unexpected harness command: {command}")
         self.requests += 1
         return next(self.statuses)
+
+
+class CompletedProcess:
+    def __init__(self, status: int) -> None:
+        self.status = status
+
+    def poll(self) -> int:
+        return self.status
+
+
+class CompletedAppProcess(AppProcess):
+    def __init__(self, status: int) -> None:
+        self.process = CompletedProcess(status)  # type: ignore[assignment]
+
+    def logs(self) -> str:
+        return "completed process log"
+
+
+def check_completed_app_exit_status() -> None:
+    CompletedAppProcess(0).close()
+
+    try:
+        CompletedAppProcess(7).close()
+    except E2EFailure as error:
+        message = str(error)
+        if "notm exited with 7" not in message or "completed process log" not in message:
+            raise AssertionError(f"unexpected completed-process error: {error}") from error
+    else:
+        raise AssertionError("accepted a completed notm process with nonzero status")
 
 
 def assert_attachment_failure(
@@ -339,6 +369,7 @@ def main() -> int:
     assert_rejected(multibyte_root)
 
     check_attachment_completion_compatibility()
+    check_completed_app_exit_status()
 
     print("Distribution E2E helper smoke passed.")
     return 0
