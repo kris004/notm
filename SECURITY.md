@@ -41,8 +41,18 @@ as the current user, and it treats message content as untrusted input.
 - There is no hosted service, account system, or telemetry.
 - The default message view is plain text. The visual HTML view sanitizes markup,
   disables JavaScript and in-app navigation, blocks file access, and does not
-  load remote images without user approval. These controls are defense in depth,
-  not a guarantee that malformed mail cannot expose a parser or rendering bug.
+  load remote images without user approval. Bounded message-local raster images
+  referenced through `cid:` may render without making a network request. These
+  controls are defense in depth, not a guarantee that malformed mail cannot
+  expose a parser or rendering bug.
+- A persistent remote-image sender exception matches one normalized mailbox
+  from `From:`. It is a user privacy preference, not proof of identity:
+  `From:` can be forged, and `notm` does not trust message-supplied
+  `Authentication-Results`, `Return-Path`, `Received`, or DKIM fields as an
+  authentication boundary. A forged message claiming an allowed address will
+  inherit the exception, so the UI warns before the user enables it. Messages
+  with a missing, malformed, grouped, or multi-mailbox `From:` cannot receive
+  persistent sender permission.
 - Archive, trash, and spam change Notmuch tags; they do not delete ordinary
   message files. Deleting a locally saved draft is a separate, explicit action.
 - Sending and synchronization are delegated to user-configured programs. Those

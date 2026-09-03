@@ -169,6 +169,8 @@ pub struct UiState {
     #[serde(default)]
     pub sender_view_preferences: BTreeMap<String, MessageViewPreference>,
     #[serde(default)]
+    pub trusted_image_senders: Vec<String>,
+    #[serde(default)]
     pub theme: ThemePreference,
     #[serde(default = "default_thread_preview_lines")]
     pub thread_preview_lines: usize,
@@ -243,6 +245,7 @@ impl Default for UiState {
             prefer_html_view: false,
             message_view_preferences: BTreeMap::new(),
             sender_view_preferences: BTreeMap::new(),
+            trusted_image_senders: Vec::new(),
             theme: ThemePreference::System,
             thread_preview_lines: 2,
             show_thread_numbers: true,
@@ -366,12 +369,14 @@ mod tests {
         object.remove("thread_preview_lines");
         object.remove("message_view_preferences");
         object.remove("sender_view_preferences");
+        object.remove("trusted_image_senders");
 
         let restored: UiState = serde_json::from_value(serialized).expect("deserialize old state");
         assert_eq!(restored.theme, ThemePreference::System);
         assert_eq!(restored.thread_preview_lines, 2);
         assert!(restored.message_view_preferences.is_empty());
         assert!(restored.sender_view_preferences.is_empty());
+        assert!(restored.trusted_image_senders.is_empty());
     }
 
     #[test]

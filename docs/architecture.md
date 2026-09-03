@@ -78,11 +78,28 @@ an ephemeral network session. These layers cover direct images, redirects,
 CSS URLs, `srcset`, and nested resource markup while JavaScript, file and
 universal-file access, and in-app navigation remain disabled.
 
-**Load remote images once** reloads only the selected message view with sanitized
-HTTP(S) image sources enabled. The permission is not persisted or shared and
-is reset by message/view navigation or application restart. Raw `From:` values
-are unauthenticated message data, so they cannot establish durable permission.
-`[ui].remote_images = true` remains an explicit global privacy override for all
-messages. View selections are persisted by Message-ID, with optional
+The fixed **Images** menu's **Load for this message** action reloads only the
+selected message view with sanitized HTTP(S) image sources enabled. The
+permission is not persisted or shared and is reset by message/view navigation
+or application restart. A separate checked **Always load from this sender**
+action persists or revokes one normalized, unambiguous `From:` mailbox. The
+next sender list is written atomically before runtime state changes, then every
+matching main and standalone view is stopped and re-rendered under the ordinary
+configured policy.
+
+This sender match deliberately does not claim authentication. Raw `From:`
+values are attacker-controlled message data; without a configured trusted mail
+boundary or local DKIM/DMARC verifier, message-supplied authentication and
+routing headers cannot safely establish identity. The menu visibly warns that
+a forged message claiming an allowed mailbox inherits the exception. The
+separate `[ui].remote_images` global override remains available in Settings but
+is not exposed as the message-context menu action.
+
+Sanitized `cid:` references may resolve only to bounded, message-local raster
+MIME parts. They become generated `data:` image sources and remain available
+while the HTTP(S) policy is blocked; SVG and unmatched or oversized resources
+are not granted this path. Decoded resources are capped at 4 MiB each and 8 MiB
+per message; reference count and generated-HTML caps prevent repeated-CID
+amplification. View selections are persisted by Message-ID, with optional
 normalized-sender defaults and message-over-sender precedence; standalone
 message windows use the same resolver and stores.

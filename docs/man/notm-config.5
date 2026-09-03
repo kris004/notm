@@ -175,14 +175,36 @@ Show shortcut hints on buttons.  Defaults to true.
 Explicit global privacy override allowing remote images in every visual HTML
 message.  Defaults to false.  With the default, remote content remains blocked
 unless the user chooses
-.B Load remote images once
+.B Images \(-> Load for this message
 for the current message view.  That one-shot permission is not persisted or
 shared and resets on message or view navigation and application restart.
+The global override remains available in Settings but is not the
+message-context Images action.
+.TP
+.B trusted_image_senders
+Application-managed array of exact normalized mailbox addresses.  The checked
+.B Images \(-> Always load from this sender
+action atomically adds or removes the current message's unambiguous
+.B From:
+mailbox, then refreshes matching open main and standalone views.  The action
+requires exactly one valid mailbox; missing, malformed, grouped, or
+multi-mailbox values remain blocked and can use only the one-message action.
+.PP
+Bounded raster images embedded in the message and referenced through
+.B cid:
+render locally without remote-image permission or a network request.  The
+resolver permits at most 4 MiB per image, 8 MiB of decoded images per message,
+2,048 resolved references, and 16 MiB of generated inline-image HTML.
 .PP
 Raw
 .B From:
-headers are not authenticated by Notmuch and cannot grant durable remote-image
-permission.
+headers are not authenticated by Notmuch.  This list is a user privacy
+preference, not proof of identity: a forged message claiming a listed address
+inherits the image permission.  notm does not treat message-supplied
+.BR Authentication-Results ,
+.BR Return-Path ,
+or routing/signature headers as a trusted authentication boundary, and the
+Images menu displays this warning.
 .TP
 .B html_mode
 HTML rendering preference.  Supported values are
@@ -428,15 +450,12 @@ locally, and confines tag changes to its disposable database.
 .SH LEGACY KEYS
 The obsolete keys
 .BR ui.confirm_destructive_tag_actions ,
-.BR ui.trusted_image_senders ,
 .BR send.one_live_self_test_per_run ,
 and
 .B sync.show_manual_sync_button
 are accepted for compatibility but ignored and omitted from printed
-configuration.  A later successful Settings write removes
-.B ui.trusted_image_senders
-instead of converting its entries into broader permissions.  The other keys
-can be removed from existing files.  Other unknown keys are errors.
+configuration.  They can be removed from existing files.  Other unknown keys
+are errors.
 .SH SEE ALSO
 .BR notm (1),
 .BR notm-test-harness (7)

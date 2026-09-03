@@ -239,7 +239,11 @@ outcome instead of being overwritten by late recovery completion.
 .BR show_text_thread ,
 .BR show_visual_html ,
 .BR image_policy ,
+.BR image_policy_menu ,
 .BR load_images_once ,
+.BR trust_sender_images ,
+.BR untrust_sender_images ,
+.BR trusted_image_senders ,
 .BR view_preference_state ,
 .BR click_sender_view_preference ,
 .BR start_link_hints ,
@@ -251,6 +255,7 @@ outcome instead of being overwritten by late recovery completion.
 .BR standalone_message_windows ,
 .BR close_standalone_message_windows ,
 .BR standalone_select_message ,
+.BR standalone_image_policy ,
 .BR standalone_respond ,
 .BR attachment_list_items ,
 .BR save_selected_attachment ,
@@ -267,6 +272,51 @@ outcome instead of being overwritten by late recovery completion.
 reloads Visual HTML with remote images enabled only for the current message
 view.  It creates no durable sender permission and resets on navigation or
 application restart.
+.PP
+.B image_policy
+toggles the checked
+.B Always load from this sender
+item in the fixed
+.B Images
+menu.
+.B trust_sender_images
+enables that exact normalized
+.B From:
+mailbox exception idempotently,
+.B untrust_sender_images
+revokes it, and
+.B trusted_image_senders
+reads the effective list.  The persistent actions are fixture-only for both
+direct and nested harness access.  Failed configuration writes leave runtime
+policy and rendered views unchanged.
+.PP
+.B image_policy_menu
+opens or closes the real popover according to its
+.B visible
+Boolean and is fixture-only.
+.PP
+.B standalone_image_policy
+opens the real standalone-window popover, activates the corresponding control,
+closes the popover, and returns its visibility in the window snapshot.  Its
+.B action
+is
+.BR load_once ,
+.BR toggle_sender ,
+.BR sender_on ,
+or
+.BR sender_off ;
+it is fixture-only and reports a persistence failure instead of reporting a
+successful toggle.
+.PP
+HTML and standalone snapshots distinguish
+.BR blocked ,
+.BR message_once ,
+.BR sender ,
+and
+.BR all_messages .
+They also expose the visible warning that raw
+.B From:
+is not authenticated by notm and can be forged.
 .SS UI and debugging
 .BR open_command_palette ,
 .BR command_completion ,

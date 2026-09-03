@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, fs::File, io::Read, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::File,
+    io::Read,
+    path::Path,
+};
 
 use anyhow::Context;
 use mailparse::{DispositionType, MailHeaderMap, body::Body};
@@ -187,6 +192,21 @@ pub struct AttachmentExtractionReport {
     pub failures: Vec<AttachmentDecodeFailure>,
 }
 
+/// CID lookup provenance for one byte range of [`ParsedMessage::html_body`].
+///
+/// Ranges are ordered, non-overlapping UTF-8 byte ranges. `None` retains
+/// message-wide lookup for an HTML body selected outside `multipart/related`.
+/// `Some`, including an empty vector, lists attachment-part indexes in lookup
+/// precedence order: the nearest related container first, followed by outer
+/// related resources in MIME order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HtmlCidPartScope {
+    pub start: usize,
+    pub end: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_indexes: Option<Vec<usize>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParsedMessage {
     pub headers: BTreeMap<String, String>,
@@ -200,6 +220,10 @@ pub struct ParsedMessage {
     pub in_reply_to: String,
     pub text_body: String,
     pub html_body: Option<String>,
+    /// Ordered CID lookup provenance for the selected HTML body without
+    /// retaining another copy of its contents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub html_cid_part_scopes: Vec<HtmlCidPartScope>,
     pub safe_body: String,
     /// Transfer-encoding problems encountered while preserving readable parts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -237,6 +261,7 @@ pub fn parse_rfc5322_with_limits(
         .or(selection.text_fallback)
         .unwrap_or_default();
     let html_body = selection.html;
+    let html_cid_part_scopes = selection.html_cid_part_scopes;
     let safe_body = if !text_body.trim().is_empty() {
         text_body.clone()
     } else if let Some(html) = &html_body {
@@ -265,6 +290,7 @@ pub fn parse_rfc5322_with_limits(
         headers,
         text_body,
         html_body,
+        html_cid_part_scopes,
         safe_body,
         decode_warnings: state.decode_warnings,
         attachments: state.attachments,
@@ -355,6 +381,7 @@ pub fn parse_reader_with_limits(
 struct BodySelection {
     text: Option<String>,
     html: Option<String>,
+    html_cid_part_scopes: Vec<HtmlCidPartScope>,
     text_fallback: Option<String>,
 }
 
@@ -365,7 +392,12 @@ impl BodySelection {
         // we render specially. Prefer an exact text/plain representation when
         // both are available from a nested selection.
         append_body(&mut self.text, other.text.or(other.text_fallback));
-        append_body(&mut self.html, other.html);
+        append_html_body(
+            &mut self.html,
+            &mut self.html_cid_part_scopes,
+            other.html,
+            other.html_cid_part_scopes,
+        );
     }
 
     fn replace_supported(&mut self, other: Self) {
@@ -374,6 +406,7 @@ impl BodySelection {
         }
         if other.html.is_some() {
             self.html = other.html;
+            self.html_cid_part_scopes = other.html_cid_part_scopes;
         }
         if other.text_fallback.is_some() {
             self.text_fallback = other.text_fallback;
@@ -391,6 +424,51 @@ fn append_body(destination: &mut Option<String>, source: Option<String>) {
             destination.push_str(&source);
         }
         _ => *destination = Some(source),
+    }
+}
+
+fn append_html_body(
+    destination: &mut Option<String>,
+    destination_scopes: &mut Vec<HtmlCidPartScope>,
+    source: Option<String>,
+    mut source_scopes: Vec<HtmlCidPartScope>,
+) {
+    let Some(source) = source.filter(|body| !body.trim().is_empty()) else {
+        return;
+    };
+    if source_scopes.is_empty() {
+        source_scopes.push(HtmlCidPartScope {
+            start: 0,
+            end: source.len(),
+            part_indexes: None,
+        });
+    }
+    match destination {
+        Some(destination) if !destination.trim().is_empty() => {
+            let previous_len = destination.len();
+            destination.push_str("\n\n");
+            if let Some(last) = destination_scopes.last_mut() {
+                debug_assert_eq!(last.end, previous_len);
+                last.end = destination.len();
+            } else {
+                destination_scopes.push(HtmlCidPartScope {
+                    start: 0,
+                    end: destination.len(),
+                    part_indexes: None,
+                });
+            }
+            let offset = destination.len();
+            for scope in &mut source_scopes {
+                scope.start = scope.start.saturating_add(offset);
+                scope.end = scope.end.saturating_add(offset);
+            }
+            destination.push_str(&source);
+            destination_scopes.extend(source_scopes);
+        }
+        _ => {
+            *destination = Some(source);
+            *destination_scopes = source_scopes;
+        }
     }
 }
 
@@ -460,18 +538,26 @@ fn walk_part(
 
     if !part.subparts.is_empty() {
         let mut selections = Vec::with_capacity(part.subparts.len());
+        let mut attachment_ranges = Vec::with_capacity(part.subparts.len());
         for (index, subpart) in part.subparts.iter().enumerate() {
             let child_named_body_allowed =
                 named_body_allowed_for_child(part, &mimetype, named_body_allowed, index);
+            let attachment_start = state.next_attachment_index;
             path.push(index);
             let selection = walk_part(subpart, depth + 1, path, child_named_body_allowed, state)?;
             path.pop();
+            attachment_ranges.push(attachment_start..state.next_attachment_index);
             selections.push(selection);
         }
         if explicitly_attached {
             return Ok(BodySelection::default());
         }
-        return Ok(select_multipart_body(part, &mimetype, selections));
+        return Ok(select_multipart_body(
+            part,
+            &mimetype,
+            selections,
+            &attachment_ranges,
+        ));
     }
 
     let content_id = part.headers.get_first_value("Content-ID");
@@ -549,16 +635,26 @@ fn walk_part(
                 "text/plain" => BodySelection {
                     text: Some(body),
                     html: None,
+                    html_cid_part_scopes: Vec::new(),
                     text_fallback: None,
                 },
-                "text/html" => BodySelection {
-                    text: None,
-                    html: Some(body),
-                    text_fallback: None,
-                },
+                "text/html" => {
+                    let body_len = body.len();
+                    BodySelection {
+                        text: None,
+                        html: Some(body),
+                        html_cid_part_scopes: vec![HtmlCidPartScope {
+                            start: 0,
+                            end: body_len,
+                            part_indexes: None,
+                        }],
+                        text_fallback: None,
+                    }
+                }
                 _ if mimetype.starts_with("text/") => BodySelection {
                     text: None,
                     html: None,
+                    html_cid_part_scopes: Vec::new(),
                     text_fallback: Some(body),
                 },
                 _ => BodySelection::default(),
@@ -577,6 +673,7 @@ fn select_multipart_body(
     part: &mailparse::ParsedMail<'_>,
     mimetype: &str,
     selections: Vec<BodySelection>,
+    attachment_ranges: &[std::ops::Range<usize>],
 ) -> BodySelection {
     match mimetype {
         "multipart/alternative" => {
@@ -590,7 +687,31 @@ fn select_multipart_body(
         }
         "multipart/related" => {
             let root_index = related_root_index(part);
-            selections.into_iter().nth(root_index).unwrap_or_default()
+            let mut selected = selections.into_iter().nth(root_index).unwrap_or_default();
+            if let Some(html) = &selected.html {
+                if selected.html_cid_part_scopes.is_empty() {
+                    selected.html_cid_part_scopes.push(HtmlCidPartScope {
+                        start: 0,
+                        end: html.len(),
+                        part_indexes: None,
+                    });
+                }
+                for scope in &mut selected.html_cid_part_scopes {
+                    let indexes = scope.part_indexes.get_or_insert_default();
+                    let mut seen = indexes.iter().copied().collect::<BTreeSet<_>>();
+                    for (index, range) in attachment_ranges.iter().enumerate() {
+                        if index == root_index {
+                            continue;
+                        }
+                        for part_index in range.clone() {
+                            if seen.insert(part_index) {
+                                indexes.push(part_index);
+                            }
+                        }
+                    }
+                }
+            }
+            selected
         }
         "multipart/signed" => selections.into_iter().next().unwrap_or_default(),
         "multipart/encrypted" => BodySelection::default(),
@@ -1242,6 +1363,34 @@ pub fn extract_attachments_detailed_with_limits(
     bytes: &[u8],
     limits: MimeLimits,
 ) -> anyhow::Result<AttachmentExtractionReport> {
+    extract_selected_attachments_detailed_with_limits(bytes, None, limits)
+}
+
+/// Extract only the requested stable attachment-part indexes.
+///
+/// Unselected parts are still traversed so indexes retain their ordinary
+/// depth-first meaning, but their payloads are not decoded or retained.
+pub fn extract_attachment_parts_detailed(
+    bytes: &[u8],
+    part_indexes: &[usize],
+) -> anyhow::Result<AttachmentExtractionReport> {
+    extract_attachment_parts_detailed_with_limits(bytes, part_indexes, MimeLimits::default())
+}
+
+pub fn extract_attachment_parts_detailed_with_limits(
+    bytes: &[u8],
+    part_indexes: &[usize],
+    limits: MimeLimits,
+) -> anyhow::Result<AttachmentExtractionReport> {
+    let selected = part_indexes.iter().copied().collect::<BTreeSet<_>>();
+    extract_selected_attachments_detailed_with_limits(bytes, Some(&selected), limits)
+}
+
+fn extract_selected_attachments_detailed_with_limits(
+    bytes: &[u8],
+    selected: Option<&BTreeSet<usize>>,
+    limits: MimeLimits,
+) -> anyhow::Result<AttachmentExtractionReport> {
     anyhow::ensure!(
         bytes.len() <= limits.max_message_bytes,
         "message exceeds the {}-byte safety limit",
@@ -1256,6 +1405,7 @@ pub fn extract_attachments_detailed_with_limits(
         &parsed,
         limits,
         false,
+        selected,
         &mut total_decoded_bytes,
         &mut next_part_index,
         &mut report,
@@ -1281,6 +1431,7 @@ fn collect_attachment_data(
     part: &mailparse::ParsedMail<'_>,
     limits: MimeLimits,
     named_body_allowed: bool,
+    selected: Option<&BTreeSet<usize>>,
     total_decoded_bytes: &mut usize,
     next_part_index: &mut usize,
     report: &mut AttachmentExtractionReport,
@@ -1294,6 +1445,7 @@ fn collect_attachment_data(
                 subpart,
                 limits,
                 child_named_body_allowed,
+                selected,
                 total_decoded_bytes,
                 next_part_index,
                 report,
@@ -1314,6 +1466,9 @@ fn collect_attachment_data(
     }
     let part_index = *next_part_index;
     *next_part_index += 1;
+    if selected.is_some_and(|selected| !selected.contains(&part_index)) {
+        return Ok(());
+    }
     let filename = filename.unwrap_or_else(|| fallback_attachment_filename(part));
     let description = part_description(&mimetype, Some(&filename), true);
     ensure_decode_may_fit(part, &description, limits.max_decoded_part_bytes)?;
@@ -1592,6 +1747,16 @@ mod tests {
         assert_eq!(report.attachments[0].filename, "good.txt");
         assert_eq!(report.attachments[0].bytes, b"good sibling");
 
+        let selected = extract_attachment_parts_detailed(&raw, &[1])
+            .expect("extract only the selected good attachment");
+        assert!(
+            selected.failures.is_empty(),
+            "an unselected malformed sibling was decoded: {selected:?}"
+        );
+        assert_eq!(selected.attachments.len(), 1);
+        assert_eq!(selected.attachments[0].part_index, 1);
+        assert_eq!(selected.attachments[0].bytes, b"good sibling");
+
         let strict_error = extract_attachments(&raw)
             .expect_err("strict extraction must reject any corrupt attachment");
         assert!(format!("{strict_error:#}").contains("broken.bin"));
@@ -1643,6 +1808,14 @@ mod tests {
             assert_eq!(parsed.text_body, "Plain body");
             assert_eq!(parsed.safe_body, "Plain body");
             assert_eq!(parsed.html_body.as_deref(), Some("<p>HTML body</p>"));
+            assert_eq!(
+                parsed.html_cid_part_scopes,
+                [HtmlCidPartScope {
+                    start: 0,
+                    end: "<p>HTML body</p>".len(),
+                    part_indexes: None,
+                }]
+            );
         }
     }
 
@@ -1750,6 +1923,14 @@ mod tests {
             parsed.html_body.as_deref(),
             Some("<p>Named related body</p>")
         );
+        assert_eq!(
+            parsed.html_cid_part_scopes,
+            [HtmlCidPartScope {
+                start: 0,
+                end: "<p>Named related body</p>".len(),
+                part_indexes: Some(vec![0]),
+            }]
+        );
         assert_eq!(parsed.attachments.len(), 1);
         assert_eq!(parsed.attachments[0].filename.as_deref(), Some("pixel.png"));
 
@@ -1823,6 +2004,14 @@ mod tests {
                          --rel--\r\n";
         let parsed = parse_rfc5322(declared).expect("parse related start root");
         assert_eq!(parsed.html_body.as_deref(), Some("<p>root</p>"));
+        assert_eq!(
+            parsed.html_cid_part_scopes,
+            [HtmlCidPartScope {
+                start: 0,
+                end: "<p>root</p>".len(),
+                part_indexes: Some(vec![0]),
+            }]
+        );
 
         let fallback = b"MIME-Version: 1.0\r\n\
                          Content-Type: multipart/related; boundary=rel\r\n\r\n\
@@ -1832,6 +2021,89 @@ mod tests {
         let parsed = parse_rfc5322(fallback).expect("parse related first-part fallback");
         assert_eq!(parsed.safe_body, "first root");
         assert!(parsed.html_body.is_none());
+    }
+
+    #[test]
+    fn appended_html_bodies_preserve_individual_cid_part_scopes() {
+        let raw = b"MIME-Version: 1.0\r\n\
+                    Content-Type: multipart/mixed; boundary=mixed\r\n\r\n\
+                    --mixed\r\n\
+                    Content-Type: multipart/related; boundary=first\r\n\r\n\
+                    --first\r\nContent-Type: text/html\r\n\r\n<p>First</p>\r\n\
+                    --first\r\nContent-Type: image/png\r\nContent-ID: <first-image>\r\n\r\nfirst\r\n\
+                    --first--\r\n\
+                    --mixed\r\n\
+                    Content-Type: multipart/related; boundary=second; start=\"<second-body>\"\r\n\r\n\
+                    --second\r\nContent-Type: image/png\r\nContent-ID: <second-image>\r\n\r\nsecond\r\n\
+                    --second\r\n\
+                    Content-Type: text/html\r\nContent-ID: <second-body>\r\n\r\n<p>Second</p>\r\n\
+                    --second--\r\n\
+                    --mixed\r\n\
+                    Content-Type: text/html\r\n\r\n<p>Unscoped</p>\r\n\
+                    --mixed--\r\n";
+
+        let parsed = parse_rfc5322(raw).expect("parse appended related bodies");
+
+        let html = "<p>First</p>\n\n<p>Second</p>\n\n<p>Unscoped</p>";
+        assert_eq!(parsed.html_body.as_deref(), Some(html));
+        let second_start = "<p>First</p>\n\n".len();
+        let third_start = "<p>First</p>\n\n<p>Second</p>\n\n".len();
+        assert_eq!(
+            parsed.html_cid_part_scopes,
+            [
+                HtmlCidPartScope {
+                    start: 0,
+                    end: second_start,
+                    part_indexes: Some(vec![0]),
+                },
+                HtmlCidPartScope {
+                    start: second_start,
+                    end: third_start,
+                    part_indexes: Some(vec![1]),
+                },
+                HtmlCidPartScope {
+                    start: third_start,
+                    end: html.len(),
+                    part_indexes: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_related_cid_scope_prefers_nearest_resources() {
+        let raw = b"MIME-Version: 1.0\r\n\
+                    Content-Type: multipart/related; boundary=outer; \
+                      start=\"<outer-root@example.test>\"\r\n\r\n\
+                    --outer\r\n\
+                    Content-Type: image/png\r\n\
+                    Content-ID: <shared@example.test>\r\n\r\n\
+                    outer image\r\n\
+                    --outer\r\n\
+                    Content-Type: multipart/related; boundary=inner\r\n\
+                    Content-ID: <outer-root@example.test>\r\n\r\n\
+                    --inner\r\n\
+                    Content-Type: text/html; charset=utf-8\r\n\r\n\
+                    <img src=\"cid:shared@example.test\">\r\n\
+                    --inner\r\n\
+                    Content-Type: image/png\r\n\
+                    Content-ID: <shared@example.test>\r\n\r\n\
+                    inner image\r\n\
+                    --inner--\r\n\
+                    --outer--\r\n";
+
+        let parsed = parse_rfc5322(raw).expect("parse nested related message");
+        let html = parsed.html_body.as_deref().expect("selected HTML body");
+
+        assert_eq!(html, "<img src=\"cid:shared@example.test\">");
+        assert_eq!(
+            parsed.html_cid_part_scopes,
+            [HtmlCidPartScope {
+                start: 0,
+                end: html.len(),
+                part_indexes: Some(vec![1, 0]),
+            }]
+        );
     }
 
     #[test]

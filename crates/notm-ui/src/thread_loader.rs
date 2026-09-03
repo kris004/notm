@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error as StdError,
     fmt, fs,
     io::Read,
@@ -14,9 +14,17 @@ use std::{
 };
 
 use anyhow::Context as _;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use mailparse::{MailHeaderMap as _, parse_content_disposition, parse_content_type, parse_headers};
-use notm_mail::{ParsedMessage, html_sanitize::sanitize_html, mime::parse_rfc5322};
+use notm_mail::{
+    Attachment, ParsedMessage,
+    html_sanitize::sanitize_html_with_cid_images,
+    mime::{
+        HtmlCidPartScope, MimeLimits, extract_attachment_parts_detailed_with_limits, parse_rfc5322,
+    },
+};
 use notm_notmuch::{Database, DatabaseMode, MessagePathState, MessageSummary, OpenConfig};
+use regex::Regex;
 
 use crate::model::MAX_LOADED_THREAD_MESSAGES;
 
@@ -36,6 +44,10 @@ const MAX_TEXT_VIEW_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RAW_VIEW_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HEADER_VIEW_BYTES: usize = 1024 * 1024;
 const MAX_MIME_NESTING_DEPTH: usize = 64;
+const MAX_INLINE_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TOTAL_INLINE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_INLINE_IMAGE_REFERENCES: usize = 2_048;
+const MAX_INLINE_IMAGE_HTML_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 struct PreparationLimits {
@@ -1358,7 +1370,7 @@ where
             let (text, html) = match &parsed {
                 Ok(parsed) => (
                     prepare_text(parsed, MAX_TEXT_VIEW_BYTES),
-                    prepare_html(parsed, limits.html_bytes),
+                    prepare_html(parsed, &bytes, limits.html_bytes),
                 ),
                 Err(error) => (
                     prepare_parse_failure_text(error, MAX_TEXT_VIEW_BYTES),
@@ -1768,7 +1780,14 @@ fn strip_trailing_crlf(bytes: &[u8], start: usize, mut end: usize) -> usize {
     end
 }
 
-fn prepare_html(parsed: &ParsedMessage, max_bytes: usize) -> PreparedHtml {
+#[derive(Debug, Clone, Copy)]
+struct PreparedHtmlCidPartScope<'a> {
+    start: usize,
+    end: usize,
+    part_indexes: Option<&'a [usize]>,
+}
+
+fn prepare_html(parsed: &ParsedMessage, source: &[u8], max_bytes: usize) -> PreparedHtml {
     let Some(html) = parsed
         .html_body
         .as_deref()
@@ -1786,19 +1805,458 @@ fn prepare_html(parsed: &ParsedMessage, max_bytes: usize) -> PreparedHtml {
         };
     }
 
-    let sanitized = sanitize_html(html);
+    let (sanitized, sanitized_cid_scopes) =
+        sanitize_html_with_cid_part_scopes(html, &parsed.html_cid_part_scopes);
+    let sanitized = resolve_inline_cid_images(&sanitized, &sanitized_cid_scopes, parsed, source);
     // These documents intentionally remain distinct even when the sanitized
-    // body contains no image markup. Their CSPs encode different authority:
-    // the default document blocks every image request, while the one-shot
-    // document permits only HTTP(S) image fetches.
+    // body contains no remote image markup. Their CSPs encode different
+    // authority: both may display bounded message-local MIME images, while
+    // only the one-shot document permits HTTP(S) image fetches.
     let images_allowed = Arc::<str>::from(visual_html_document(&sanitized, true));
-    let blocked_body = strip_img_tags(&sanitized);
+    let blocked_body = strip_remote_img_tags(&sanitized);
     let images_blocked = Arc::<str>::from(visual_html_document(&blocked_body, false));
     PreparedHtml::Ready {
         original_len: html.len(),
         images_allowed,
         images_blocked,
     }
+}
+
+fn sanitize_html_with_cid_part_scopes<'a>(
+    html: &str,
+    scopes: &'a [HtmlCidPartScope],
+) -> (String, Vec<PreparedHtmlCidPartScope<'a>>) {
+    let source_scopes = prepared_html_cid_part_scopes(html, scopes);
+
+    let mut sanitized = String::with_capacity(html.len());
+    let mut sanitized_scopes = Vec::with_capacity(source_scopes.len());
+    for scope in source_scopes {
+        let fragment = sanitize_html_with_cid_images(&html[scope.start..scope.end]);
+        let start = sanitized.len();
+        sanitized.push_str(&fragment);
+        sanitized_scopes.push(PreparedHtmlCidPartScope {
+            start,
+            end: sanitized.len(),
+            part_indexes: scope.part_indexes,
+        });
+    }
+    (sanitized, sanitized_scopes)
+}
+
+fn resolve_inline_cid_images(
+    html: &str,
+    cid_scopes: &[PreparedHtmlCidPartScope<'_>],
+    parsed: &ParsedMessage,
+    source: &[u8],
+) -> String {
+    resolve_inline_cid_images_scoped_with_limits(
+        html,
+        cid_scopes,
+        parsed,
+        source,
+        MAX_INLINE_IMAGE_BYTES,
+        MAX_TOTAL_INLINE_IMAGE_BYTES,
+    )
+}
+
+#[cfg(test)]
+fn resolve_inline_cid_images_with_limits(
+    html: &str,
+    parsed: &ParsedMessage,
+    source: &[u8],
+    max_inline_image_bytes: usize,
+    max_total_inline_image_bytes: usize,
+) -> String {
+    let cid_scopes = prepared_html_cid_part_scopes(html, &parsed.html_cid_part_scopes);
+    resolve_inline_cid_images_scoped_with_limits(
+        html,
+        &cid_scopes,
+        parsed,
+        source,
+        max_inline_image_bytes,
+        max_total_inline_image_bytes,
+    )
+}
+
+fn prepared_html_cid_part_scopes<'a>(
+    html: &str,
+    scopes: &'a [HtmlCidPartScope],
+) -> Vec<PreparedHtmlCidPartScope<'a>> {
+    let valid_scopes = !scopes.is_empty()
+        && scopes.iter().try_fold(0_usize, |expected_start, scope| {
+            (scope.start == expected_start
+                && scope.end >= scope.start
+                && scope.end <= html.len()
+                && html.is_char_boundary(scope.start)
+                && html.is_char_boundary(scope.end))
+            .then_some(scope.end)
+        }) == Some(html.len());
+    if valid_scopes {
+        scopes
+            .iter()
+            .map(|scope| PreparedHtmlCidPartScope {
+                start: scope.start,
+                end: scope.end,
+                part_indexes: scope.part_indexes.as_deref(),
+            })
+            .collect()
+    } else {
+        // A missing scope is the backwards-compatible message-wide form.
+        // Malformed nonempty metadata is an internal provenance failure and
+        // must not widen CID lookup.
+        vec![PreparedHtmlCidPartScope {
+            start: 0,
+            end: html.len(),
+            part_indexes: (!scopes.is_empty()).then_some([].as_slice()),
+        }]
+    }
+}
+
+#[derive(Debug)]
+struct InlineCidSegmentSelection {
+    start: usize,
+    end: usize,
+    part_indexes_by_content_id: BTreeMap<String, usize>,
+}
+
+#[derive(Debug)]
+struct InlineCidResource {
+    content_id: String,
+    data_uri: String,
+}
+
+fn select_inline_cid_segment_candidates<'a>(
+    candidates: impl IntoIterator<Item = &'a Attachment>,
+    referenced: &BTreeSet<String>,
+    selected_part_indexes: &mut BTreeSet<usize>,
+    selected_total_bytes: &mut usize,
+    max_inline_image_bytes: usize,
+    max_total_inline_image_bytes: usize,
+) -> BTreeMap<String, usize> {
+    let mut selected = BTreeMap::new();
+    for attachment in candidates {
+        let Some(content_id) = attachment.content_id.as_deref().map(normalize_content_id) else {
+            continue;
+        };
+        if content_id.is_empty()
+            || attachment.decode_error.is_some()
+            || !inline_image_content_type_is_safe(&attachment.content_type)
+            || !referenced.contains(&content_id)
+            || selected.contains_key(&content_id)
+            || attachment.size == 0
+            || attachment.size > max_inline_image_bytes
+        {
+            continue;
+        }
+        if !selected_part_indexes.contains(&attachment.part_index) {
+            let Some(next_total) = selected_total_bytes.checked_add(attachment.size) else {
+                continue;
+            };
+            if next_total > max_total_inline_image_bytes {
+                continue;
+            }
+            *selected_total_bytes = next_total;
+            selected_part_indexes.insert(attachment.part_index);
+        }
+        selected.insert(content_id, attachment.part_index);
+    }
+    selected
+}
+
+fn resolve_inline_cid_images_scoped_with_limits(
+    html: &str,
+    cid_scopes: &[PreparedHtmlCidPartScope<'_>],
+    parsed: &ParsedMessage,
+    source: &[u8],
+    max_inline_image_bytes: usize,
+    max_total_inline_image_bytes: usize,
+) -> String {
+    let cid_source = Regex::new(r#"(?i)\bsrc="cid:([^"]+)""#).expect("valid cid source regex");
+    if !cid_source.is_match(html) {
+        return html.to_string();
+    }
+
+    // Parsed attachment metadata comes from decoding this exact bounded source
+    // and therefore carries authoritative decoded sizes and stable part
+    // indexes. Each selected HTML body keeps its ordered related-container
+    // provenance, while decoded-byte accounting and extraction stay global.
+    // An oversized candidate is skipped without making a later fitting
+    // sibling disappear.
+    let attachments_by_part_index = parsed
+        .attachments
+        .iter()
+        .map(|attachment| (attachment.part_index, attachment))
+        .collect::<BTreeMap<_, _>>();
+    let mut selected_part_indexes = BTreeSet::new();
+    let mut selected_total_bytes = 0_usize;
+    let mut segment_selections = Vec::with_capacity(cid_scopes.len());
+    for scope in cid_scopes {
+        let Some(segment) = html.get(scope.start..scope.end) else {
+            continue;
+        };
+        let referenced = cid_source
+            .captures_iter(segment)
+            .filter_map(|captures| decode_cid_url_content_id(&captures[1]))
+            .collect::<BTreeSet<_>>();
+        let part_indexes_by_content_id = if let Some(part_indexes) = scope.part_indexes {
+            select_inline_cid_segment_candidates(
+                part_indexes
+                    .iter()
+                    .filter_map(|index| attachments_by_part_index.get(index).copied()),
+                &referenced,
+                &mut selected_part_indexes,
+                &mut selected_total_bytes,
+                max_inline_image_bytes,
+                max_total_inline_image_bytes,
+            )
+        } else {
+            select_inline_cid_segment_candidates(
+                &parsed.attachments,
+                &referenced,
+                &mut selected_part_indexes,
+                &mut selected_total_bytes,
+                max_inline_image_bytes,
+                max_total_inline_image_bytes,
+            )
+        };
+        segment_selections.push(InlineCidSegmentSelection {
+            start: scope.start,
+            end: scope.end,
+            part_indexes_by_content_id,
+        });
+    }
+
+    let extraction_limits = MimeLimits {
+        max_decoded_part_bytes: max_inline_image_bytes,
+        max_total_decoded_bytes: max_total_inline_image_bytes,
+        ..MimeLimits::default()
+    };
+    let resources_by_part_index = if selected_part_indexes.is_empty() {
+        BTreeMap::new()
+    } else {
+        let selected_part_indexes = selected_part_indexes.iter().copied().collect::<Vec<_>>();
+        extract_attachment_parts_detailed_with_limits(
+            source,
+            &selected_part_indexes,
+            extraction_limits,
+        )
+        .map(|report| {
+            let mut total_bytes = 0_usize;
+            let mut resources = BTreeMap::<usize, InlineCidResource>::new();
+            for attachment in report.attachments {
+                let Some(content_id) = attachment.content_id.as_deref() else {
+                    continue;
+                };
+                if !inline_image_content_type_is_safe(&attachment.content_type)
+                    || attachment.bytes.is_empty()
+                    || attachment.bytes.len() > max_inline_image_bytes
+                {
+                    continue;
+                }
+                let content_id = normalize_content_id(content_id);
+                if content_id.is_empty() || resources.contains_key(&attachment.part_index) {
+                    continue;
+                }
+                let Some(next_total) = total_bytes.checked_add(attachment.bytes.len()) else {
+                    continue;
+                };
+                if next_total > max_total_inline_image_bytes {
+                    continue;
+                }
+                total_bytes = next_total;
+                resources.insert(
+                    attachment.part_index,
+                    InlineCidResource {
+                        content_id,
+                        data_uri: format!(
+                            "data:{};base64,{}",
+                            attachment.content_type,
+                            BASE64_STANDARD.encode(&attachment.bytes)
+                        ),
+                    },
+                );
+            }
+            resources
+        })
+        .unwrap_or_default()
+    };
+
+    let mut segment_index = 0_usize;
+    replace_cid_sources_bounded_by(
+        html,
+        &cid_source,
+        MAX_INLINE_IMAGE_HTML_BYTES,
+        MAX_INLINE_IMAGE_REFERENCES,
+        |start, end, content_id| {
+            while segment_selections
+                .get(segment_index)
+                .is_some_and(|segment| start >= segment.end)
+            {
+                segment_index = segment_index.saturating_add(1);
+            }
+            let segment = segment_selections.get(segment_index)?;
+            if start < segment.start || end > segment.end {
+                return None;
+            }
+            let part_index = segment.part_indexes_by_content_id.get(content_id)?;
+            let resource = resources_by_part_index.get(part_index)?;
+            (resource.content_id == content_id).then_some(resource.data_uri.as_str())
+        },
+    )
+}
+
+#[cfg(test)]
+fn replace_cid_sources_bounded(
+    html: &str,
+    cid_source: &Regex,
+    resources: &BTreeMap<String, String>,
+    max_output_bytes: usize,
+    max_resolved_references: usize,
+) -> String {
+    replace_cid_sources_bounded_by(
+        html,
+        cid_source,
+        max_output_bytes,
+        max_resolved_references,
+        |_, _, content_id| resources.get(content_id).map(String::as_str),
+    )
+}
+
+fn replace_cid_sources_bounded_by<'a>(
+    html: &str,
+    cid_source: &Regex,
+    max_output_bytes: usize,
+    max_resolved_references: usize,
+    mut resource_for: impl FnMut(usize, usize, &str) -> Option<&'a str>,
+) -> String {
+    // Resolve only when the sanitized base document fits the output budget,
+    // then track projected final length before copying each data URI so
+    // repeated references cannot amplify one bounded MIME part without limit.
+    let resolution_fits_base_document = html.len() <= max_output_bytes;
+    let effective_output_limit = max_output_bytes.max(html.len());
+    let mut projected_len = html.len();
+    let mut resolved_references = 0_usize;
+    let mut last_end = 0_usize;
+    let mut output = String::with_capacity(html.len());
+
+    for captures in cid_source.captures_iter(html) {
+        let Some(source) = captures.get(0) else {
+            continue;
+        };
+        output.push_str(&html[last_end..source.start()]);
+        let content_id = decode_cid_url_content_id(&captures[1]);
+        let resource = content_id
+            .as_ref()
+            .and_then(|content_id| resource_for(source.start(), source.end(), content_id));
+        let replacement_len = resource.map_or(r#"src="""#.len(), |resource| {
+            r#"src="""#.len().saturating_add(resource.len())
+        });
+        let candidate_len = projected_len
+            .saturating_sub(source.as_str().len())
+            .saturating_add(replacement_len);
+        let resolve = resource.is_some()
+            && resolution_fits_base_document
+            && resolved_references < max_resolved_references
+            && candidate_len <= effective_output_limit;
+
+        if resolve {
+            let resource = resource.expect("checked resource");
+            output.push_str(r#"src=""#);
+            output.push_str(resource);
+            output.push('"');
+            projected_len = candidate_len;
+            resolved_references += 1;
+        } else {
+            output.push_str(r#"src="""#);
+            projected_len = projected_len
+                .saturating_sub(source.as_str().len())
+                .saturating_add(r#"src="""#.len());
+        }
+        last_end = source.end();
+    }
+    output.push_str(&html[last_end..]);
+    debug_assert_eq!(output.len(), projected_len);
+    debug_assert!(!resolution_fits_base_document || output.len() <= max_output_bytes);
+    output
+}
+
+fn inline_image_content_type_is_safe(content_type: &str) -> bool {
+    matches!(
+        content_type.trim().to_ascii_lowercase().as_str(),
+        "image/avif" | "image/gif" | "image/jpeg" | "image/png" | "image/webp"
+    )
+}
+
+fn decode_cid_url_content_id(value: &str) -> Option<String> {
+    // Ammonia parses the source attribute through html5ever and serializes its
+    // DOM value back into double-quoted HTML. Decode exactly the entities that
+    // serializer emits, once, to recover the CID URL before applying RFC 2392
+    // percent decoding. Unknown entity-looking text remains literal.
+    let value = decode_sanitized_attribute_entities(value);
+    let source = value.as_bytes();
+    let mut decoded = Vec::with_capacity(source.len());
+    let mut index = 0;
+    while index < source.len() {
+        if source[index] != b'%' {
+            decoded.push(source[index]);
+            index += 1;
+            continue;
+        }
+        let high = source.get(index + 1).and_then(|byte| hex_value(*byte))?;
+        let low = source.get(index + 2).and_then(|byte| hex_value(*byte))?;
+        decoded.push((high << 4) | low);
+        index += 3;
+    }
+    if decoded.iter().any(u8::is_ascii_control) {
+        return None;
+    }
+    let decoded = String::from_utf8(decoded).ok()?;
+    let content_id = normalize_content_id(&decoded);
+    (!content_id.is_empty()).then_some(content_id)
+}
+
+fn decode_sanitized_attribute_entities(value: &str) -> String {
+    let mut decoded = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        let remainder = &value[index..];
+        let (replacement, consumed) = if remainder.starts_with("&amp;") {
+            ("&", "&amp;".len())
+        } else if remainder.starts_with("&quot;") {
+            ("\"", "&quot;".len())
+        } else if remainder.starts_with("&nbsp;") {
+            ("\u{00a0}", "&nbsp;".len())
+        } else {
+            let character = remainder
+                .chars()
+                .next()
+                .expect("nonempty attribute remainder");
+            decoded.push(character);
+            index += character.len_utf8();
+            continue;
+        };
+        decoded.push_str(replacement);
+        index += consumed;
+    }
+    decoded
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn normalize_content_id(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim()
+        .to_ascii_lowercase()
 }
 
 fn render_parsed_message_text(parsed: &ParsedMessage, collapse_quotes: bool) -> String {
@@ -1865,7 +2323,7 @@ fn render_body_with_quote_collapse(body: &str, collapse_quotes: bool) -> String 
     }
 }
 
-fn strip_img_tags(html: &str) -> String {
+fn strip_remote_img_tags(html: &str) -> String {
     let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len());
     let mut pos = 0;
@@ -1883,8 +2341,14 @@ fn strip_img_tags(html: &str) -> String {
         }
         out.push_str(&html[pos..start]);
         if let Some(relative_end) = lower[start..].find('>') {
-            out.push_str("<span class=\"notm-blocked-image\">[image blocked]</span>");
-            pos = start + relative_end + 1;
+            let end = start + relative_end + 1;
+            let tag = &html[start..end];
+            if tag.to_ascii_lowercase().contains(r#"src="data:image/"#) {
+                out.push_str(tag);
+            } else {
+                out.push_str("<span class=\"notm-blocked-image\">[image blocked]</span>");
+            }
+            pos = end;
         } else {
             pos = html.len();
             break;
@@ -1896,9 +2360,9 @@ fn strip_img_tags(html: &str) -> String {
 
 fn visual_html_document(body: &str, allow_remote_images: bool) -> String {
     let image_sources = if allow_remote_images {
-        "http: https:"
+        "data: http: https:"
     } else {
-        "'none'"
+        "data:"
     };
     format!(
         r#"<!doctype html>
@@ -1992,6 +2456,18 @@ fn parsed_message_bytes(parsed: &ParsedMessage) -> usize {
                 .fold(0_usize, |total, value| total.saturating_add(value.len())),
         )
         .saturating_add(parsed.html_body.as_ref().map(String::len).unwrap_or(0))
+        .saturating_add(
+            parsed
+                .html_cid_part_scopes
+                .iter()
+                .fold(0_usize, |total, scope| {
+                    total
+                        .saturating_add(std::mem::size_of_val(scope))
+                        .saturating_add(scope.part_indexes.as_ref().map_or(0, |indexes| {
+                            indexes.len().saturating_mul(std::mem::size_of::<usize>())
+                        }))
+                }),
+        )
         .saturating_add(parsed.headers.iter().fold(0_usize, |total, (key, value)| {
             total
                 .saturating_add(std::mem::size_of::<(String, String)>())
@@ -2072,6 +2548,7 @@ fn attachment_manifest_bytes(attachment: &AttachmentManifest) -> usize {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         fmt::Write as _,
         path::{Path, PathBuf},
         sync::{
@@ -2082,13 +2559,15 @@ mod tests {
     };
 
     use notm_notmuch::{Database, MessageSummary, OpenConfig};
+    use regex::Regex;
 
     use super::{
         DEFAULT_PREPARATION_LIMITS, MAX_CANDIDATE_THREAD_IDS, MessageSource, MimePreflightLimits,
         PreparationLimits, TargetMessageNotFound, ThreadLoadCoordinator, ThreadLoadRequest,
-        ThreadLoaderService, load_thread, load_thread_with_reader, preflight_mime,
-        prepare_message_with_parser, prepare_thread, prepare_thread_with_cancel,
-        prepare_thread_with_limits, prepare_thread_with_resolution, read_bounded,
+        ThreadLoaderService, decode_cid_url_content_id, load_thread, load_thread_with_reader,
+        parse_rfc5322, preflight_mime, prepare_message_with_parser, prepare_thread,
+        prepare_thread_with_cancel, prepare_thread_with_limits, prepare_thread_with_resolution,
+        read_bounded, replace_cid_sources_bounded, resolve_inline_cid_images_with_limits,
     };
 
     fn notmuch_fixture_config(temp: &tempfile::TempDir) -> (OpenConfig, PathBuf) {
@@ -2154,6 +2633,194 @@ mod tests {
         }
         source.push_str("--x-- \t");
         source.into_bytes()
+    }
+
+    fn related_html_with_inline_jpegs(count: usize) -> Vec<u8> {
+        const TINY_JPEG: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAACAAIDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD3+iiigD//2Q==";
+        let mut source = String::from(
+            "MIME-Version: 1.0\r\n\
+             From: not a valid mailbox ???\r\n\
+             Subject: Inline image fixture\r\n\
+             Content-Type: multipart/related; boundary=related\r\n\r\n\
+             --related\r\n\
+             Content-Type: multipart/alternative; boundary=alternative\r\n\r\n\
+             --alternative\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\r\n\
+             Inline image fixture.\r\n\
+             --alternative\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\r\n\
+             <p>Inline images:</p>",
+        );
+        for index in 0..count {
+            source.push_str(&format!(
+                "<img src=\"cid:scan-{index}@example.test\" alt=\"scan {index}\">"
+            ));
+        }
+        source.push_str(
+            "<img src=\"https://remote.example.test/tracker.jpg\" alt=\"remote\">\r\n\
+             --alternative--\r\n",
+        );
+        for index in 0..count {
+            source.push_str(&format!(
+                "--related\r\n\
+                 Content-Type: image/jpeg; name=scan-{index}.jpg\r\n\
+                 Content-Disposition: inline; filename=scan-{index}.jpg\r\n\
+                 Content-ID: <scan-{index}@example.test>\r\n\
+                 Content-Transfer-Encoding: base64\r\n\r\n\
+                 {TINY_JPEG}\r\n"
+            ));
+        }
+        source.push_str("--related--\r\n");
+        source.into_bytes()
+    }
+
+    fn related_html_with_inline_base64_payloads(payloads: &[&str]) -> Vec<u8> {
+        let mut source = String::from(
+            "MIME-Version: 1.0\r\n\
+             Content-Type: multipart/related; boundary=related\r\n\r\n\
+             --related\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\r\n",
+        );
+        for index in 0..payloads.len() {
+            write!(
+                source,
+                "<img src=\"cid:image-{index}@example.test\" alt=\"image {index}\">"
+            )
+            .expect("write HTML CID reference");
+        }
+        source.push_str("\r\n");
+        for (index, payload) in payloads.iter().enumerate() {
+            write!(
+                source,
+                "--related\r\n\
+                 Content-Type: image/png; name=image-{index}.png\r\n\
+                 Content-Disposition: inline; filename=image-{index}.png\r\n\
+                 Content-ID: <image-{index}@example.test>\r\n\
+                 Content-Transfer-Encoding: base64\r\n\r\n\
+                 {payload}\r\n"
+            )
+            .expect("write inline image fixture");
+        }
+        source.push_str("--related--\r\n");
+        source.into_bytes()
+    }
+
+    fn related_html_with_encoded_cid_url() -> Vec<u8> {
+        b"MIME-Version: 1.0\r\n\
+          Content-Type: multipart/related; boundary=related\r\n\r\n\
+          --related\r\n\
+          Content-Type: text/html; charset=utf-8\r\n\r\n\
+          <img src=\"cid:scan%2F1&amp;part@example.test\" alt=\"encoded CID\">\r\n\
+          --related\r\n\
+          Content-Type: image/png; name=scan.png\r\n\
+          Content-Disposition: inline; filename=scan.png\r\n\
+          Content-ID: <scan/1&part@example.test>\r\n\
+          Content-Transfer-Encoding: base64\r\n\r\n\
+          QQ==\r\n\
+          --related--\r\n"
+            .to_vec()
+    }
+
+    fn selected_related_html_with_duplicate_cid_siblings() -> Vec<u8> {
+        b"MIME-Version: 1.0\r\n\
+          Content-Type: multipart/mixed; boundary=outer\r\n\r\n\
+          --outer\r\n\
+          Content-Type: image/png; name=unrelated.png\r\n\
+          Content-Disposition: attachment; filename=unrelated.png\r\n\
+          Content-ID: <shared@example.test>\r\n\
+          Content-Transfer-Encoding: base64\r\n\r\n\
+          V1JPTkc=\r\n\
+          --outer\r\n\
+          Content-Type: multipart/alternative; boundary=alternative\r\n\r\n\
+          --alternative\r\n\
+          Content-Type: multipart/related; boundary=old-related\r\n\r\n\
+          --old-related\r\n\
+          Content-Type: text/html; charset=utf-8\r\n\r\n\
+          <p>Unselected HTML</p>\r\n\
+          --old-related\r\n\
+          Content-Type: image/png; name=old.png\r\n\
+          Content-Disposition: inline; filename=old.png\r\n\
+          Content-ID: <shared@example.test>\r\n\
+          Content-Transfer-Encoding: base64\r\n\r\n\
+          T0xE\r\n\
+          --old-related--\r\n\
+          --alternative\r\n\
+          Content-Type: multipart/related; boundary=selected-related; \
+            start=\"<selected-root@example.test>\"\r\n\r\n\
+          --selected-related\r\n\
+          Content-Type: image/png; name=selected.png\r\n\
+          Content-Disposition: inline; filename=selected.png\r\n\
+          Content-ID: <shared@example.test>\r\n\
+          Content-Transfer-Encoding: base64\r\n\r\n\
+          UklHSFQ=\r\n\
+          --selected-related\r\n\
+          Content-Type: text/html; charset=utf-8\r\n\
+          Content-ID: <selected-root@example.test>\r\n\r\n\
+          <img src=\"cid:shared@example.test\" alt=\"selected\">\r\n\
+          --selected-related--\r\n\
+          --alternative--\r\n\
+          --outer--\r\n"
+            .to_vec()
+    }
+
+    fn appended_related_html_with_reused_cid() -> Vec<u8> {
+        b"MIME-Version: 1.0\r\n\
+          Content-Type: multipart/mixed; boundary=mixed\r\n\r\n\
+          --mixed\r\n\
+          Content-Type: multipart/related; boundary=first-related\r\n\r\n\
+          --first-related\r\n\
+          Content-Type: text/html; charset=utf-8\r\n\r\n\
+          <img src=\"cid:shared@example.test\" alt=\"first\">\r\n\
+          --first-related\r\n\
+          Content-Type: image/png; name=first.png\r\n\
+          Content-Disposition: inline; filename=first.png\r\n\
+          Content-ID: <shared@example.test>\r\n\
+          Content-Transfer-Encoding: base64\r\n\r\n\
+          RklSU1Q=\r\n\
+          --first-related--\r\n\
+          --mixed\r\n\
+          Content-Type: multipart/related; boundary=second-related; \
+            start=\"<second-root@example.test>\"\r\n\r\n\
+          --second-related\r\n\
+          Content-Type: image/png; name=second.png\r\n\
+          Content-Disposition: inline; filename=second.png\r\n\
+          Content-ID: <shared@example.test>\r\n\
+          Content-Transfer-Encoding: base64\r\n\r\n\
+          U0VDT05E\r\n\
+          --second-related\r\n\
+          Content-Type: text/html; charset=utf-8\r\n\
+          Content-ID: <second-root@example.test>\r\n\r\n\
+          <img src=\"cid:shared@example.test\" alt=\"second\">\r\n\
+          --second-related--\r\n\
+          --mixed--\r\n"
+            .to_vec()
+    }
+
+    fn nested_related_html_with_duplicate_cid() -> Vec<u8> {
+        b"MIME-Version: 1.0\r\n\
+          Content-Type: multipart/related; boundary=outer-related; \
+            start=\"<outer-root@example.test>\"\r\n\r\n\
+          --outer-related\r\n\
+          Content-Type: image/png; name=outer.png\r\n\
+          Content-Disposition: inline; filename=outer.png\r\n\
+          Content-ID: <shared@example.test>\r\n\
+          Content-Transfer-Encoding: base64\r\n\r\n\
+          T1VURVI=\r\n\
+          --outer-related\r\n\
+          Content-Type: multipart/related; boundary=inner-related\r\n\
+          Content-ID: <outer-root@example.test>\r\n\r\n\
+          --inner-related\r\n\
+          Content-Type: text/html; charset=utf-8\r\n\r\n\
+          <img src=\"cid:shared@example.test\" alt=\"nested\">\r\n\
+          --inner-related\r\n\
+          Content-Type: image/png; name=inner.png\r\n\
+          Content-Disposition: inline; filename=inner.png\r\n\
+          Content-ID: <shared@example.test>\r\n\
+          Content-Transfer-Encoding: base64\r\n\r\n\
+          SU5ORVI=\r\n\
+          --inner-related--\r\n\
+          --outer-related--\r\n"
+            .to_vec()
     }
 
     fn message_with_tiny_calendars(count: usize) -> Vec<u8> {
@@ -2560,9 +3227,9 @@ Content-Type: text/html; charset=utf-8\n\n\
         let blocked = content.html_document(false).expect("blocked document");
         let allowed = content.html_document(true).expect("one-shot document");
         assert!(!Arc::ptr_eq(&blocked, &allowed));
-        assert!(blocked.contains("default-src 'none'; img-src 'none'"));
-        assert!(!blocked.contains("img-src http: https:"));
-        assert!(allowed.contains("default-src 'none'; img-src http: https:"));
+        assert!(blocked.contains("default-src 'none'; img-src data:"));
+        assert!(!blocked.contains("img-src data: http: https:"));
+        assert!(allowed.contains("default-src 'none'; img-src data: http: https:"));
         for document in [&blocked, &allowed] {
             assert!(document.contains("script-src 'none'"));
             assert!(document.contains("connect-src 'none'"));
@@ -3172,6 +3839,289 @@ signature\r\n"
                 .to_string()
                 .contains("responsive rendering limit is 16 bytes")
         );
+    }
+
+    #[test]
+    fn related_cid_images_render_locally_without_remote_image_permission() {
+        let source = related_html_with_inline_jpegs(7);
+        let prepared = prepare_thread(
+            "thread-1".to_string(),
+            vec![message("message-1", "/fixture/related")],
+            None,
+            move |_, _| Ok(source.clone()),
+        )
+        .expect("prepare related message");
+        let content = &prepared.message_contents["message-1"];
+
+        let blocked = content.html_document(false).expect("blocked HTML");
+        assert!(blocked.contains("img-src data:"), "{blocked}");
+        assert_eq!(blocked.matches("data:image/jpeg;base64,").count(), 7);
+        assert!(blocked.contains("alt=\"scan 6\""), "{blocked}");
+        assert!(!blocked.contains("remote.example.test"), "{blocked}");
+
+        let allowed = content.html_document(true).expect("allowed HTML");
+        assert!(allowed.contains("img-src data: http: https:"), "{allowed}");
+        assert_eq!(allowed.matches("data:image/jpeg;base64,").count(), 7);
+        assert!(allowed.contains("https://remote.example.test/tracker.jpg"));
+        assert!(!allowed.contains("cid:"), "{allowed}");
+    }
+
+    #[test]
+    fn selected_related_cid_scope_excludes_unrelated_duplicate_ids() {
+        let source = selected_related_html_with_duplicate_cid_siblings();
+        let parsed = parse_rfc5322(&source).expect("parse duplicate CID fixture");
+        assert_eq!(
+            parsed
+                .html_cid_part_scopes
+                .iter()
+                .map(|scope| scope.part_indexes.as_deref())
+                .collect::<Vec<_>>(),
+            [Some([2].as_slice())]
+        );
+        let html = parsed.html_body.as_deref().expect("selected HTML body");
+
+        let resolved = resolve_inline_cid_images_with_limits(html, &parsed, &source, 1024, 4096);
+
+        assert!(
+            resolved.contains("data:image/png;base64,UklHSFQ="),
+            "{resolved}"
+        );
+        assert!(!resolved.contains("V1JPTkc="), "{resolved}");
+        assert!(!resolved.contains("T0xE"), "{resolved}");
+        assert!(!resolved.contains("cid:"), "{resolved}");
+    }
+
+    #[test]
+    fn appended_related_html_bodies_resolve_reused_cids_in_their_own_scopes() {
+        let source = appended_related_html_with_reused_cid();
+        let parsed = parse_rfc5322(&source).expect("parse appended related fixture");
+        assert_eq!(
+            parsed
+                .html_cid_part_scopes
+                .iter()
+                .map(|scope| scope.part_indexes.as_deref())
+                .collect::<Vec<_>>(),
+            [Some([0].as_slice()), Some([1].as_slice())]
+        );
+
+        let prepared = prepare_thread(
+            "thread-1".to_string(),
+            vec![message("message-1", "/fixture/appended-related")],
+            None,
+            move |_, _| Ok(source.clone()),
+        )
+        .expect("prepare appended related fixture");
+        let blocked = prepared.message_contents["message-1"]
+            .html_document(false)
+            .expect("blocked HTML");
+        let first = blocked
+            .find("data:image/png;base64,RklSU1Q=")
+            .expect("first related resource");
+        let second = blocked
+            .find("data:image/png;base64,U0VDT05E")
+            .expect("second related resource");
+
+        assert!(first < second, "{blocked}");
+        assert_eq!(blocked.matches("data:image/png;base64,").count(), 2);
+        assert!(!blocked.contains("cid:"), "{blocked}");
+    }
+
+    #[test]
+    fn appended_related_html_bodies_share_the_decoded_byte_budget() {
+        let source = appended_related_html_with_reused_cid();
+        let parsed = parse_rfc5322(&source).expect("parse appended related fixture");
+        let html = parsed.html_body.as_deref().expect("selected HTML bodies");
+
+        let resolved = resolve_inline_cid_images_with_limits(html, &parsed, &source, 16, 5);
+
+        assert!(
+            resolved.contains("data:image/png;base64,RklSU1Q="),
+            "{resolved}"
+        );
+        assert!(!resolved.contains("U0VDT05E"), "{resolved}");
+        assert_eq!(resolved.matches("data:image/png;base64,").count(), 1);
+        assert!(!resolved.contains("cid:"), "{resolved}");
+    }
+
+    #[test]
+    fn nested_related_html_prefers_the_nearest_duplicate_cid_resource() {
+        let source = nested_related_html_with_duplicate_cid();
+        let parsed = parse_rfc5322(&source).expect("parse nested related fixture");
+        assert_eq!(
+            parsed
+                .html_cid_part_scopes
+                .iter()
+                .map(|scope| scope.part_indexes.as_deref())
+                .collect::<Vec<_>>(),
+            [Some([1, 0].as_slice())]
+        );
+        let html = parsed.html_body.as_deref().expect("selected HTML body");
+
+        let resolved = resolve_inline_cid_images_with_limits(html, &parsed, &source, 1024, 4096);
+
+        assert!(
+            resolved.contains("data:image/png;base64,SU5ORVI="),
+            "{resolved}"
+        );
+        assert!(!resolved.contains("T1VURVI="), "{resolved}");
+        assert!(!resolved.contains("cid:"), "{resolved}");
+    }
+
+    #[test]
+    fn cid_url_decoding_is_strict_and_single_pass() {
+        assert_eq!(
+            decode_cid_url_content_id("Scan%2f1&amp;Part@Example.Test"),
+            Some("scan/1&part@example.test".to_string())
+        );
+        assert_eq!(
+            decode_cid_url_content_id("literal+plus@example.test"),
+            Some("literal+plus@example.test".to_string())
+        );
+        assert_eq!(
+            decode_cid_url_content_id("literal%2Bplus@example.test"),
+            Some("literal+plus@example.test".to_string())
+        );
+        assert_eq!(
+            decode_cid_url_content_id("literal&amp;amp;entity@example.test"),
+            Some("literal&amp;entity@example.test".to_string())
+        );
+        assert_eq!(
+            decode_cid_url_content_id("literal%26amp%3Bentity@example.test"),
+            Some("literal&amp;entity@example.test".to_string())
+        );
+        assert_eq!(
+            decode_cid_url_content_id("literal%252Fpath@example.test"),
+            Some("literal%2fpath@example.test".to_string())
+        );
+        assert_eq!(
+            decode_cid_url_content_id("%C3%A9@example.test"),
+            Some("é@example.test".to_string())
+        );
+        for malformed in [
+            "bad%",
+            "bad%2",
+            "bad%zz",
+            "%ff@example.test",
+            "%00@example.test",
+            "%0a@example.test",
+            "%0D@example.test",
+            "%7f@example.test",
+        ] {
+            assert_eq!(decode_cid_url_content_id(malformed), None, "{malformed}");
+        }
+    }
+
+    #[test]
+    fn malformed_cid_urls_are_removed_without_valid_siblings() {
+        let source = b"MIME-Version: 1.0\r\n\
+                       Content-Type: text/html; charset=utf-8\r\n\r\n\
+                       <img src=\"cid:bad%\"><img src=\"cid:%ff@example.test\">";
+        let parsed = parse_rfc5322(source).expect("parse malformed CID fixture");
+        let html = parsed.html_body.as_deref().expect("fixture HTML body");
+
+        let resolved = resolve_inline_cid_images_with_limits(html, &parsed, source, 1024, 4096);
+
+        assert_eq!(resolved.matches(r#"src="""#).count(), 2, "{resolved}");
+        assert!(!resolved.contains("cid:"), "{resolved}");
+        assert!(!resolved.contains("bad%"), "{resolved}");
+    }
+
+    #[test]
+    fn percent_encoded_and_html_serialized_cid_url_resolves_locally() {
+        let source = related_html_with_encoded_cid_url();
+        let prepared = prepare_thread(
+            "thread-1".to_string(),
+            vec![message("message-1", "/fixture/encoded-cid")],
+            None,
+            move |_, _| Ok(source.clone()),
+        )
+        .expect("prepare encoded CID fixture");
+
+        let blocked = prepared.message_contents["message-1"]
+            .html_document(false)
+            .expect("blocked HTML");
+        assert!(blocked.contains("data:image/png;base64,QQ=="), "{blocked}");
+        assert!(!blocked.contains("cid:"), "{blocked}");
+        assert!(!blocked.contains("scan%2F1"), "{blocked}");
+    }
+
+    #[test]
+    fn oversized_cid_part_does_not_remove_valid_siblings() {
+        // Decoded sizes are 2, 5, and 1 bytes. With a four-byte per-part
+        // limit, the middle image must be omitted without losing either
+        // fitting sibling.
+        let source = related_html_with_inline_base64_payloads(&["QUI=", "QUJDREU=", "Wg=="]);
+        let parsed = parse_rfc5322(&source).expect("parse related CID fixture");
+        let html = parsed.html_body.as_deref().expect("fixture HTML body");
+
+        let resolved = resolve_inline_cid_images_with_limits(html, &parsed, &source, 4, 4);
+
+        assert_eq!(resolved.matches("data:image/png;base64,").count(), 2);
+        assert!(
+            resolved.contains("data:image/png;base64,QUI="),
+            "{resolved}"
+        );
+        assert!(
+            resolved.contains("data:image/png;base64,Wg=="),
+            "{resolved}"
+        );
+        assert!(!resolved.contains("QUJDREU="), "{resolved}");
+        assert!(!resolved.contains("cid:"), "{resolved}");
+    }
+
+    #[test]
+    fn cid_part_crossing_total_budget_does_not_remove_later_fitting_sibling() {
+        // Decoded sizes are 3, 3, and 1 bytes. The second candidate would
+        // cross the four-byte aggregate limit; skipping it leaves room for the
+        // final one-byte sibling.
+        let source = related_html_with_inline_base64_payloads(&["QUJD", "REVG", "Rw=="]);
+        let parsed = parse_rfc5322(&source).expect("parse related CID fixture");
+        let html = parsed.html_body.as_deref().expect("fixture HTML body");
+
+        let resolved = resolve_inline_cid_images_with_limits(html, &parsed, &source, 4, 4);
+
+        assert_eq!(resolved.matches("data:image/png;base64,").count(), 2);
+        assert!(
+            resolved.contains("data:image/png;base64,QUJD"),
+            "{resolved}"
+        );
+        assert!(
+            resolved.contains("data:image/png;base64,Rw=="),
+            "{resolved}"
+        );
+        assert!(!resolved.contains("REVG"), "{resolved}");
+        assert!(!resolved.contains("cid:"), "{resolved}");
+    }
+
+    #[test]
+    fn repeated_cid_references_are_bounded_by_count_and_generated_bytes() {
+        let html = (0..32)
+            .map(|_| r#"<img src="cid:shared@example.test">"#)
+            .collect::<String>();
+        let cid_source = Regex::new(r#"(?i)\bsrc="cid:([^"]+)""#).expect("valid cid source regex");
+        let resource = format!("data:image/png;base64,{}", "A".repeat(400));
+        let resources = BTreeMap::from([("shared@example.test".to_string(), resource)]);
+
+        let count_limited =
+            replace_cid_sources_bounded(&html, &cid_source, &resources, usize::MAX, 3);
+        assert_eq!(count_limited.matches("data:image/png;base64,").count(), 3);
+        assert!(!count_limited.contains("cid:"), "{count_limited}");
+        assert!(count_limited.contains(r#"src="""#), "{count_limited}");
+
+        let byte_limit = html.len() + 500;
+        let byte_limited =
+            replace_cid_sources_bounded(&html, &cid_source, &resources, byte_limit, usize::MAX);
+        assert!(byte_limited.len() <= byte_limit);
+        assert!(
+            byte_limited.matches("data:image/png;base64,").count() < 32,
+            "{byte_limited}"
+        );
+        assert!(!byte_limited.contains("cid:"), "{byte_limited}");
+
+        let oversized_base =
+            replace_cid_sources_bounded(&html, &cid_source, &resources, html.len() - 1, usize::MAX);
+        assert_eq!(oversized_base.matches("data:image/png;base64,").count(), 0);
+        assert!(!oversized_base.contains("cid:"), "{oversized_base}");
     }
 
     #[test]

@@ -8,7 +8,10 @@ use std::{
 use chrono::Utc;
 use gtk::prelude::*;
 use gtk4 as gtk;
-use notm_mail::{ReplyKind, address::parse_address_list};
+use notm_mail::{
+    ReplyKind,
+    address::{parse_address_list, parse_one},
+};
 #[cfg(test)]
 use notm_notmuch::MessagePathState;
 use notm_notmuch::{AppliedTagChange, MessageSummary};
@@ -38,6 +41,7 @@ pub(crate) enum StandaloneImagePolicy {
 pub(crate) struct StandalonePolicySnapshot {
     pub(crate) collapse_quotes: bool,
     pub(crate) remote_images: bool,
+    pub(crate) trusted_image_senders: Vec<String>,
     pub(crate) show_keybind_hints: bool,
     pub(crate) normal_input_mode: bool,
     pub(crate) response_sensitive: bool,
@@ -79,6 +83,8 @@ pub(crate) type StandaloneRememberView =
 pub(crate) type StandaloneSenderView = Rc<dyn Fn(&MessageSummary) -> Option<MessageViewPreference>>;
 pub(crate) type StandaloneToggleSenderView =
     Rc<dyn Fn(&MessageSummary, MessageViewPreference) -> anyhow::Result<bool>>;
+pub(crate) type StandaloneSetSenderRemoteImages =
+    Rc<dyn Fn(&MessageSummary, bool) -> anyhow::Result<()>>;
 
 pub(crate) struct StandaloneOpenOptions {
     pub(crate) parent: gtk::ApplicationWindow,
@@ -101,6 +107,7 @@ pub(crate) struct StandaloneOpenOptions {
     pub(crate) remember_view: StandaloneRememberView,
     pub(crate) sender_view: StandaloneSenderView,
     pub(crate) toggle_sender_view: StandaloneToggleSenderView,
+    pub(crate) set_sender_remote_images: StandaloneSetSenderRemoteImages,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -122,6 +129,18 @@ pub(crate) struct StandaloneWindowSnapshot {
     pub(crate) html_policy_text: String,
     pub(crate) image_policy_button_label: String,
     pub(crate) image_policy_button_sensitive: bool,
+    pub(crate) image_policy_button_width: i32,
+    pub(crate) image_policy_button_height: i32,
+    pub(crate) image_policy_row_height: i32,
+    pub(crate) image_policy_menu_visible: bool,
+    pub(crate) load_images_once_label: String,
+    pub(crate) load_images_once_sensitive: bool,
+    pub(crate) selected_image_sender: Option<String>,
+    pub(crate) sender_remote_images_allowed: bool,
+    pub(crate) sender_image_trust_label: String,
+    pub(crate) sender_image_trust_active: bool,
+    pub(crate) sender_image_trust_sensitive: bool,
+    pub(crate) sender_image_warning_text: String,
     pub(crate) network_session_ephemeral: bool,
     pub(crate) title: Option<String>,
     pub(crate) status: String,
@@ -273,18 +292,61 @@ impl StandaloneMessageController {
         action_row.append(&copy_menu_button);
         root.append(&action_row);
 
-        let image_policy_button = gtk::Button::with_label("Load remote images once");
-        image_policy_button.set_widget_name("notm-message-window-image-policy-button");
+        let (image_policy_button, image_policy_menu_box) = menu_button_with_box(
+            "Images",
+            "notm-message-window-image-policy-button",
+            &options.policy,
+        );
         image_policy_button.set_tooltip_text(Some(
-            "Remote images can reveal that you opened a message and expose your network address. This action applies only to the current message and resets when you leave it.",
+            "Choose whether to load remote images for this message or always from its sender.",
         ));
+        image_policy_button.set_valign(gtk::Align::Center);
+        let load_images_once_button = gtk::Button::with_label("Load for this message");
+        load_images_once_button.set_widget_name("notm-message-window-load-images-once-button");
+        load_images_once_button.set_tooltip_text(Some(
+            "Load remote images only for the selected message. Shortcut: I m.",
+        ));
+        let sender_image_trust_check = gtk::CheckButton::with_label("Always load from this sender");
+        sender_image_trust_check.set_widget_name("notm-message-window-sender-image-trust-check");
+        sender_image_trust_check.set_tooltip_text(Some(
+            "Persistently allow remote images for the exact From address on this message. Shortcut: I a.",
+        ));
+        image_policy_menu_box.append(&load_images_once_button);
+        image_policy_menu_box.append(&sender_image_trust_check);
+        image_policy_menu_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        let image_policy_help = gtk::Label::new(Some(
+            "Remote images can reveal that you opened a message and expose your network address.",
+        ));
+        image_policy_help.set_xalign(0.0);
+        image_policy_help.set_wrap(true);
+        image_policy_help.set_max_width_chars(44);
+        image_policy_help.add_css_class("dim-label");
+        image_policy_help.set_margin_top(6);
+        image_policy_help.set_margin_bottom(6);
+        image_policy_help.set_margin_start(8);
+        image_policy_help.set_margin_end(8);
+        image_policy_menu_box.append(&image_policy_help);
+        let sender_image_warning_label = gtk::Label::new(None);
+        sender_image_warning_label.set_widget_name("notm-message-window-sender-image-warning");
+        sender_image_warning_label.set_xalign(0.0);
+        sender_image_warning_label.set_wrap(true);
+        sender_image_warning_label.set_max_width_chars(52);
+        sender_image_warning_label.set_margin_bottom(8);
+        sender_image_warning_label.set_margin_start(8);
+        sender_image_warning_label.set_margin_end(8);
+        image_policy_menu_box.append(&sender_image_warning_label);
         let html_policy_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         html_policy_row.set_widget_name("notm-message-window-html-policy-row");
         html_policy_row.set_visible(false);
         let html_policy_label = gtk::Label::new(None);
         html_policy_label.set_xalign(0.0);
-        html_policy_label.set_wrap(true);
         html_policy_label.set_hexpand(true);
+        html_policy_label.set_single_line_mode(true);
+        html_policy_label.set_width_chars(1);
+        html_policy_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        html_policy_label.set_tooltip_text(Some(
+            "Visual HTML is sanitized: scripts and in-app navigation are blocked, and links open externally. Use F for link hints.",
+        ));
         html_policy_label.add_css_class("dim-label");
         image_policy_button.set_halign(gtk::Align::End);
         html_policy_row.append(&html_policy_label);
@@ -362,6 +424,11 @@ impl StandaloneMessageController {
             html_policy_row,
             html_policy_label,
             image_policy_button,
+            image_policy_menu_box,
+            load_images_once_button,
+            sender_image_trust_check,
+            sender_image_warning_label,
+            image_policy_action_error: RefCell::new(None),
             collapse_quotes_button,
             message_header_box,
             message_stack,
@@ -390,6 +457,7 @@ impl StandaloneMessageController {
             remember_view: options.remember_view,
             sender_view: options.sender_view,
             toggle_sender_view: options.toggle_sender_view,
+            set_sender_remote_images: options.set_sender_remote_images,
             path_actions_sensitive: Cell::new(policy.response_sensitive),
             message_html_by_id: RefCell::new(BTreeMap::new()),
             message_sources: options.message_sources,
@@ -456,10 +524,12 @@ impl StandaloneMessageController {
                     &standalone.view_headers_button,
                     &standalone.view_raw_button,
                     &standalone.sender_view_preference_button,
-                    &standalone.image_policy_button,
                 ] {
                     button.set_sensitive(false);
                 }
+                standalone.image_policy_button.set_sensitive(false);
+                standalone.load_images_once_button.set_sensitive(false);
+                standalone.sender_image_trust_check.set_sensitive(false);
             }
         }
     }
@@ -550,6 +620,34 @@ impl StandaloneMessageController {
         }
     }
 
+    pub(crate) fn refresh_sender_image_policy(&self, sender: &str) {
+        let sender = normalize_sender(sender);
+        if sender.is_empty() {
+            return;
+        }
+
+        let windows = self.windows.borrow().clone();
+        for standalone in windows {
+            let affected = current_message(&standalone)
+                .and_then(|message| message_image_sender(&message))
+                .is_some_and(|current| current == sender);
+            if !affected {
+                continue;
+            }
+
+            standalone.state.borrow_mut().image_policy = StandaloneImagePolicy::Config;
+            let html_visible = html_view_is_visible(&standalone);
+            if html_visible {
+                standalone.link_hints.cancel_silent();
+                standalone.html_view.stop_loading();
+                set_html_image_loading(&standalone.html_view, false);
+                show_message_view(&standalone, MessageViewKind::Html);
+            } else {
+                update_current_message_buttons(&standalone);
+            }
+        }
+    }
+
     pub(crate) fn snapshots(&self) -> Vec<StandaloneWindowSnapshot> {
         self.windows
             .borrow()
@@ -592,6 +690,47 @@ impl StandaloneMessageController {
         let standalone = self.windows.borrow().get(window_index).cloned()?;
         let shown = choose_message_view(&standalone, MessageViewKind::Html);
         Some((shown, standalone.snapshot()))
+    }
+
+    pub(crate) fn activate_image_action(
+        &self,
+        window_index: usize,
+        action: &str,
+    ) -> anyhow::Result<Option<StandaloneWindowSnapshot>> {
+        let Some(standalone) = self.windows.borrow().get(window_index).cloned() else {
+            return Ok(None);
+        };
+        *standalone.image_policy_action_error.borrow_mut() = None;
+        match action {
+            "load_once" => {
+                standalone.image_policy_button.popup();
+                standalone.load_images_once_button.emit_clicked();
+            }
+            "toggle_sender" => {
+                standalone.image_policy_button.popup();
+                standalone.sender_image_trust_check.emit_activate();
+            }
+            "sender_on" => {
+                if !standalone.sender_image_trust_check.is_active() {
+                    standalone.image_policy_button.popup();
+                    standalone.sender_image_trust_check.emit_activate();
+                }
+            }
+            "sender_off" => {
+                if standalone.sender_image_trust_check.is_active() {
+                    standalone.image_policy_button.popup();
+                    standalone.sender_image_trust_check.emit_activate();
+                }
+            }
+            _ => anyhow::bail!(
+                "standalone image action must be load_once, toggle_sender, sender_on, or sender_off"
+            ),
+        }
+        standalone.image_policy_button.popdown();
+        if let Some(error) = standalone.image_policy_action_error.borrow_mut().take() {
+            anyhow::bail!(error);
+        }
+        Ok(Some(standalone.snapshot()))
     }
 
     pub(crate) fn scroll_html_lines(
@@ -716,7 +855,12 @@ struct StandaloneMessageWindow {
     sender_view_preference_button: gtk::Button,
     html_policy_row: gtk::Box,
     html_policy_label: gtk::Label,
-    image_policy_button: gtk::Button,
+    image_policy_button: gtk::MenuButton,
+    image_policy_menu_box: gtk::Box,
+    load_images_once_button: gtk::Button,
+    sender_image_trust_check: gtk::CheckButton,
+    sender_image_warning_label: gtk::Label,
+    image_policy_action_error: RefCell<Option<String>>,
     collapse_quotes_button: gtk::Button,
     message_header_box: gtk::Box,
     message_stack: gtk::Stack,
@@ -745,6 +889,7 @@ struct StandaloneMessageWindow {
     remember_view: StandaloneRememberView,
     sender_view: StandaloneSenderView,
     toggle_sender_view: StandaloneToggleSenderView,
+    set_sender_remote_images: StandaloneSetSenderRemoteImages,
     path_actions_sensitive: Cell<bool>,
     message_html_by_id: RefCell<BTreeMap<String, bool>>,
     message_sources: BTreeMap<String, MessageSource>,
@@ -754,10 +899,18 @@ struct StandaloneMessageWindow {
 impl StandaloneMessageWindow {
     fn snapshot(&self) -> StandaloneWindowSnapshot {
         let state = self.state.borrow();
-        let global_remote_images_allowed = (self.policy)().remote_images;
+        let policy = (self.policy)();
+        let global_remote_images_allowed = policy.remote_images;
+        let selected_message = state.messages.get(state.selected_index);
+        let selected_image_sender = selected_message.and_then(message_image_sender);
+        let sender_remote_images_allowed = selected_image_sender
+            .as_deref()
+            .is_some_and(|sender| image_sender_is_trusted(&policy, sender));
         let image_loading_allowed = webkit_view_images_allowed(&self.html_view);
         let image_permission = if global_remote_images_allowed {
             "all_messages"
+        } else if sender_remote_images_allowed {
+            "sender"
         } else if state.view == MessageViewKind::Html && image_loading_allowed {
             "message_once"
         } else {
@@ -791,9 +944,32 @@ impl StandaloneMessageWindow {
             image_policy_button_label: self
                 .image_policy_button
                 .label()
-                .map(|label| strip_binding_suffix(&label))
+                .map(|label| label.to_string())
                 .unwrap_or_default(),
             image_policy_button_sensitive: self.image_policy_button.is_sensitive(),
+            image_policy_button_width: self.image_policy_button.width(),
+            image_policy_button_height: self.image_policy_button.height(),
+            image_policy_row_height: self.html_policy_row.height(),
+            image_policy_menu_visible: self
+                .image_policy_button
+                .popover()
+                .is_some_and(|popover| popover.is_visible()),
+            load_images_once_label: self
+                .load_images_once_button
+                .label()
+                .map(|label| label.to_string())
+                .unwrap_or_default(),
+            load_images_once_sensitive: self.load_images_once_button.is_sensitive(),
+            selected_image_sender,
+            sender_remote_images_allowed,
+            sender_image_trust_label: self
+                .sender_image_trust_check
+                .label()
+                .map(|label| label.to_string())
+                .unwrap_or_default(),
+            sender_image_trust_active: self.sender_image_trust_check.is_active(),
+            sender_image_trust_sensitive: self.sender_image_trust_check.is_sensitive(),
+            sender_image_warning_text: self.sender_image_warning_label.text().to_string(),
             network_session_ephemeral: self
                 .html_view
                 .network_session()
@@ -812,6 +988,7 @@ struct StandaloneShortcutState {
     pending_response: Rc<Cell<bool>>,
     pending_view: Rc<Cell<bool>>,
     pending_copy: Rc<Cell<bool>>,
+    pending_images: Rc<Cell<bool>>,
 }
 
 impl StandaloneShortcutState {
@@ -821,6 +998,7 @@ impl StandaloneShortcutState {
             pending_response: Rc::new(Cell::new(false)),
             pending_view: Rc::new(Cell::new(false)),
             pending_copy: Rc::new(Cell::new(false)),
+            pending_images: Rc::new(Cell::new(false)),
         }
     }
 
@@ -829,6 +1007,7 @@ impl StandaloneShortcutState {
         self.pending_response.set(false);
         self.pending_view.set(false);
         self.pending_copy.set(false);
+        self.pending_images.set(false);
     }
 }
 
@@ -846,6 +1025,12 @@ enum StandaloneCopyField {
 enum StandaloneViewAction {
     Show(MessageViewKind),
     ToggleSenderDefault,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StandaloneImageAction {
+    LoadMessage,
+    ToggleSender,
 }
 
 fn connect_message_window_actions(standalone: &Rc<StandaloneMessageWindow>) {
@@ -901,11 +1086,37 @@ fn connect_message_window_actions(standalone: &Rc<StandaloneMessageWindow>) {
         });
 
     let standalone_weak = Rc::downgrade(standalone);
-    standalone.image_policy_button.connect_clicked(move |_| {
-        if let Some(standalone) = standalone_weak.upgrade() {
-            activate_image_policy_button(&standalone);
-        }
-    });
+    standalone
+        .load_images_once_button
+        .connect_clicked(move |_| {
+            if let Some(standalone) = standalone_weak.upgrade() {
+                activate_load_images_once(&standalone);
+                standalone.image_policy_button.popdown();
+            }
+        });
+
+    let standalone_weak = Rc::downgrade(standalone);
+    standalone
+        .sender_image_trust_check
+        .connect_toggled(move |check| {
+            if let Some(standalone) = standalone_weak.upgrade() {
+                let enabled = check.is_active();
+                let Some(message) = current_message(&standalone) else {
+                    update_current_message_buttons(&standalone);
+                    return;
+                };
+                let sender_trusted = message_image_sender(&message)
+                    .as_deref()
+                    .is_some_and(|sender| image_sender_is_trusted(&(standalone.policy)(), sender));
+                if enabled == sender_trusted {
+                    return;
+                }
+                let result = set_sender_remote_images_from_control(&standalone, &message, enabled);
+                *standalone.image_policy_action_error.borrow_mut() =
+                    result.err().map(|error| error.to_string());
+                standalone.image_policy_button.popdown();
+            }
+        });
 
     let standalone_weak = Rc::downgrade(standalone);
     standalone.collapse_quotes_button.connect_clicked(move |_| {
@@ -1033,12 +1244,17 @@ fn update_button_binding_labels(standalone: &StandaloneMessageWindow) {
         "y s",
         standalone,
     );
-    let image_base =
-        strip_binding_suffix(&standalone.image_policy_button.label().unwrap_or_default());
+    set_menu_button_label(&standalone.image_policy_button, "Images", "I", standalone);
     set_button_label(
-        &standalone.image_policy_button,
-        &image_base,
-        "I",
+        &standalone.load_images_once_button,
+        "Load for this message",
+        "I m",
+        standalone,
+    );
+    set_check_button_label(
+        &standalone.sender_image_trust_check,
+        "Always load from this sender",
+        "I a",
         standalone,
     );
 }
@@ -1107,6 +1323,11 @@ fn standalone_key_controller(
             standalone.copy_menu_button.popdown();
             return propagation_for_handled(run_copy_key(&standalone, key));
         }
+        if shortcuts.pending_images.get() {
+            shortcuts.pending_images.set(false);
+            standalone.image_policy_button.popdown();
+            return propagation_for_handled(run_image_key(&standalone, key));
+        }
         if shortcuts.pending_go.get() {
             shortcuts.pending_go.set(false);
             return propagation_for_handled(if key == gtk::gdk::Key::g {
@@ -1155,8 +1376,10 @@ fn standalone_key_controller(
                 .status_label
                 .set_text("Copy: m message id, t thread id, f from, o to, c cc, s subject");
             true
-        } else if key == gtk::gdk::Key::I {
-            activate_image_policy_button(&standalone);
+        } else if is_image_prefix(key, mods) {
+            if open_image_policy_menu(&standalone) {
+                shortcuts.pending_images.set(true);
+            }
             true
         } else if key == gtk::gdk::Key::F
             || (key == gtk::gdk::Key::f && mods.contains(gtk::gdk::ModifierType::SHIFT_MASK))
@@ -1224,6 +1447,30 @@ fn connect_dropdown_sequence_keys(
         propagation_for_handled(handled)
     });
     standalone.copy_menu_box.add_controller(controller);
+
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let standalone_weak = Rc::downgrade(standalone);
+    let shortcut_state = shortcuts.clone();
+    controller.connect_key_pressed(move |_, key, _, _| {
+        let Some(standalone) = standalone_weak.upgrade() else {
+            return gtk::glib::Propagation::Proceed;
+        };
+        if key == gtk::gdk::Key::Escape {
+            shortcut_state.pending_images.set(false);
+            standalone.image_policy_button.popdown();
+            standalone.status_label.set_text("Normal mode");
+            return gtk::glib::Propagation::Stop;
+        }
+        if key == gtk::gdk::Key::j || key == gtk::gdk::Key::k {
+            return gtk::glib::Propagation::Proceed;
+        }
+        let handled = run_image_key(&standalone, key);
+        shortcut_state.pending_images.set(false);
+        standalone.image_policy_button.popdown();
+        propagation_for_handled(handled)
+    });
+    standalone.image_policy_menu_box.add_controller(controller);
 }
 
 fn propagation_for_handled(handled: bool) -> gtk::glib::Propagation {
@@ -1238,6 +1485,7 @@ fn popdown_shortcut_menus(standalone: &StandaloneMessageWindow) {
     standalone.response_menu_button.popdown();
     standalone.view_menu_button.popdown();
     standalone.copy_menu_button.popdown();
+    standalone.image_policy_button.popdown();
 }
 
 fn run_response_key(standalone: &StandaloneMessageWindow, key: gtk::gdk::Key) -> bool {
@@ -1328,6 +1576,41 @@ fn copy_sequence_field(key: gtk::gdk::Key) -> Option<StandaloneCopyField> {
     } else {
         None
     }
+}
+
+fn run_image_key(standalone: &StandaloneMessageWindow, key: gtk::gdk::Key) -> bool {
+    match image_sequence_action(key) {
+        Some(StandaloneImageAction::LoadMessage) => {
+            activate_load_images_once(standalone);
+            true
+        }
+        Some(StandaloneImageAction::ToggleSender) => {
+            if standalone.sender_image_trust_check.is_sensitive() {
+                standalone.sender_image_trust_check.emit_activate();
+            } else {
+                standalone.status_label.set_text(
+                    "Always load from this sender is unavailable: From must contain exactly one valid email address",
+                );
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+fn image_sequence_action(key: gtk::gdk::Key) -> Option<StandaloneImageAction> {
+    if key == gtk::gdk::Key::m {
+        Some(StandaloneImageAction::LoadMessage)
+    } else if key == gtk::gdk::Key::a {
+        Some(StandaloneImageAction::ToggleSender)
+    } else {
+        None
+    }
+}
+
+fn is_image_prefix(key: gtk::gdk::Key, mods: gtk::gdk::ModifierType) -> bool {
+    key == gtk::gdk::Key::I
+        || (key == gtk::gdk::Key::i && mods.contains(gtk::gdk::ModifierType::SHIFT_MASK))
 }
 
 fn current_message(standalone: &StandaloneMessageWindow) -> Option<MessageSummary> {
@@ -1792,7 +2075,7 @@ fn toggle_quote_collapse(standalone: &StandaloneMessageWindow) {
     });
 }
 
-fn activate_image_policy_button(standalone: &StandaloneMessageWindow) {
+fn activate_load_images_once(standalone: &StandaloneMessageWindow) {
     if !ensure_path_actions_sensitive(standalone) {
         return;
     }
@@ -1800,7 +2083,7 @@ fn activate_image_policy_button(standalone: &StandaloneMessageWindow) {
         standalone.status_label.set_text("No message selected");
         return;
     };
-    if message_allows_images(&(standalone.policy)()) {
+    if message_allows_images(&(standalone.policy)(), &message) {
         update_message_buttons(standalone, &message);
         return;
     }
@@ -1814,10 +2097,81 @@ fn activate_image_policy_button(standalone: &StandaloneMessageWindow) {
     show_message_view(standalone, MessageViewKind::Html);
 }
 
+fn open_image_policy_menu(standalone: &StandaloneMessageWindow) -> bool {
+    if !ensure_path_actions_sensitive(standalone) {
+        return false;
+    }
+    let Some(message) = current_message(standalone) else {
+        standalone.status_label.set_text("No message selected");
+        return false;
+    };
+    if !cached_message_has_html(standalone, &message) {
+        standalone.status_label.set_text("No visual HTML part");
+        return false;
+    }
+    if !html_view_is_visible(standalone) && !show_message_view(standalone, MessageViewKind::Html) {
+        return false;
+    }
+    update_message_buttons(standalone, &message);
+    standalone.image_policy_button.popup();
+    standalone
+        .status_label
+        .set_text("Images: m load for this message, a always load from this sender; j/k choose");
+    true
+}
+
+fn set_sender_remote_images_from_control(
+    standalone: &StandaloneMessageWindow,
+    message: &MessageSummary,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    if !ensure_path_actions_sensitive(standalone) {
+        update_current_message_buttons(standalone);
+        anyhow::bail!("message file actions are unavailable while tags are changing");
+    }
+    let sender = message_image_sender(message)
+        .ok_or_else(|| anyhow::anyhow!("From must contain exactly one valid email address"))?;
+    let result = (standalone.set_sender_remote_images)(message, enabled);
+    match &result {
+        Ok(()) => {
+            let global_remote_images = (standalone.policy)().remote_images;
+            let status = if enabled {
+                format!(
+                    "Always loading remote images from {sender}; warning: From addresses can be spoofed"
+                )
+            } else if global_remote_images {
+                format!(
+                    "Removed the remote-image exception for {sender}; the global setting still loads remote images"
+                )
+            } else {
+                format!("Stopped automatically loading remote images from {sender}")
+            };
+            standalone.status_label.set_text(&status);
+        }
+        Err(error) => standalone.status_label.set_text(&format!(
+            "Could not {} the remote-image exception for {sender}: {error}",
+            if enabled { "save" } else { "remove" }
+        )),
+    }
+    update_current_message_buttons(standalone);
+    result
+}
+
+fn update_current_message_buttons(standalone: &StandaloneMessageWindow) {
+    if let Some(message) = current_message(standalone) {
+        update_message_buttons(standalone, &message);
+    }
+}
+
 fn update_message_buttons(standalone: &StandaloneMessageWindow, message: &MessageSummary) {
     let has_html = cached_message_has_html(standalone, message);
     let html_visible = standalone.state.borrow().view == MessageViewKind::Html;
     let path_actions_sensitive = standalone.path_actions_sensitive.get();
+    let policy = (standalone.policy)();
+    let sender = message_image_sender(message);
+    let sender_trusted = sender
+        .as_deref()
+        .is_some_and(|sender| image_sender_is_trusted(&policy, sender));
     standalone.view_html_button.set_visible(has_html);
     standalone
         .view_html_button
@@ -1829,46 +2183,59 @@ fn update_message_buttons(standalone: &StandaloneMessageWindow, message: &Messag
         .image_policy_button
         .set_visible(html_visible && has_html);
     if !has_html {
-        standalone
-            .image_policy_button
-            .set_label("Load remote images once");
         standalone.image_policy_button.set_sensitive(false);
+        standalone.load_images_once_button.set_sensitive(false);
+        standalone.sender_image_trust_check.set_sensitive(false);
+        // Keep the hidden checkbox synchronized with policy. Resetting it to
+        // false for a text-only message would emit `toggled` and accidentally
+        // persist a revocation for an otherwise trusted sender.
+        standalone
+            .sender_image_trust_check
+            .set_active(sender_trusted);
+        standalone
+            .sender_image_warning_label
+            .set_text(&sender_image_warning_text(sender.as_deref()));
+        let sender_tooltip = sender.as_deref().map(sender_image_trust_tooltip);
+        standalone
+            .sender_image_trust_check
+            .set_tooltip_text(sender_tooltip.as_deref());
         update_button_binding_labels(standalone);
         return;
     }
-    let policy = (standalone.policy)();
     if html_visible {
-        let image_policy = if webkit_view_images_allowed(&standalone.html_view) {
-            if policy.remote_images {
-                "remote images allowed for all messages by settings"
-            } else {
-                "remote images loaded once for this message"
-            }
+        let image_policy = if policy.remote_images {
+            "Remote images load automatically."
+        } else if sender_trusted {
+            "Remote images load automatically for this sender."
+        } else if webkit_view_images_allowed(&standalone.html_view) {
+            "Remote images loaded for this message."
         } else {
-            "remote content blocked"
+            "Remote images blocked."
         };
-        standalone.html_policy_label.set_text(&format!(
-            "Privacy-protected HTML: {image_policy}; message scripts and in-app navigation are blocked; links open externally (F shows link hints)."
-        ));
+        standalone.html_policy_label.set_text(image_policy);
     }
-    if policy.remote_images {
-        standalone
-            .image_policy_button
-            .set_label("Images allowed for all messages");
-        standalone.image_policy_button.set_sensitive(false);
-    } else if html_visible && webkit_view_images_allowed(&standalone.html_view) {
-        standalone
-            .image_policy_button
-            .set_label("Images loaded once for this message");
-        standalone.image_policy_button.set_sensitive(false);
-    } else {
-        standalone
-            .image_policy_button
-            .set_label("Load remote images once");
-        standalone
-            .image_policy_button
-            .set_sensitive(path_actions_sensitive);
-    }
+    let policy_allows_images = policy.remote_images || sender_trusted;
+    let message_images_loaded =
+        html_visible && webkit_view_images_allowed(&standalone.html_view) && !policy_allows_images;
+    standalone
+        .image_policy_button
+        .set_sensitive(path_actions_sensitive);
+    standalone
+        .load_images_once_button
+        .set_sensitive(path_actions_sensitive && !policy_allows_images && !message_images_loaded);
+    standalone
+        .sender_image_trust_check
+        .set_active(sender_trusted);
+    standalone
+        .sender_image_trust_check
+        .set_sensitive(path_actions_sensitive && sender.is_some());
+    standalone
+        .sender_image_warning_label
+        .set_text(&sender_image_warning_text(sender.as_deref()));
+    let sender_tooltip = sender.as_deref().map(sender_image_trust_tooltip);
+    standalone
+        .sender_image_trust_check
+        .set_tooltip_text(sender_tooltip.as_deref());
     update_button_binding_labels(standalone);
 }
 
@@ -2106,8 +2473,24 @@ fn set_menu_button_label(
     widget.set_label(&button_label(base, binding, standalone));
 }
 
-fn message_allows_images(policy: &StandalonePolicySnapshot) -> bool {
+fn set_check_button_label(
+    widget: &gtk::CheckButton,
+    base: &str,
+    binding: &str,
+    standalone: &StandaloneMessageWindow,
+) {
+    widget.set_label(Some(&button_label(base, binding, standalone)));
+}
+
+fn message_allows_images(policy: &StandalonePolicySnapshot, message: &MessageSummary) -> bool {
     policy.remote_images
+        || message_image_sender(message)
+            .as_deref()
+            .is_some_and(|sender| image_sender_is_trusted(policy, sender))
+}
+
+fn message_image_sender(message: &MessageSummary) -> Option<String> {
+    parse_one(&message.from).map(|address| normalize_sender(&address.email))
 }
 
 fn message_sender_email(message: &MessageSummary) -> Option<String> {
@@ -2119,6 +2502,29 @@ fn message_sender_email(message: &MessageSummary) -> Option<String> {
 
 fn normalize_sender(sender: &str) -> String {
     sender.trim().to_ascii_lowercase()
+}
+
+fn image_sender_is_trusted(policy: &StandalonePolicySnapshot, sender: &str) -> bool {
+    let sender = normalize_sender(sender);
+    policy
+        .trusted_image_senders
+        .iter()
+        .any(|trusted| normalize_sender(trusted) == sender)
+}
+
+fn sender_image_warning_text(sender: Option<&str>) -> String {
+    match sender {
+        Some(sender) => format!(
+            "Warning: the From address {sender} is not authenticated by notm and can be spoofed. A forged message using this address will also be allowed to load remote images."
+        ),
+        None => "Always load from this sender is unavailable because From must contain exactly one valid email address. You can still load images for this message only.".to_string(),
+    }
+}
+
+fn sender_image_trust_tooltip(sender: &str) -> String {
+    format!(
+        "Persistently allow remote images for {sender}. This relies on the message's spoofable From address. Shortcut: I a."
+    )
 }
 
 fn set_html_image_loading(view: &webkit6::WebView, allow_remote_images: bool) {
@@ -2394,6 +2800,9 @@ mod tests {
         assert!(is_view_prefix(gtk::gdk::Key::V, none));
         assert!(is_view_prefix(gtk::gdk::Key::v, shift));
         assert!(!is_view_prefix(gtk::gdk::Key::v, none));
+        assert!(is_image_prefix(gtk::gdk::Key::I, none));
+        assert!(is_image_prefix(gtk::gdk::Key::i, shift));
+        assert!(!is_image_prefix(gtk::gdk::Key::i, none));
         assert_eq!(
             response_sequence_action(gtk::gdk::Key::r),
             Some(StandaloneResponseAction::Reply(ReplyKind::Sender))
@@ -2454,8 +2863,17 @@ mod tests {
             copy_sequence_field(gtk::gdk::Key::s),
             Some(StandaloneCopyField::Subject)
         );
+        assert_eq!(
+            image_sequence_action(gtk::gdk::Key::m),
+            Some(StandaloneImageAction::LoadMessage)
+        );
+        assert_eq!(
+            image_sequence_action(gtk::gdk::Key::a),
+            Some(StandaloneImageAction::ToggleSender)
+        );
         assert_eq!(view_sequence_action(gtk::gdk::Key::j), None);
         assert_eq!(copy_sequence_field(gtk::gdk::Key::j), None);
+        assert_eq!(image_sequence_action(gtk::gdk::Key::j), None);
         assert_eq!(
             sender_view_preference_label(MessageViewPreference::VisualHtml),
             "Always: Visual HTML"
@@ -2489,5 +2907,48 @@ mod tests {
             StandaloneImagePolicy::Config
         );
         assert_eq!(state.borrow().image_policy, StandaloneImagePolicy::Config);
+    }
+
+    #[test]
+    fn standalone_sender_image_policy_requires_one_exact_valid_from_mailbox() {
+        let mut message = message_summary("message-1", &["inbox"], &["message-1"]);
+        message.from = "Sender <Shared@Example.Test>".to_string();
+        assert_eq!(
+            message_image_sender(&message).as_deref(),
+            Some("shared@example.test")
+        );
+
+        let trusted = StandalonePolicySnapshot {
+            collapse_quotes: false,
+            remote_images: false,
+            trusted_image_senders: vec!["SHARED@example.test".to_string()],
+            show_keybind_hints: true,
+            normal_input_mode: true,
+            response_sensitive: true,
+        };
+        assert!(image_sender_is_trusted(&trusted, "shared@example.test"));
+        assert!(message_allows_images(&trusted, &message));
+
+        message.from = "one@example.test, two@example.test".to_string();
+        assert_eq!(message_image_sender(&message), None);
+        assert!(!message_allows_images(&trusted, &message));
+
+        message.from = "Bad Sender <bad@>".to_string();
+        assert_eq!(message_image_sender(&message), None);
+        assert!(!message_allows_images(&trusted, &message));
+    }
+
+    #[test]
+    fn standalone_sender_image_warning_is_explicit_about_from_spoofing() {
+        let warning = sender_image_warning_text(Some("sender@example.test"));
+        assert!(warning.contains("sender@example.test"));
+        assert!(warning.contains("From address"));
+        assert!(warning.contains("not authenticated"));
+        assert!(warning.contains("spoofed"));
+        assert!(warning.contains("forged message"));
+
+        let unavailable = sender_image_warning_text(None);
+        assert!(unavailable.contains("exactly one valid email address"));
+        assert!(unavailable.contains("this message only"));
     }
 }

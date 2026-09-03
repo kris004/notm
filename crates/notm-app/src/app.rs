@@ -146,6 +146,7 @@ fn launch_options(cfg: &config::AppConfig, app_config_path: Option<PathBuf>) -> 
         show_message_list: cfg.ui.show_message_list,
         show_message_view: cfg.ui.show_message_view,
         remote_images: cfg.ui.remote_images,
+        trusted_image_senders: cfg.ui.trusted_image_senders.clone(),
         show_thread_numbers: cfg.ui.show_thread_numbers,
         show_thread_dates: cfg.ui.show_thread_dates,
         show_thread_tags: cfg.ui.show_thread_tags,
@@ -419,6 +420,22 @@ mod tests {
 
         assert_eq!(options.theme, ThemePreference::Dark);
         assert_eq!(options.thread_preview_lines, 7);
+    }
+
+    #[test]
+    fn launch_options_passes_trusted_image_senders() {
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.ui.trusted_image_senders = vec![
+            "sender@example.test".to_string(),
+            "other@example.test".to_string(),
+        ];
+
+        let options = super::launch_options(&cfg, None);
+
+        assert_eq!(
+            options.trusted_image_senders,
+            ["sender@example.test", "other@example.test"]
+        );
     }
 
     #[test]
