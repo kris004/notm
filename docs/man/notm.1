@@ -32,6 +32,20 @@ instead of the default application configuration described under
 .B launch
 Start the GTK application for normal desktop mail use.
 .TP
+.B refresh --all
+Refresh active searches in already-running same-user instances on the caller's
+existing local session bus.  Do not launch or focus a window, change the query,
+run sync commands, or modify mail.  Wait for busy work and a full search begun
+after the request, including result-model application.
+.TP
+.BI "refresh --all --timeout-seconds " SECONDS
+Set the overall connection, discovery, and completion deadline (1 through 300
+seconds, default 30).  A timed-out request may still finish remotely.
+.TP
+.B refresh --all --test-instances
+Target only isolated fixture/test instances, never the normal application.
+Without this flag, fixture/test instances are excluded.
+.TP
 .BI "launch " MAILTO_URI
 Open an RFC 6068
 .B mailto
@@ -101,6 +115,35 @@ Explicit notm fields take precedence; otherwise libnotmuch uses the standard
 .BR NOTMUCH_DATABASE ,
 .B NOTMUCH_PROFILE,
 XDG, profile, and legacy discovery rules.
+.SH REFRESH COMPATIBILITY
+Refresh uses
+.B DBUS_SESSION_BUS_ADDRESS
+or the existing
+.I $XDG_RUNTIME_DIR/bus
+when that variable is absent.  It needs no display environment and does not
+autolaunch a bus or application.  Other session buses are outside its scope.
+Normal launches share one application owner per bus.
+.PP
+Exit 0 means all discovered instances completed a refresh, including a
+successful no-op when none are running.  Standard output is a JSON object with
+.B refreshed
+and
+.B failed
+fields.  Exit 1 indicates a connection, discovery, compatibility, search, or
+deadline failure; early errors use standard error.  Invalid syntax exits 2.
+.B --config
+is not a refresh selector and is rejected.
+.PP
+Older running processes without the versioned search-refresh interface fail
+with a relaunch-required diagnostic.  Replacing the binary alone does not
+upgrade them.  Refresh never signals, closes, or restarts a process.  Fixtures
+are isolated even without the developer test harness.
+.PP
+Drafts and unsaved composer edits are retained.  Full-search reconciliation
+restarts pagination, clears visual/multi-selection and prepared caches, and
+retains the selected exact thread if it remains in the first refreshed page
+and retained path state is safe.  No first-row activation or focus routing is
+performed.
 .SH SAFETY
 .B notm
 does not run startup sync or automatic

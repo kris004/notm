@@ -12,6 +12,8 @@ use anyhow::{Context, ensure};
 use notm_test_support::ui_driver::UiDriver;
 use serde_json::{Value, json};
 
+#[path = "support/external_refresh_gui.rs"]
+mod external_refresh_gui;
 #[path = "support/gui_test_display.rs"]
 mod gui_test_display;
 #[path = "support/local_http_tracker.rs"]
@@ -19,6 +21,8 @@ mod local_http_tracker;
 #[cfg(unix)]
 #[path = "support/local_smtp.rs"]
 mod local_smtp;
+#[path = "support/refresh_bus.rs"]
+mod refresh_bus;
 
 use gui_test_display::{GuiTestDisplay, gtk_display_environment};
 use local_http_tracker::LocalHttpTracker;
@@ -55,6 +59,8 @@ struct FixtureLaunchOptions<'a> {
     message_id: Option<&'a str>,
     mailto_uri: Option<&'a str>,
     application_id: Option<&'a str>,
+    session_bus_address: Option<&'a str>,
+    production: bool,
     fixture: bool,
     system_prefers_dark: Option<bool>,
     startup_recovery_delay_ms: Option<u64>,
@@ -328,10 +334,12 @@ impl FixtureApp {
         if options.fixture {
             command.arg("--fixture");
         }
-        command.args(["--test-harness", "--test-harness-socket"]);
-        command
-            .arg(&socket_path)
-            .args(["--test-harness-token", token]);
+        if !options.production {
+            command.args(["--test-harness", "--test-harness-socket"]);
+            command
+                .arg(&socket_path)
+                .args(["--test-harness-token", token]);
+        }
         if let Some(message_id) = options.message_id {
             command.args(["--message-id", message_id]);
         }
@@ -380,6 +388,9 @@ impl FixtureApp {
             command.env("GDK_DEBUG", "default-settings");
         }
         display.configure_command(&mut command);
+        if let Some(address) = options.session_bus_address {
+            command.env("DBUS_SESSION_BUS_ADDRESS", address);
+        }
         let child = command
             .env("HOME", home)
             .env("XDG_CONFIG_HOME", config_home)

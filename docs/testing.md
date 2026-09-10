@@ -50,7 +50,7 @@ submit a message.
 The delivery gate is intentionally explicit. It requires Cargo and the native
 build dependencies plus `actionlint`, ShellCheck, mandoc,
 `desktop-file-validate`, `appstreamcli`, GnuPG, Weston, Xvfb, Sway, `wtype`,
-`dbus-run-session`, and Python 3. A missing tool, skipped display test, or
+`dbus-run-session`, `dbus-daemon`, and Python 3. A missing tool, skipped display test, or
 unavailable command is a failure, not a pass.
 
 Run the routine checks and the disposable send probe above, then:
@@ -162,6 +162,32 @@ make smoke-live-send
 the configured default query. `live-self-send` sends one unique message through
 the configured transport and then waits briefly for it to appear in Notmuch; it
 does not force sync.
+
+## External search-refresh checks
+
+The production refresh CLI has real-process, private-D-Bus tests for no-instance
+success, normal/test namespace separation, multiple peers, older peers, and
+bounded failures without a display or usable application configuration:
+
+```sh
+cargo test --locked -p notm-app --test remote_refresh
+```
+
+The following required-display tests call the real refresh CLI and production
+D-Bus method. The optional developer harness is used only to arrange and inspect
+test state; the normal-instance smoke explicitly has no harness. They cover
+freshly indexed search results in two instances, query/selection/draft/focus
+preservation, no writes or external sync, and in-flight search/tag ordering.
+Each smoke creates its own bus and disposable database:
+
+```sh
+tests/run_with_headless_weston.sh dbus-run-session -- \
+  cargo test --locked -p notm-app --test desktop_ui_smoke external_refresh_ -- \
+    --nocapture --test-threads=1
+```
+
+See [the production contract](external-refresh.md) for service integration and
+compatibility. Never point these tests at the interactive desktop's session bus.
 
 ## Sync checks
 

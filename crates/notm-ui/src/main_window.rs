@@ -102,13 +102,16 @@ use crate::{
     },
 };
 
+mod external_refresh;
+
 #[cfg(test)]
 use crate::widgets::attachments::AttachmentActionResult;
 
 pub use crate::widgets::settings::{RuntimeSettings, RuntimeSettingsStore};
 
-const NORMAL_APPLICATION_ID: &str = "io.github.kris004.notm";
-const TEST_HARNESS_APPLICATION_ID_NAMESPACE: &str = "io.github.kris004.notm.test.";
+use crate::remote_refresh::{
+    NORMAL_APPLICATION_ID, TEST_APPLICATION_NAMESPACE as TEST_HARNESS_APPLICATION_ID_NAMESPACE,
+};
 const TEST_HARNESS_APPLICATION_ID_PREFIX: &str = "io.github.kris004.notm.test.t";
 const TEST_HARNESS_APPLICATION_ID_ENV: &str = "NOTM_TEST_HARNESS_APPLICATION_ID";
 const OPEN_MESSAGE_ID_ACTION: &str = "open-message-id";
@@ -283,6 +286,7 @@ pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
 
     add_open_message_id_action(&app, &options, &main_window, &attachment_open_dir);
     add_compose_mailto_action(&app, &options, &main_window, &attachment_open_dir);
+    external_refresh::register_on_startup(&app, &options, &main_window);
     let activate_options = options.clone();
     let activate_main_window = main_window.clone();
     let activate_attachment_open_dir = attachment_open_dir.clone();
@@ -343,8 +347,10 @@ fn validate_launch_options(options: &LaunchOptions) -> anyhow::Result<()> {
 }
 
 fn application_id_for_launch(options: &LaunchOptions) -> anyhow::Result<String> {
-    if options.automation_enabled {
-        if let Some(application_id) = std::env::var_os(TEST_HARNESS_APPLICATION_ID_ENV) {
+    if options.automation_enabled || options.fixture_mode {
+        if let Some(application_id) =
+            std::env::var_os(TEST_HARNESS_APPLICATION_ID_ENV).filter(|_| options.automation_enabled)
+        {
             let application_id = application_id.into_string().map_err(|_| {
                 anyhow::anyhow!("{TEST_HARNESS_APPLICATION_ID_ENV} must be valid UTF-8")
             })?;
@@ -529,6 +535,7 @@ struct Widgets {
     search_bar: SearchBarController,
     search_page_coordinator: SearchPageCoordinator,
     sync_refresh_generation: Rc<Cell<Option<u64>>>,
+    external_refresh_generation: Rc<Cell<Option<u64>>>,
     input_mode_generation: Rc<Cell<u64>>,
     hidden_tag_searches: HiddenTagSearchStore,
     thread_list: ThreadListController,
@@ -1723,6 +1730,7 @@ fn build_ui(
         search_bar,
         search_page_coordinator: search_page_coordinator(&options),
         sync_refresh_generation,
+        external_refresh_generation: Rc::new(Cell::new(None)),
         input_mode_generation: Rc::new(Cell::new(0)),
         hidden_tag_searches,
         thread_list,
@@ -12564,6 +12572,7 @@ fn finish_replaced_search_then<F>(
         preserve_search_focus,
         select_first,
         restored_thread,
+        background_refresh: widgets.external_refresh_generation.get() == Some(generation),
     };
     widgets.thread_list.apply_model_update_then(
         &thread_model_snapshot(state),
@@ -12586,6 +12595,7 @@ struct ReplacedSearchUiCompletion {
     preserve_search_focus: bool,
     select_first: bool,
     restored_thread: Option<(usize, notm_notmuch::ThreadSummary)>,
+    background_refresh: bool,
 }
 
 fn finish_replaced_search_after_model(
@@ -12600,6 +12610,7 @@ fn finish_replaced_search_after_model(
         preserve_search_focus,
         select_first,
         restored_thread,
+        background_refresh,
     } = completion;
     update_tag_searches(options, widgets, state);
     let pending_open_message_id = { state.borrow().pending_open_message_id.clone() };
@@ -12654,7 +12665,10 @@ fn finish_replaced_search_after_model(
         ));
     }
     update_thread_result_label(widgets, state);
-    if !preserve_search_focus && state.borrow().input_mode == InputMode::Normal {
+    if !background_refresh
+        && !preserve_search_focus
+        && state.borrow().input_mode == InputMode::Normal
+    {
         focus_active_pane(widgets, state);
     }
     update_debug(widgets, state);
@@ -18495,6 +18509,7 @@ fn handle_automation_request(
                 .map(|(start, end)| json!({"start": start, "end": end}));
             json!({
                 "ok": true,
+                "window_is_active": widgets.window.is_active(),
                 "search": widgets.search_bar.entry().text().to_string(),
                 "search_has_focus": widget_contains_focus(widgets.search_bar.entry().upcast_ref()),
                 "search_selection_bounds": search_selection_bounds,
@@ -24509,6 +24524,17 @@ mod tests {
         assert!(app_id.starts_with(TEST_HARNESS_APPLICATION_ID_PREFIX));
         assert!(gtk::gio::Application::id_is_valid(&app_id));
         assert!(application_flags_for_launch(&options).is_empty());
+    }
+
+    #[test]
+    fn fixture_without_harness_also_uses_an_isolated_application_id() {
+        let options = LaunchOptions {
+            fixture_mode: true,
+            ..LaunchOptions::default()
+        };
+        let id = application_id_for_launch(&options).expect("fixture application ID");
+        assert!(id.starts_with(TEST_HARNESS_APPLICATION_ID_PREFIX));
+        assert_ne!(id, NORMAL_APPLICATION_ID);
     }
 
     #[test]

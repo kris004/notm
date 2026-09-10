@@ -20,6 +20,26 @@ const FIXTURE_RECOVERY_PATH_ENV: &str = "NOTM_FIXTURE_TEST_RECOVERY_PATH";
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     let app_config_path = cli.config.clone().unwrap_or_else(crate::paths::config_path);
     match cli.command {
+        Command::Refresh {
+            all: _,
+            test_instances,
+            timeout_seconds,
+        } => {
+            anyhow::ensure!(
+                cli.config.is_none(),
+                "--config does not select refresh targets; refresh uses the session bus"
+            );
+            let report = notm_ui::remote_refresh::refresh_running(
+                test_instances,
+                Duration::from_secs(u64::from(timeout_seconds)),
+            )?;
+            println!("{}", serde_json::to_string(&report)?);
+            anyhow::ensure!(
+                report.failed.is_empty(),
+                "some running instances could not refresh; see the report above"
+            );
+            Ok(())
+        }
         Command::Launch {
             automation,
             automation_socket,

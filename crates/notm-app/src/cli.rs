@@ -18,6 +18,25 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    #[command(
+        about = "Refresh active searches in already-running instances without opening a window"
+    )]
+    Refresh {
+        #[arg(
+            long,
+            required = true,
+            help = "Refresh every applicable instance on this session bus"
+        )]
+        all: bool,
+        #[arg(
+            long,
+            help = "Target only isolated fixture/test instances, never normal instances"
+        )]
+        test_instances: bool,
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=300),
+              help = "Overall deadline, including discovery and search completion (1-300 seconds)")]
+        timeout_seconds: u32,
+    },
     #[command(about = "Launch the GTK mail client")]
     Launch {
         #[arg(
@@ -83,6 +102,19 @@ mod tests {
     use clap::Parser;
 
     use super::{Cli, Command};
+
+    #[test]
+    fn refresh_requires_explicit_scope_and_a_bounded_deadline() {
+        assert!(Cli::try_parse_from(["notm", "refresh"]).is_err());
+        assert!(Cli::try_parse_from(["notm", "refresh", "--all"]).is_ok());
+        assert!(Cli::try_parse_from(["notm", "refresh", "--all", "--test-instances"]).is_ok());
+        for value in ["0", "301", "-1", "forever"] {
+            assert!(
+                Cli::try_parse_from(["notm", "refresh", "--all", "--timeout-seconds", value])
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn launch_accepts_message_id_target() {
