@@ -1144,6 +1144,120 @@ fn fixture_visual_selection_navigation_matches_normal_viewport() -> anyhow::Resu
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn fixture_unicode_preview_whitespace_does_not_inflate_rows() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_unicode_preview_whitespace_does_not_inflate_rows: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running Unicode preview row-height smoke with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-preview-whitespace-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let body = format!(
+        "{}{}",
+        "Preview text before hidden separators and after links. ".repeat(5),
+        "More preview text.\u{2028}".repeat(7)
+    );
+    let expected_preview = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let variants = [
+        ("line", body.clone()),
+        ("paragraph", body.replace('\u{2028}', "\u{2029}")),
+        ("spaces", expected_preview.clone()),
+    ];
+    let mut sources = Vec::new();
+    {
+        let db = fixture.open_readwrite()?;
+        for (index, (name, body)) in variants.iter().enumerate() {
+            let path = fixture.maildir.join(format!("cur/preview-{name}:2,S"));
+            let raw = format!(
+                "From: Preview Sender <preview@example.test>\r\n\
+                 To: Fixture User <fixture@example.test>\r\n\
+                 Subject: Whitespace preview {name}\r\n\
+                 Date: Thu, 18 Jun 2026 20:00:0{index} +0000\r\n\
+                 Message-ID: <preview-{name}@fixture.test>\r\n\
+                 MIME-Version: 1.0\r\n\
+                 Content-Type: text/plain; charset=utf-8\r\n\r\n\
+                 {body}\r\n"
+            );
+            fs::write(&path, &raw)?;
+            db.index_file_with_tags(&path, &["preview-whitespace"])?;
+            sources.push((path, raw));
+        }
+    }
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:preview-whitespace\"\n\
+             \n[ui]\nthread_preview_lines = 2\nshow_sidebar = false\nshow_message_view = false\n\
+             \n[send]\nenabled = false\n\
+             \n[sync]\nenabled = false\n\
+             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+        ),
+    )?;
+    let token = format!("notm-preview-whitespace-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    let search = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let rows = json_array_at(&search, &["state", "thread_list_items"])?;
+    ensure!(
+        rows.len() == variants.len(),
+        "missing preview fixtures: {search}"
+    );
+    let control_index = rows
+        .iter()
+        .position(|row| row["subject"] == "Whitespace preview spaces")
+        .context("normalized preview control was not found")?;
+
+    // Compare actual allocations, not just the label's configured line limit:
+    // hidden separators can inflate the row while the label still draws two lines.
+    for width in [900, 600, 1100] {
+        driver.command("resize_window", json!({"width": width, "height": 700}))?;
+        thread::sleep(Duration::from_millis(350));
+        let control = driver.command("thread_row_layout", json!({"index": control_index}))?;
+        let control_height = control["row"]["height"]
+            .as_f64()
+            .filter(|height| *height > 0.0)
+            .with_context(|| format!("control row was not allocated: {control}"))?;
+        for index in 0..rows.len() {
+            let layout = driver.command("thread_row_layout", json!({"index": index}))?;
+            let height = layout["row"]["height"]
+                .as_f64()
+                .with_context(|| format!("preview row was not allocated: {layout}"))?;
+            ensure!(
+                (height - control_height).abs() <= 1.0,
+                "Unicode preview inflated row {index} at window width {width}: control={control}, actual={layout}"
+            );
+        }
+    }
+    let details = driver.command("thread_ui_details", json!({}))?;
+    for row in rows {
+        let thread_id = row["thread_id"]
+            .as_str()
+            .context("fixture thread has no ID")?;
+        assert_eq!(
+            details["thread_details"][thread_id]["preview"], expected_preview,
+            "Unicode preview was not normalized: {details}"
+        );
+    }
+    for (path, raw) in sources {
+        assert_eq!(
+            fs::read_to_string(path)?,
+            raw,
+            "original message was modified"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn fixture_compose_rejects_attachment_header_injection() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {

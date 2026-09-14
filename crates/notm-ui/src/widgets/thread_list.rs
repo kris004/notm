@@ -2127,6 +2127,8 @@ fn body_preview(body: &str) -> String {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('>'))
+        // Unicode separators can inflate GTK row height even in ellipsized previews.
+        .flat_map(str::split_whitespace)
         .collect::<Vec<_>>()
         .join(" ");
     if preview.chars().count() > THREAD_PREVIEW_CACHE_MAX_CHARS {
@@ -2472,6 +2474,40 @@ mod tests {
         let long = body_preview(&"x".repeat(THREAD_PREVIEW_CACHE_MAX_CHARS + 50));
         assert_eq!(long.chars().count(), THREAD_PREVIEW_CACHE_MAX_CHARS);
         assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn cached_body_preview_collapses_unicode_whitespace() {
+        for separator in [
+            "  ", "\t", "\r\n", "\u{000b}", "\u{000c}", "\u{0085}", "\u{00a0}", "\u{2003}",
+            "\u{2028}", "\u{2029}",
+        ] {
+            assert_eq!(
+                body_preview(&format!("first{separator}{separator}second")),
+                "first second",
+                "preview retained whitespace {separator:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_body_preview_normalization_preserves_quote_filtering() {
+        assert_eq!(
+            body_preview(
+                "\r\n \t> ignored quote\r\n first\tword\u{2028}second word \n\
+                 \u{2029}\n\u{00a0}> another quote\n third word\n"
+            ),
+            "first word second word third word"
+        );
+        assert!(body_preview("\t\u{2028}\u{2029}\n > ignored quote\n").is_empty());
+    }
+
+    #[test]
+    fn cached_body_preview_normalizes_before_unicode_safe_truncation() {
+        let prefix = "é".repeat(THREAD_PREVIEW_CACHE_MAX_CHARS - 2);
+        let preview = body_preview(&format!("{prefix}\u{2028}\u{2029}{}", "🙂".repeat(10)));
+        assert_eq!(preview, format!("{prefix} …"));
+        assert_eq!(preview.chars().count(), THREAD_PREVIEW_CACHE_MAX_CHARS);
     }
 
     #[test]
