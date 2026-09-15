@@ -41,6 +41,7 @@ pub struct RuntimeSettings {
     pub(crate) excluded_tags: Vec<String>,
     pub(crate) sync_maildir_flags_after_tag_change: bool,
     pub(crate) remote_images: bool,
+    pub(crate) html_dark_background: bool,
     pub(crate) layout_preference: LayoutPreference,
 }
 
@@ -53,6 +54,7 @@ impl Default for RuntimeSettings {
             excluded_tags: vec!["trash".to_string(), "spam".to_string()],
             sync_maildir_flags_after_tag_change: true,
             remote_images: false,
+            html_dark_background: false,
             layout_preference: LayoutPreference::Auto,
         }
     }
@@ -90,6 +92,10 @@ pub fn sync_maildir_flags_after_tag_change(store: &RuntimeSettingsStore) -> bool
 
 pub fn remote_images(store: &RuntimeSettingsStore) -> bool {
     snapshot(store).remote_images
+}
+
+pub fn html_dark_background(store: &RuntimeSettingsStore) -> bool {
+    snapshot(store).html_dark_background
 }
 
 pub fn layout_preference(store: &RuntimeSettingsStore) -> LayoutPreference {
@@ -216,6 +222,7 @@ pub struct SettingsDialogTestState {
     pub thread_preview_lines: String,
     pub show_thread_preview: bool,
     pub remote_images: bool,
+    pub html_dark_background: bool,
     pub send_timeout_seconds: String,
 }
 
@@ -226,6 +233,7 @@ struct PendingSettingsDialog {
     thread_preview_lines: gtk::Entry,
     show_thread_preview: gtk::CheckButton,
     remote_images: gtk::CheckButton,
+    html_dark_background: gtk::CheckButton,
     send_timeout_seconds: gtk::Entry,
 }
 
@@ -499,6 +507,13 @@ impl SettingsController {
             },
             "Visual HTML is sanitized. Message scripts stay blocked; http/https/mailto links open externally.",
         );
+        let html_dark_background = settings_check_row(
+            &form,
+            "Dark HTML background",
+            seed.runtime.html_dark_background,
+            "Use a dark reading background and light text in Visual HTML, independently of the application theme. Overrides sender colors without inverting images or enabling remote content.",
+        );
+        html_dark_background.set_widget_name("notm-settings-html-dark-background");
         let start_maximized = settings_check_row(
             &form,
             "Start maximized",
@@ -771,6 +786,7 @@ impl SettingsController {
             thread_preview_lines: thread_preview_lines.clone(),
             show_thread_preview: show_thread_preview.clone(),
             remote_images: remote_images.clone(),
+            html_dark_background: html_dark_background.clone(),
             send_timeout_seconds: send_timeout_seconds.clone(),
         });
         let app_config_path = seed.app_config_path.clone();
@@ -843,6 +859,7 @@ impl SettingsController {
                     start_maximized: start_maximized.is_active(),
                     show_debug_panel: show_debug_panel.is_active(),
                     remote_images: remote_images.is_active(),
+                    html_dark_background: html_dark_background.is_active(),
                     hidden_tag_searches: hidden_tag_searches.text().to_string(),
                     send_enabled: send_enabled.is_active(),
                     send_transport: combo_active_id(&send_transport),
@@ -946,6 +963,7 @@ impl SettingsController {
                 thread_preview_lines: pending.thread_preview_lines.text().to_string(),
                 show_thread_preview: pending.show_thread_preview.is_active(),
                 remote_images: pending.remote_images.is_active(),
+                html_dark_background: pending.html_dark_background.is_active(),
                 send_timeout_seconds: pending.send_timeout_seconds.text().to_string(),
             })
     }
@@ -958,6 +976,7 @@ impl SettingsController {
             preview_entry,
             preview_check,
             remote_images,
+            html_dark_background,
             send_timeout_entry,
         ) = {
             let pending = self.inner.pending.borrow();
@@ -983,6 +1002,7 @@ impl SettingsController {
                 pending.thread_preview_lines.clone(),
                 pending.show_thread_preview.clone(),
                 pending.remote_images.clone(),
+                pending.html_dark_background.clone(),
                 pending.send_timeout_seconds.clone(),
             )
         };
@@ -1012,6 +1032,12 @@ impl SettingsController {
             .and_then(serde_json::Value::as_bool)
         {
             remote_images.set_active(enabled);
+        }
+        if let Some(enabled) = args
+            .get("html_dark_background")
+            .and_then(serde_json::Value::as_bool)
+        {
+            html_dark_background.set_active(enabled);
         }
         if let Some(timeout) = args.get("send_timeout_seconds") {
             let text = match timeout {
@@ -1073,6 +1099,7 @@ struct SettingsValues {
     start_maximized: bool,
     show_debug_panel: bool,
     remote_images: bool,
+    html_dark_background: bool,
     hidden_tag_searches: String,
     send_enabled: bool,
     send_transport: String,
@@ -1118,6 +1145,7 @@ fn apply_settings_values(values: &SettingsValues) -> anyhow::Result<SettingsAppl
             excluded_tags: parse_string_list(&values.excluded_tags),
             sync_maildir_flags_after_tag_change: values.sync_maildir_flags_after_tag_change,
             remote_images: values.remote_images,
+            html_dark_background: values.html_dark_background,
             layout_preference: parse_layout_preference(&values.layout),
         },
         show_thread_numbers: values.show_thread_numbers,
@@ -1687,6 +1715,12 @@ fn persist_settings_values(path: Option<&Path>, values: &SettingsValues) -> anyh
     set_bool(root, "ui", "start_maximized", values.start_maximized);
     set_bool(root, "ui", "show_debug_panel", values.show_debug_panel);
     set_bool(root, "ui", "remote_images", values.remote_images);
+    set_bool(
+        root,
+        "ui",
+        "html_dark_background",
+        values.html_dark_background,
+    );
     set_string_array(
         root,
         "ui",

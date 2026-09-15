@@ -220,6 +220,18 @@ required.
 
 ## GUI smoke checks
 
+The dark Visual HTML background regression exercises the real Settings checkbox,
+Apply/Save, invalid-save rollback, restart, both message readers, inline sender
+color overrides, restored light colors, scroll retention, and unchanged
+one-shot/blocked image permissions using a loopback request tracker:
+
+```sh
+NOTM_REQUIRE_GTK_DISPLAY=1 \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
+    fixture_dark_html_background_applies_without_reloading_and_persists -- \
+    --exact --nocapture --test-threads=1
+```
+
 The Cargo desktop UI smokes use a private, software-rendered headless Sway
 compositor by default. Each fixture app gets its own 1920x1080 Wayland display,
 and at most two GUI fixtures run concurrently. This keeps test windows off the

@@ -214,6 +214,16 @@ and
 The default is
 .BR sanitize_then_render_text_fallback .
 .TP
+.B html_dark_background
+Use a dark background with light text and links in Visual HTML, independently
+of the application theme.  Defaults to false.  The Settings UI exposes this as
+.BR "Dark HTML background" .
+Apply changes the reading pane and open standalone message windows immediately;
+Save also persists the preference.  Sender text and background colors are
+overridden, but image pixels are not inverted.  Changing this setting does not
+reload messages or change image permissions.  Disable it to restore the original
+light rendering.
+.TP
 .B message_view_preferences
 Application-managed table mapping Message-IDs to remembered views.  Supported
 values are

@@ -166,6 +166,7 @@ fn launch_options(cfg: &config::AppConfig, app_config_path: Option<PathBuf>) -> 
         show_message_list: cfg.ui.show_message_list,
         show_message_view: cfg.ui.show_message_view,
         remote_images: cfg.ui.remote_images,
+        html_dark_background: cfg.ui.html_dark_background,
         trusted_image_senders: cfg.ui.trusted_image_senders.clone(),
         show_thread_numbers: cfg.ui.show_thread_numbers,
         show_thread_dates: cfg.ui.show_thread_dates,
@@ -435,11 +436,13 @@ mod tests {
         let mut cfg = crate::config::AppConfig::default();
         cfg.ui.theme = "dark".to_string();
         cfg.ui.thread_preview_lines = 7;
+        cfg.ui.html_dark_background = true;
 
         let options = super::launch_options(&cfg, None);
 
         assert_eq!(options.theme, ThemePreference::Dark);
         assert_eq!(options.thread_preview_lines, 7);
+        assert!(options.html_dark_background);
     }
 
     #[test]

@@ -175,6 +175,7 @@ pub struct LaunchOptions {
     pub show_message_list: bool,
     pub show_message_view: bool,
     pub remote_images: bool,
+    pub html_dark_background: bool,
     pub show_thread_numbers: bool,
     pub show_thread_dates: bool,
     pub show_thread_tags: bool,
@@ -250,6 +251,7 @@ impl Default for LaunchOptions {
             show_message_list: true,
             show_message_view: true,
             remote_images: false,
+            html_dark_background: false,
             show_thread_numbers: true,
             show_thread_dates: true,
             show_thread_tags: true,
@@ -508,6 +510,7 @@ fn sync_runtime_settings_from_launch_options(options: &LaunchOptions) {
             excluded_tags: options.excluded_tags.clone(),
             sync_maildir_flags_after_tag_change: options.sync_maildir_flags_after_tag_change,
             remote_images: options.remote_images,
+            html_dark_background: options.html_dark_background,
             layout_preference: parse_layout_preference(&options.layout),
         },
     );
@@ -1705,6 +1708,7 @@ fn build_ui(
     connect_html_navigation_policy(&html_view, &status_label);
     connect_html_hover_status(&html_view, &status_label);
     let html_lifecycle = HtmlViewLifecycle::new(&html_view, &status_label);
+    html_lifecycle.set_dark_background(settings::html_dark_background(&options.runtime_settings));
     html_lifecycle.load_html(&empty_visual_html_document(), Some("about:blank"));
     let link_opener: LinkHintOpener = Rc::new(open_html_link_externally);
     let link_hints = LinkHintController::new(&html_view, &status_label, link_opener);
@@ -11804,6 +11808,7 @@ fn html_view_state(
         "load_generation": lifecycle.generation,
         "completed_load_generation": lifecycle.completed_generation,
         "images": lifecycle.images,
+        "appearance": lifecycle.appearance,
         "global_remote_images_allowed": global_remote_images_allowed,
         "sender_email": sender_email,
         "selected_image_sender": selected_image_sender,
@@ -13919,6 +13924,7 @@ fn open_standalone_message_window(
         StandalonePolicySnapshot {
             collapse_quotes: policy_quote_collapse.get(),
             remote_images: settings::remote_images(&policy_options.runtime_settings),
+            html_dark_background: settings::html_dark_background(&policy_options.runtime_settings),
             trusted_image_senders: state.trusted_image_senders.clone(),
             show_keybind_hints: state.show_keybind_hints,
             normal_input_mode: state.input_mode == InputMode::Normal,
@@ -20267,6 +20273,7 @@ fn settings_test_state_json(
         "theme": theme_state,
         "preview": rendered_thread_preview_json(widgets, state),
         "remote_images": settings::remote_images(&options.runtime_settings),
+        "html_dark_background": settings::html_dark_background(&options.runtime_settings),
         "configured_send_timeout_seconds": options.send_timeout_seconds,
         "app_config_path": options.app_config_path,
         "status_text": widgets.status_label.text().to_string(),
@@ -22136,6 +22143,7 @@ fn apply_settings_application(
     let next_layout_preference = next_runtime.layout_preference;
     let next_excluded_tags = next_runtime.excluded_tags.clone();
     let next_remote_images = next_runtime.remote_images;
+    let next_html_dark_background = next_runtime.html_dark_background;
     settings::update(&options.runtime_settings, next_runtime);
 
     {
@@ -22153,6 +22161,12 @@ fn apply_settings_application(
     }
     theme::apply_theme_preference(&widgets.gtk_settings, &widgets.css_provider, next_theme);
     widgets.theme_background_probe.queue_draw();
+    widgets
+        .html_lifecycle
+        .set_dark_background(next_html_dark_background);
+    widgets
+        .standalone_messages
+        .set_dark_background(next_html_dark_background);
     *widgets.hidden_tag_searches.borrow_mut() = application.hidden_tag_searches;
 
     apply_pane_visibility_values(
@@ -22174,15 +22188,16 @@ fn apply_settings_application(
     widgets
         .standalone_messages
         .refresh_remote_image_policy(previous_runtime.remote_images, next_remote_images);
-    if html_view_is_visible(widgets) {
-        let scroll = current_message_scroll_fraction(widgets);
-        show_visual_html_selected_message(options, widgets, state);
-        restore_message_scroll_fraction(widgets, scroll);
-    } else {
-        set_html_image_loading(
-            &widgets.html_view,
-            settings::remote_images(&options.runtime_settings),
-        );
+    // Appearance-only changes must not reload remote images or revoke the
+    // current message's one-shot permission.
+    if previous_runtime.remote_images != next_remote_images {
+        if html_view_is_visible(widgets) {
+            let scroll = current_message_scroll_fraction(widgets);
+            show_visual_html_selected_message(options, widgets, state);
+            restore_message_scroll_fraction(widgets, scroll);
+        } else {
+            set_html_image_loading(&widgets.html_view, next_remote_images);
+        }
     }
 
     let search_reload_scheduled = previous_runtime.page_size != next_page_size
