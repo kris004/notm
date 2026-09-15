@@ -19457,14 +19457,13 @@ fn handle_automation_request(
                 let response_sender = req.response.clone();
                 let w = widgets.clone();
                 let st = state.clone();
-                let mut response = Some(response);
+                let response_name = response["response"].clone();
                 gtk::glib::timeout_add_local(DRAFT_IO_POLL_INTERVAL, move || {
                     if w.draft_save_active.get().is_some() {
                         return gtk::glib::ControlFlow::Continue;
                     }
-                    let mut response = response
-                        .take()
-                        .expect("confirmation response is sent only once");
+                    let mut response = pending_confirmation_state_json(&w, &st);
+                    response["response"] = response_name.clone();
                     let status = w.status_label.text().to_string();
                     let failed = status.starts_with("Draft save failed:")
                         || status.starts_with("Delete local draft failed:")

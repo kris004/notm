@@ -12064,6 +12064,11 @@ fn clean_xdg_duplicate_draft_headers_preserve_recipients_and_reject_authors() ->
         )?["ok"],
         true
     );
+    // Keep the save pending beyond the confirmation handler's initial snapshot.
+    assert_eq!(
+        driver.command("set_fixture_draft_delay", json!({"milliseconds": 600}))?["ok"],
+        true
+    );
     let save = driver.command("save_draft", json!({}))?;
     assert_eq!(
         save["pending_confirmation"], true,
@@ -12075,6 +12080,14 @@ fn clean_xdg_duplicate_draft_headers_preserve_recipients_and_reject_authors() ->
         json!({"response": "accept", "id": confirmation_id}),
     )?;
     assert_eq!(accepted["ok"], true, "replacement save failed: {accepted}");
+    assert_eq!(accepted["response"], "accept");
+    let saved_state = driver.command("app_state", json!({}))?;
+    for field in ["active_draft", "last_error", "last_operation"] {
+        assert_eq!(
+            accepted[field], saved_state["state"][field],
+            "delayed confirmation returned stale {field}: {accepted}"
+        );
+    }
     let replacement_path = accepted["active_draft"]["path"]
         .as_str()
         .map(PathBuf::from)
