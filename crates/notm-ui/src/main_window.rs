@@ -12347,7 +12347,7 @@ fn start_full_search(
                             thread_list::reduce_replace_search(data),
                             response.select_first,
                             move |applied| {
-                                record_full_search_outcome(&continue_state, generation);
+                                record_full_search_outcome(&continue_state, generation, applied);
                                 restore_tag_warning_after_search(
                                     &continue_options,
                                     &continue_widgets,
@@ -12371,7 +12371,7 @@ fn start_full_search(
                                 &st,
                                 thread_list::reduce_search_error(err, has_threads),
                             );
-                            record_full_search_outcome(&st, response.generation);
+                            record_full_search_outcome(&st, response.generation, true);
                             restore_tag_warning_after_search(&opts, &w, &st, false);
                             w.tag_refresh_selected_thread_id.borrow_mut().take();
                         }
@@ -12451,7 +12451,11 @@ fn restore_tag_warning_after_search(
     update_debug(widgets, state);
 }
 
-fn record_full_search_outcome(state: &SharedState, generation: u64) {
+fn record_full_search_outcome(state: &SharedState, generation: u64, completed: bool) {
+    if !completed {
+        // A cancelled model application must leave refresh waiters pending.
+        return;
+    }
     let mut state = state.borrow_mut();
     state.full_search_outcome_generation = generation;
     state.full_search_outcome_error = state.search_error.clone();
@@ -24258,6 +24262,38 @@ mod tests {
             full_search_outcome_at_or_after(&state, 5),
             Some(Ok(())),
             "an unrelated mutable search error replaced the recorded full-search outcome"
+        );
+    }
+
+    #[test]
+    fn cancelled_full_search_does_not_satisfy_refresh_waiters() {
+        let state = Rc::new(RefCell::new(UiState {
+            full_search_outcome_generation: 5,
+            full_search_outcome_error: Some("earlier search failed".to_string()),
+            ..UiState::default()
+        }));
+
+        record_full_search_outcome(&state, 6, false);
+        assert_eq!(full_search_outcome_at_or_after(&state.borrow(), 6), None);
+        assert_eq!(
+            full_search_outcome_at_or_after(&state.borrow(), 5),
+            Some(Err("earlier search failed".to_string())),
+            "a cancelled model application replaced the last completed outcome"
+        );
+
+        record_full_search_outcome(&state, 7, true);
+        assert_eq!(
+            full_search_outcome_at_or_after(&state.borrow(), 6),
+            Some(Ok(())),
+            "a subsequent fully applied search must satisfy the pending refresh"
+        );
+
+        state.borrow_mut().search_error = Some("replacement search failed".to_string());
+        record_full_search_outcome(&state, 8, true);
+        assert_eq!(
+            full_search_outcome_at_or_after(&state.borrow(), 8),
+            Some(Err("replacement search failed".to_string())),
+            "a completed search failure must still be reported"
         );
     }
 
