@@ -241,6 +241,11 @@ contract: `notm` does not authenticate raw `From:` or trust message-supplied
 authentication headers, so a forged message claiming an allowed address
 inherits the permission.
 
+`html_view_state.appearance` and standalone `html_lifecycle.appearance` expose
+the dark-background flag and WebKit's computed body, first-link, and first-table
+colors, plus the first image's filter. These become available after the ready
+probe; they verify rendered appearance rather than just the saved preference.
+
 In fixture mode, `draft_list_state` reports whether the rendered Saved drafts
 section, explicit empty state, bounded scroller, rows, and per-selection Delete
 button are mapped. It also reports the selected row, compose fields, active
@@ -332,7 +337,7 @@ dialog ID and visible controls, the requested theme and live resolved
 limit, the send-timeout entry and configured launch value, and the actual
 rendered preview label's line limit, visibility, and text. `respond_settings`
 drives that same GTK dialog's response signal. It accepts optional `id`,
-`theme`, `thread_preview_lines`, `show_thread_preview`, and
+`theme`, `html_dark_background`, `remote_images`, `thread_preview_lines`, `show_thread_preview`, and
 `send_timeout_seconds` arguments plus `response` set to `apply`, `save`, or
 `close`, for example:
 

@@ -41,6 +41,7 @@ pub(crate) enum StandaloneImagePolicy {
 pub(crate) struct StandalonePolicySnapshot {
     pub(crate) collapse_quotes: bool,
     pub(crate) remote_images: bool,
+    pub(crate) html_dark_background: bool,
     pub(crate) trusted_image_senders: Vec<String>,
     pub(crate) show_keybind_hints: bool,
     pub(crate) normal_input_mode: bool,
@@ -377,6 +378,7 @@ impl StandaloneMessageController {
         let policy = (options.policy)();
         (options.initialize_html_view)(&html_view, &status_label, policy.remote_images);
         let html_lifecycle = HtmlViewLifecycle::new(&html_view, &status_label);
+        html_lifecycle.set_dark_background(policy.html_dark_background);
         let link_hints =
             LinkHintController::new(&html_view, &status_label, options.open_link.clone());
         html_lifecycle.load_html(&options.initial_html, Some("about:blank"));
@@ -594,6 +596,12 @@ impl StandaloneMessageController {
             standalone.window.close();
         }
         count
+    }
+
+    pub(crate) fn set_dark_background(&self, enabled: bool) {
+        for standalone in self.windows.borrow().iter() {
+            standalone.html_lifecycle.set_dark_background(enabled);
+        }
     }
 
     pub(crate) fn refresh_remote_image_policy(&self, previous: bool, current: bool) {
@@ -2921,6 +2929,7 @@ mod tests {
         let trusted = StandalonePolicySnapshot {
             collapse_quotes: false,
             remote_images: false,
+            html_dark_background: false,
             trusted_image_senders: vec!["SHARED@example.test".to_string()],
             show_keybind_hints: true,
             normal_input_mode: true,

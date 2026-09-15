@@ -208,6 +208,8 @@ pub struct UiConfig {
     #[serde(default)]
     pub remote_images: bool,
     #[serde(default)]
+    pub html_dark_background: bool,
+    #[serde(default)]
     pub trusted_image_senders: Vec<String>,
     #[serde(default = "default_html_mode")]
     pub html_mode: String,
@@ -253,6 +255,7 @@ impl Default for UiConfig {
             show_thread_preview: true,
             show_keybind_hints: true,
             remote_images: false,
+            html_dark_background: false,
             trusted_image_senders: Vec::new(),
             html_mode: "sanitize_then_render_text_fallback".to_string(),
             message_view_preferences: BTreeMap::new(),
@@ -811,6 +814,22 @@ mod tests {
                 });
             }
         }
+    }
+
+    #[test]
+    fn html_dark_background_is_opt_in_and_requires_a_boolean() {
+        assert!(!AppConfig::default().ui.html_dark_background);
+        assert!(
+            !parse_validated("[ui]\ntheme = \"dark\"\n")
+                .unwrap()
+                .ui
+                .html_dark_background
+        );
+        let config = parse_validated("[ui]\nhtml_dark_background = true\n").unwrap();
+        assert!(config.ui.html_dark_background);
+        assert_eq!(config.ui.theme, "system");
+        assert!(!config.ui.remote_images);
+        assert!(parse_validated("[ui]\nhtml_dark_background = \"dark\"\n").is_err());
     }
 
     #[test]

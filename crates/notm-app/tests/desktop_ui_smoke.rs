@@ -12,6 +12,8 @@ use anyhow::{Context, ensure};
 use notm_test_support::ui_driver::UiDriver;
 use serde_json::{Value, json};
 
+#[path = "support/external_refresh_gui.rs"]
+mod external_refresh_gui;
 #[path = "support/gui_test_display.rs"]
 mod gui_test_display;
 #[path = "support/local_http_tracker.rs"]
@@ -19,6 +21,8 @@ mod local_http_tracker;
 #[cfg(unix)]
 #[path = "support/local_smtp.rs"]
 mod local_smtp;
+#[path = "support/refresh_bus.rs"]
+mod refresh_bus;
 
 use gui_test_display::{GuiTestDisplay, gtk_display_environment};
 use local_http_tracker::LocalHttpTracker;
@@ -55,6 +59,8 @@ struct FixtureLaunchOptions<'a> {
     message_id: Option<&'a str>,
     mailto_uri: Option<&'a str>,
     application_id: Option<&'a str>,
+    session_bus_address: Option<&'a str>,
+    production: bool,
     fixture: bool,
     system_prefers_dark: Option<bool>,
     startup_recovery_delay_ms: Option<u64>,
@@ -328,10 +334,12 @@ impl FixtureApp {
         if options.fixture {
             command.arg("--fixture");
         }
-        command.args(["--test-harness", "--test-harness-socket"]);
-        command
-            .arg(&socket_path)
-            .args(["--test-harness-token", token]);
+        if !options.production {
+            command.args(["--test-harness", "--test-harness-socket"]);
+            command
+                .arg(&socket_path)
+                .args(["--test-harness-token", token]);
+        }
         if let Some(message_id) = options.message_id {
             command.args(["--message-id", message_id]);
         }
@@ -380,6 +388,9 @@ impl FixtureApp {
             command.env("GDK_DEBUG", "default-settings");
         }
         display.configure_command(&mut command);
+        if let Some(address) = options.session_bus_address {
+            command.env("DBUS_SESSION_BUS_ADDRESS", address);
+        }
         let child = command
             .env("HOME", home)
             .env("XDG_CONFIG_HOME", config_home)
@@ -10913,6 +10924,242 @@ fn fixture_tag_undo_restores_each_messages_original_tags() -> anyhow::Result<()>
 
 #[cfg(unix)]
 #[test]
+fn fixture_dark_html_background_applies_without_reloading_and_persists() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_dark_html_background_applies_without_reloading_and_persists: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running dark HTML background UI smoke with {display}");
+    let tracker = LocalHttpTracker::start()?;
+    let root = tempfile::Builder::new()
+        .prefix("notm-dark-html-ui-")
+        .tempdir()?;
+    let config_path = root.path().join("notm.toml");
+    fs::write(&config_path, "[ui]\ntheme = \"light\"\n")?;
+    let token = format!("notm-dark-html-ui-{}", unique_run_id()?);
+    let mut app =
+        FixtureApp::spawn_fixture_with_config(root.path().join("app"), &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let saved_path = fixture_app_config_path(&mut driver)?;
+    let database = saved_path.parent().context("fixture database parent")?;
+    let notmuch_config = database
+        .parent()
+        .context("fixture root")?
+        .join("notmuch-config");
+    let html = format!(
+        r##"<table bgcolor="#ffffff" style="background-color:#ffffff !important;color:#101010 !important"><tr><td>
+<h1>Dark reader fixture</h1>
+<p>Readable text without changing the message.</p>
+<a href="https://example.test/" style="color:#002244 !important"><span>Example link</span></a>
+<blockquote>Quoted message</blockquote>
+<img src="{}" alt="Remote image">
+{}</td></tr></table>"##,
+        tracker.url("/dark-reader"),
+        "<p>More message text for scrolling.</p>".repeat(100),
+    );
+    index_remote_html_message(
+        database,
+        &notmuch_config,
+        "dark-reader@fixture.test",
+        "Reader <reader@example.test>",
+        "Dark reader fixture",
+        &html,
+    )?;
+    select_first_thread(&mut driver, "id:dark-reader@fixture.test")?;
+    show_visual_html_and_wait(&mut driver, false)?;
+
+    driver.command(
+        "set_pane_visibility",
+        json!({"pane": "message", "visible": false}),
+    )?;
+    driver.command("open_selected_thread", json!({}))?;
+    wait_for_standalone_window_count(&mut driver, 1)?;
+    driver.command("standalone_show_visual_html", json!({"window_index": 0}))?;
+    driver.command(
+        "set_pane_visibility",
+        json!({"pane": "message", "visible": true}),
+    )?;
+    let (light, light_windows) = wait_for_html_background(&mut driver, false, 1)?;
+    assert_eq!(light["appearance"]["background"], "rgb(255, 255, 255)");
+    assert_eq!(light["appearance"]["table_foreground"], "rgb(16, 16, 16)");
+    assert_eq!(light["appearance"]["link"], "rgb(0, 34, 68)");
+    let original_saved_bytes = fs::read(&saved_path).ok();
+    driver.command("open_settings", json!({}))?;
+    let initial = driver.command("settings_test_state", json!({}))?;
+    assert_eq!(initial["dialog"]["html_dark_background"], false);
+
+    // Invalid Save must not apply or persist the new checkbox.
+    let rejected = driver.command(
+        "respond_settings",
+        json!({
+            "response": "save", "html_dark_background": true, "thread_preview_lines": 0,
+        }),
+    )?;
+    assert_eq!(rejected["ok"], false, "{rejected}");
+    assert_eq!(rejected["state"]["html_dark_background"], false);
+    assert_eq!(fs::read(&saved_path).ok(), original_saved_bytes);
+
+    for enabled in [true, false, true] {
+        let applied = driver.command(
+            "respond_settings",
+            json!({
+                "response": "apply", "html_dark_background": enabled, "thread_preview_lines": 2,
+            }),
+        )?;
+        assert_eq!(applied["ok"], true, "{applied}");
+        assert_eq!(applied["state"]["html_dark_background"], enabled);
+        assert_eq!(applied["state"]["theme"]["requested"], "light");
+        assert_eq!(
+            fs::read(&saved_path).ok(),
+            original_saved_bytes,
+            "Apply persisted settings"
+        );
+        let (view, windows) = wait_for_html_background(&mut driver, enabled, 1)?;
+        assert_eq!(
+            view["load_generation"], light["load_generation"],
+            "appearance reloaded main HTML"
+        );
+        assert_eq!(
+            windows[0]["html_lifecycle"]["generation"],
+            light_windows[0]["html_lifecycle"]["generation"],
+            "appearance reloaded standalone HTML"
+        );
+        assert_remote_images_blocked(&view)?;
+        assert_eq!(windows[0]["image_permission"], "blocked");
+        if enabled {
+            for appearance in [
+                &view["appearance"],
+                &windows[0]["html_lifecycle"]["appearance"],
+            ] {
+                assert_eq!(appearance["background"], "rgb(30, 30, 30)", "{appearance}");
+                assert_eq!(
+                    appearance["foreground"], "rgb(230, 230, 230)",
+                    "{appearance}"
+                );
+                assert_eq!(
+                    appearance["table_background"], "rgba(0, 0, 0, 0)",
+                    "{appearance}"
+                );
+                assert_eq!(
+                    appearance["table_foreground"], "rgb(230, 230, 230)",
+                    "{appearance}"
+                );
+                assert_eq!(appearance["link"], "rgb(138, 180, 248)", "{appearance}");
+            }
+        } else {
+            assert_eq!(
+                view["appearance"], light["appearance"],
+                "sender colors were not restored"
+            );
+        }
+    }
+    tracker.ensure_stable(&[], Duration::from_millis(250))?;
+    driver.command("respond_settings", json!({"response": "close"}))?;
+
+    // A presentation change also preserves an explicit one-shot image grant.
+    driver.command("load_images_once", json!({}))?;
+    let loaded =
+        wait_for_html_view_permission(&mut driver, ExpectedImagePermission::MessageOnce, None)?;
+    tracker.wait_for_requests(&["/dark-reader"], STARTUP_TIMEOUT)?;
+    driver.command("scroll_html_view_lines", json!({"lines": 8}))?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let scroll_before = loop {
+        let state = driver.command("html_scroll_state", json!({}))?;
+        if state["scroll"]["y"].as_f64().is_some_and(|y| y > 0.0) && state["pending"] == false {
+            break state["scroll"]["y"].as_f64().unwrap();
+        }
+        ensure!(Instant::now() < deadline, "HTML did not scroll: {state}");
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+    driver.command("open_settings", json!({}))?;
+    for enabled in [false, true] {
+        let response = if enabled { "save" } else { "apply" };
+        let applied = driver.command(
+            "respond_settings",
+            json!({
+                "response": response, "html_dark_background": enabled,
+            }),
+        )?;
+        assert_eq!(applied["ok"], true, "{applied}");
+        let (view, _) = wait_for_html_background(&mut driver, enabled, 1)?;
+        assert_eq!(view["load_generation"], loaded["load_generation"]);
+        assert_eq!(view["image_permission"], "message_once");
+        assert_eq!(view["appearance"]["image_filter"], "none");
+        let scroll = driver.command("html_scroll_state", json!({}))?;
+        ensure!(
+            (scroll["scroll"]["y"].as_f64().unwrap() - scroll_before).abs() < 2.0,
+            "appearance moved the reading position: {scroll}"
+        );
+    }
+    tracker.ensure_stable(&["/dark-reader"], Duration::from_millis(250))?;
+    let saved_bytes = fs::read(&saved_path)?;
+    let saved: toml::Value = toml::from_str(std::str::from_utf8(&saved_bytes)?)?;
+    assert_eq!(saved["ui"]["html_dark_background"].as_bool(), Some(true));
+    assert_eq!(saved["ui"]["remote_images"].as_bool(), Some(false));
+
+    // Reload the saved preference into a fresh isolated fixture process.
+    fs::write(&config_path, saved_bytes)?;
+    drop(driver);
+    drop(app);
+    let mut restarted =
+        FixtureApp::spawn_fixture_with_config(root.path().join("restart"), &token, &config_path)?;
+    let mut driver = restarted.connect(&token)?;
+    select_first_thread(&mut driver, "id:html-message@fixture.test")?;
+    show_visual_html_and_wait(&mut driver, false)?;
+    let (view, _) = wait_for_html_background(&mut driver, true, 0)?;
+    assert_eq!(view["appearance"]["background"], "rgb(30, 30, 30)");
+    assert_remote_images_blocked(&view)?;
+    // Newly opened standalone windows inherit the saved setting as well.
+    driver.command(
+        "set_pane_visibility",
+        json!({"pane": "message", "visible": false}),
+    )?;
+    driver.command("open_selected_thread", json!({}))?;
+    wait_for_standalone_window_count(&mut driver, 1)?;
+    driver.command("standalone_show_visual_html", json!({"window_index": 0}))?;
+    let (_, windows) = wait_for_html_background(&mut driver, true, 1)?;
+    assert_eq!(
+        windows[0]["html_lifecycle"]["appearance"]["background"],
+        "rgb(30, 30, 30)"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn wait_for_html_background(
+    driver: &mut UiDriver,
+    dark: bool,
+    standalone_count: usize,
+) -> anyhow::Result<(Value, Vec<Value>)> {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let view = driver.command("html_view_state", json!({}))?;
+        let state = driver.command("standalone_message_windows", json!({}))?;
+        let windows = json_array_at(&state, &["windows"])?;
+        if view["appearance"]["dark_background"] == dark
+            && view["loading"] == false
+            && windows.len() == standalone_count
+            && windows.iter().all(|window| {
+                window["html_lifecycle"]["appearance"]["dark_background"] == dark
+                    && window["html_lifecycle"]["ready"] == true
+                    && window["html_lifecycle"]["pending"] == false
+            })
+        {
+            return Ok((view, windows.to_vec()));
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "HTML background did not become dark={dark}: {view}; {state}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn fixture_settings_preview_limits_apply_without_partial_persistence() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
@@ -11817,6 +12064,11 @@ fn clean_xdg_duplicate_draft_headers_preserve_recipients_and_reject_authors() ->
         )?["ok"],
         true
     );
+    // Keep the save pending beyond the confirmation handler's initial snapshot.
+    assert_eq!(
+        driver.command("set_fixture_draft_delay", json!({"milliseconds": 600}))?["ok"],
+        true
+    );
     let save = driver.command("save_draft", json!({}))?;
     assert_eq!(
         save["pending_confirmation"], true,
@@ -11828,6 +12080,14 @@ fn clean_xdg_duplicate_draft_headers_preserve_recipients_and_reject_authors() ->
         json!({"response": "accept", "id": confirmation_id}),
     )?;
     assert_eq!(accepted["ok"], true, "replacement save failed: {accepted}");
+    assert_eq!(accepted["response"], "accept");
+    let saved_state = driver.command("app_state", json!({}))?;
+    for field in ["active_draft", "last_error", "last_operation"] {
+        assert_eq!(
+            accepted[field], saved_state["state"][field],
+            "delayed confirmation returned stale {field}: {accepted}"
+        );
+    }
     let replacement_path = accepted["active_draft"]["path"]
         .as_str()
         .map(PathBuf::from)

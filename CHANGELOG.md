@@ -4,6 +4,8 @@ Notable user-facing changes are recorded here.
 
 ## Unreleased
 
+- Add an optional dark Visual HTML background in Settings, including standalone
+  message windows, without inverting images or reloading remote content.
 - Render bounded raster images referenced through `cid:` from the message's own
   `multipart/related` MIME parts without granting remote-network permission.
 - Replace the relabeling remote-image button with a fixed, compact **Images**

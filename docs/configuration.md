@@ -90,6 +90,7 @@ start_maximized = false
 remote_images = false
 trusted_image_senders = []
 html_mode = "sanitize_then_render_text_fallback"
+html_dark_background = false
 
 custom_saved_searches = [
   { name = "Unread", query = "tag:unread and not tag:trash" },
@@ -101,6 +102,14 @@ hidden_tag_searches = []
 `three_pane` (or `columns`), or `stacked`. `page_size` accepts 1 through 1,000,
 and `thread_preview_lines` accepts 1 through 20. `html_mode` accepts
 `sanitize_then_render_text_fallback` or `visual_html_preferred`.
+
+`html_dark_background` opts into a dark background with light text and links in
+Visual HTML, independently of `theme`. Enable **Settings → UI → Dark HTML
+background** and choose **Apply** for this session or **Save** to persist it.
+It updates the reading pane and open standalone message windows without
+reloading the message or changing image permissions. Sender text/background
+colors are overridden for readability; image pixels are not inverted. Turn it
+off to restore the original light rendering. The default is `false`.
 
 `remote_images` defaults to `false`, which blocks remote content in Visual HTML.
 The **Images** menu's **Load for this message** action permits sanitized remote

@@ -1,0 +1,27 @@
+/* User-origin !important rules override even inline sender colors. Scope the
+ * override to the message body, leaving notm's link-hint overlay untouched. */
+:root[data-notm-dark-background] {
+  color-scheme: dark !important;
+  background-color: #1e1e1e !important;
+  color: #e6e6e6 !important;
+}
+:root[data-notm-dark-background] body {
+  background-color: #1e1e1e !important;
+  color: #e6e6e6 !important;
+}
+:root[data-notm-dark-background] body * {
+  background-color: transparent !important;
+  background-image: none !important;
+  color: inherit !important;
+  border-color: #555555 !important;
+  text-shadow: none !important;
+}
+:root[data-notm-dark-background] body a {
+  color: #8ab4f8 !important;
+}
+:root[data-notm-dark-background] body blockquote,
+:root[data-notm-dark-background] body .notm-blocked-image {
+  color: #b8b8b8 !important;
+}
+/* Do not invert or filter images: embedded and permitted remote photos retain
+ * their original pixels. Disabling the mode restores the sender's colors. */

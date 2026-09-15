@@ -102,13 +102,16 @@ use crate::{
     },
 };
 
+mod external_refresh;
+
 #[cfg(test)]
 use crate::widgets::attachments::AttachmentActionResult;
 
 pub use crate::widgets::settings::{RuntimeSettings, RuntimeSettingsStore};
 
-const NORMAL_APPLICATION_ID: &str = "io.github.kris004.notm";
-const TEST_HARNESS_APPLICATION_ID_NAMESPACE: &str = "io.github.kris004.notm.test.";
+use crate::remote_refresh::{
+    NORMAL_APPLICATION_ID, TEST_APPLICATION_NAMESPACE as TEST_HARNESS_APPLICATION_ID_NAMESPACE,
+};
 const TEST_HARNESS_APPLICATION_ID_PREFIX: &str = "io.github.kris004.notm.test.t";
 const TEST_HARNESS_APPLICATION_ID_ENV: &str = "NOTM_TEST_HARNESS_APPLICATION_ID";
 const OPEN_MESSAGE_ID_ACTION: &str = "open-message-id";
@@ -172,6 +175,7 @@ pub struct LaunchOptions {
     pub show_message_list: bool,
     pub show_message_view: bool,
     pub remote_images: bool,
+    pub html_dark_background: bool,
     pub show_thread_numbers: bool,
     pub show_thread_dates: bool,
     pub show_thread_tags: bool,
@@ -247,6 +251,7 @@ impl Default for LaunchOptions {
             show_message_list: true,
             show_message_view: true,
             remote_images: false,
+            html_dark_background: false,
             show_thread_numbers: true,
             show_thread_dates: true,
             show_thread_tags: true,
@@ -283,6 +288,7 @@ pub fn launch(options: LaunchOptions) -> anyhow::Result<()> {
 
     add_open_message_id_action(&app, &options, &main_window, &attachment_open_dir);
     add_compose_mailto_action(&app, &options, &main_window, &attachment_open_dir);
+    external_refresh::register_on_startup(&app, &options, &main_window);
     let activate_options = options.clone();
     let activate_main_window = main_window.clone();
     let activate_attachment_open_dir = attachment_open_dir.clone();
@@ -343,8 +349,10 @@ fn validate_launch_options(options: &LaunchOptions) -> anyhow::Result<()> {
 }
 
 fn application_id_for_launch(options: &LaunchOptions) -> anyhow::Result<String> {
-    if options.automation_enabled {
-        if let Some(application_id) = std::env::var_os(TEST_HARNESS_APPLICATION_ID_ENV) {
+    if options.automation_enabled || options.fixture_mode {
+        if let Some(application_id) =
+            std::env::var_os(TEST_HARNESS_APPLICATION_ID_ENV).filter(|_| options.automation_enabled)
+        {
             let application_id = application_id.into_string().map_err(|_| {
                 anyhow::anyhow!("{TEST_HARNESS_APPLICATION_ID_ENV} must be valid UTF-8")
             })?;
@@ -502,6 +510,7 @@ fn sync_runtime_settings_from_launch_options(options: &LaunchOptions) {
             excluded_tags: options.excluded_tags.clone(),
             sync_maildir_flags_after_tag_change: options.sync_maildir_flags_after_tag_change,
             remote_images: options.remote_images,
+            html_dark_background: options.html_dark_background,
             layout_preference: parse_layout_preference(&options.layout),
         },
     );
@@ -529,6 +538,7 @@ struct Widgets {
     search_bar: SearchBarController,
     search_page_coordinator: SearchPageCoordinator,
     sync_refresh_generation: Rc<Cell<Option<u64>>>,
+    external_refresh_generation: Rc<Cell<Option<u64>>>,
     input_mode_generation: Rc<Cell<u64>>,
     hidden_tag_searches: HiddenTagSearchStore,
     thread_list: ThreadListController,
@@ -648,7 +658,7 @@ struct Widgets {
     gtk_heartbeat: Rc<Cell<u64>>,
     close_when_idle: Rc<Cell<bool>>,
     close_flush_in_progress: Rc<Cell<bool>>,
-    tag_refresh_selected_thread_id: Rc<RefCell<Option<String>>>,
+    refresh_selected_thread_id: Rc<RefCell<Option<(u64, String)>>>,
     standalone_messages: StandaloneMessageController,
 }
 
@@ -1698,6 +1708,7 @@ fn build_ui(
     connect_html_navigation_policy(&html_view, &status_label);
     connect_html_hover_status(&html_view, &status_label);
     let html_lifecycle = HtmlViewLifecycle::new(&html_view, &status_label);
+    html_lifecycle.set_dark_background(settings::html_dark_background(&options.runtime_settings));
     html_lifecycle.load_html(&empty_visual_html_document(), Some("about:blank"));
     let link_opener: LinkHintOpener = Rc::new(open_html_link_externally);
     let link_hints = LinkHintController::new(&html_view, &status_label, link_opener);
@@ -1723,6 +1734,7 @@ fn build_ui(
         search_bar,
         search_page_coordinator: search_page_coordinator(&options),
         sync_refresh_generation,
+        external_refresh_generation: Rc::new(Cell::new(None)),
         input_mode_generation: Rc::new(Cell::new(0)),
         hidden_tag_searches,
         thread_list,
@@ -1844,7 +1856,7 @@ fn build_ui(
         gtk_heartbeat: Rc::new(Cell::new(0)),
         close_when_idle: Rc::new(Cell::new(false)),
         close_flush_in_progress: Rc::new(Cell::new(false)),
-        tag_refresh_selected_thread_id: Rc::new(RefCell::new(None)),
+        refresh_selected_thread_id: Rc::new(RefCell::new(None)),
         standalone_messages: StandaloneMessageController::new(),
     };
     debug_assert!(
@@ -11796,6 +11808,7 @@ fn html_view_state(
         "load_generation": lifecycle.generation,
         "completed_load_generation": lifecycle.completed_generation,
         "images": lifecycle.images,
+        "appearance": lifecycle.appearance,
         "global_remote_images_allowed": global_remote_images_allowed,
         "sender_email": sender_email,
         "selected_image_sender": selected_image_sender,
@@ -12334,7 +12347,7 @@ fn start_full_search(
                             thread_list::reduce_replace_search(data),
                             response.select_first,
                             move |applied| {
-                                record_full_search_outcome(&continue_state, generation);
+                                record_full_search_outcome(&continue_state, generation, applied);
                                 restore_tag_warning_after_search(
                                     &continue_options,
                                     &continue_widgets,
@@ -12343,7 +12356,7 @@ fn start_full_search(
                                 );
                                 if !applied {
                                     continue_widgets
-                                        .tag_refresh_selected_thread_id
+                                        .refresh_selected_thread_id
                                         .borrow_mut()
                                         .take();
                                 }
@@ -12358,9 +12371,9 @@ fn start_full_search(
                                 &st,
                                 thread_list::reduce_search_error(err, has_threads),
                             );
-                            record_full_search_outcome(&st, response.generation);
+                            record_full_search_outcome(&st, response.generation, true);
                             restore_tag_warning_after_search(&opts, &w, &st, false);
-                            w.tag_refresh_selected_thread_id.borrow_mut().take();
+                            w.refresh_selected_thread_id.borrow_mut().take();
                         }
                     }
                 }
@@ -12438,7 +12451,11 @@ fn restore_tag_warning_after_search(
     update_debug(widgets, state);
 }
 
-fn record_full_search_outcome(state: &SharedState, generation: u64) {
+fn record_full_search_outcome(state: &SharedState, generation: u64, completed: bool) {
+    if !completed {
+        // A cancelled model application must leave refresh waiters pending.
+        return;
+    }
     let mut state = state.borrow_mut();
     state.full_search_outcome_generation = generation;
     state.full_search_outcome_error = state.search_error.clone();
@@ -12523,19 +12540,17 @@ fn finish_replaced_search_then<F>(
     let cached = outcome.cached;
     let preserve_search_focus = widgets.search_bar.has_focus();
     apply_thread_search_state_update(state, outcome.update);
-    let restored_thread = widgets
-        .tag_refresh_selected_thread_id
-        .borrow_mut()
-        .take()
-        .and_then(|thread_id| {
-            state
-                .borrow()
-                .thread_list_items
-                .iter()
-                .enumerate()
-                .find(|(_, thread)| thread.thread_id == thread_id)
-                .map(|(index, thread)| (index, thread.clone()))
-        });
+    let restored_thread_id =
+        take_refresh_selected_thread_id(&widgets.refresh_selected_thread_id, generation);
+    let restored_thread = restored_thread_id.and_then(|thread_id| {
+        state
+            .borrow()
+            .thread_list_items
+            .iter()
+            .enumerate()
+            .find(|(_, thread)| thread.thread_id == thread_id)
+            .map(|(index, thread)| (index, thread.clone()))
+    });
     {
         let mut state = state.borrow_mut();
         reconcile_selected_message_state_after_search(
@@ -12564,6 +12579,7 @@ fn finish_replaced_search_then<F>(
         preserve_search_focus,
         select_first,
         restored_thread,
+        background_refresh: widgets.external_refresh_generation.get() == Some(generation),
     };
     widgets.thread_list.apply_model_update_then(
         &thread_model_snapshot(state),
@@ -12586,6 +12602,7 @@ struct ReplacedSearchUiCompletion {
     preserve_search_focus: bool,
     select_first: bool,
     restored_thread: Option<(usize, notm_notmuch::ThreadSummary)>,
+    background_refresh: bool,
 }
 
 fn finish_replaced_search_after_model(
@@ -12600,6 +12617,7 @@ fn finish_replaced_search_after_model(
         preserve_search_focus,
         select_first,
         restored_thread,
+        background_refresh,
     } = completion;
     update_tag_searches(options, widgets, state);
     let pending_open_message_id = { state.borrow().pending_open_message_id.clone() };
@@ -12654,7 +12672,10 @@ fn finish_replaced_search_after_model(
         ));
     }
     update_thread_result_label(widgets, state);
-    if !preserve_search_focus && state.borrow().input_mode == InputMode::Normal {
+    if !background_refresh
+        && !preserve_search_focus
+        && state.borrow().input_mode == InputMode::Normal
+    {
         focus_active_pane(widgets, state);
     }
     update_debug(widgets, state);
@@ -13905,6 +13926,7 @@ fn open_standalone_message_window(
         StandalonePolicySnapshot {
             collapse_quotes: policy_quote_collapse.get(),
             remote_images: settings::remote_images(&policy_options.runtime_settings),
+            html_dark_background: settings::html_dark_background(&policy_options.runtime_settings),
             trusted_image_senders: state.trusted_image_senders.clone(),
             show_keybind_hints: state.show_keybind_hints,
             normal_input_mode: state.input_mode == InputMode::Normal,
@@ -15130,10 +15152,7 @@ fn finish_tag_worker(
     if refresh_required {
         let selected_thread_id =
             selected_thread_id_for_tag_refresh(&state.borrow(), discard_retained_message_state);
-        widgets
-            .tag_refresh_selected_thread_id
-            .replace(selected_thread_id);
-        schedule_search(
+        let generation = schedule_search(
             options,
             widgets,
             state,
@@ -15142,10 +15161,13 @@ fn finish_tag_worker(
             Duration::ZERO,
         );
         widgets
+            .refresh_selected_thread_id
+            .replace(selected_thread_id.map(|thread_id| (generation, thread_id)));
+        widgets
             .status_label
             .set_text("Tag operation finished; refreshing the latest search…");
     } else {
-        widgets.tag_refresh_selected_thread_id.borrow_mut().take();
+        widgets.refresh_selected_thread_id.borrow_mut().take();
     }
     close_main_window_after_background_activity(widgets, state);
 }
@@ -15162,6 +15184,18 @@ fn selected_thread_id_for_tag_refresh(
             .as_ref()
             .map(|thread| thread.thread_id.clone())
     }
+}
+
+fn take_refresh_selected_thread_id(
+    selection: &RefCell<Option<(u64, String)>>,
+    generation: u64,
+) -> Option<String> {
+    selection
+        .borrow_mut()
+        .take()
+        .and_then(|(owner_generation, thread_id)| {
+            (owner_generation == generation).then_some(thread_id)
+        })
 }
 
 fn reconcile_selected_message_state_after_search(
@@ -18495,6 +18529,7 @@ fn handle_automation_request(
                 .map(|(start, end)| json!({"start": start, "end": end}));
             json!({
                 "ok": true,
+                "window_is_active": widgets.window.is_active(),
                 "search": widgets.search_bar.entry().text().to_string(),
                 "search_has_focus": widget_contains_focus(widgets.search_bar.entry().upcast_ref()),
                 "search_selection_bounds": search_selection_bounds,
@@ -19436,14 +19471,13 @@ fn handle_automation_request(
                 let response_sender = req.response.clone();
                 let w = widgets.clone();
                 let st = state.clone();
-                let mut response = Some(response);
+                let response_name = response["response"].clone();
                 gtk::glib::timeout_add_local(DRAFT_IO_POLL_INTERVAL, move || {
                     if w.draft_save_active.get().is_some() {
                         return gtk::glib::ControlFlow::Continue;
                     }
-                    let mut response = response
-                        .take()
-                        .expect("confirmation response is sent only once");
+                    let mut response = pending_confirmation_state_json(&w, &st);
+                    response["response"] = response_name.clone();
                     let status = w.status_label.text().to_string();
                     let failed = status.starts_with("Draft save failed:")
                         || status.starts_with("Delete local draft failed:")
@@ -20252,6 +20286,7 @@ fn settings_test_state_json(
         "theme": theme_state,
         "preview": rendered_thread_preview_json(widgets, state),
         "remote_images": settings::remote_images(&options.runtime_settings),
+        "html_dark_background": settings::html_dark_background(&options.runtime_settings),
         "configured_send_timeout_seconds": options.send_timeout_seconds,
         "app_config_path": options.app_config_path,
         "status_text": widgets.status_label.text().to_string(),
@@ -22121,6 +22156,7 @@ fn apply_settings_application(
     let next_layout_preference = next_runtime.layout_preference;
     let next_excluded_tags = next_runtime.excluded_tags.clone();
     let next_remote_images = next_runtime.remote_images;
+    let next_html_dark_background = next_runtime.html_dark_background;
     settings::update(&options.runtime_settings, next_runtime);
 
     {
@@ -22138,6 +22174,12 @@ fn apply_settings_application(
     }
     theme::apply_theme_preference(&widgets.gtk_settings, &widgets.css_provider, next_theme);
     widgets.theme_background_probe.queue_draw();
+    widgets
+        .html_lifecycle
+        .set_dark_background(next_html_dark_background);
+    widgets
+        .standalone_messages
+        .set_dark_background(next_html_dark_background);
     *widgets.hidden_tag_searches.borrow_mut() = application.hidden_tag_searches;
 
     apply_pane_visibility_values(
@@ -22159,15 +22201,16 @@ fn apply_settings_application(
     widgets
         .standalone_messages
         .refresh_remote_image_policy(previous_runtime.remote_images, next_remote_images);
-    if html_view_is_visible(widgets) {
-        let scroll = current_message_scroll_fraction(widgets);
-        show_visual_html_selected_message(options, widgets, state);
-        restore_message_scroll_fraction(widgets, scroll);
-    } else {
-        set_html_image_loading(
-            &widgets.html_view,
-            settings::remote_images(&options.runtime_settings),
-        );
+    // Appearance-only changes must not reload remote images or revoke the
+    // current message's one-shot permission.
+    if previous_runtime.remote_images != next_remote_images {
+        if html_view_is_visible(widgets) {
+            let scroll = current_message_scroll_fraction(widgets);
+            show_visual_html_selected_message(options, widgets, state);
+            restore_message_scroll_fraction(widgets, scroll);
+        } else {
+            set_html_image_loading(&widgets.html_view, next_remote_images);
+        }
     }
 
     let search_reload_scheduled = previous_runtime.page_size != next_page_size
@@ -22771,6 +22814,25 @@ mod tests {
             ..notm_notmuch::TagBatchReport::default()
         };
         assert!(tag_report_has_uncertain_retained_state(&close_failure));
+    }
+
+    #[test]
+    fn refresh_selection_is_scoped_to_its_search_generation() {
+        let selection = RefCell::new(Some((5, "old-selected-thread".to_string())));
+
+        assert_eq!(
+            take_refresh_selected_thread_id(&selection, 6),
+            None,
+            "a superseding user search restored the cancelled refresh's selection"
+        );
+        assert!(selection.borrow().is_none());
+
+        selection.replace(Some((7, "current-selected-thread".to_string())));
+        assert_eq!(
+            take_refresh_selected_thread_id(&selection, 7).as_deref(),
+            Some("current-selected-thread")
+        );
+        assert_eq!(take_refresh_selected_thread_id(&selection, 7), None);
     }
 
     #[test]
@@ -24233,6 +24295,38 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_full_search_does_not_satisfy_refresh_waiters() {
+        let state = Rc::new(RefCell::new(UiState {
+            full_search_outcome_generation: 5,
+            full_search_outcome_error: Some("earlier search failed".to_string()),
+            ..UiState::default()
+        }));
+
+        record_full_search_outcome(&state, 6, false);
+        assert_eq!(full_search_outcome_at_or_after(&state.borrow(), 6), None);
+        assert_eq!(
+            full_search_outcome_at_or_after(&state.borrow(), 5),
+            Some(Err("earlier search failed".to_string())),
+            "a cancelled model application replaced the last completed outcome"
+        );
+
+        record_full_search_outcome(&state, 7, true);
+        assert_eq!(
+            full_search_outcome_at_or_after(&state.borrow(), 6),
+            Some(Ok(())),
+            "a subsequent fully applied search must satisfy the pending refresh"
+        );
+
+        state.borrow_mut().search_error = Some("replacement search failed".to_string());
+        record_full_search_outcome(&state, 8, true);
+        assert_eq!(
+            full_search_outcome_at_or_after(&state.borrow(), 8),
+            Some(Err("replacement search failed".to_string())),
+            "a completed search failure must still be reported"
+        );
+    }
+
+    #[test]
     fn delayed_sync_refresh_work_is_scoped_to_non_fixture_harnesses() {
         let harness = LaunchOptions {
             automation_enabled: true,
@@ -24509,6 +24603,17 @@ mod tests {
         assert!(app_id.starts_with(TEST_HARNESS_APPLICATION_ID_PREFIX));
         assert!(gtk::gio::Application::id_is_valid(&app_id));
         assert!(application_flags_for_launch(&options).is_empty());
+    }
+
+    #[test]
+    fn fixture_without_harness_also_uses_an_isolated_application_id() {
+        let options = LaunchOptions {
+            fixture_mode: true,
+            ..LaunchOptions::default()
+        };
+        let id = application_id_for_launch(&options).expect("fixture application ID");
+        assert!(id.starts_with(TEST_HARNESS_APPLICATION_ID_PREFIX));
+        assert_ne!(id, NORMAL_APPLICATION_ID);
     }
 
     #[test]

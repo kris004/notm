@@ -45,6 +45,12 @@ Mail retrieval and general database updates stay with the tools you choose.
 `notm` can run explicitly configured sync commands, but automatic startup sync
 is off by default.
 
+After an external tool updates the index, `notm refresh --all` refreshes the
+active searches of already-running instances without opening or focusing a
+window, running sync commands, or modifying mail. See
+[external search refresh](docs/external-refresh.md) for service integration,
+deadlines, isolation, and compatibility.
+
 ## Requirements
 
 The supported build target is Linux. Building requires:

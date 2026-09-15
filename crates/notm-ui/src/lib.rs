@@ -9,6 +9,7 @@ mod html_view_lifecycle;
 pub mod main_window;
 pub mod messages;
 pub mod model;
+pub mod remote_refresh;
 pub mod screenshot;
 pub mod theme;
 mod thread_loader;

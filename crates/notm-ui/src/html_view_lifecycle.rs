@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::BTreeMap,
     rc::{Rc, Weak},
 };
@@ -61,7 +61,7 @@ pub(crate) struct HtmlScrollMetrics {
 }
 
 impl HtmlScrollMetrics {
-    fn from_report(report: ScrollReport) -> Self {
+    fn from_report(report: &ScrollReport) -> Self {
         let h = report.h.max(0.0);
         let c = report.c.max(0.0);
         let max = (h - c).max(0.0);
@@ -99,11 +99,23 @@ pub(crate) struct HtmlViewLifecycleSnapshot {
     pub(crate) pending_restore: Option<f64>,
     pub(crate) scroll: Option<HtmlScrollMetrics>,
     pub(crate) images: Option<HtmlImageMetrics>,
+    pub(crate) appearance: Option<HtmlAppearanceSnapshot>,
     #[serde(rename = "error")]
     pub(crate) last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct HtmlAppearanceSnapshot {
+    pub(crate) dark_background: bool,
+    pub(crate) background: String,
+    pub(crate) foreground: String,
+    pub(crate) link: Option<String>,
+    pub(crate) table_background: Option<String>,
+    pub(crate) table_foreground: Option<String>,
+    pub(crate) image_filter: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct ScrollReport {
     generation: u64,
     ready: bool,
@@ -112,6 +124,8 @@ struct ScrollReport {
     c: f64,
     #[serde(default)]
     images: HtmlImageMetrics,
+    #[serde(default)]
+    appearance: Option<HtmlAppearanceSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +155,7 @@ struct LifecycleState {
     ready_generation: Option<u64>,
     metrics: Option<HtmlScrollMetrics>,
     image_metrics: Option<HtmlImageMetrics>,
+    appearance: Option<HtmlAppearanceSnapshot>,
     pending_restore: Option<PendingRestore>,
     restore_in_flight: Option<u64>,
     next_evaluation_id: u64,
@@ -154,6 +169,7 @@ impl LifecycleState {
         self.ready_generation = None;
         self.metrics = None;
         self.image_metrics = None;
+        self.appearance = None;
         self.pending_restore = None;
         self.restore_in_flight = None;
         // Completion callbacks retain their own generation token, so keeping
@@ -203,8 +219,11 @@ impl LifecycleState {
         if report.ready {
             self.completed_generation = report.generation;
         }
-        self.metrics = Some(HtmlScrollMetrics::from_report(report));
+        self.metrics = Some(HtmlScrollMetrics::from_report(&report));
         self.image_metrics = Some(report.images);
+        if let Some(appearance) = report.appearance {
+            self.appearance = Some(appearance);
+        }
         self.last_error = None;
         true
     }
@@ -233,8 +252,11 @@ impl LifecycleState {
         if report.ready {
             self.completed_generation = report.generation;
         }
-        self.metrics = Some(HtmlScrollMetrics::from_report(report));
+        self.metrics = Some(HtmlScrollMetrics::from_report(&report));
         self.image_metrics = Some(report.images);
+        if let Some(appearance) = report.appearance {
+            self.appearance = Some(appearance);
+        }
         self.last_error = None;
         if evaluation.kind == EvaluationKind::Restore && report.ready {
             self.pending_restore = None;
@@ -257,6 +279,7 @@ impl LifecycleState {
                 .map(|pending| pending.fraction),
             scroll: self.metrics,
             images: self.image_metrics,
+            appearance: self.appearance.clone(),
             last_error: self.last_error.clone(),
         }
     }
@@ -266,6 +289,7 @@ struct HtmlViewLifecycleInner {
     view: webkit6::WebView,
     status_label: gtk::Label,
     state: RefCell<LifecycleState>,
+    dark_background: Cell<bool>,
 }
 
 #[derive(Clone)]
@@ -280,9 +304,19 @@ impl HtmlViewLifecycle {
                 view: view.clone(),
                 status_label: status_label.clone(),
                 state: RefCell::new(LifecycleState::default()),
+                dark_background: Cell::new(false),
             }),
         };
         lifecycle.install_scroll_observer();
+        if let Some(manager) = view.user_content_manager() {
+            manager.add_style_sheet(&webkit6::UserStyleSheet::new(
+                include_str!("html_dark.css"),
+                webkit6::UserContentInjectedFrames::TopFrame,
+                webkit6::UserStyleLevel::User,
+                &[],
+                &[],
+            ));
+        }
         lifecycle.connect_load_events();
         lifecycle
     }
@@ -293,9 +327,26 @@ impl HtmlViewLifecycle {
         // completion event emitted by `stop_loading` can then only observe the
         // new generation and will be rejected by the document token check.
         self.inner.view.stop_loading();
-        let document = document_with_generation(document, generation);
+        let document =
+            document_with_generation(document, generation, self.inner.dark_background.get());
         self.inner.view.load_html(&document, base_uri);
         generation
+    }
+
+    /// Change only presentation, without reloading a message or its images.
+    /// New loads receive the preference in their root element before rendering;
+    /// a load already in flight receives the latest value from its ready probe.
+    pub(crate) fn set_dark_background(&self, enabled: bool) {
+        if self.inner.dark_background.replace(enabled) == enabled {
+            return;
+        }
+        let channel = if enabled { 30.0 / 255.0 } else { 1.0 };
+        self.inner
+            .view
+            .set_background_color(&gtk::gdk::RGBA::new(channel, channel, channel, 1.0));
+        if self.inner.state.borrow().snapshot().ready {
+            evaluate(&self.inner, EvaluationKind::Probe, "");
+        }
     }
 
     pub(crate) fn scroll_lines(&self, lines: f64) {
@@ -402,7 +453,11 @@ fn evaluate(inner: &Rc<HtmlViewLifecycleInner>, kind: EvaluationKind, operation:
 }
 
 fn evaluate_started(inner: &Rc<HtmlViewLifecycleInner>, evaluation: Evaluation, operation: &str) {
-    let script = scroll_evaluation_script(evaluation.generation, operation);
+    let operation = format!(
+        "document.documentElement.toggleAttribute('data-notm-dark-background', {}); {operation}",
+        inner.dark_background.get()
+    );
+    let script = scroll_evaluation_script(evaluation.generation, &operation);
     let weak_inner: Weak<HtmlViewLifecycleInner> = Rc::downgrade(inner);
     inner.view.evaluate_javascript(
         &script,
@@ -445,6 +500,10 @@ fn scroll_evaluation_script(generation: u64, operation: &str) -> String {
   const loaded = images.filter(image => image.complete && image.naturalWidth > 0).length;
   const failed = images.filter(image => image.complete && image.naturalWidth === 0).length;
   if (actual === {generation} && document.readyState === "complete") {{ {operation} }}
+  const bodyStyle = document.body ? getComputedStyle(document.body) : null;
+  const link = document.querySelector("body a");
+  const table = document.querySelector("body table");
+  const image = document.querySelector("body img");
   return JSON.stringify({{
     generation: actual,
     ready: actual === {generation} && document.readyState === "complete",
@@ -456,23 +515,38 @@ fn scroll_evaluation_script(generation: u64, operation: &str) -> String {
       loaded,
       failed,
       pending: images.length - loaded - failed
+    }},
+    appearance: {{
+      dark_background: document.documentElement.hasAttribute("data-notm-dark-background"),
+      background: bodyStyle?.backgroundColor || "",
+      foreground: bodyStyle?.color || "",
+      link: link ? getComputedStyle(link).color : null,
+      table_background: table ? getComputedStyle(table).backgroundColor : null,
+      table_foreground: table ? getComputedStyle(table).color : null,
+      image_filter: image ? getComputedStyle(image).filter : null
     }}
   }});
 }})()"#
     )
 }
 
-fn document_with_generation(document: &str, generation: u64) -> String {
+fn document_with_generation(document: &str, generation: u64, dark_background: bool) -> String {
+    let appearance = if dark_background {
+        " data-notm-dark-background"
+    } else {
+        ""
+    };
     if let Some(html_start) = document.find("<html") {
         let insert_at = html_start + "<html".len();
         let mut tagged = String::with_capacity(document.len() + 40);
         tagged.push_str(&document[..insert_at]);
         tagged.push_str(&format!(" data-notm-generation=\"{generation}\""));
+        tagged.push_str(appearance);
         tagged.push_str(&document[insert_at..]);
         tagged
     } else {
         format!(
-            "<!doctype html><html data-notm-generation=\"{generation}\"><body>{document}</body></html>"
+            "<!doctype html><html data-notm-generation=\"{generation}\"{appearance}><body>{document}</body></html>"
         )
     }
 }
@@ -489,6 +563,7 @@ mod tests {
             h: 1_000.0,
             c: 200.0,
             images: HtmlImageMetrics::default(),
+            appearance: None,
         }
     }
 
@@ -627,12 +702,25 @@ mod tests {
     #[test]
     fn documents_receive_a_generation_token() {
         assert_eq!(
-            document_with_generation("<!doctype html><html><body>x</body></html>", 42),
+            document_with_generation("<!doctype html><html><body>x</body></html>", 42, false),
             "<!doctype html><html data-notm-generation=\"42\"><body>x</body></html>"
         );
         assert_eq!(
-            document_with_generation("fragment", 7),
+            document_with_generation("fragment", 7, false),
             "<!doctype html><html data-notm-generation=\"7\"><body>fragment</body></html>"
+        );
+    }
+
+    #[test]
+    fn dark_background_is_applied_before_document_load_without_changing_content() {
+        let body = "<body><p style=\"color: black !important\">Text</p><img src=\"data:image/png;base64,AA==\"></body>";
+        assert_eq!(
+            document_with_generation(&format!("<html>{body}</html>"), 3, true),
+            format!("<html data-notm-generation=\"3\" data-notm-dark-background>{body}</html>")
+        );
+        assert_eq!(
+            document_with_generation("fragment", 7, true),
+            "<!doctype html><html data-notm-generation=\"7\" data-notm-dark-background><body>fragment</body></html>"
         );
     }
 }
