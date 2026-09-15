@@ -161,9 +161,11 @@ fn poll_refresh(
     // it. Existing reconciliation preserves composer fields and active drafts;
     // it deliberately clears visual/multi-selection and stale message caches.
     let query = state.borrow().current_query.clone();
-    *widgets.tag_refresh_selected_thread_id.borrow_mut() =
-        selected_thread_id_for_tag_refresh(&state.borrow(), false);
+    let selected_thread_id = selected_thread_id_for_tag_refresh(&state.borrow(), false);
     let generation = schedule_search(options, widgets, state, &query, false, Duration::ZERO);
+    widgets
+        .refresh_selected_thread_id
+        .replace(selected_thread_id.map(|thread_id| (generation, thread_id)));
     widgets.external_refresh_generation.set(Some(generation));
     None
 }

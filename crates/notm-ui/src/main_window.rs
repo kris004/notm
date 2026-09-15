@@ -658,7 +658,7 @@ struct Widgets {
     gtk_heartbeat: Rc<Cell<u64>>,
     close_when_idle: Rc<Cell<bool>>,
     close_flush_in_progress: Rc<Cell<bool>>,
-    tag_refresh_selected_thread_id: Rc<RefCell<Option<String>>>,
+    refresh_selected_thread_id: Rc<RefCell<Option<(u64, String)>>>,
     standalone_messages: StandaloneMessageController,
 }
 
@@ -1856,7 +1856,7 @@ fn build_ui(
         gtk_heartbeat: Rc::new(Cell::new(0)),
         close_when_idle: Rc::new(Cell::new(false)),
         close_flush_in_progress: Rc::new(Cell::new(false)),
-        tag_refresh_selected_thread_id: Rc::new(RefCell::new(None)),
+        refresh_selected_thread_id: Rc::new(RefCell::new(None)),
         standalone_messages: StandaloneMessageController::new(),
     };
     debug_assert!(
@@ -12356,7 +12356,7 @@ fn start_full_search(
                                 );
                                 if !applied {
                                     continue_widgets
-                                        .tag_refresh_selected_thread_id
+                                        .refresh_selected_thread_id
                                         .borrow_mut()
                                         .take();
                                 }
@@ -12373,7 +12373,7 @@ fn start_full_search(
                             );
                             record_full_search_outcome(&st, response.generation, true);
                             restore_tag_warning_after_search(&opts, &w, &st, false);
-                            w.tag_refresh_selected_thread_id.borrow_mut().take();
+                            w.refresh_selected_thread_id.borrow_mut().take();
                         }
                     }
                 }
@@ -12540,19 +12540,17 @@ fn finish_replaced_search_then<F>(
     let cached = outcome.cached;
     let preserve_search_focus = widgets.search_bar.has_focus();
     apply_thread_search_state_update(state, outcome.update);
-    let restored_thread = widgets
-        .tag_refresh_selected_thread_id
-        .borrow_mut()
-        .take()
-        .and_then(|thread_id| {
-            state
-                .borrow()
-                .thread_list_items
-                .iter()
-                .enumerate()
-                .find(|(_, thread)| thread.thread_id == thread_id)
-                .map(|(index, thread)| (index, thread.clone()))
-        });
+    let restored_thread_id =
+        take_refresh_selected_thread_id(&widgets.refresh_selected_thread_id, generation);
+    let restored_thread = restored_thread_id.and_then(|thread_id| {
+        state
+            .borrow()
+            .thread_list_items
+            .iter()
+            .enumerate()
+            .find(|(_, thread)| thread.thread_id == thread_id)
+            .map(|(index, thread)| (index, thread.clone()))
+    });
     {
         let mut state = state.borrow_mut();
         reconcile_selected_message_state_after_search(
@@ -15154,10 +15152,7 @@ fn finish_tag_worker(
     if refresh_required {
         let selected_thread_id =
             selected_thread_id_for_tag_refresh(&state.borrow(), discard_retained_message_state);
-        widgets
-            .tag_refresh_selected_thread_id
-            .replace(selected_thread_id);
-        schedule_search(
+        let generation = schedule_search(
             options,
             widgets,
             state,
@@ -15166,10 +15161,13 @@ fn finish_tag_worker(
             Duration::ZERO,
         );
         widgets
+            .refresh_selected_thread_id
+            .replace(selected_thread_id.map(|thread_id| (generation, thread_id)));
+        widgets
             .status_label
             .set_text("Tag operation finished; refreshing the latest search…");
     } else {
-        widgets.tag_refresh_selected_thread_id.borrow_mut().take();
+        widgets.refresh_selected_thread_id.borrow_mut().take();
     }
     close_main_window_after_background_activity(widgets, state);
 }
@@ -15186,6 +15184,18 @@ fn selected_thread_id_for_tag_refresh(
             .as_ref()
             .map(|thread| thread.thread_id.clone())
     }
+}
+
+fn take_refresh_selected_thread_id(
+    selection: &RefCell<Option<(u64, String)>>,
+    generation: u64,
+) -> Option<String> {
+    selection
+        .borrow_mut()
+        .take()
+        .and_then(|(owner_generation, thread_id)| {
+            (owner_generation == generation).then_some(thread_id)
+        })
 }
 
 fn reconcile_selected_message_state_after_search(
@@ -22804,6 +22814,25 @@ mod tests {
             ..notm_notmuch::TagBatchReport::default()
         };
         assert!(tag_report_has_uncertain_retained_state(&close_failure));
+    }
+
+    #[test]
+    fn refresh_selection_is_scoped_to_its_search_generation() {
+        let selection = RefCell::new(Some((5, "old-selected-thread".to_string())));
+
+        assert_eq!(
+            take_refresh_selected_thread_id(&selection, 6),
+            None,
+            "a superseding user search restored the cancelled refresh's selection"
+        );
+        assert!(selection.borrow().is_none());
+
+        selection.replace(Some((7, "current-selected-thread".to_string())));
+        assert_eq!(
+            take_refresh_selected_thread_id(&selection, 7).as_deref(),
+            Some("current-selected-thread")
+        );
+        assert_eq!(take_refresh_selected_thread_id(&selection, 7), None);
     }
 
     #[test]
