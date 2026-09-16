@@ -35,6 +35,15 @@
     <name>notm contributors</name>
   </developer>
   <releases>
+    <release version="0.1.3" date="2026-09-16">
+      <description>
+        <p>
+          Add safe exit controls, an optional dark Visual HTML background,
+          external search refresh, inline CID images, remote-image controls,
+          keyboard UI fixes, and native ARM64 release bundles.
+        </p>
+      </description>
+    </release>
     <release version="0.1.2" date="2026-08-28">
       <description>
         <p>
