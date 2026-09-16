@@ -468,6 +468,7 @@ fn open_or_present_main_window(
 ) {
     if let Some(handle) = main_window.borrow().as_ref().cloned() {
         handle.widgets.close_when_idle.set(false);
+        handle.widgets.exit_requested.set(false);
         if let Some(message_id) = open_message_id {
             open_message_id_request(options, &handle.widgets, &handle.state, &message_id);
         }
@@ -558,6 +559,7 @@ struct Widgets {
     palette_button: gtk::Button,
     settings_button: gtk::Button,
     help_button: gtk::Button,
+    exit_button: gtk::Button,
     sidebar_toggle_button: gtk::Button,
     thread_list_toggle_button: gtk::Button,
     message_pane_toggle_button: gtk::Button,
@@ -657,6 +659,7 @@ struct Widgets {
     draft_capture_source: Rc<RefCell<Option<gtk::glib::SourceId>>>,
     gtk_heartbeat: Rc<Cell<u64>>,
     close_when_idle: Rc<Cell<bool>>,
+    exit_requested: Rc<Cell<bool>>,
     close_flush_in_progress: Rc<Cell<bool>>,
     refresh_selected_thread_id: Rc<RefCell<Option<(u64, String)>>>,
     standalone_messages: StandaloneMessageController,
@@ -1134,6 +1137,12 @@ fn build_ui(
     let palette_button = gtk::Button::with_label("Commands");
     let settings_button = gtk::Button::with_label("Settings");
     let help_button = gtk::Button::with_label("Help");
+    let exit_button = gtk::Button::with_label("Exit");
+    exit_button.set_widget_name("notm-exit-button");
+    exit_button.set_valign(gtk::Align::Center);
+    exit_button.set_tooltip_text(Some(
+        "Exit notm (ZZ in normal mode, or :q / :quit / :exit). Prompts for unsaved drafts and waits for active work.",
+    ));
     let sidebar_toggle_button = pane_toggle_button(
         "sidebar-show-symbolic",
         "notm-sidebar-toggle-button",
@@ -1168,6 +1177,7 @@ fn build_ui(
     view_controls.append(&layout_toggle_button);
     top_bar.append(&toolbar);
     top_bar.append(&view_controls);
+    top_bar.append(&exit_button);
     root.append(&top_bar);
 
     let left = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -1756,6 +1766,7 @@ fn build_ui(
         palette_button: palette_button.clone(),
         settings_button: settings_button.clone(),
         help_button: help_button.clone(),
+        exit_button: exit_button.clone(),
         sidebar_toggle_button: sidebar_toggle_button.clone(),
         thread_list_toggle_button: thread_list_toggle_button.clone(),
         message_pane_toggle_button: message_pane_toggle_button.clone(),
@@ -1855,6 +1866,7 @@ fn build_ui(
         draft_capture_source: Rc::new(RefCell::new(None)),
         gtk_heartbeat: Rc::new(Cell::new(0)),
         close_when_idle: Rc::new(Cell::new(false)),
+        exit_requested: Rc::new(Cell::new(false)),
         close_flush_in_progress: Rc::new(Cell::new(false)),
         refresh_selected_thread_id: Rc::new(RefCell::new(None)),
         standalone_messages: StandaloneMessageController::new(),
@@ -1957,6 +1969,10 @@ fn build_ui(
         &widgets.composer.send_button(),
     );
     connect_pane_visibility_toggles(&options, &widgets, &state);
+    let w = widgets.clone();
+    exit_button.connect_clicked(move |_| {
+        request_exit(&w);
+    });
     connect_auto_layout(&widgets, &state);
     connect_compose_helpers(
         &options,
@@ -1986,6 +2002,9 @@ fn build_ui(
         window.connect_close_request(move |window| {
             if w.composer.take_allow_close_once() {
                 flush_undo_tag_persistence();
+                if w.exit_requested.replace(false) {
+                    w.standalone_messages.close_all();
+                }
                 return gtk::glib::Propagation::Proceed;
             }
             if w.composer.has_pending_confirmation() {
@@ -4617,12 +4636,22 @@ fn pane_visibility_json(widgets: &Widgets, state: &SharedState) -> serde_json::V
 
 fn layout_state_json(widgets: &Widgets, state: &SharedState) -> serde_json::Value {
     let state = state.borrow();
+    let exit_bounds = widgets.exit_button.compute_bounds(&widgets.window);
     json!({
         "ok": true,
         "layout_preference": layout_preference_name(state.layout_preference),
         "layout": content_layout_name(state.content_layout),
         "window_width": widgets.window.width(),
         "window_height": widgets.window.height(),
+        "exit_button": {
+            "label": widgets.exit_button.label().map(|label| label.to_string()),
+            "mapped": widgets.exit_button.is_mapped(),
+            "sensitive": widgets.exit_button.is_sensitive(),
+            "bounds": exit_bounds.map(|bounds| json!({
+                "x": bounds.x(), "y": bounds.y(),
+                "width": bounds.width(), "height": bounds.height(),
+            })),
+        },
         "outer_orientation": if widgets.outer_paned.orientation() == gtk::Orientation::Vertical {
             "vertical"
         } else {
@@ -5567,6 +5596,7 @@ fn update_button_binding_labels(widgets: &Widgets, state: &SharedState) {
     set_button_label(&widgets.palette_button, "Commands", "Ctrl+K", state);
     set_button_label(&widgets.settings_button, "Settings", ",", state);
     set_button_label(&widgets.help_button, "Help", "?", state);
+    set_button_label(&widgets.exit_button, "Exit", "ZZ", state);
     update_layout_toggle_button(widgets, state);
     set_button_label(&widgets.search_bar.button(), "Search", "/", state);
     set_button_label(
@@ -6060,6 +6090,14 @@ fn composer_shortcut_action(
     }
 }
 
+fn is_exit_sequence_key(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> bool {
+    !modifiers.intersects(
+        gtk::gdk::ModifierType::CONTROL_MASK
+            | gtk::gdk::ModifierType::ALT_MASK
+            | gtk::gdk::ModifierType::SUPER_MASK,
+    ) && shifted_shortcut_key(key, modifiers, gtk::gdk::Key::z, gtk::gdk::Key::Z)
+}
+
 fn activate_composer_shortcut(
     options: &LaunchOptions,
     widgets: &Widgets,
@@ -6269,6 +6307,7 @@ fn install_shortcuts(
     let undo = undo_state.clone();
     let saved = saved_store.clone();
     let pending_go = Rc::new(RefCell::new(false));
+    let pending_exit = Cell::new(false);
     let pending_custom_search = Rc::new(RefCell::new(false));
     let pending_response = Rc::new(RefCell::new(false));
     let pending_view = Rc::new(RefCell::new(false));
@@ -6294,6 +6333,7 @@ fn install_shortcuts(
     let observed_input_mode_generation = Cell::new(w.input_mode_generation.get());
     let normal_handler: Rc<MainShortcutHandler> = Rc::new(move |key, mods| {
         let cancel_pending_sequences = || {
+            pending_exit.set(false);
             *pending_go.borrow_mut() = false;
             *pending_custom_search.borrow_mut() = false;
             *pending_response.borrow_mut() = false;
@@ -6317,12 +6357,32 @@ fn install_shortcuts(
             cancel_pending_sequences();
             observed_input_mode_generation.set(input_mode_generation);
         }
+        if mods.intersects(
+            gtk::gdk::ModifierType::CONTROL_MASK
+                | gtk::gdk::ModifierType::ALT_MASK
+                | gtk::gdk::ModifierType::SUPER_MASK,
+        ) {
+            pending_exit.set(false);
+        }
         let ctrl = mods.contains(gtk::gdk::ModifierType::CONTROL_MASK);
         if ctrl {
             return gtk::glib::Propagation::Proceed;
         }
         if st.borrow().input_mode == InputMode::Insert {
             return gtk::glib::Propagation::Proceed;
+        }
+        // Re-pressing Shift between the two Zs is not a cancelled sequence.
+        // Real keyboards deliver these modifier key presses separately.
+        if matches!(key, gtk::gdk::Key::Shift_L | gtk::gdk::Key::Shift_R) {
+            return gtk::glib::Propagation::Proceed;
+        }
+        if pending_exit.replace(false) {
+            if is_exit_sequence_key(key, mods) {
+                request_exit(&w);
+            } else {
+                w.status_label.set_text("Exit cancelled");
+            }
+            return gtk::glib::Propagation::Stop;
         }
         if compose_view_is_visible(&w)
             && let Some(action) = composer_shortcut_action(key, mods)
@@ -6418,7 +6478,10 @@ fn install_shortcuts(
             set_input_mode(&w, &st, InputMode::Insert, "Insert mode (Esc for normal)");
             return gtk::glib::Propagation::Stop;
         }
-        if main_text_entry_has_focus(&w) && normal_text_focus_blocks_key(key) {
+        if main_text_entry_has_focus(&w)
+            && normal_text_focus_blocks_key(key)
+            && !is_exit_sequence_key(key, mods)
+        {
             cancel_pending_sequences();
             w.status_label
                 .set_text("Normal mode: press Enter or i to edit this field");
@@ -6768,6 +6831,12 @@ fn install_shortcuts(
                     ),
                 },
             );
+            true
+        } else if is_exit_sequence_key(key, mods) {
+            clear_numeric_prefix(&numeric_prefix);
+            pending_exit.set(true);
+            w.status_label
+                .set_text("Exit: press Z again to exit, Esc to cancel");
             true
         } else if key == gtk::gdk::Key::z {
             clear_numeric_prefix(&numeric_prefix);
@@ -7600,6 +7669,9 @@ impl PendingTransition {
         widgets: &Widgets,
         state: &SharedState,
     ) {
+        if matches!(self, Self::CloseMainWindow) {
+            widgets.exit_requested.set(false);
+        }
         let restore = match self {
             Self::ReplaceComposer(replacement) => replacement.rejection_restore.clone(),
             Self::ShowSelectedMessage {
@@ -12444,6 +12516,7 @@ fn restore_tag_warning_after_search(
         TagWarningRefreshOutcome::RefreshFailed(message) => {
             widgets.status_label.set_text(&message);
             if widgets.close_when_idle.replace(false) {
+                widgets.exit_requested.set(false);
                 widgets.window.present();
             }
         }
@@ -16755,7 +16828,18 @@ fn close_main_window_after_background_activity(widgets: &Widgets, state: &Shared
             || widgets.draft_save_active.get().is_some()
     };
     if !background_activity && widgets.close_when_idle.replace(false) {
-        flush_and_close_main_window(widgets, state);
+        if widgets.exit_requested.get() {
+            // Re-enter the close transition with the latest composer state.
+            // Sync/tag/save completion must not bypass Exit's draft prompt.
+            let fields = compose_fields(widgets, state);
+            let active_draft = state.borrow().active_draft.clone();
+            if composer_requires_confirmation(&fields, active_draft.as_ref()) {
+                widgets.window.present();
+            }
+            widgets.window.close();
+        } else {
+            flush_and_close_main_window(widgets, state);
+        }
     }
 }
 
@@ -16772,6 +16856,17 @@ fn flush_and_close_main_window(widgets: &Widgets, state: &SharedState) {
         return;
     }
     flush_latest_draft_then_close(widgets.clone(), state.clone());
+}
+
+fn request_exit(widgets: &Widgets) -> bool {
+    if widgets.composer.has_pending_confirmation() {
+        return false;
+    }
+    widgets.exit_requested.set(true);
+    // Do not use Application::quit: the normal close path confirms dirty drafts,
+    // flushes recovery state, and preserves application holds for active workers.
+    widgets.window.close();
+    true
 }
 
 fn flush_latest_draft_then_close(widgets: Widgets, state: SharedState) {
@@ -16801,6 +16896,7 @@ fn flush_latest_draft_then_close(widgets: Widgets, state: SharedState) {
             }
             Err(error) => {
                 w.close_flush_in_progress.set(false);
+                w.exit_requested.set(false);
                 let message = format!("Draft autosave failed while closing: {error}");
                 {
                     let mut state = st.borrow_mut();
@@ -17444,6 +17540,7 @@ fn fail_send_before_transport(
         state.last_operation = Some("send draft flush failed".to_string());
     }
     widgets.close_when_idle.set(false);
+    widgets.exit_requested.set(false);
     widgets.status_label.set_text(&message);
     widgets.window.present();
     update_background_activity_controls(options, widgets, state);
@@ -18481,6 +18578,11 @@ fn handle_automation_request(
             });
             json!({"ok": true})
         }
+        "click_exit" => {
+            hold_application_for_harness_response(widgets, req.response_written);
+            widgets.exit_button.emit_clicked();
+            json!({"ok": true})
+        }
         "app_state" => json!({"ok": true, "state": &*state.borrow()}),
         "search_status" => search_status_json(widgets, state),
         "tag_status" => tag_status_json(state),
@@ -18564,6 +18666,7 @@ fn handle_automation_request(
         }
         "send_key" => match injected_shortcut(&req.args) {
             Ok((key, modifiers)) => {
+                hold_application_for_harness_response(widgets, req.response_written);
                 let propagation = shortcut_router.handle_key(key, modifiers);
                 spin_main_context_for(Duration::from_millis(25));
                 json!({
@@ -19869,6 +19972,7 @@ fn handle_automation_request(
             }
         }
         "run_command" => {
+            hold_application_for_harness_response(widgets, req.response_written);
             let command = req
                 .args
                 .get("command")
@@ -20045,6 +20149,20 @@ fn handle_automation_request(
     if !response_deferred {
         let _ = req.response.send(result);
     }
+}
+
+fn hold_application_for_harness_response(widgets: &Widgets, response_written: mpsc::Receiver<()>) {
+    let hold = widgets
+        .window
+        .application()
+        .map(|application| application.hold());
+    gtk::glib::timeout_add_local(Duration::from_millis(10), move || {
+        let _keep_application_alive = &hold;
+        match response_written.try_recv() {
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => gtk::glib::ControlFlow::Break,
+            Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+        }
+    });
 }
 
 fn automation_command_allowed_while_confirmation_pending(command: &str) -> bool {
@@ -20499,7 +20617,8 @@ fn ensure_automation_request_allowed(
         | "trust_sender_images"
         | "always_load_sender_images"
         | "untrust_sender_images"
-        | "send_key" => Some(AutomationOperation::FixtureOnly),
+        | "send_key"
+        | "click_exit" => Some(AutomationOperation::FixtureOnly),
         "pending_confirmation" | "respond_confirmation" => {
             Some(AutomationOperation::ConfirmationControl)
         }
@@ -20619,6 +20738,7 @@ fn run_named_command(
 ) -> serde_json::Value {
     let command = normalize_command_input(command);
     match command.as_str() {
+        "q" | "quit" | "exit" => json!({"ok": request_exit(widgets)}),
         "search" => {
             let query = widgets.search_bar.entry().text().to_string();
             run_search(options, widgets, state, &query);
@@ -21173,6 +21293,9 @@ fn command_name_candidates() -> &'static [&'static str] {
         "shortcuts",
         "help",
         "commands",
+        "q",
+        "quit",
+        "exit",
     ]
 }
 
@@ -21536,6 +21659,11 @@ fn shortcut_help_entries() -> &'static [HelpEntry] {
             section: "Basics",
             key: "?",
             description: "Open this help window.",
+        },
+        HelpEntry {
+            section: "Basics",
+            key: "ZZ",
+            description: "Exit notm from normal mode. Prompts for unsaved drafts and waits for active work; q still toggles quotes.",
         },
         HelpEntry {
             section: "Pane navigation",
@@ -22046,6 +22174,11 @@ fn command_help_entries() -> &'static [HelpEntry] {
             section: "Application commands",
             key: ":settings",
             description: "Open Settings.",
+        },
+        HelpEntry {
+            section: "Application commands",
+            key: ":q / :quit / :exit",
+            description: "Exit notm, including standalone message windows. Uses the same draft confirmation and safe close as the Exit button.",
         },
         HelpEntry {
             section: "Application commands",
@@ -25353,6 +25486,41 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(marker).expect("order marker"), "12");
         assert!(reports[1].contains("stdout=/tmp/notm-test-config|/tmp/notm-test-database|work"));
+    }
+
+    #[test]
+    fn exit_binding_requires_uppercase_z_without_command_modifiers() {
+        use gtk::gdk::{Key, ModifierType as Mods};
+        assert!(is_exit_sequence_key(Key::Z, Mods::empty()));
+        assert!(is_exit_sequence_key(Key::Z, Mods::SHIFT_MASK));
+        assert!(is_exit_sequence_key(Key::z, Mods::SHIFT_MASK));
+        assert!(!is_exit_sequence_key(Key::z, Mods::empty()));
+        assert!(!is_exit_sequence_key(Key::q, Mods::empty()));
+        for modifier in [Mods::CONTROL_MASK, Mods::ALT_MASK, Mods::SUPER_MASK] {
+            assert!(!is_exit_sequence_key(Key::Z, modifier));
+            assert!(!is_exit_sequence_key(Key::z, modifier | Mods::SHIFT_MASK));
+        }
+    }
+
+    #[test]
+    fn exit_commands_are_completed_and_documented() {
+        for command in ["q", "quit", "exit"] {
+            assert!(command_name_candidates().contains(&command));
+            assert!(command_completion_matches(&format!(":{command}")).contains(&command));
+            assert!(command_help_entries().iter().any(|entry| {
+                entry
+                    .key
+                    .split(" / ")
+                    .any(|key| key == format!(":{command}"))
+            }));
+        }
+        assert_eq!(command_completion(":qu").as_deref(), Some("quit"));
+        assert_eq!(command_completion(":ex").as_deref(), Some("exit"));
+        assert!(
+            shortcut_help_entries()
+                .iter()
+                .any(|entry| entry.key == "ZZ")
+        );
     }
 
     #[test]

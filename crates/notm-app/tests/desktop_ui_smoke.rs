@@ -1935,6 +1935,115 @@ fn failed_manual_sync_reports_stderr_and_recovers() -> anyhow::Result<()> {
 #[cfg(unix)]
 #[test]
 fn closing_main_window_waits_for_manual_sync() -> anyhow::Result<()> {
+    assert_close_waits_for_manual_sync("close_main_window", json!({}))
+}
+
+#[cfg(unix)]
+#[test]
+fn exit_command_waits_for_manual_sync() -> anyhow::Result<()> {
+    assert_close_waits_for_manual_sync("run_command", json!({"command": ":quit"}))
+}
+
+#[cfg(unix)]
+#[test]
+fn exit_after_sync_still_confirms_unsaved_drafts() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP exit_after_sync_still_confirms_unsaved_drafts: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running deferred Exit draft confirmation UI smoke with {display}");
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-exit-sync-draft-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+             \n[sync]\nenabled = true\nexternal_receive_enabled = true\nexternal_receive_on_startup = false\nexternal_receive_command = \"sleep 2\"\n\
+             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n\
+             \n[automation]\nallow_live_send_test = true\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+        ),
+    )?;
+    let recovery_path = work_dir.join("state/notm/draft.json");
+    let token = format!("notm-exit-sync-draft-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    driver.command("open_compose", json!({}))?;
+    driver.command(
+        "compose_set_body",
+        json!({"value": "Keep my unsaved draft during sync."}),
+    )?;
+
+    for response in ["reject", "accept"] {
+        let started = driver.command("run_manual_sync", json!({}))?;
+        assert_eq!(started["state"]["sync_in_progress"], true);
+        assert_eq!(
+            driver.command("run_command", json!({"command": ":quit"}))?["ok"],
+            true
+        );
+        let pending = driver.command("pending_confirmation", json!({}))?;
+        assert_eq!(
+            pending["pending"],
+            Value::Null,
+            "close must wait for sync: {pending}"
+        );
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            let pending = driver.command("pending_confirmation", json!({}))?;
+            if !pending["pending"].is_null() {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "deferred Exit never offered draft confirmation"
+            );
+            thread::sleep(STARTUP_POLL_INTERVAL);
+        }
+        let state = driver.command("app_state", json!({}))?;
+        assert_eq!(state["state"]["sync_in_progress"], false);
+        assert_eq!(
+            state["state"]["compose_fields"]["body"],
+            "Keep my unsaved draft during sync."
+        );
+        let id = pending_confirmation_id(&mut driver, "close_main_window")?;
+        let result = driver.command(
+            "respond_confirmation",
+            json!({"response": response, "id": id}),
+        )?;
+        assert_eq!(result["ok"], true);
+        if response == "reject" {
+            let layout = driver.command("layout_state", json!({}))?;
+            assert_eq!(
+                layout["exit_button"]["mapped"], true,
+                "cancelled Exit left the main window hidden: {layout}"
+            );
+            ensure!(
+                app.child.try_wait()?.is_none(),
+                "cancelled Exit stopped the app"
+            );
+        }
+    }
+    drop(driver);
+    ensure!(
+        app.wait_for_exit(STARTUP_TIMEOUT)?.success(),
+        "accepted deferred Exit failed"
+    );
+    assert_eq!(
+        recovery_body(&recovery_path)?,
+        "Keep my unsaved draft during sync."
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn assert_close_waits_for_manual_sync(command: &str, args: Value) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let Some(display) = gtk_display_environment()? else {
@@ -1980,7 +2089,7 @@ fn closing_main_window_waits_for_manual_sync() -> anyhow::Result<()> {
         "manual sync was not pending: {started}"
     );
 
-    let close = driver.command("close_main_window", json!({}))?;
+    let close = driver.command(command, args)?;
     assert_eq!(close["ok"], true, "main-window close failed: {close}");
     drop(driver);
     thread::sleep(Duration::from_millis(250));
@@ -2892,6 +3001,215 @@ fn fixture_explicit_draft_save_keeps_gtk_responsive_and_preserves_newer_edits() 
         status["save_busy"], false,
         "draft save stayed busy: {status}"
     );
+    Ok(())
+}
+
+#[test]
+fn fixture_exit_button_stays_visible_and_preserves_cancelled_drafts() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_exit_button_stays_visible_and_preserves_cancelled_drafts: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running responsive Exit button UI smoke with {display}");
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-exit-button-ui-{run_id}"));
+    let token = format!("notm-exit-button-ui-{run_id}");
+    let recovery_path = work_dir.join("exit-recovery.json");
+    let mut app = FixtureApp::spawn_inner(
+        work_dir,
+        &token,
+        FixtureLaunchOptions {
+            fixture: true,
+            fixture_recovery_path: Some(recovery_path.clone()),
+            ..FixtureLaunchOptions::default()
+        },
+    )?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    driver.command("select_thread_by_index", json!({"index": 0}))?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    driver.command(
+        "set_pane_visibility",
+        json!({"pane": "message", "visible": false}),
+    )?;
+    driver.command("open_selected_thread", json!({}))?;
+    wait_for_standalone_window_count(&mut driver, 1)?;
+    driver.command("open_compose", json!({}))?;
+    driver.command(
+        "compose_set_body",
+        json!({"value": "Keep this draft when Exit is cancelled."}),
+    )?;
+    assert_eq!(recovery_path_from_harness(&mut driver)?, recovery_path);
+
+    for (width, height) in [(600, 600), (900, 650), (1500, 900)] {
+        driver.command("resize_window", json!({"width": width, "height": height}))?;
+        driver.command("send_key", json!({"key": "Escape"}))?;
+        let layout = driver.command("layout_state", json!({}))?;
+        let button = &layout["exit_button"];
+        assert_eq!(button["mapped"], true, "Exit is not mapped: {layout}");
+        assert_eq!(button["sensitive"], true, "Exit is disabled: {layout}");
+        assert!(
+            button["label"]
+                .as_str()
+                .is_some_and(|label| label.contains("ZZ"))
+        );
+        let bounds = &button["bounds"];
+        let x = bounds["x"].as_f64().context("Exit x")?;
+        let y = bounds["y"].as_f64().context("Exit y")?;
+        let button_width = bounds["width"].as_f64().context("Exit width")?;
+        let button_height = bounds["height"].as_f64().context("Exit height")?;
+        ensure!(
+            x >= 0.0
+                && y >= 0.0
+                && button_width > 0.0
+                && button_height > 0.0
+                && x + button_width <= layout["window_width"].as_f64().context("window width")?
+                && y + button_height
+                    <= layout["window_height"].as_f64().context("window height")?,
+            "Exit is clipped at requested size {width}x{height}: {layout}"
+        );
+        assert_eq!(driver.command("click_exit", json!({}))?["ok"], true);
+        let id = pending_confirmation_id(&mut driver, "close_main_window")?;
+        driver.command(
+            "respond_confirmation",
+            json!({"response": "reject", "id": id}),
+        )?;
+        let state = driver.command("app_state", json!({}))?;
+        assert_eq!(
+            state["state"]["compose_fields"]["body"],
+            "Keep this draft when Exit is cancelled."
+        );
+        wait_for_standalone_window_count(&mut driver, 1)?;
+        ensure!(
+            app.child.try_wait()?.is_none(),
+            "cancelled Exit stopped the app"
+        );
+    }
+
+    // An autosave failure must keep both the main window and readers open.
+    driver.command("fail_next_draft_write", json!({}))?;
+    driver.command(
+        "compose_set_body",
+        json!({"value": "Latest edits survive exit."}),
+    )?;
+    driver.command("click_exit", json!({}))?;
+    let id = pending_confirmation_id(&mut driver, "close_main_window")?;
+    driver.command(
+        "respond_confirmation",
+        json!({"response": "accept", "id": id}),
+    )?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let state = driver.command("app_state", json!({}))?;
+        if state["state"]["last_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("Draft autosave failed while closing"))
+        {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "close did not surface the draft write failure: {state}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+    wait_for_standalone_window_count(&mut driver, 1)?;
+    driver.command("click_exit", json!({}))?;
+    let id = pending_confirmation_id(&mut driver, "close_main_window")?;
+    driver.command(
+        "respond_confirmation",
+        json!({"response": "accept", "id": id}),
+    )?;
+    drop(driver);
+    ensure!(
+        app.wait_for_exit(STARTUP_TIMEOUT)?.success(),
+        "Exit did not close all windows"
+    );
+    assert_eq!(recovery_body(&recovery_path)?, "Latest edits survive exit.");
+    Ok(())
+}
+
+#[test]
+fn fixture_exit_commands_and_vim_binding_use_safe_close() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_exit_commands_and_vim_binding_use_safe_close: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running Exit commands and Vim binding UI smoke with {display}");
+    for command in [":q", ":quit", ":exit", "ZZ"] {
+        let run_id = unique_run_id()?;
+        let work_dir = std::env::temp_dir().join(format!("notm-exit-command-ui-{run_id}"));
+        let token = format!("notm-exit-command-ui-{run_id}");
+        let mut app = FixtureApp::spawn(work_dir, &token)?;
+        let mut driver = app.connect(&token)?;
+        driver.wait_for_search(STARTUP_TIMEOUT)?;
+        if command == "ZZ" {
+            // Never interpret typed Zs as an application exit in Insert mode.
+            driver.command("focus_search", json!({}))?;
+            driver.command("send_key", json!({"key": "i"}))?;
+            for _ in 0..2 {
+                let key = driver.command("send_key", json!({"key": "Z"}))?;
+                assert_eq!(
+                    key["handled"], false,
+                    "Insert-mode Z was intercepted: {key}"
+                );
+            }
+            driver.command("send_key", json!({"key": "Escape"}))?;
+            // A single Z, Esc, unrelated key, or mode transition cannot exit.
+            for cancel in ["Escape", "j"] {
+                assert_eq!(
+                    driver.command("send_key", json!({"key": "Z"}))?["handled"],
+                    true
+                );
+                driver.command("send_key", json!({"key": cancel}))?;
+                ensure!(
+                    app.child.try_wait()?.is_none(),
+                    "cancelled ZZ stopped the app"
+                );
+            }
+            driver.command("send_key", json!({"key": "Z"}))?;
+            driver.command("open_command_palette", json!({}))?;
+            driver.command("send_key", json!({"key": "Escape"}))?;
+            driver.command("focus_search", json!({}))?;
+            // Test physical Shift+z keyvals as well as an uppercase Z.
+            driver.command("send_key", json!({"key": "z", "modifiers": ["shift"]}))?;
+            ensure!(
+                app.child.try_wait()?.is_none(),
+                "stale Z survived an input-mode change"
+            );
+            driver.command(
+                "send_key",
+                json!({"key": "Shift_L", "modifiers": ["shift"]}),
+            )?;
+            assert_eq!(
+                driver.command("send_key", json!({"key": "Z", "modifiers": ["shift"]}))?["handled"],
+                true
+            );
+        } else {
+            let completion = driver.command("command_completion", json!({"input": command}))?;
+            ensure!(
+                completion["matches"]
+                    .as_array()
+                    .context("command matches")?
+                    .iter()
+                    .any(|value| value == &command[1..]),
+                "missing exit completion: {completion}"
+            );
+            assert_eq!(
+                driver.command("run_command", json!({"command": command}))?["ok"],
+                true
+            );
+        }
+        drop(driver);
+        ensure!(
+            app.wait_for_exit(STARTUP_TIMEOUT)?.success(),
+            "{command} did not exit cleanly"
+        );
+    }
     Ok(())
 }
 

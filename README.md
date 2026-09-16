@@ -185,6 +185,10 @@ that build.
 Press `?` in the application for searchable shortcut help. A few useful keys:
 
 - `/` searches, `:` opens the command palette, and `j`/`k` move through rows.
+- **Exit**, `ZZ` in normal mode, or `:q` / `:quit` / `:exit` exits notm,
+  including standalone message windows. Unsaved drafts still prompt, recovery
+  drafts are flushed, and active work finishes before exit. Lowercase `q`
+  continues to toggle quoted text; `zz` remains tag undo.
 - `J`/`K` select the next or previous message in a thread; lowercase `j`/`k`
   continue to scroll the message view.
 - `Ctrl+e`/`Ctrl+y` scroll the message-list viewport down or up one line without

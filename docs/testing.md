@@ -220,6 +220,26 @@ required.
 
 ## GUI smoke checks
 
+Exit controls have required-display coverage for button bounds at 600x600,
+900x650, and 1500x900, rejected draft confirmations, failed close-time draft
+writes, standalone reader shutdown, command completion, and normal-mode `ZZ`
+versus Insert-mode input. The sync checks also verify that `:quit` does not
+abandon an active worker and still offers a cancellable dirty-draft confirmation
+after the worker finishes:
+
+```sh
+tests/run_with_headless_weston.sh dbus-run-session -- \
+  cargo test --locked -p notm-app --test desktop_ui_smoke exit_ -- \
+    --nocapture --test-threads=1
+```
+
+For visual acceptance, use the private Sway fixture setup in
+`tests/ui_text_focus_smoke.py`, resize the actual main window, capture each size,
+and click the Exit button at its `layout_state.exit_button.bounds` coordinates.
+Check the draft-confirmation cancel path before confirming exit. Also send real
+`Shift+z`, `Shift+z` and `:quit` followed by Enter with `wtype`; harness key
+injection alone is not physical keyboard coverage.
+
 The dark Visual HTML background regression exercises the real Settings checkbox,
 Apply/Save, invalid-save rollback, restart, both message readers, inline sender
 color overrides, restored light colors, scroll retention, and unchanged

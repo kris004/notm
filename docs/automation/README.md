@@ -178,13 +178,20 @@ Implemented test-harness commands include:
   `respond_settings`, `save_settings`, `resize_window`, `pane_visibility`,
   `set_pane_visibility`, `layout_state`,
   `set_fixture_thread_delay`, `set_fixture_composer_preparation_delay`,
-  `set_layout`, `toggle_layout`, `toggle_debug_panel`, `close_main_window`,
+  `set_layout`, `toggle_layout`, `toggle_debug_panel`, `close_main_window`, `click_exit`,
   custom saved-search commands, and custom tag-editor commands
 
 `focus_search` and `focus_compose_field` move GTK focus without forcing Insert
 mode. Tests that exercise keyboard editing should send the same `/`, `i`, or
 Enter transition that a user would use instead of relying on the harness to
 change modes implicitly.
+
+`click_exit` is fixture-only and clicks the real Exit button. Unlike
+`close_main_window`, exit also closes standalone message windows after draft
+confirmation, recovery flush, and active work complete. `layout_state` includes
+the Exit button's label, mapped/sensitive state, and window-relative bounds for
+responsive-layout checks. `run_command` accepts `q`, `quit`, and `exit` through
+the same normal application close path.
 
 Fixture harnesses can route an application shortcut directly through the same
 ordered key router used by the main window with `send_key`. Pass a GDK key name
