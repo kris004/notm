@@ -4,8 +4,15 @@ Notable user-facing changes are recorded here.
 
 ## Unreleased
 
+## [0.1.3] - 2026-09-16
+
+- Add an Exit button, Normal-mode `ZZ`, and `:q`, `:quit`, and `:exit`
+  commands that preserve dirty-draft confirmations and wait for active work.
 - Add an optional dark Visual HTML background in Settings, including standalone
   message windows, without inverting images or reloading remote content.
+- Add bounded `notm refresh --all` requests so external indexers can refresh
+  running instances without activating windows, running sync commands, or
+  disturbing the active query and composer.
 - Render bounded raster images referenced through `cid:` from the message's own
   `multipart/related` MIME parts without granting remote-network permission.
 - Replace the relabeling remote-image button with a fixed, compact **Images**
@@ -14,6 +21,15 @@ Notable user-facing changes are recorded here.
   `From:` mailbox and refreshes matching open views. The menu warns that
   `From:` is unauthenticated and spoofable, so forged mail claiming an allowed
   address inherits the exception.
+- Keep the thread-list viewport stable during visual selection, improve command
+  palette contrast, and normalize Unicode whitespace in thread previews.
+- Preserve draft confirmations after asynchronous saves and keep external
+  refresh and thread selection scoped to the correct search generation.
+- Add native ARM64 release bundles with independent reproducibility comparison
+  and sandboxed packaged-application tests.
+- Add source-pinned Flatpak packaging and an isolated distribution gate as
+  preparation for a possible future Flathub submission. The Flatpak manifest
+  remains pinned to `v0.1.2`; it is not a `v0.1.3` Flatpak release.
 
 ## [0.1.2] - 2026-08-28
 
@@ -79,7 +95,8 @@ Notable user-facing changes are recorded here.
   message body while results refresh.
 - Sender-default view actions now use compact labels and the `V a` shortcut.
 
-[Unreleased]: https://github.com/kris004/notm/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/kris004/notm/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/kris004/notm/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/kris004/notm/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/kris004/notm/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/kris004/notm/releases/tag/v0.1.0
