@@ -16828,7 +16828,18 @@ fn close_main_window_after_background_activity(widgets: &Widgets, state: &Shared
             || widgets.draft_save_active.get().is_some()
     };
     if !background_activity && widgets.close_when_idle.replace(false) {
-        flush_and_close_main_window(widgets, state);
+        if widgets.exit_requested.get() {
+            // Re-enter the close transition with the latest composer state.
+            // Sync/tag/save completion must not bypass Exit's draft prompt.
+            let fields = compose_fields(widgets, state);
+            let active_draft = state.borrow().active_draft.clone();
+            if composer_requires_confirmation(&fields, active_draft.as_ref()) {
+                widgets.window.present();
+            }
+            widgets.window.close();
+        } else {
+            flush_and_close_main_window(widgets, state);
+        }
     }
 }
 

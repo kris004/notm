@@ -1945,6 +1945,104 @@ fn exit_command_waits_for_manual_sync() -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
+#[test]
+fn exit_after_sync_still_confirms_unsaved_drafts() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP exit_after_sync_still_confirms_unsaved_drafts: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running deferred Exit draft confirmation UI smoke with {display}");
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-exit-sync-draft-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:inbox\"\n\
+             \n[sync]\nenabled = true\nexternal_receive_enabled = true\nexternal_receive_on_startup = false\nexternal_receive_command = \"sleep 2\"\n\
+             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n\
+             \n[automation]\nallow_live_send_test = true\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+        ),
+    )?;
+    let recovery_path = work_dir.join("state/notm/draft.json");
+    let token = format!("notm-exit-sync-draft-ui-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    driver.wait_for_search(STARTUP_TIMEOUT)?;
+    driver.command("open_compose", json!({}))?;
+    driver.command(
+        "compose_set_body",
+        json!({"value": "Keep my unsaved draft during sync."}),
+    )?;
+
+    for response in ["reject", "accept"] {
+        let started = driver.command("run_manual_sync", json!({}))?;
+        assert_eq!(started["state"]["sync_in_progress"], true);
+        assert_eq!(
+            driver.command("run_command", json!({"command": ":quit"}))?["ok"],
+            true
+        );
+        let pending = driver.command("pending_confirmation", json!({}))?;
+        assert_eq!(
+            pending["pending"],
+            Value::Null,
+            "close must wait for sync: {pending}"
+        );
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            let pending = driver.command("pending_confirmation", json!({}))?;
+            if !pending["pending"].is_null() {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "deferred Exit never offered draft confirmation"
+            );
+            thread::sleep(STARTUP_POLL_INTERVAL);
+        }
+        let state = driver.command("app_state", json!({}))?;
+        assert_eq!(state["state"]["sync_in_progress"], false);
+        assert_eq!(
+            state["state"]["compose_fields"]["body"],
+            "Keep my unsaved draft during sync."
+        );
+        let id = pending_confirmation_id(&mut driver, "close_main_window")?;
+        let result = driver.command(
+            "respond_confirmation",
+            json!({"response": response, "id": id}),
+        )?;
+        assert_eq!(result["ok"], true);
+        if response == "reject" {
+            let layout = driver.command("layout_state", json!({}))?;
+            assert_eq!(
+                layout["exit_button"]["mapped"], true,
+                "cancelled Exit left the main window hidden: {layout}"
+            );
+            ensure!(
+                app.child.try_wait()?.is_none(),
+                "cancelled Exit stopped the app"
+            );
+        }
+    }
+    drop(driver);
+    ensure!(
+        app.wait_for_exit(STARTUP_TIMEOUT)?.success(),
+        "accepted deferred Exit failed"
+    );
+    assert_eq!(
+        recovery_body(&recovery_path)?,
+        "Keep my unsaved draft during sync."
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
 fn assert_close_waits_for_manual_sync(command: &str, args: Value) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 

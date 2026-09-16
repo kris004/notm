@@ -223,8 +223,9 @@ required.
 Exit controls have required-display coverage for button bounds at 600x600,
 900x650, and 1500x900, rejected draft confirmations, failed close-time draft
 writes, standalone reader shutdown, command completion, and normal-mode `ZZ`
-versus Insert-mode input. The sync check also verifies that `:quit` does not
-abandon an active worker:
+versus Insert-mode input. The sync checks also verify that `:quit` does not
+abandon an active worker and still offers a cancellable dirty-draft confirmation
+after the worker finishes:
 
 ```sh
 tests/run_with_headless_weston.sh dbus-run-session -- \
