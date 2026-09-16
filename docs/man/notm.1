@@ -144,6 +144,27 @@ restarts pagination, clears visual/multi-selection and prepared caches, and
 retains the selected exact thread if it remains in the first refreshed page
 and retained path state is safe.  No first-row activation or focus routing is
 performed.
+.SH EXITING THE DESKTOP
+Click
+.B Exit
+or press
+.B ZZ
+(two uppercase Z keys) in normal mode.  Alternatively, open the command palette
+with
+.B :
+and run
+.BR q ,
+.BR quit ,
+or
+.BR exit .
+These actions confirm unsaved drafts, flush recovery state, wait for active
+work, and close standalone message windows only after the main window can
+safely close.  Cancel the confirmation to keep working.
+Lowercase
+.B q
+still toggles quoted text, and
+.B zz
+still undoes the last tag change.
 .SH SAFETY
 .B notm
 does not run startup sync or automatic
