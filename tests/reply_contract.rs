@@ -256,7 +256,7 @@ Body"#;
 }
 
 #[test]
-fn html_only_reply_keeps_html_quote_hidden_from_plain_composer() -> anyhow::Result<()> {
+fn html_only_reply_keeps_quote_separate_from_editable_body() -> anyhow::Result<()> {
     let raw = b"From: Alice <alice@example.test>\r\nTo: Me <me@example.test>\r\nSubject: HTML Hello\r\nDate: Thu, 25 Jun 2026 05:30:00 +0000\r\nMessage-ID: <html-orig@example.test>\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><p><b>Hello</b> from HTML</p><script>bad()</script></body></html>";
     let parsed = parse_rfc5322(raw)?;
     let identity = Identity {

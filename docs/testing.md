@@ -451,6 +451,20 @@ NOTM_REQUIRE_GTK_DISPLAY=1 \
   -- --exact --nocapture --test-threads=1
 ```
 
+HTML reply context has a fixture-backed GTK smoke. It verifies that Reply and
+Reply all show an expanded, read-only safe-text quote, long quotes scroll within
+a bounded viewport, short stacked composers scroll instead of clipping, saved
+drafts restore the quote, and clearing or replacing the composer removes stale
+context. The preview must not duplicate the quote in the editable body or change
+either outgoing quote alternative:
+
+```sh
+NOTM_REQUIRE_GTK_DISPLAY=1 \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
+  fixture_html_replies_show_original_without_changing_composed_body \
+  -- --exact --nocapture --test-threads=1
+```
+
 A separate non-fixture smoke uses a disposable Notmuch database and Maildir to
 verify first and repeated indexed draft saves, the background search refresh,
 and clean navigation away from the saved composer:

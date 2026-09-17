@@ -5673,6 +5673,176 @@ fn assert_target_message_rendered(driver: &mut UiDriver) -> anyhow::Result<()> {
 
 #[cfg(unix)]
 #[test]
+fn fixture_html_replies_show_original_without_changing_composed_body() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_html_replies_show_original_without_changing_composed_body: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running reply quote desktop UI smoke with {display}");
+
+    fn visible_quote(driver: &mut UiDriver) -> anyhow::Result<Value> {
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            let entry = driver.command("entry_state", json!({}))?;
+            if entry["reply_quote"]["mapped"] == true
+                && entry["reply_quote"]["height"].as_i64().unwrap_or(0) > 0
+            {
+                return Ok(entry);
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "reply quote did not map: {entry}"
+            );
+            thread::sleep(STARTUP_POLL_INTERVAL);
+        }
+    }
+
+    fn clear_reply(driver: &mut UiDriver) -> anyhow::Result<()> {
+        let cleared = driver.command("clear_draft", json!({}))?;
+        assert_eq!(cleared["ok"], true, "clear failed: {cleared}");
+        if cleared["pending_confirmation"] == true {
+            let accepted = driver.command("respond_confirmation", json!({"response": "accept"}))?;
+            assert_eq!(accepted["ok"], true, "discard failed: {accepted}");
+        }
+        let entry = driver.command("entry_state", json!({}))?;
+        assert_eq!(entry["reply_quote"]["visible"], false);
+        assert_eq!(entry["reply_quote"]["text"], "");
+        Ok(())
+    }
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-reply-quote-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        "[ui]\nlayout = \"columns\"\nstart_maximized = true\nshow_sidebar = false\n\
+         show_message_list = false\nshow_message_view = true\n",
+    )?;
+    let token = format!("notm-reply-quote-ui-{run_id}");
+    let mut app = FixtureApp::spawn_fixture_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+
+    for (command, message_id, expected_text) in [
+        ("reply_selected", "html-message@fixture.test", "Safe HTML."),
+        (
+            "reply_all_selected",
+            "long-html-message@fixture.test",
+            "Scrollable HTML fixture row 80",
+        ),
+    ] {
+        select_first_thread(&mut driver, &format!("id:{message_id}"))?;
+        let reply = driver.command(command, json!({}))?;
+        assert_eq!(reply["ok"], true, "{command} failed: {reply}");
+        wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+        let entry = visible_quote(&mut driver)?;
+        let fields = &entry["compose_fields"];
+        let quote = fields["text_reply_quote"].as_str().context("text quote")?;
+        assert_eq!(fields["body"], "", "quote leaked into the editable body");
+        assert_eq!(entry["reply_quote"]["text"], quote.trim());
+        assert_eq!(entry["reply_quote"]["expanded"], true);
+        assert_eq!(entry["reply_quote"]["editable"], false);
+        assert!(
+            quote.contains(expected_text),
+            "wrong original message: {entry}"
+        );
+        assert!(
+            !quote.contains("<script>"),
+            "raw HTML shown as quote: {entry}"
+        );
+        if command == "reply_all_selected" {
+            ensure!(
+                entry["reply_quote"]["height"]
+                    .as_i64()
+                    .context("quote height")?
+                    <= 160,
+                "long quote grew beyond its bounded viewport: {entry}"
+            );
+            ensure!(
+                entry["reply_quote"]["scroll_upper"]
+                    .as_f64()
+                    .context("quote extent")?
+                    > entry["reply_quote"]["scroll_page_size"]
+                        .as_f64()
+                        .context("quote viewport")?,
+                "long quote cannot scroll: {entry}"
+            );
+        }
+
+        let edited = driver.command("compose_set_body", json!({"value": "My answer."}))?;
+        assert_eq!(edited["ok"], true);
+        assert_eq!(edited["compose_fields"]["body"], "My answer.");
+        for field in ["text_reply_quote", "html_reply_quote"] {
+            assert_eq!(edited["compose_fields"][field], fields[field]);
+        }
+        let saved = driver.command("save_draft", json!({}))?;
+        assert_eq!(saved["ok"], true, "save failed: {saved}");
+        clear_reply(&mut driver)?;
+        assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
+        let reopened = driver.command("activate_draft_by_index", json!({"index": 0}))?;
+        assert_eq!(reopened["ok"], true, "reopen failed: {reopened}");
+        let restored = visible_quote(&mut driver)?;
+        assert_eq!(restored["reply_quote"]["text"], quote.trim());
+        assert_eq!(restored["compose_fields"], edited["compose_fields"]);
+        if command == "reply_all_selected" {
+            for pane in ["sidebar", "threads"] {
+                assert_eq!(
+                    driver.command(
+                        "set_pane_visibility",
+                        json!({"pane": pane, "visible": true})
+                    )?["ok"],
+                    true
+                );
+            }
+            assert_eq!(
+                driver.command("set_layout", json!({"layout": "stacked"}))?["ok"],
+                true
+            );
+            let deadline = Instant::now() + STARTUP_TIMEOUT;
+            loop {
+                let stacked = driver.command("entry_state", json!({}))?;
+                let scroll = &stacked["composer_scroll"];
+                if scroll["scroll_upper"].as_f64().context("composer extent")?
+                    > scroll["scroll_page_size"]
+                        .as_f64()
+                        .context("composer viewport")?
+                {
+                    break;
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "short composer clipped content instead of scrolling: {stacked}"
+                );
+                thread::sleep(STARTUP_POLL_INTERVAL);
+            }
+        }
+        clear_reply(&mut driver)?;
+    }
+
+    select_first_thread(&mut driver, "id:unicode@fixture.test")?;
+    assert_eq!(driver.command("reply_selected", json!({}))?["ok"], true);
+    wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let plain = driver.command("entry_state", json!({}))?;
+    assert_eq!(plain["reply_quote"]["visible"], false);
+    assert_eq!(plain["reply_quote"]["text"], "");
+    assert!(
+        plain["compose_fields"]["body"]
+            .as_str()
+            .context("plain reply")?
+            .contains("> ")
+    );
+    clear_reply(&mut driver)?;
+    assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
+    let fresh = driver.command("entry_state", json!({}))?;
+    assert_eq!(fresh["reply_quote"]["visible"], false);
+    assert_eq!(fresh["compose_fields"]["body"], "");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn fixture_reply_all_preserves_quoted_names_and_flattens_groups() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(

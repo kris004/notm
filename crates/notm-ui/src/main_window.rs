@@ -18629,6 +18629,10 @@ fn handle_automation_request(
                 .entry()
                 .selection_bounds()
                 .map(|(start, end)| json!({"start": start, "end": end}));
+            let quote_body = widgets.composer.reply_quote_body();
+            let quote_buffer = quote_body.buffer();
+            let quote_scroll = widgets.composer.reply_quote_scrolled().vadjustment();
+            let composer_scroll = widgets.composer.root().vadjustment();
             json!({
                 "ok": true,
                 "window_is_active": widgets.window.is_active(),
@@ -18657,6 +18661,22 @@ fn handle_automation_request(
                     .unwrap_or_default()
                     .to_string(),
                 "compose_fields": compose_fields(widgets, state),
+                "reply_quote": {
+                    "visible": widgets.composer.reply_quote().is_visible(),
+                    "expanded": widgets.composer.reply_quote().is_expanded(),
+                    "mapped": quote_body.is_mapped(),
+                    "editable": quote_body.is_editable(),
+                    "text": quote_buffer.text(
+                        &quote_buffer.start_iter(), &quote_buffer.end_iter(), true
+                    ).to_string(),
+                    "height": widgets.composer.reply_quote_scrolled().height(),
+                    "scroll_upper": quote_scroll.upper(),
+                    "scroll_page_size": quote_scroll.page_size(),
+                },
+                "composer_scroll": {
+                    "scroll_upper": composer_scroll.upper(),
+                    "scroll_page_size": composer_scroll.page_size(),
+                },
                 "input_mode": format!("{:?}", state.borrow().input_mode),
                 "active_pane": format!("{:?}", state.borrow().active_pane),
                 "main_shortcut_controller_count": main_shortcut_controller_count(widgets),
