@@ -5891,10 +5891,22 @@ fn fixture_html_replies_show_original_without_changing_composed_body() -> anyhow
             let accepted = driver.command("respond_confirmation", json!({"response": "accept"}))?;
             assert_eq!(accepted["ok"], true, "discard failed: {accepted}");
         }
-        let entry = driver.command("entry_state", json!({}))?;
-        assert_eq!(entry["reply_quote"]["visible"], false);
-        assert_eq!(entry["reply_quote"]["text"], "");
-        Ok(())
+        // The command acknowledges the recovery flush before its completion
+        // callback clears the composer widgets.
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            let entry = driver.command("entry_state", json!({}))?;
+            if entry["reply_quote"]["visible"] == false {
+                assert_eq!(entry["reply_quote"]["text"], "");
+                return Ok(());
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "reply quote survived draft clear: {}",
+                entry["reply_quote"]
+            );
+            thread::sleep(STARTUP_POLL_INTERVAL);
+        }
     }
 
     fn assert_composer_scroll_edges(driver: &mut UiDriver, field: &str) -> anyhow::Result<()> {
@@ -5995,7 +6007,17 @@ fn fixture_html_replies_show_original_without_changing_composed_body() -> anyhow
         }
         let saved = driver.command("save_draft", json!({}))?;
         assert_eq!(saved["ok"], true, "save failed: {saved}");
+        // A clean saved draft clears asynchronously without a confirmation.
+        // Exercise that completion boundary even on fast local machines.
+        assert_eq!(
+            driver.command("set_fixture_draft_delay", json!({"milliseconds": 300}))?["ok"],
+            true
+        );
         clear_reply(&mut driver)?;
+        assert_eq!(
+            driver.command("set_fixture_draft_delay", json!({"milliseconds": 0}))?["ok"],
+            true
+        );
         assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
         let reopened = driver.command("activate_draft_by_index", json!({"index": 0}))?;
         assert_eq!(reopened["ok"], true, "reopen failed: {reopened}");
