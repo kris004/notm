@@ -5897,6 +5897,37 @@ fn fixture_html_replies_show_original_without_changing_composed_body() -> anyhow
         Ok(())
     }
 
+    fn assert_composer_scroll_edges(driver: &mut UiDriver, field: &str) -> anyhow::Result<()> {
+        driver.command("focus_compose_field", json!({"field": "subject"}))?;
+        let normal = driver.command("send_key", json!({"key": "Escape"}))?;
+        assert_eq!(normal["input_mode"], "Normal", "{normal}");
+        assert_eq!(normal["active_pane"], "Message", "{normal}");
+        for (keys, bottom) in [(&["G"][..], true), (&["g", "g"][..], false)] {
+            for key in keys {
+                let result = driver.command("send_key", json!({"key": key}))?;
+                assert_eq!(result["handled"], true, "{result}");
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let entry = driver.command("entry_state", json!({}))?;
+                let scroll = &entry[field];
+                let upper = scroll["scroll_upper"].as_f64().context("scroll extent")?;
+                let page = scroll["scroll_page_size"].as_f64().context("scroll page")?;
+                let value = scroll["scroll_value"].as_f64().context("scroll position")?;
+                let expected = if bottom { upper - page } else { 0.0 };
+                if upper > page && (value - expected).abs() <= 1.0 {
+                    break;
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "{keys:?} did not reach the {field} edge: {scroll}"
+                );
+                thread::sleep(STARTUP_POLL_INTERVAL);
+            }
+        }
+        Ok(())
+    }
+
     let run_id = unique_run_id()?;
     let work_dir = std::env::temp_dir().join(format!("notm-reply-quote-ui-{run_id}"));
     fs::create_dir_all(&work_dir)?;
@@ -6002,6 +6033,7 @@ fn fixture_html_replies_show_original_without_changing_composed_body() -> anyhow
                 );
                 thread::sleep(STARTUP_POLL_INTERVAL);
             }
+            assert_composer_scroll_edges(&mut driver, "composer_scroll")?;
         }
         clear_reply(&mut driver)?;
     }
@@ -6023,6 +6055,44 @@ fn fixture_html_replies_show_original_without_changing_composed_body() -> anyhow
     let fresh = driver.command("entry_state", json!({}))?;
     assert_eq!(fresh["reply_quote"]["visible"], false);
     assert_eq!(fresh["compose_fields"]["body"], "");
+
+    // When the whole composer fits, retain navigation within a long body.
+    assert_eq!(
+        driver.command("set_layout", json!({"layout": "columns"}))?["ok"],
+        true
+    );
+    for pane in ["sidebar", "threads"] {
+        assert_eq!(
+            driver.command(
+                "set_pane_visibility",
+                json!({"pane": pane, "visible": false}),
+            )?["ok"],
+            true
+        );
+    }
+    let long_body = "A scrollable composer body line.\n".repeat(100);
+    assert_eq!(
+        driver.command("compose_set_body", json!({"value": long_body}))?["ok"],
+        true
+    );
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let entry = driver.command("entry_state", json!({}))?;
+        let scroll = &entry["composer_scroll"];
+        if scroll["scroll_upper"].as_f64().context("composer extent")?
+            <= scroll["scroll_page_size"]
+                .as_f64()
+                .context("composer viewport")?
+        {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "full-height composer still overflows: {entry}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+    assert_composer_scroll_edges(&mut driver, "composer_body_scroll")?;
     Ok(())
 }
 

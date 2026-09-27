@@ -469,7 +469,9 @@ Reply all show an expanded, read-only safe-text quote, long quotes scroll within
 a bounded viewport, short stacked composers scroll instead of clipping, saved
 drafts restore the quote, and clearing or replacing the composer removes stale
 context. The preview must not duplicate the quote in the editable body or change
-either outgoing quote alternative:
+either outgoing quote alternative. Normal-mode `G`/`gg` must reach the outer
+composer edges when it overflows, while retaining long-body navigation when
+the whole composer fits:
 
 ```sh
 NOTM_REQUIRE_GTK_DISPLAY=1 \

@@ -5016,7 +5016,15 @@ fn scroll_window_to_edge(scrolled: &gtk::ScrolledWindow, bottom: bool) {
 
 fn active_message_scrolled(widgets: &Widgets) -> gtk::ScrolledWindow {
     if compose_view_is_visible(widgets) {
-        widgets.composer.scrolled().clone()
+        // Whole-composer navigation must reach controls below the editor in a
+        // short pane. Preserve body scrolling when the outer viewport fits.
+        let outer = widgets.composer.root();
+        let adjustment = outer.vadjustment();
+        if adjustment.upper() - adjustment.lower() > adjustment.page_size() {
+            outer
+        } else {
+            widgets.composer.scrolled()
+        }
     } else if html_view_is_visible(widgets) {
         widgets.html_scrolled.clone()
     } else {
@@ -18633,6 +18641,7 @@ fn handle_automation_request(
             let quote_buffer = quote_body.buffer();
             let quote_scroll = widgets.composer.reply_quote_scrolled().vadjustment();
             let composer_scroll = widgets.composer.root().vadjustment();
+            let composer_body_scroll = widgets.composer.scrolled().vadjustment();
             json!({
                 "ok": true,
                 "window_is_active": widgets.window.is_active(),
@@ -18674,8 +18683,14 @@ fn handle_automation_request(
                     "scroll_page_size": quote_scroll.page_size(),
                 },
                 "composer_scroll": {
+                    "scroll_value": composer_scroll.value(),
                     "scroll_upper": composer_scroll.upper(),
                     "scroll_page_size": composer_scroll.page_size(),
+                },
+                "composer_body_scroll": {
+                    "scroll_value": composer_body_scroll.value(),
+                    "scroll_upper": composer_body_scroll.upper(),
+                    "scroll_page_size": composer_body_scroll.page_size(),
                 },
                 "input_mode": format!("{:?}", state.borrow().input_mode),
                 "active_pane": format!("{:?}", state.borrow().active_pane),
