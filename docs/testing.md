@@ -267,6 +267,19 @@ compositor. CI also runs the link-hint fixture under Xvfb as a narrow GTK and
 WebKitGTK X11-backend check without repeating the complete UI suite. The older
 `live` value remains an alias for `provided`.
 
+The sender-list layout smoke compares a 28-participant thread and a long Unicode
+sender name with a single-sender control at several window widths. It checks real
+row allocations, single-line sender ellipsization and full-text tooltips,
+independent counts/tags, display toggles, and matched/total counts in a filtered
+search. It uses only disposable mail and leaves the source messages unchanged:
+
+```sh
+tests/run_with_headless_weston.sh dbus-run-session -- \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
+  fixture_many_thread_senders_keep_metadata_compact -- \
+  --exact --nocapture --test-threads=1
+```
+
 The standalone-message WebKit lifecycle has a required-display regression
 smoke. It rapidly replaces a long HTML document, checks generation-scoped
 readiness and event-driven scrolling while the GTK heartbeat advances, and
@@ -448,6 +461,22 @@ in a disposable non-fixture harness, as documented in
 NOTM_REQUIRE_GTK_DISPLAY=1 \
   cargo test --locked -p notm-app --test desktop_ui_smoke \
   fixture_draft_confirmations_preserve_rejected_state \
+  -- --exact --nocapture --test-threads=1
+```
+
+HTML reply context has a fixture-backed GTK smoke. It verifies that Reply and
+Reply all show an expanded, read-only safe-text quote, long quotes scroll within
+a bounded viewport, short stacked composers scroll instead of clipping, saved
+drafts restore the quote, and clearing or replacing the composer removes stale
+context. The preview must not duplicate the quote in the editable body or change
+either outgoing quote alternative. Normal-mode `G`/`gg` must reach the outer
+composer edges when it overflows, while retaining long-body navigation when
+the whole composer fits:
+
+```sh
+NOTM_REQUIRE_GTK_DISPLAY=1 \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
+  fixture_html_replies_show_original_without_changing_composed_body \
   -- --exact --nocapture --test-threads=1
 ```
 

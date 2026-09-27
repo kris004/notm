@@ -1384,6 +1384,9 @@ impl ThreadListController {
             "title": named_widget_bounds_json(&root, &relative_to, &format!("notm-thread-title-{index}"), viewport_width, viewport_height),
             "date": named_widget_bounds_json(&root, &relative_to, &format!("notm-thread-date-{index}"), viewport_width, viewport_height),
             "meta": named_widget_bounds_json(&root, &relative_to, &format!("notm-thread-meta-{index}"), viewport_width, viewport_height),
+            "authors": named_widget_bounds_json(&root, &relative_to, &format!("notm-thread-authors-{index}"), viewport_width, viewport_height),
+            "count": named_widget_bounds_json(&root, &relative_to, &format!("notm-thread-count-{index}"), viewport_width, viewport_height),
+            "tags": named_widget_bounds_json(&root, &relative_to, &format!("notm-thread-tags-{index}"), viewport_width, viewport_height),
             "preview": named_widget_bounds_json(&root, &relative_to, &format!("notm-thread-preview-{index}"), viewport_width, viewport_height),
         })
     }
@@ -1690,27 +1693,35 @@ fn thread_row_widget(index: usize, snapshot: &ThreadRowSnapshot) -> gtk::Box {
         date.add_css_class("notm-thread-date");
         meta_row.append(&date);
     }
-    let meta_text = if display.tags {
-        format!(
-            "{}  ·  {}/{}  ·  {}",
-            thread.authors,
-            thread.matched_messages,
-            thread.total_messages,
-            thread.tags.join(" ")
-        )
-    } else {
-        format!(
-            "{}  ·  {}/{}",
-            thread.authors, thread.matched_messages, thread.total_messages
-        )
-    };
-    let meta = gtk::Label::new(Some(&meta_text));
+    // Measure senders, counts, and tags independently so a long sender list
+    // cannot wrap the row or push the remaining metadata out of the viewport.
+    let meta = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     meta.set_widget_name(&format!("notm-thread-meta-{index}"));
-    meta.set_xalign(0.0);
     meta.set_hexpand(true);
     meta.set_halign(gtk::Align::Fill);
     meta.add_css_class("dim-label");
-    meta.set_wrap(true);
+    let authors = thread_metadata_label(&thread.authors);
+    authors.set_widget_name(&format!("notm-thread-authors-{index}"));
+    // Prefer a compact sender width before distributing spare space, leaving
+    // ordinary tag lists room even when the thread has many participants.
+    authors.set_max_width_chars(16);
+    authors.set_hexpand(true);
+    meta.append(&authors);
+    meta.append(&gtk::Label::new(Some("·")));
+    let count = gtk::Label::new(Some(&format!(
+        "{}/{}",
+        thread.matched_messages, thread.total_messages
+    )));
+    count.set_widget_name(&format!("notm-thread-count-{index}"));
+    count.set_single_line_mode(true);
+    count.set_tooltip_text(Some("Matched messages / total messages"));
+    meta.append(&count);
+    if display.tags && !thread.tags.is_empty() {
+        meta.append(&gtk::Label::new(Some("·")));
+        let tags = thread_metadata_label(&thread.tags.join(" "));
+        tags.set_widget_name(&format!("notm-thread-tags-{index}"));
+        meta.append(&tags);
+    }
     content.append(&title);
     meta_row.append(&meta);
     content.append(&meta_row);
@@ -1733,6 +1744,16 @@ fn thread_row_widget(index: usize, snapshot: &ThreadRowSnapshot) -> gtk::Box {
     row_content.append(&content);
     box_.append(&row_content);
     box_
+}
+
+fn thread_metadata_label(text: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.set_single_line_mode(true);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_max_width_chars(32);
+    label.set_tooltip_text(Some(text));
+    label
 }
 
 fn thread_title_text(thread: &ThreadSummary, detail: &ThreadUiDetails) -> String {
@@ -1957,6 +1978,7 @@ fn named_widget_bounds_json(
     let height = bounds.height() as f64;
     let right = x + width;
     let bottom = y + height;
+    let label = widget.downcast_ref::<gtk::Label>();
     Some(json!({
         "x": x,
         "y": y,
@@ -1965,6 +1987,10 @@ fn named_widget_bounds_json(
         "right": right,
         "bottom": bottom,
         "fully_visible": x >= -1.0 && y >= -1.0 && right <= viewport_width + 1.0 && bottom <= viewport_height + 1.0,
+        "text": label.map(|label| label.text().to_string()),
+        "tooltip": widget.tooltip_text().map(|text| text.to_string()),
+        "line_count": label.map(|label| label.layout().line_count()),
+        "ellipsized": label.map(|label| label.layout().is_ellipsized()),
     }))
 }
 

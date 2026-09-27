@@ -1157,6 +1157,191 @@ fn fixture_visual_selection_navigation_matches_normal_viewport() -> anyhow::Resu
 
 #[cfg(unix)]
 #[test]
+fn fixture_many_thread_senders_keep_metadata_compact() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_many_thread_senders_keep_metadata_compact: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running long sender-list row-layout smoke with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-sender-layout-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let variants = ["control", "many", "long"];
+    let mut sources = Vec::new();
+    {
+        let db = fixture.open_readwrite()?;
+        for name in variants {
+            for index in 0..28 {
+                let author = match name {
+                    "many" => format!("Participant {index:02}"),
+                    "long" => "LongÜnicodeName".repeat(30),
+                    _ => "Participant".to_string(),
+                };
+                let address_index = if name == "many" { index } else { 0 };
+                let references = if index == 0 {
+                    String::new()
+                } else {
+                    format!("References: <sender-{name}-0@fixture.test>\r\n")
+                };
+                let path = fixture
+                    .maildir
+                    .join(format!("cur/sender-{name}-{index}:2,S"));
+                let raw = format!(
+                    "From: {author} <participant-{address_index}@example.test>\r\n\
+                     To: Fixture User <fixture@example.test>\r\n\
+                     Subject: Sender layout {name}\r\n\
+                     Date: Thu, 18 Jun 2026 20:00:{index:02} +0000\r\n\
+                     Message-ID: <sender-{name}-{index}@fixture.test>\r\n\
+                     {references}\
+                     MIME-Version: 1.0\r\n\
+                     Content-Type: text/plain; charset=utf-8\r\n\r\n\
+                     A short preview.\r\n"
+                );
+                fs::write(&path, &raw)?;
+                db.index_file_with_tags(&path, &["inbox", "sender-layout"])?;
+                sources.push((path, raw));
+            }
+        }
+    }
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:sender-layout\"\n\
+             \n[ui]\nshow_sidebar = false\nshow_message_view = false\n\
+             show_thread_numbers = true\nshow_thread_dates = true\nshow_thread_tags = true\n\
+             \n[send]\nenabled = false\n\
+             \n[sync]\nenabled = false\n\
+             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+        ),
+    )?;
+    let token = format!("notm-sender-layout-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    let search = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let rows = json_array_at(&search, &["state", "thread_list_items"])?;
+    ensure!(
+        rows.len() == variants.len(),
+        "missing sender fixtures: {search}"
+    );
+    let control_index = rows
+        .iter()
+        .position(|row| row["subject"] == "Sender layout control")
+        .context("single-sender control was not found")?;
+    for row in rows {
+        assert_eq!(row["total_messages"], 28, "{row}");
+        assert_eq!(row["matched_messages"], 28, "{row}");
+    }
+
+    // Compare allocations, not just label settings: a sender must not widen the
+    // list, increase the card height, or clip the count and ordinary tags.
+    for width in [900, 600, 480, 1100] {
+        driver.command("resize_window", json!({"width": width, "height": 700}))?;
+        let layouts = (0..rows.len())
+            .map(|index| driver.command("thread_row_layout", json!({"index": index})))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let control = &layouts[control_index];
+        let control_height = control["row"]["height"]
+            .as_f64()
+            .filter(|height| *height > 0.0)
+            .with_context(|| format!("control row was not allocated: {control}"))?;
+        for (index, layout) in layouts.iter().enumerate() {
+            let height = layout["row"]["height"]
+                .as_f64()
+                .with_context(|| format!("sender row was not allocated: {layout}"))?;
+            ensure!(
+                (height - control_height).abs() <= 1.0,
+                "senders inflated row {index} at width {width}: control={control}, actual={layout}"
+            );
+        }
+        for (index, (row, layout)) in rows.iter().zip(&layouts).enumerate() {
+            let viewport_width = layout["viewport_width"]
+                .as_f64()
+                .context("thread list has no viewport width")?;
+            for field in ["row", "authors", "count", "tags"] {
+                // Short viewports may need vertical scrolling; no field may
+                // overflow horizontally or collapse to zero width.
+                ensure!(
+                    layout[field]["x"].as_f64().is_some_and(|x| x >= -1.0)
+                        && layout[field]["width"].as_f64().is_some_and(|w| w > 0.0)
+                        && layout[field]["right"]
+                            .as_f64()
+                            .is_some_and(|right| right <= viewport_width + 1.0),
+                    "{field} overflowed at window width {width}: {layout}"
+                );
+            }
+            for field in ["authors", "count", "tags"] {
+                assert_eq!(layout[field]["line_count"], 1, "{field}: {layout}");
+                assert_eq!(layout[field]["y"], layout["authors"]["y"], "{layout}");
+            }
+            assert_eq!(layout["authors"]["text"], row["authors"], "{layout}");
+            assert_eq!(layout["authors"]["tooltip"], row["authors"], "{layout}");
+            assert_eq!(layout["count"]["text"], "28/28", "{layout}");
+            assert_eq!(layout["count"]["ellipsized"], false, "{layout}");
+            assert_eq!(layout["tags"]["text"], "inbox sender-layout", "{layout}");
+            assert_eq!(layout["tags"]["tooltip"], "inbox sender-layout", "{layout}");
+            // Very narrow layouts may elide tags too, but not the message count.
+            if width >= 600 {
+                assert_eq!(layout["tags"]["ellipsized"], false, "{layout}");
+            }
+            if index != control_index {
+                assert_eq!(layout["authors"]["ellipsized"], true, "{layout}");
+            }
+        }
+    }
+
+    for (command, field, visible) in [
+        ("notags", "tags", false),
+        ("nodates", "date", false),
+        ("nonumber", "number", false),
+        ("tags", "tags", true),
+        ("dates", "date", true),
+        ("number", "number", true),
+    ] {
+        let result = driver.command("run_command", json!({"command": command}))?;
+        assert_eq!(result["ok"], true, "{result}");
+        let layout = driver.command("thread_row_layout", json!({"index": control_index}))?;
+        assert_eq!(!layout[field].is_null(), visible, "{command}: {layout}");
+        assert_eq!(layout["count"]["text"], "28/28", "{layout}");
+        assert_eq!(layout["count"]["fully_visible"], true, "{layout}");
+    }
+    let partial = driver.command(
+        "run_search",
+        json!({"query": "tag:sender-layout and from:participant-0@example.test"}),
+    )?;
+    assert_eq!(partial["ok"], true, "{partial}");
+    let searched = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let partial_rows = json_array_at(&searched, &["state", "thread_list_items"])?;
+    let (index, row) = partial_rows
+        .iter()
+        .enumerate()
+        .find(|(_, row)| row["subject"] == "Sender layout many")
+        .context("many-sender thread was lost in the filtered search")?;
+    assert_eq!(row["matched_messages"], 1, "{row}");
+    assert_eq!(row["total_messages"], 28, "{row}");
+    let layout = driver.command("thread_row_layout", json!({"index": index}))?;
+    assert_eq!(layout["count"]["text"], "1/28", "{layout}");
+    assert_eq!(layout["count"]["ellipsized"], false, "{layout}");
+    assert_eq!(layout["authors"]["tooltip"], row["authors"], "{layout}");
+
+    for (path, raw) in sources {
+        assert_eq!(
+            fs::read_to_string(path)?,
+            raw,
+            "original message was modified"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn fixture_unicode_preview_whitespace_does_not_inflate_rows() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
@@ -5668,6 +5853,268 @@ fn assert_target_message_rendered(driver: &mut UiDriver) -> anyhow::Result<()> {
         !text.contains("Reply two body with quote."),
         "message view rendered the thread's last message instead of the target: {rendered}"
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_html_replies_show_original_without_changing_composed_body() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_html_replies_show_original_without_changing_composed_body: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running reply quote desktop UI smoke with {display}");
+
+    fn visible_quote(driver: &mut UiDriver) -> anyhow::Result<Value> {
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            let entry = driver.command("entry_state", json!({}))?;
+            if entry["reply_quote"]["mapped"] == true
+                && entry["reply_quote"]["height"].as_i64().unwrap_or(0) > 0
+            {
+                return Ok(entry);
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "reply quote did not map: {entry}"
+            );
+            thread::sleep(STARTUP_POLL_INTERVAL);
+        }
+    }
+
+    fn clear_reply(driver: &mut UiDriver) -> anyhow::Result<()> {
+        let cleared = driver.command("clear_draft", json!({}))?;
+        assert_eq!(cleared["ok"], true, "clear failed: {cleared}");
+        if cleared["pending_confirmation"] == true {
+            let accepted = driver.command("respond_confirmation", json!({"response": "accept"}))?;
+            assert_eq!(accepted["ok"], true, "discard failed: {accepted}");
+        }
+        // The command acknowledges the recovery flush before its completion
+        // callback clears the composer widgets.
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            let entry = driver.command("entry_state", json!({}))?;
+            if entry["reply_quote"]["visible"] == false {
+                assert_eq!(entry["reply_quote"]["text"], "");
+                return Ok(());
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "reply quote survived draft clear: {}",
+                entry["reply_quote"]
+            );
+            thread::sleep(STARTUP_POLL_INTERVAL);
+        }
+    }
+
+    fn assert_composer_scroll_edges(driver: &mut UiDriver, field: &str) -> anyhow::Result<()> {
+        driver.command("focus_compose_field", json!({"field": "subject"}))?;
+        let normal = driver.command("send_key", json!({"key": "Escape"}))?;
+        assert_eq!(normal["input_mode"], "Normal", "{normal}");
+        assert_eq!(normal["active_pane"], "Message", "{normal}");
+        for (keys, bottom) in [(&["G"][..], true), (&["g", "g"][..], false)] {
+            for key in keys {
+                let result = driver.command("send_key", json!({"key": key}))?;
+                assert_eq!(result["handled"], true, "{result}");
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let entry = driver.command("entry_state", json!({}))?;
+                let scroll = &entry[field];
+                let upper = scroll["scroll_upper"].as_f64().context("scroll extent")?;
+                let page = scroll["scroll_page_size"].as_f64().context("scroll page")?;
+                let value = scroll["scroll_value"].as_f64().context("scroll position")?;
+                let expected = if bottom { upper - page } else { 0.0 };
+                if upper > page && (value - expected).abs() <= 1.0 {
+                    break;
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "{keys:?} did not reach the {field} edge: {scroll}"
+                );
+                thread::sleep(STARTUP_POLL_INTERVAL);
+            }
+        }
+        Ok(())
+    }
+
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-reply-quote-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        "[ui]\nlayout = \"columns\"\nstart_maximized = true\nshow_sidebar = false\n\
+         show_message_list = false\nshow_message_view = true\n",
+    )?;
+    let token = format!("notm-reply-quote-ui-{run_id}");
+    let mut app = FixtureApp::spawn_fixture_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+
+    for (command, message_id, expected_text) in [
+        ("reply_selected", "html-message@fixture.test", "Safe HTML."),
+        (
+            "reply_all_selected",
+            "long-html-message@fixture.test",
+            "Scrollable HTML fixture row 80",
+        ),
+    ] {
+        select_first_thread(&mut driver, &format!("id:{message_id}"))?;
+        let reply = driver.command(command, json!({}))?;
+        assert_eq!(reply["ok"], true, "{command} failed: {reply}");
+        wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+        let entry = visible_quote(&mut driver)?;
+        let fields = &entry["compose_fields"];
+        let quote = fields["text_reply_quote"].as_str().context("text quote")?;
+        assert_eq!(fields["body"], "", "quote leaked into the editable body");
+        assert_eq!(entry["reply_quote"]["text"], quote.trim());
+        assert_eq!(entry["reply_quote"]["expanded"], true);
+        assert_eq!(entry["reply_quote"]["editable"], false);
+        assert!(
+            quote.contains(expected_text),
+            "wrong original message: {entry}"
+        );
+        assert!(
+            !quote.contains("<script>"),
+            "raw HTML shown as quote: {entry}"
+        );
+        if command == "reply_all_selected" {
+            ensure!(
+                entry["reply_quote"]["height"]
+                    .as_i64()
+                    .context("quote height")?
+                    <= 160,
+                "long quote grew beyond its bounded viewport: {entry}"
+            );
+            ensure!(
+                entry["reply_quote"]["scroll_upper"]
+                    .as_f64()
+                    .context("quote extent")?
+                    > entry["reply_quote"]["scroll_page_size"]
+                        .as_f64()
+                        .context("quote viewport")?,
+                "long quote cannot scroll: {entry}"
+            );
+        }
+
+        let edited = driver.command("compose_set_body", json!({"value": "My answer."}))?;
+        assert_eq!(edited["ok"], true);
+        assert_eq!(edited["compose_fields"]["body"], "My answer.");
+        for field in ["text_reply_quote", "html_reply_quote"] {
+            assert_eq!(edited["compose_fields"][field], fields[field]);
+        }
+        let saved = driver.command("save_draft", json!({}))?;
+        assert_eq!(saved["ok"], true, "save failed: {saved}");
+        // A clean saved draft clears asynchronously without a confirmation.
+        // Exercise that completion boundary even on fast local machines.
+        assert_eq!(
+            driver.command("set_fixture_draft_delay", json!({"milliseconds": 300}))?["ok"],
+            true
+        );
+        clear_reply(&mut driver)?;
+        assert_eq!(
+            driver.command("set_fixture_draft_delay", json!({"milliseconds": 0}))?["ok"],
+            true
+        );
+        assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
+        let reopened = driver.command("activate_draft_by_index", json!({"index": 0}))?;
+        assert_eq!(reopened["ok"], true, "reopen failed: {reopened}");
+        let restored = visible_quote(&mut driver)?;
+        assert_eq!(restored["reply_quote"]["text"], quote.trim());
+        assert_eq!(restored["compose_fields"], edited["compose_fields"]);
+        if command == "reply_all_selected" {
+            for pane in ["sidebar", "threads"] {
+                assert_eq!(
+                    driver.command(
+                        "set_pane_visibility",
+                        json!({"pane": pane, "visible": true})
+                    )?["ok"],
+                    true
+                );
+            }
+            assert_eq!(
+                driver.command("set_layout", json!({"layout": "stacked"}))?["ok"],
+                true
+            );
+            let deadline = Instant::now() + STARTUP_TIMEOUT;
+            loop {
+                let stacked = driver.command("entry_state", json!({}))?;
+                let scroll = &stacked["composer_scroll"];
+                if scroll["scroll_upper"].as_f64().context("composer extent")?
+                    > scroll["scroll_page_size"]
+                        .as_f64()
+                        .context("composer viewport")?
+                {
+                    break;
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "short composer clipped content instead of scrolling: {stacked}"
+                );
+                thread::sleep(STARTUP_POLL_INTERVAL);
+            }
+            assert_composer_scroll_edges(&mut driver, "composer_scroll")?;
+        }
+        clear_reply(&mut driver)?;
+    }
+
+    select_first_thread(&mut driver, "id:unicode@fixture.test")?;
+    assert_eq!(driver.command("reply_selected", json!({}))?["ok"], true);
+    wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let plain = driver.command("entry_state", json!({}))?;
+    assert_eq!(plain["reply_quote"]["visible"], false);
+    assert_eq!(plain["reply_quote"]["text"], "");
+    assert!(
+        plain["compose_fields"]["body"]
+            .as_str()
+            .context("plain reply")?
+            .contains("> ")
+    );
+    clear_reply(&mut driver)?;
+    assert_eq!(driver.command("open_compose", json!({}))?["ok"], true);
+    let fresh = driver.command("entry_state", json!({}))?;
+    assert_eq!(fresh["reply_quote"]["visible"], false);
+    assert_eq!(fresh["compose_fields"]["body"], "");
+
+    // When the whole composer fits, retain navigation within a long body.
+    assert_eq!(
+        driver.command("set_layout", json!({"layout": "columns"}))?["ok"],
+        true
+    );
+    for pane in ["sidebar", "threads"] {
+        assert_eq!(
+            driver.command(
+                "set_pane_visibility",
+                json!({"pane": pane, "visible": false}),
+            )?["ok"],
+            true
+        );
+    }
+    let long_body = "A scrollable composer body line.\n".repeat(100);
+    assert_eq!(
+        driver.command("compose_set_body", json!({"value": long_body}))?["ok"],
+        true
+    );
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let entry = driver.command("entry_state", json!({}))?;
+        let scroll = &entry["composer_scroll"];
+        if scroll["scroll_upper"].as_f64().context("composer extent")?
+            <= scroll["scroll_page_size"]
+                .as_f64()
+                .context("composer viewport")?
+        {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "full-height composer still overflows: {entry}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+    assert_composer_scroll_edges(&mut driver, "composer_body_scroll")?;
     Ok(())
 }
 

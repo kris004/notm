@@ -38,6 +38,8 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
 const COMPOSE_BODY_MIN_HEIGHT: i32 = 96;
 const COMPOSE_BODY_NATURAL_HEIGHT: i32 = 260;
+const REPLY_QUOTE_MIN_HEIGHT: i32 = 72;
+const REPLY_QUOTE_MAX_HEIGHT: i32 = 160;
 const KEYBOARD_CURSOR_CLASS: &str = "notm-keyboard-cursor";
 pub(crate) const DRAFT_LIST_MIN_HEIGHT: i32 = 72;
 pub(crate) const DRAFT_LIST_MAX_HEIGHT: i32 = 160;
@@ -948,7 +950,7 @@ pub(crate) struct NamedDraftEntry {
 
 #[derive(Clone)]
 pub(crate) struct ComposerController {
-    root: gtk::Box,
+    root: gtk::ScrolledWindow,
     from: gtk::Entry,
     to: gtk::Entry,
     cc: gtk::Entry,
@@ -958,6 +960,9 @@ pub(crate) struct ComposerController {
     autosave_suppressed: Rc<Cell<bool>>,
     vim_context: VimIMContext,
     scrolled: gtk::ScrolledWindow,
+    reply_quote: gtk::Expander,
+    reply_quote_body: gtk::TextView,
+    reply_quote_scrolled: gtk::ScrolledWindow,
     attachments: gtk::Label,
     add_attachment: gtk::Button,
     save_draft: gtk::Button,
@@ -980,10 +985,9 @@ pub(crate) struct ComposerController {
 
 impl ComposerController {
     pub(crate) fn new(paths: ComposerPaths) -> Self {
-        let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        root.set_widget_name("notm-composer");
-        root.set_hexpand(true);
-        root.set_vexpand(true);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        content.set_hexpand(true);
+        content.set_vexpand(true);
         let from = entry_with_placeholder("From");
         let to = entry_with_placeholder("To");
         let cc = entry_with_placeholder("Cc");
@@ -1015,6 +1019,33 @@ impl ComposerController {
             .max_content_height(COMPOSE_BODY_NATURAL_HEIGHT)
             .child(&body)
             .build();
+
+        // HTML replies keep their outgoing quote separate from the editable
+        // body. Show its safe text alternative without duplicating that quote
+        // in the editor or loading any remote content.
+        let reply_quote_body = gtk::TextView::builder()
+            .editable(false)
+            .cursor_visible(false)
+            .monospace(true)
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .build();
+        reply_quote_body.set_widget_name("notm-reply-quote-body");
+        let reply_quote_scrolled = gtk::ScrolledWindow::builder()
+            .hexpand(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .propagate_natural_height(true)
+            .min_content_height(REPLY_QUOTE_MIN_HEIGHT)
+            .max_content_height(REPLY_QUOTE_MAX_HEIGHT)
+            .child(&reply_quote_body)
+            .build();
+        let reply_quote = gtk::Expander::builder()
+            .label("Original message (included in reply)")
+            .expanded(true)
+            .visible(false)
+            .child(&reply_quote_scrolled)
+            .build();
+        reply_quote.set_widget_name("notm-reply-quote");
 
         let address_suggestions = gtk::ListBox::new();
         address_suggestions.set_widget_name("notm-address-suggestions-list");
@@ -1060,9 +1091,10 @@ impl ComposerController {
             bcc.clone().upcast(),
             subject.clone().upcast(),
             scrolled.clone().upcast(),
+            reply_quote.clone().upcast(),
             attachments.clone().upcast(),
         ] {
-            root.append(&widget);
+            content.append(&widget);
         }
 
         let draft_section = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -1108,8 +1140,19 @@ impl ComposerController {
             .build();
         draft_scrolled.set_widget_name("notm-saved-drafts-scrolled");
         draft_section.append(&draft_scrolled);
-        root.append(&draft_section);
-        root.append(&actions);
+        content.append(&draft_section);
+        content.append(&actions);
+
+        // A stacked or short message pane must scroll instead of clipping the
+        // quote and composer actions below the minimum-size body editor.
+        let root = gtk::ScrolledWindow::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .child(&content)
+            .build();
+        root.set_widget_name("notm-composer");
 
         Self {
             root,
@@ -1122,6 +1165,9 @@ impl ComposerController {
             autosave_suppressed: Rc::new(Cell::new(false)),
             vim_context,
             scrolled,
+            reply_quote,
+            reply_quote_body,
+            reply_quote_scrolled,
             attachments,
             add_attachment,
             save_draft,
@@ -1148,7 +1194,7 @@ impl ComposerController {
         }
     }
 
-    pub(crate) fn root(&self) -> gtk::Box {
+    pub(crate) fn root(&self) -> gtk::ScrolledWindow {
         self.root.clone()
     }
 
@@ -1178,6 +1224,18 @@ impl ComposerController {
 
     pub(crate) fn scrolled(&self) -> gtk::ScrolledWindow {
         self.scrolled.clone()
+    }
+
+    pub(crate) fn reply_quote(&self) -> gtk::Expander {
+        self.reply_quote.clone()
+    }
+
+    pub(crate) fn reply_quote_body(&self) -> gtk::TextView {
+        self.reply_quote_body.clone()
+    }
+
+    pub(crate) fn reply_quote_scrolled(&self) -> gtk::ScrolledWindow {
+        self.reply_quote_scrolled.clone()
     }
 
     pub(crate) fn connect_vim(
@@ -1728,6 +1786,7 @@ impl ComposerController {
         self.bcc.set_text(&fields.bcc);
         self.subject.set_text(&fields.subject);
         self.body.buffer().set_text(&fields.body);
+        self.show_reply_quote(fields.text_reply_quote.as_deref());
         self.autosave_suppressed.set(false);
         self.move_cursor_to_start();
     }
@@ -1740,6 +1799,7 @@ impl ComposerController {
         self.bcc.set_text(&message.bcc.join(", "));
         self.subject.set_text(&message.subject);
         self.body.buffer().set_text(&message.body);
+        self.show_reply_quote(message.text_reply_quote.as_deref());
         self.autosave_suppressed.set(false);
         self.move_cursor_to_start();
     }
@@ -1756,9 +1816,19 @@ impl ComposerController {
         self.bcc.set_text("");
         self.subject.set_text("");
         self.body.buffer().set_text("");
+        self.show_reply_quote(None);
         self.autosave_suppressed.set(false);
         self.hide_address_suggestions();
         fields
+    }
+
+    fn show_reply_quote(&self, quote: Option<&str>) {
+        let quote = quote.unwrap_or_default().trim();
+        self.reply_quote_body.buffer().set_text(quote);
+        self.reply_quote.set_visible(!quote.is_empty());
+        self.reply_quote.set_expanded(true);
+        self.reply_quote_scrolled.vadjustment().set_value(0.0);
+        self.root.vadjustment().set_value(0.0);
     }
 
     pub(crate) fn move_cursor_to_start(&self) {
