@@ -267,6 +267,19 @@ compositor. CI also runs the link-hint fixture under Xvfb as a narrow GTK and
 WebKitGTK X11-backend check without repeating the complete UI suite. The older
 `live` value remains an alias for `provided`.
 
+The sender-list layout smoke compares a 28-participant thread and a long Unicode
+sender name with a single-sender control at several window widths. It checks real
+row allocations, single-line sender ellipsization and full-text tooltips,
+independent counts/tags, display toggles, and matched/total counts in a filtered
+search. It uses only disposable mail and leaves the source messages unchanged:
+
+```sh
+tests/run_with_headless_weston.sh dbus-run-session -- \
+  cargo test --locked -p notm-app --test desktop_ui_smoke \
+  fixture_many_thread_senders_keep_metadata_compact -- \
+  --exact --nocapture --test-threads=1
+```
+
 The standalone-message WebKit lifecycle has a required-display regression
 smoke. It rapidly replaces a long HTML document, checks generation-scoped
 readiness and event-driven scrolling while the GTK heartbeat advances, and

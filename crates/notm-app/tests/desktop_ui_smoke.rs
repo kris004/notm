@@ -1157,6 +1157,191 @@ fn fixture_visual_selection_navigation_matches_normal_viewport() -> anyhow::Resu
 
 #[cfg(unix)]
 #[test]
+fn fixture_many_thread_senders_keep_metadata_compact() -> anyhow::Result<()> {
+    let Some(display) = gtk_display_environment()? else {
+        eprintln!(
+            "SKIP fixture_many_thread_senders_keep_metadata_compact: no GUI test display is available"
+        );
+        return Ok(());
+    };
+    eprintln!("running long sender-list row-layout smoke with {display}");
+
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let run_id = unique_run_id()?;
+    let work_dir = std::env::temp_dir().join(format!("notm-sender-layout-ui-{run_id}"));
+    fs::create_dir_all(&work_dir)?;
+    let variants = ["control", "many", "long"];
+    let mut sources = Vec::new();
+    {
+        let db = fixture.open_readwrite()?;
+        for name in variants {
+            for index in 0..28 {
+                let author = match name {
+                    "many" => format!("Participant {index:02}"),
+                    "long" => "LongÜnicodeName".repeat(30),
+                    _ => "Participant".to_string(),
+                };
+                let address_index = if name == "many" { index } else { 0 };
+                let references = if index == 0 {
+                    String::new()
+                } else {
+                    format!("References: <sender-{name}-0@fixture.test>\r\n")
+                };
+                let path = fixture
+                    .maildir
+                    .join(format!("cur/sender-{name}-{index}:2,S"));
+                let raw = format!(
+                    "From: {author} <participant-{address_index}@example.test>\r\n\
+                     To: Fixture User <fixture@example.test>\r\n\
+                     Subject: Sender layout {name}\r\n\
+                     Date: Thu, 18 Jun 2026 20:00:{index:02} +0000\r\n\
+                     Message-ID: <sender-{name}-{index}@fixture.test>\r\n\
+                     {references}\
+                     MIME-Version: 1.0\r\n\
+                     Content-Type: text/plain; charset=utf-8\r\n\r\n\
+                     A short preview.\r\n"
+                );
+                fs::write(&path, &raw)?;
+                db.index_file_with_tags(&path, &["inbox", "sender-layout"])?;
+                sources.push((path, raw));
+            }
+        }
+    }
+    let config_path = work_dir.join("notm.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[notmuch]\ndatabase_path = {}\nconfig_path = {}\ndefault_query = \"tag:sender-layout\"\n\
+             \n[ui]\nshow_sidebar = false\nshow_message_view = false\n\
+             show_thread_numbers = true\nshow_thread_dates = true\nshow_thread_tags = true\n\
+             \n[send]\nenabled = false\n\
+             \n[sync]\nenabled = false\n\
+             \n[drafts]\nsave_maildir = false\nindex_after_save = false\n",
+            toml_path(&fixture.root),
+            toml_path(&fixture.config_path),
+        ),
+    )?;
+    let token = format!("notm-sender-layout-{run_id}");
+    let mut app = FixtureApp::spawn_with_config(work_dir, &token, &config_path)?;
+    let mut driver = app.connect(&token)?;
+    let search = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let rows = json_array_at(&search, &["state", "thread_list_items"])?;
+    ensure!(
+        rows.len() == variants.len(),
+        "missing sender fixtures: {search}"
+    );
+    let control_index = rows
+        .iter()
+        .position(|row| row["subject"] == "Sender layout control")
+        .context("single-sender control was not found")?;
+    for row in rows {
+        assert_eq!(row["total_messages"], 28, "{row}");
+        assert_eq!(row["matched_messages"], 28, "{row}");
+    }
+
+    // Compare allocations, not just label settings: a sender must not widen the
+    // list, increase the card height, or clip the count and ordinary tags.
+    for width in [900, 600, 480, 1100] {
+        driver.command("resize_window", json!({"width": width, "height": 700}))?;
+        let layouts = (0..rows.len())
+            .map(|index| driver.command("thread_row_layout", json!({"index": index})))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let control = &layouts[control_index];
+        let control_height = control["row"]["height"]
+            .as_f64()
+            .filter(|height| *height > 0.0)
+            .with_context(|| format!("control row was not allocated: {control}"))?;
+        for (index, layout) in layouts.iter().enumerate() {
+            let height = layout["row"]["height"]
+                .as_f64()
+                .with_context(|| format!("sender row was not allocated: {layout}"))?;
+            ensure!(
+                (height - control_height).abs() <= 1.0,
+                "senders inflated row {index} at width {width}: control={control}, actual={layout}"
+            );
+        }
+        for (index, (row, layout)) in rows.iter().zip(&layouts).enumerate() {
+            let viewport_width = layout["viewport_width"]
+                .as_f64()
+                .context("thread list has no viewport width")?;
+            for field in ["row", "authors", "count", "tags"] {
+                // Short viewports may need vertical scrolling; no field may
+                // overflow horizontally or collapse to zero width.
+                ensure!(
+                    layout[field]["x"].as_f64().is_some_and(|x| x >= -1.0)
+                        && layout[field]["width"].as_f64().is_some_and(|w| w > 0.0)
+                        && layout[field]["right"]
+                            .as_f64()
+                            .is_some_and(|right| right <= viewport_width + 1.0),
+                    "{field} overflowed at window width {width}: {layout}"
+                );
+            }
+            for field in ["authors", "count", "tags"] {
+                assert_eq!(layout[field]["line_count"], 1, "{field}: {layout}");
+                assert_eq!(layout[field]["y"], layout["authors"]["y"], "{layout}");
+            }
+            assert_eq!(layout["authors"]["text"], row["authors"], "{layout}");
+            assert_eq!(layout["authors"]["tooltip"], row["authors"], "{layout}");
+            assert_eq!(layout["count"]["text"], "28/28", "{layout}");
+            assert_eq!(layout["count"]["ellipsized"], false, "{layout}");
+            assert_eq!(layout["tags"]["text"], "inbox sender-layout", "{layout}");
+            assert_eq!(layout["tags"]["tooltip"], "inbox sender-layout", "{layout}");
+            // Very narrow layouts may elide tags too, but not the message count.
+            if width >= 600 {
+                assert_eq!(layout["tags"]["ellipsized"], false, "{layout}");
+            }
+            if index != control_index {
+                assert_eq!(layout["authors"]["ellipsized"], true, "{layout}");
+            }
+        }
+    }
+
+    for (command, field, visible) in [
+        ("notags", "tags", false),
+        ("nodates", "date", false),
+        ("nonumber", "number", false),
+        ("tags", "tags", true),
+        ("dates", "date", true),
+        ("number", "number", true),
+    ] {
+        let result = driver.command("run_command", json!({"command": command}))?;
+        assert_eq!(result["ok"], true, "{result}");
+        let layout = driver.command("thread_row_layout", json!({"index": control_index}))?;
+        assert_eq!(!layout[field].is_null(), visible, "{command}: {layout}");
+        assert_eq!(layout["count"]["text"], "28/28", "{layout}");
+        assert_eq!(layout["count"]["fully_visible"], true, "{layout}");
+    }
+    let partial = driver.command(
+        "run_search",
+        json!({"query": "tag:sender-layout and from:participant-0@example.test"}),
+    )?;
+    assert_eq!(partial["ok"], true, "{partial}");
+    let searched = driver.wait_for_search(STARTUP_TIMEOUT)?;
+    let partial_rows = json_array_at(&searched, &["state", "thread_list_items"])?;
+    let (index, row) = partial_rows
+        .iter()
+        .enumerate()
+        .find(|(_, row)| row["subject"] == "Sender layout many")
+        .context("many-sender thread was lost in the filtered search")?;
+    assert_eq!(row["matched_messages"], 1, "{row}");
+    assert_eq!(row["total_messages"], 28, "{row}");
+    let layout = driver.command("thread_row_layout", json!({"index": index}))?;
+    assert_eq!(layout["count"]["text"], "1/28", "{layout}");
+    assert_eq!(layout["count"]["ellipsized"], false, "{layout}");
+    assert_eq!(layout["authors"]["tooltip"], row["authors"], "{layout}");
+
+    for (path, raw) in sources {
+        assert_eq!(
+            fs::read_to_string(path)?,
+            raw,
+            "original message was modified"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn fixture_unicode_preview_whitespace_does_not_inflate_rows() -> anyhow::Result<()> {
     let Some(display) = gtk_display_environment()? else {
         eprintln!(
