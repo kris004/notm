@@ -15,6 +15,8 @@ Notable user-facing changes are recorded here.
   scrolling reach controls below the editor in short composer panes.
 - Update async-trait for compatibility with current Clippy without suppressing
   lints.
+- Update the HTML sanitizer to the patched Ammonia release for
+  GHSA-m6mh-2hw2-555x; keep SVG animation elements outside the email policy.
 
 ## [0.1.3] - 2026-09-16
 

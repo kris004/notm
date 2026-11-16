@@ -144,6 +144,19 @@ mod tests {
     use super::{html_to_safe_text, sanitize_html, sanitize_html_with_cid_images};
 
     #[test]
+    fn rejects_svg_link_mutation_elements() {
+        // Keep SVG animation outside the email policy (GHSA-m6mh-2hw2-555x).
+        let input = r#"<svg><a><set attributeName="href" to="javascript:alert(1)"/>
+            <animate attributeName="href" values="javascript:alert(2)"/>
+            <text>Link</text></a></svg>"#;
+        for sanitized in [sanitize_html(input), sanitize_html_with_cid_images(input)] {
+            assert!(!sanitized.contains("<set"), "{sanitized}");
+            assert!(!sanitized.contains("<animate"), "{sanitized}");
+            assert!(!sanitized.contains("javascript:"), "{sanitized}");
+        }
+    }
+
+    #[test]
     fn html_to_text_handles_rowspan_with_empty_rows() {
         let rendered = html_to_safe_text(r#"<table><td rowspan="8"><tr><tr>"#);
 
