@@ -371,6 +371,124 @@ fn external_refresh_sync_reloads_retained_content_without_changing_message() -> 
 }
 
 #[test]
+fn external_refresh_sync_keeps_pending_thread_navigation() -> anyhow::Result<()> {
+    if gtk_display_environment()?.is_none() {
+        eprintln!("SKIP external_refresh_sync_keeps_pending_thread_navigation: no display");
+        return Ok(());
+    }
+    let root = tempfile::tempdir()?;
+    let (_fixture, config) = position_fixture(root.path())?;
+    let bus = PrivateBus::start()?;
+    let mut app = launch(&root.path().join("app"), &config, &bus, false)?;
+    let mut driver = app.connect("refresh-test")?;
+    select_first_result(&mut driver, "tag:position-test")?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let original = driver.command("app_state", json!({}))?;
+    let expected = original["state"]["thread_list_items"][12]["thread_id"].clone();
+    assert_eq!(
+        driver.command("set_fixture_thread_delay", json!({"milliseconds": 1500}))?["ok"],
+        true
+    );
+    assert_eq!(
+        driver.command("run_manual_sync", json!({"test_refresh_delay_ms": 600}))?["ok"],
+        true
+    );
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    while driver.command("app_state", json!({}))?["state"]["search_loading"] != true {
+        ensure!(Instant::now() < deadline, "refresh did not start");
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+    assert_eq!(
+        driver.command("select_thread_by_index", json!({"index": 12}))?["ok"],
+        true
+    );
+    let pending = driver.command("thread_load_status", json!({}))?;
+    assert_eq!(pending["busy"], true, "{pending}");
+    let during = driver.command("app_state", json!({}))?;
+    assert_ne!(during["state"]["selected_thread"]["thread_id"], expected);
+    while driver.command("app_state", json!({}))?["state"]["sync_in_progress"] == true {
+        ensure!(Instant::now() < deadline, "refresh did not complete");
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+    let completed = wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        completed["submitted"], pending["submitted"],
+        "refresh replaced the pending navigation"
+    );
+    assert_eq!(
+        completed["cancelled"], pending["cancelled"],
+        "refresh cancelled the pending navigation"
+    );
+    let state = driver.command("app_state", json!({}))?;
+    assert_eq!(state["state"]["selected_thread"]["thread_id"], expected);
+    assert_eq!(
+        driver.command("thread_selection_view_state", json!({}))?["selected_local"],
+        12
+    );
+    Ok(())
+}
+
+#[test]
+fn external_refresh_preserves_html_message_scroll() -> anyhow::Result<()> {
+    if gtk_display_environment()?.is_none() {
+        eprintln!("SKIP external_refresh_preserves_html_message_scroll: no display");
+        return Ok(());
+    }
+    let root = tempfile::tempdir()?;
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let config = write_config(root.path(), &fixture)?;
+    let bus = PrivateBus::start()?;
+    let mut app = launch(&root.path().join("app"), &config, &bus, false)?;
+    let mut driver = app.connect("refresh-test")?;
+    select_first_thread(&mut driver, "id:long-html-message@fixture.test")?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    driver.command("resize_window", json!({"width": 1100, "height": 600}))?;
+    assert_eq!(driver.command("show_visual_html", json!({}))?["ok"], true);
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let html = driver.command("html_scroll_state", json!({}))?;
+        if html["ready"] == true && html["scroll"]["canScroll"] == true {
+            break;
+        }
+        ensure!(Instant::now() < deadline, "HTML not ready: {html}");
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+    driver.command("scroll_html_view_lines", json!({"lines": 8}))?;
+    let before = loop {
+        let html = driver.command("html_scroll_state", json!({}))?;
+        if html["pending"] == false && html["scroll"]["y"].as_f64().is_some_and(|y| y > 100.0) {
+            break html;
+        }
+        ensure!(Instant::now() < deadline, "HTML did not scroll: {html}");
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+    completed_refresh(&bus, true, 1)?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let after = loop {
+        let html = driver.command("html_scroll_state", json!({}))?;
+        if html["ready"] == true
+            && html["pending"] == false
+            && html["generation"].as_u64() > before["generation"].as_u64()
+        {
+            break html;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "HTML reload did not finish: {html}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+    ensure!(
+        (after["scroll"]["y"].as_f64().context("reloaded scroll")?
+            - before["scroll"]["y"].as_f64().context("original scroll")?)
+        .abs()
+            < 2.0,
+        "HTML reading position moved: before={before}, after={after}"
+    );
+    Ok(())
+}
+
+#[test]
 fn external_refresh_sync_keeps_navigation_made_during_worker() -> anyhow::Result<()> {
     if gtk_display_environment()?.is_none() {
         eprintln!("SKIP external_refresh_sync_keeps_navigation_made_during_worker: no display");

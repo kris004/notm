@@ -185,7 +185,9 @@ a delayed refresh. They inspect actual GTK row geometry repeatedly so delayed
 scroll callbacks cannot hide a jump. Each smoke creates its own bus and
 disposable database. Content-reload coverage checks that newly synced replies
 are loaded without changing the message being read, stealing focus, or losing
-Raw Source / Reply functionality:
+Raw Source / Reply functionality. Additional regressions cover navigation whose
+thread preparation is still pending when refresh completes, and retaining a
+scrolled Visual HTML message's reading position:
 
 ```sh
 tests/run_with_headless_weston.sh dbus-run-session -- \

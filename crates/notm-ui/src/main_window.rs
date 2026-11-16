@@ -12384,7 +12384,6 @@ fn schedule_refresh(
     let viewport = same_query
         .then(|| widgets.thread_list.latest_viewport(viewport))
         .flatten();
-    widgets.thread_load_coordinator.borrow_mut().cancel();
     cancel_composer_preparation(widgets, state);
     widgets.search_page_coordinator.cancel();
     widgets.thread_list.cancel_model_update();
@@ -12721,7 +12720,11 @@ fn finish_replaced_search_then<F>(
         .collect();
     let selected_index = widgets.thread_list.selected_index();
     let refresh_selected = refresh.as_ref().and_then(|refresh| {
-        selected_thread_id_for_tag_refresh(&state.borrow(), !refresh.keep_message_state)
+        selected_thread_id_for_tag_refresh(
+            &state.borrow(),
+            !refresh.keep_message_state,
+            selected_index,
+        )
     });
     apply_thread_search_state_update(state, outcome.update);
     let restored_thread = refresh_selected.clone().and_then(|thread_id| {
@@ -12751,7 +12754,16 @@ fn finish_replaced_search_then<F>(
             viewport = None;
         }
     }
-    let reload_selection = refresh.is_some() && restored_thread.is_some();
+    let pending_navigation_retained = widgets
+        .thread_load_coordinator
+        .borrow()
+        .active_generation()
+        .is_some()
+        && restored_thread.as_ref().is_some_and(|(_, thread)| {
+            refresh_selected.as_deref() == Some(thread.thread_id.as_str())
+        });
+    let reload_selection =
+        refresh.is_some() && restored_thread.is_some() && !pending_navigation_retained;
     {
         let mut state = state.borrow_mut();
         reconcile_selected_message_state_after_search(
@@ -13953,6 +13965,23 @@ fn finish_thread_load(
         }
     };
     let active_pane = state.borrow().active_pane;
+    let message_scroll = matches!(intent, ThreadLoadIntent::Refresh { .. })
+        .then(|| {
+            let same_message = state
+                .borrow()
+                .selected_message
+                .as_ref()
+                .is_some_and(|selected| {
+                    prepared
+                        .messages
+                        .get(selected_index)
+                        .is_some_and(|message| message.message_id == selected.message_id)
+                });
+            same_message
+                .then(|| current_message_scroll_fraction(widgets))
+                .flatten()
+        })
+        .flatten();
     let operation = match &intent {
         ThreadLoadIntent::Refresh { .. } | ThreadLoadIntent::Preview { .. } => {
             format!("previewed thread {}", thread.thread_id)
@@ -13994,6 +14023,7 @@ fn finish_thread_load(
                 // scrolling helper, and routes focus: none belongs in a
                 // background repaint.
                 show_preferred_selected_message_view(options, widgets, state);
+                restore_message_scroll_fraction(widgets, message_scroll);
             }
         }
         ThreadLoadIntent::Preview {
@@ -15491,13 +15521,17 @@ fn finish_tag_worker(
 fn selected_thread_id_for_tag_refresh(
     state: &UiState,
     discard_retained_message_state: bool,
+    cursor_index: Option<usize>,
 ) -> Option<String> {
     if state.tag_paths_uncertain || discard_retained_message_state {
         None
     } else {
-        state
-            .selected_thread
-            .as_ref()
+        // The cursor can be newer than selected_thread while its asynchronous
+        // preparation is pending. Never restore the previously displayed row
+        // over that newer navigation.
+        cursor_index
+            .and_then(|index| state.thread_list_items.get(index))
+            .or(state.selected_thread.as_ref())
             .map(|thread| thread.thread_id.clone())
     }
 }
@@ -23321,8 +23355,14 @@ mod tests {
             selected_thread: Some(thread("b")),
             selected_message: Some(message.clone()),
             messages: vec![message],
+            thread_list_items: vec![thread("a"), thread("b"), thread("c")],
             ..UiState::default()
         };
+        assert_eq!(
+            selected_thread_id_for_tag_refresh(&state, false, Some(2)).as_deref(),
+            Some("c"),
+            "the pending cursor must take precedence over the displayed thread"
+        );
         reconcile_selected_message_state_after_search(&mut state, Some(&thread("b")));
         assert!(state.selected_message.is_some());
         assert_eq!(state.messages.len(), 1);
@@ -23360,13 +23400,16 @@ mod tests {
         };
 
         assert_eq!(
-            selected_thread_id_for_tag_refresh(&state, false).as_deref(),
+            selected_thread_id_for_tag_refresh(&state, false, None).as_deref(),
             Some("selected-thread")
         );
 
         state.tag_paths_uncertain = tag_report_has_uncertain_retained_state(&report);
 
-        assert_eq!(selected_thread_id_for_tag_refresh(&state, false), None);
+        assert_eq!(
+            selected_thread_id_for_tag_refresh(&state, false, None),
+            None
+        );
     }
 
     #[test]
@@ -23424,7 +23467,7 @@ mod tests {
         assert!(!tag_report_has_uncertain_retained_state(&report));
         assert!(!state.tag_paths_uncertain);
         assert!(tag_report_requires_fresh_message_state(&report));
-        assert_eq!(selected_thread_id_for_tag_refresh(&state, true), None);
+        assert_eq!(selected_thread_id_for_tag_refresh(&state, true, None), None);
         assert!(tag_path_actions_blocked(&state));
         assert!(!report.is_complete());
         assert_eq!(report.changed_messages, 0);
@@ -23486,9 +23529,9 @@ mod tests {
         };
 
         assert!(tag_report_requires_fresh_message_state(&report));
-        assert_eq!(selected_thread_id_for_tag_refresh(&state, true), None);
+        assert_eq!(selected_thread_id_for_tag_refresh(&state, true, None), None);
         assert_eq!(
-            selected_thread_id_for_tag_refresh(&state, false).as_deref(),
+            selected_thread_id_for_tag_refresh(&state, false, None).as_deref(),
             Some("still-present-thread")
         );
     }
@@ -23551,7 +23594,7 @@ mod tests {
         assert!(inverse_tag_mutations(&worker.report.changes).is_empty());
         assert!(!tag_report_has_uncertain_retained_state(&worker.report));
         assert!(!state.tag_paths_uncertain);
-        assert_eq!(selected_thread_id_for_tag_refresh(&state, true), None);
+        assert_eq!(selected_thread_id_for_tag_refresh(&state, true, None), None);
 
         reconcile_selected_message_state_after_search(&mut state, None);
         assert_eq!(state.selected_thread, None);
@@ -23603,7 +23646,7 @@ mod tests {
             worker.operation_errors[0]
         );
         assert!(!tag_report_has_uncertain_retained_state(&worker.report));
-        assert_eq!(selected_thread_id_for_tag_refresh(&state, true), None);
+        assert_eq!(selected_thread_id_for_tag_refresh(&state, true, None), None);
         assert!(inverse_tag_mutations(&worker.report.changes).is_empty());
 
         let invalid_id = finalize_tag_worker_result(
