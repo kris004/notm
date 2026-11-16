@@ -13947,15 +13947,19 @@ fn finish_thread_load(
     let pending_message_selection = widgets.pending_message_selection.take();
     let selected_index = match &intent {
         ThreadLoadIntent::OpenMessage { .. } => prepared.target_message_index.unwrap_or(0),
-        ThreadLoadIntent::Refresh { .. } => state
-            .borrow()
-            .selected_message
-            .as_ref()
-            .and_then(|selected| {
-                prepared
-                    .messages
-                    .iter()
-                    .position(|message| message.message_id == selected.message_id)
+        ThreadLoadIntent::Refresh { .. } => pending_message_selection
+            .filter(|index| *index < prepared.messages.len())
+            .or_else(|| {
+                state
+                    .borrow()
+                    .selected_message
+                    .as_ref()
+                    .and_then(|selected| {
+                        prepared
+                            .messages
+                            .iter()
+                            .position(|message| message.message_id == selected.message_id)
+                    })
             })
             .unwrap_or_else(|| prepared.messages.len().saturating_sub(1)),
         ThreadLoadIntent::Preview { .. } | ThreadLoadIntent::Open { .. } => {

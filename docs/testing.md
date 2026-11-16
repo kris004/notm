@@ -187,8 +187,9 @@ scroll callbacks cannot hide a jump. Each smoke creates its own bus and
 disposable database. Content-reload coverage checks that newly synced replies
 are loaded without changing the message being read, stealing focus, or losing
 Raw Source / Reply functionality. Additional regressions cover navigation whose
-thread preparation is still pending when refresh completes, and retaining a
-scrolled Visual HTML message's reading position:
+thread preparation is still pending when refresh completes, message selections
+queued during the background reload, and retaining a scrolled Visual HTML
+message's reading position:
 
 ```sh
 tests/run_with_headless_weston.sh dbus-run-session -- \

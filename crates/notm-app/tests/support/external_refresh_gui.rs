@@ -408,6 +408,66 @@ fn external_refresh_sync_reloads_retained_content_without_changing_message() -> 
 }
 
 #[test]
+fn external_refresh_sync_honors_message_navigation_during_reload() -> anyhow::Result<()> {
+    if gtk_display_environment()?.is_none() {
+        eprintln!("SKIP external_refresh_sync_honors_message_navigation_during_reload: no display");
+        return Ok(());
+    }
+    let root = tempfile::tempdir()?;
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let config = write_config(root.path(), &fixture)?;
+    let bus = PrivateBus::start()?;
+    let mut app = launch(&root.path().join("app"), &config, &bus, false)?;
+    let mut driver = app.connect("refresh-test")?;
+    select_first_thread(&mut driver, "id:thread-root-three-message@fixture.test")?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let selected = driver.command("select_message_by_index", json!({"index": 0}))?;
+    assert_eq!(
+        selected["selected_message"]["message_id"],
+        "thread-root-three-message@fixture.test"
+    );
+    assert_eq!(
+        driver.command("set_fixture_thread_delay", json!({"milliseconds": 1500}))?["ok"],
+        true
+    );
+    assert_eq!(driver.command("run_manual_sync", json!({}))?["ok"], true);
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let state = driver.command("app_state", json!({}))?;
+        let load = driver.command("thread_load_status", json!({}))?;
+        if state["state"]["sync_in_progress"] == false && load["busy"] == true {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "background reload did not start: {state}, {load}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+    let queued = driver.command("select_message_by_index", json!({"index": 1}))?;
+    assert_eq!(queued["ok"], true, "{queued}");
+    assert_eq!(
+        queued["selected_message"]["message_id"], "thread-root-three-message@fixture.test",
+        "selection was not queued during the reload"
+    );
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let state = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        state["state"]["selected_message"]["message_id"],
+        "thread-reply1-three-message@fixture.test",
+        "background reload discarded the queued message selection"
+    );
+    let text = driver.command("message_view_text", json!({}))?;
+    ensure!(
+        text["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Reply one body.")),
+        "queued message was not rendered: {text}"
+    );
+    Ok(())
+}
+
+#[test]
 fn external_refresh_sync_keeps_pending_thread_navigation() -> anyhow::Result<()> {
     if gtk_display_environment()?.is_none() {
         eprintln!("SKIP external_refresh_sync_keeps_pending_thread_navigation: no display");
