@@ -83,6 +83,9 @@ unread-only search), the next surviving neighbour is selected, or the previous
 one if needed. The visible anchor is reconciled independently; an empty result
 clears the cursor. New navigation while the worker runs takes precedence over
 the saved position. An explicit new search still starts at the first page.
+If replies reorder previously loaded threads, the contiguous loaded window may
+expand to keep both the cursor and visible anchor present. This work remains
+cancellable in the background; GTK model updates remain incremental.
 
 Composer contents, unsaved edits, and active drafts remain intact. Refresh
 clears visual/multi-selection and prepared-thread caches. Uncertain retained

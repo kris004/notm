@@ -31,6 +31,10 @@ fn refresh_positions_match_sorted_query_and_support_cancellation() -> anyhow::Re
         db.thread_positions("tag:inbox", &options, &ids, || true),
         Err(notm_notmuch::Error::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted
     ));
+    assert!(matches!(
+        db.search_threads_with_cancel("tag:inbox", &options, || true),
+        Err(notm_notmuch::Error::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted
+    ));
     Ok(())
 }
 

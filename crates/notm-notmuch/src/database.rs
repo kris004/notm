@@ -345,6 +345,18 @@ impl Database {
         query: &str,
         options: &QueryOptions,
     ) -> Result<Vec<ThreadSummary>> {
+        self.search_threads_with_cancel(query, options, || false)
+    }
+
+    /// Search a contiguous window with cancellation between iterator steps.
+    /// This also bounds cancellation latency when a refresh expands its window
+    /// to retain rows that moved to distant sorted positions.
+    pub fn search_threads_with_cancel(
+        &self,
+        query: &str,
+        options: &QueryOptions,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Vec<ThreadSummary>> {
         let q = self.create_query(query, options)?;
         let mut threads = std::ptr::null_mut();
         let status = unsafe { ffi::notmuch_query_search_threads(q.as_ptr(), &mut threads) };
@@ -352,6 +364,9 @@ impl Database {
         let mut out = Vec::new();
         let mut skipped = 0usize;
         while unsafe { ffi::notmuch_threads_valid(threads) } != 0 {
+            if cancelled() {
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into());
+            }
             let thread = unsafe { ffi::notmuch_threads_get(threads) };
             if !thread.is_null() {
                 if skipped >= options.offset && out.len() < options.limit {

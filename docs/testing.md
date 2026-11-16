@@ -180,8 +180,9 @@ freshly indexed search results in two instances, query/selection/draft/focus
 preservation, no writes or external sync, and in-flight search/tag ordering.
 Position regressions also cover marking read, external arrivals, manual sync,
 appended and directly located later pages, partial-row viewport offsets,
-selection removal in unread-only searches, empty results, and navigation during
-a delayed refresh. They inspect actual GTK row geometry repeatedly so delayed
+selection removal in unread-only searches, empty results, a later-page selected
+thread promoted to the top by a new reply, and navigation during a delayed
+refresh. They inspect actual GTK row geometry repeatedly so delayed
 scroll callbacks cannot hide a jump. Each smoke creates its own bus and
 disposable database. Content-reload coverage checks that newly synced replies
 are loaded without changing the message being read, stealing focus, or losing

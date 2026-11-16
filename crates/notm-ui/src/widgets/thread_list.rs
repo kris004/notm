@@ -105,6 +105,37 @@ impl RefreshWindow {
             .unwrap_or(self.offset)
             .min(total.saturating_sub(self.thread_ids.len().max(1)))
     }
+
+    fn refreshed_range(
+        &self,
+        positions: &BTreeMap<String, usize>,
+        total: usize,
+        page_size: usize,
+    ) -> std::ops::Range<usize> {
+        let offset = self.refreshed_offset(positions, total);
+        // A reply can promote a selected/visible thread far ahead of the old
+        // page. Include every surviving loaded ID, not just the first one:
+        // cursor and viewport anchors can be independent, and navigation can
+        // change while this worker runs. Keep the window contiguous so absolute
+        // navigation and visual-selection ranges still describe the real query.
+        let start = positions
+            .values()
+            .copied()
+            .min()
+            .unwrap_or(offset)
+            .min(offset);
+        let end = offset
+            .saturating_add(self.thread_ids.len().max(page_size))
+            .max(
+                positions
+                    .values()
+                    .copied()
+                    .max()
+                    .map_or(0, |index| index + 1),
+            )
+            .min(total);
+        start..end
+    }
 }
 
 pub(crate) struct SearchPageResponse {
@@ -1693,8 +1724,9 @@ fn execute_search_request(
             || cancelled.load(Ordering::Acquire),
         )?;
         ensure_search_not_cancelled(cancelled)?;
-        offset = window.refreshed_offset(&positions, total);
-        window_limit = window.thread_ids.len().max(limit);
+        let range = window.refreshed_range(&positions, total, limit);
+        offset = range.start;
+        window_limit = range.len();
     }
     let key = search_cache_key(
         query,
@@ -1726,7 +1758,8 @@ fn execute_search_request(
         sort: SortOrder::NewestFirst,
         excluded_tags: excluded_tags.clone(),
     };
-    let threads = db.search_threads(query, &options)?;
+    let threads =
+        db.search_threads_with_cancel(query, &options, || cancelled.load(Ordering::Acquire))?;
     ensure_search_not_cancelled(cancelled)?;
     let count = match cache_policy {
         SearchCachePolicy::Use => db
@@ -2494,6 +2527,12 @@ mod tests {
         assert_eq!(window.refreshed_offset(&BTreeMap::new(), 80), 40);
         assert_eq!(window.refreshed_offset(&BTreeMap::new(), 2), 0);
         assert_eq!(window.refreshed_offset(&BTreeMap::new(), 0), 0);
+        assert_eq!(
+            window.refreshed_range(&positions(&[("a", 41), ("b", 0), ("c", 42)]), 80, 3),
+            0..44,
+            "a promoted thread must remain in the same contiguous loaded window"
+        );
+        assert_eq!(window.refreshed_range(&BTreeMap::new(), 0, 20), 0..0);
     }
 
     fn test_revision(uuid: &str, revision: u64) -> Revision {

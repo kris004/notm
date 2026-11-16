@@ -7,7 +7,8 @@ Notable user-facing changes are recorded here.
 ## [0.1.4] - 2026-11-15
 
 - Keep the thread-list cursor and visible row offset stable after marking read,
-  external refresh, and manual sync, including later pages and new arrivals.
+  external refresh, and manual sync, including later pages, new arrivals, and
+  threads reordered by replies.
   If a thread leaves an unread-only search, select a surviving neighbour without
   jumping to the top; newer user navigation takes precedence over refresh.
 - Show the original HTML message alongside the reply composer.

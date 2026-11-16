@@ -240,6 +240,43 @@ fn external_refresh_preserves_read_cursor_and_viewport_beyond_first_page() -> an
             thread::sleep(STARTUP_POLL_INTERVAL);
         }
         assert_position_preserved(&mut driver, &before).with_context(|| app.logs())?;
+        if located {
+            // A reply can move the selected later-page thread to position zero,
+            // outside the original window. It must not be treated as deleted.
+            let message_id = before.0["state"]["selected_message"]["message_id"]
+                .as_str()
+                .context("selected message before promotion")?;
+            let path = fixture.maildir.join("new/position-promoted-reply");
+            fs::write(
+                &path,
+                format!(
+                    "From: sender@example.test\r\nTo: reader@example.test\r\n\
+                     Subject: Re: Position message\r\nMessage-ID: <promoted-reply@example.test>\r\n\
+                     In-Reply-To: <{message_id}>\r\nReferences: <{message_id}>\r\n\
+                     Date: 30 Nov 2026 00:00:00 +0000\r\n\r\nPromoted thread reply.\r\n"
+                ),
+            )?;
+            fixture
+                .open_readwrite()?
+                .index_file_with_tags(&path, &["inbox", "unread", "position-test"])?;
+            let sorted = fixture
+                .open_readonly()?
+                .search_threads("tag:position-test", &notm_notmuch::QueryOptions::default())?;
+            assert_eq!(
+                sorted[0].thread_id,
+                before.0["state"]["selected_thread"]["thread_id"]
+                    .as_str()
+                    .unwrap(),
+                "fixture did not promote the selected thread"
+            );
+            completed_refresh(&bus, true, 1)?;
+            wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+            assert_position_preserved(&mut driver, &before).with_context(|| app.logs())?;
+            let state = driver.command("app_state", json!({}))?;
+            assert_eq!(state["state"]["thread_window_offset"], 0);
+            assert_eq!(state["state"]["selected_message"]["message_id"], message_id);
+            assert_eq!(state["state"]["messages"].as_array().unwrap().len(), 2);
+        }
     }
     Ok(())
 }
