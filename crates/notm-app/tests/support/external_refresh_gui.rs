@@ -297,6 +297,80 @@ fn external_refresh_removed_unread_row_keeps_neighbour_and_viewport() -> anyhow:
 }
 
 #[test]
+fn external_refresh_sync_reloads_retained_content_without_changing_message() -> anyhow::Result<()> {
+    if gtk_display_environment()?.is_none() {
+        eprintln!(
+            "SKIP external_refresh_sync_reloads_retained_content_without_changing_message: no display"
+        );
+        return Ok(());
+    }
+    let root = tempfile::tempdir()?;
+    let (fixture, config) = position_fixture(root.path())?;
+    let bus = PrivateBus::start()?;
+    let mut app = launch(&root.path().join("app"), &config, &bus, false)?;
+    let mut driver = app.connect("refresh-test")?;
+    select_first_thread(&mut driver, "id:position-80@example.test")?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    driver.command("focus_search", json!({}))?;
+    let before = position_snapshot(&mut driver)?;
+    let path = fixture.maildir.join("new/position-reply");
+    fs::write(
+        &path,
+        "From: sender@example.test\r\nTo: reader@example.test\r\n\
+         Subject: Re: Position message 080\r\nMessage-ID: <position-reply@example.test>\r\n\
+         In-Reply-To: <position-80@example.test>\r\nReferences: <position-80@example.test>\r\n\
+         Date: 29 Nov 2026 00:00:00 +0000\r\n\r\nNew reply received during sync.\r\n",
+    )?;
+    fixture
+        .open_readwrite()?
+        .index_file_with_tags(&path, &["inbox", "unread"])?;
+    assert_eq!(driver.command("run_manual_sync", json!({}))?["ok"], true);
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let state = driver.command("app_state", json!({}))?;
+        if state["state"]["sync_in_progress"] == false {
+            break;
+        }
+        ensure!(Instant::now() < deadline, "sync did not complete: {state}");
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_position_preserved(&mut driver, &before).with_context(|| app.logs())?;
+    let state = driver.command("app_state", json!({}))?;
+    assert_eq!(state["state"]["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        state["state"]["selected_message"]["message_id"], "position-80@example.test",
+        "refresh switched from the message being read to the new reply"
+    );
+    assert_eq!(
+        driver.command("entry_state", json!({}))?["search_has_focus"],
+        true,
+        "background content reload stole focus"
+    );
+    assert_eq!(driver.command("show_raw_source", json!({}))?["ok"], true);
+    let text = driver.command("message_view_text", json!({}))?;
+    ensure!(
+        text["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Position fixture message 80."))
+    );
+    let reply = driver.command("reply_selected", json!({}))?;
+    assert_eq!(
+        reply["ok"], true,
+        "retained reply content unavailable: {reply}"
+    );
+    assert_eq!(reply["pending"], true, "{reply}");
+    wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let state = driver.command("app_state", json!({}))?;
+    ensure!(
+        state["state"]["compose_fields"]["body"]
+            .as_str()
+            .is_some_and(|body| body.contains("Position fixture message 80."))
+    );
+    Ok(())
+}
+
+#[test]
 fn external_refresh_sync_keeps_navigation_made_during_worker() -> anyhow::Result<()> {
     if gtk_display_environment()?.is_none() {
         eprintln!("SKIP external_refresh_sync_keeps_navigation_made_during_worker: no display");

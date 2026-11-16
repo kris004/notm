@@ -155,6 +155,17 @@ fn poll_refresh(
                 .map_err(|error| ("SearchFailed", error)),
         );
     }
+    // A selected-thread reload is read-only and does not invalidate a completed
+    // search. Wait for preparation before dispatch, but do not advance the
+    // required generation for a refresh's own background content reload.
+    if widgets
+        .thread_load_coordinator
+        .borrow()
+        .active_generation()
+        .is_some()
+    {
+        return None;
+    }
 
     // Use the completed active query, not unfinished text in the search entry.
     // Preserve the loaded window, cursor and viewport independently. The shared
@@ -178,11 +189,6 @@ fn writers_or_preparation_busy(widgets: &Widgets, state: &SharedState) -> bool {
             .named_draft_io_coordinator
             .borrow()
             .migration_in_progress()
-        || widgets
-            .thread_load_coordinator
-            .borrow()
-            .active_generation()
-            .is_some()
         || widgets
             .composer_preparation_coordinator
             .borrow()

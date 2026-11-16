@@ -12751,10 +12751,7 @@ fn finish_replaced_search_then<F>(
             viewport = None;
         }
     }
-    let reload_selection = refresh.is_some()
-        && restored_thread.as_ref().is_some_and(|(_, thread)| {
-            refresh_selected.as_deref() != Some(thread.thread_id.as_str())
-        });
+    let reload_selection = refresh.is_some() && restored_thread.is_some();
     {
         let mut state = state.borrow_mut();
         reconcile_selected_message_state_after_search(
@@ -12770,9 +12767,9 @@ fn finish_replaced_search_then<F>(
         state.multi_selected_threads.clear();
         state.multi_selected_thread_snapshots.clear();
     }
-    // The prepared cache is intentionally scoped to the currently selected
-    // thread. A successful replacement search clears that selection, so do not
-    // retain raw/MIME/attachment payloads from the previous result set.
+    // Prepared payloads belong to the old database revision. Reload a retained
+    // selection in the background as well, so replies/raw views remain usable
+    // and new messages are included without selecting a different message.
     widgets.prepared_threads.borrow_mut().clear();
     let opts = options.clone();
     let w = widgets.clone();
@@ -13938,11 +13935,22 @@ fn finish_thread_load(
     let pending_message_selection = widgets.pending_message_selection.take();
     let selected_index = match &intent {
         ThreadLoadIntent::OpenMessage { .. } => prepared.target_message_index.unwrap_or(0),
-        ThreadLoadIntent::Refresh { .. }
-        | ThreadLoadIntent::Preview { .. }
-        | ThreadLoadIntent::Open { .. } => pending_message_selection
-            .filter(|index| *index < prepared.messages.len())
+        ThreadLoadIntent::Refresh { .. } => state
+            .borrow()
+            .selected_message
+            .as_ref()
+            .and_then(|selected| {
+                prepared
+                    .messages
+                    .iter()
+                    .position(|message| message.message_id == selected.message_id)
+            })
             .unwrap_or_else(|| prepared.messages.len().saturating_sub(1)),
+        ThreadLoadIntent::Preview { .. } | ThreadLoadIntent::Open { .. } => {
+            pending_message_selection
+                .filter(|index| *index < prepared.messages.len())
+                .unwrap_or_else(|| prepared.messages.len().saturating_sub(1))
+        }
     };
     let active_pane = state.borrow().active_pane;
     let operation = match &intent {
@@ -13981,14 +13989,11 @@ fn finish_thread_load(
     match intent {
         ThreadLoadIntent::Refresh { .. } => {
             if !compose_view_is_visible(widgets) {
-                let _ = request_show_selected_message(
-                    options,
-                    widgets,
-                    state,
-                    active_pane,
-                    message_position_status(state, index, "Selected"),
-                    None,
-                );
+                // Nothing is closing a composer here. The normal transition
+                // flushes drafts asynchronously, restores selection through a
+                // scrolling helper, and routes focus: none belongs in a
+                // background repaint.
+                show_preferred_selected_message_view(options, widgets, state);
             }
         }
         ThreadLoadIntent::Preview {

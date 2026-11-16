@@ -183,7 +183,9 @@ appended and directly located later pages, partial-row viewport offsets,
 selection removal in unread-only searches, empty results, and navigation during
 a delayed refresh. They inspect actual GTK row geometry repeatedly so delayed
 scroll callbacks cannot hide a jump. Each smoke creates its own bus and
-disposable database:
+disposable database. Content-reload coverage checks that newly synced replies
+are loaded without changing the message being read, stealing focus, or losing
+Raw Source / Reply functionality:
 
 ```sh
 tests/run_with_headless_weston.sh dbus-run-session -- \

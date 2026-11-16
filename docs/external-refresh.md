@@ -27,7 +27,9 @@ commands, sends mail, or schedules draft/tag writes.
   `io.github.kris004.notm.test.*` namespace on that bus. It never includes the
   normal instance. Fixtures without a test harness also use this namespace.
 - Exit **0** means every discovered target completed a qualifying full search,
-  including application of its result model. **No running instance is a
+  including application of its result model. Read-only selected-message content
+  preparation may finish afterward; it does not require another search.
+  **No running instance is a
   successful no-op**, with `{"refreshed":0,"failed":[]}` on stdout.
 - Exit **1** means discovery, connection, compatibility, search, or deadline
   failure. A normal completion report is a single JSON object on stdout with
