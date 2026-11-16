@@ -369,6 +369,47 @@ impl Database {
         Ok(out)
     }
 
+    /// Locate previously loaded IDs in the current sorted query without loading
+    /// message bodies or retaining the rest of the result set.
+    /// Positions cover the whole query; `options.offset` and `limit` are ignored.
+    pub fn thread_positions(
+        &self,
+        query: &str,
+        options: &QueryOptions,
+        ids: &BTreeSet<String>,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<BTreeMap<String, usize>> {
+        let mut positions = BTreeMap::new();
+        if ids.is_empty() {
+            return Ok(positions);
+        }
+        let q = self.create_query(query, options)?;
+        let mut threads = std::ptr::null_mut();
+        let status = unsafe { ffi::notmuch_query_search_threads(q.as_ptr(), &mut threads) };
+        check(status, self.status_string())?;
+        let mut index = 0;
+        while unsafe { ffi::notmuch_threads_valid(threads) } != 0 {
+            if cancelled() {
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into());
+            }
+            let thread = unsafe { ffi::notmuch_threads_get(threads) };
+            if !thread.is_null() {
+                let id = unsafe { cstr_to_string(ffi::notmuch_thread_get_thread_id(thread)) };
+                if ids.contains(&id) {
+                    positions.insert(id, index);
+                }
+                index += 1;
+                unsafe { ffi::notmuch_thread_destroy(thread) };
+            }
+            if positions.len() == ids.len() {
+                break;
+            }
+            unsafe { ffi::notmuch_threads_move_to_next(threads) };
+        }
+        check_threads_iterator(threads, self.status_string())?;
+        Ok(positions)
+    }
+
     pub fn search_messages(
         &self,
         query: &str,

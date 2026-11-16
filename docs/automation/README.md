@@ -126,10 +126,12 @@ Implemented test-harness commands include:
   `thread_load_status`, `composer_preparation_status`,
   `draft_autosave_status`, `recovery_load_status`, `get_logs`, `screenshot`
 - search/navigation: `focus_search`, `set_search_query`, `run_search`,
-  `load_more_threads`, `scroll_thread_list_to_bottom`, `thread_page_info`,
+  `load_more_threads`, `scroll_thread_list_to_bottom`, `scroll_thread_list_lines`,
+  `thread_page_info`,
   `thread_selection_view_state`, `thread_row_layout`, `thread_list_rows`,
   `select_saved_search`, `save_current_search`, `select_thread_by_index`,
-  `select_relative_thread`, `select_thread_edge`, `open_selected_thread`,
+  `select_thread_absolute`, `select_relative_thread`, `select_thread_edge`,
+  `open_selected_thread`,
   `select_message_by_index`, `select_relative_message`, `thread_ui_details`,
   `toggle_multi_select_thread`, `clear_multi_selection`
 - tags: `archive_selected`, `mark_read_selected`, `mark_unread_selected`,
@@ -180,6 +182,12 @@ Implemented test-harness commands include:
   `set_fixture_thread_delay`, `set_fixture_composer_preparation_delay`,
   `set_layout`, `toggle_layout`, `toggle_debug_panel`, `close_main_window`, `click_exit`,
   custom saved-search commands, and custom tag-editor commands
+
+`select_thread_absolute` accepts a zero-based `index` across the whole query;
+it may schedule a page load. `scroll_thread_list_lines` accepts fractional
+`lines` (clamped to -100 through 100) without moving the cursor.
+`thread_selection_view_state` reports the first visible `anchor_index` and its
+pixel `anchor_top`, including partially visible rows.
 
 `focus_search` and `focus_compose_field` move GTK focus without forcing Insert
 mode. Tests that exercise keyboard editing should send the same `/`, `i`, or

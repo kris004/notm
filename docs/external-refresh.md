@@ -72,13 +72,20 @@ search requires a later one. User searches and mutations retain priority and
 can supersede a refresh without being cancelled by it. A busy instance may
 therefore exhaust the caller's deadline.
 
-The existing full-search reconciliation is used without first-row activation
-or focus routing. Composer contents, unsaved edits, and active drafts remain
-intact. The selected exact thread ID is retained if it is still in the first
-refreshed page and retained path state is not uncertain. As with other full
-searches, pagination restarts at the first page, visual/multi-selection is
-cleared, and prepared-thread caches are discarded. Existing uncertain-tag
-warnings and their safety gates are not bypassed.
+Refresh retains the loaded window, selected thread, and visible row offset
+without first-row activation or focus routing. This also applies after marking
+mail read and after manual sync. New arrivals before the loaded window update
+the total and absolute row numbers without taking the user back to the top.
+When a selected thread no longer matches (for example, marking read in an
+unread-only search), the next surviving neighbour is selected, or the previous
+one if needed. The visible anchor is reconciled independently; an empty result
+clears the cursor. New navigation while the worker runs takes precedence over
+the saved position. An explicit new search still starts at the first page.
+
+Composer contents, unsaved edits, and active drafts remain intact. Refresh
+clears visual/multi-selection and prepared-thread caches. Uncertain retained
+path state still prevents retaining message selection: existing uncertain-tag
+warnings and safety gates are not bypassed.
 
 ## Protocol and older processes
 
