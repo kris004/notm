@@ -4,7 +4,7 @@ Notable user-facing changes are recorded here.
 
 ## Unreleased
 
-## [0.1.4] - 2026-11-15
+## [0.1.4] - 2026-11-18
 
 - Keep the thread-list cursor and visible row offset stable after marking read,
   external refresh, and manual sync, including later pages, new arrivals, and

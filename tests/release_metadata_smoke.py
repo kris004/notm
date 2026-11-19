@@ -100,8 +100,8 @@ def main() -> int:
             (
                 "changelog-version",
                 "CHANGELOG.md",
-                "## [0.1.4] - 2026-11-15",
-                "## [9.9.9] - 2026-11-15",
+                "## [0.1.4] - 2026-11-18",
+                "## [9.9.9] - 2026-11-18",
                 "latest changelog version mismatch",
             ),
             (
@@ -114,8 +114,8 @@ def main() -> int:
             (
                 "appstream-version",
                 "packaging/io.github.kris004.notm.metainfo.xml",
-                '<release version="0.1.4" date="2026-11-15">',
-                '<release version="9.9.9" date="2026-11-15">',
+                '<release version="0.1.4" date="2026-11-18">',
+                '<release version="9.9.9" date="2026-11-18">',
                 "latest AppStream version mismatch",
             ),
             (

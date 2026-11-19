@@ -35,7 +35,7 @@
     <name>notm contributors</name>
   </developer>
   <releases>
-    <release version="0.1.4" date="2026-11-15">
+    <release version="0.1.4" date="2026-11-18">
       <description>
         <p>
           Preserve the mail-list cursor and viewport during refresh and sync,

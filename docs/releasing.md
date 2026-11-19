@@ -109,7 +109,7 @@ the corresponding minimal public key is pinned in
 `docs/release-signing-key.asc`. The release workflow verifies the tag against
 that key as well as GitHub's tag-object verification.
 
-The pinned primary currently expires at **2026-11-13 22:55:31 UTC**. CI and the
+The pinned primary currently expires at **2027-11-15 19:00:00 UTC**. CI and the
 release workflow warn when 90 days or less remain and fail when 30 days or less
 remain, when the key is expired, or when the pinned certificate has no expiry.
 The read-only check is:
@@ -146,6 +146,7 @@ gpg --quick-set-expire \
 updated_key=$(mktemp)
 trap 'rm -f "$updated_key"' EXIT
 gpg --batch --armor --export-options export-minimal \
+  --export-filter 'keep-uid=mbox = 30157929+kris004@users.noreply.github.com' \
   --export "$fingerprint" >"$updated_key"
 packaging/check-release-key-expiry.sh "$updated_key" "$fingerprint"
 gpg --batch --show-keys --with-subkey-fingerprints "$updated_key"
@@ -154,8 +155,10 @@ install -m 0644 "$updated_key" docs/release-signing-key.asc
 
 The first expiry command updates the primary key; the second updates the named
 authentication and encryption subkeys. Supplying subkey fingerprints does not
-also update the primary key. The expiry update and export require no new key or
-fingerprint, but GnuPG may request the hardware-key PIN and touch. If the
+also update the primary key. The export filter preserves only the public GitHub
+identity; do not publish other identities from the local keyring. The expiry
+update and export require no new key or fingerprint, but GnuPG may request the
+hardware-key PIN and touch. If the
 certification-capable primary key is unavailable, stop; do not generate a
 replacement or weaken the policy as a workaround. Re-run the complete delivery
 gate, publish the refreshed public certificate through the GitHub account's
