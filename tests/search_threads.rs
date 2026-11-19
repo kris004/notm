@@ -1,6 +1,44 @@
 use notm_notmuch::{QueryOptions, SortOrder};
 
 #[test]
+fn refresh_positions_match_sorted_query_and_support_cancellation() -> anyhow::Result<()> {
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let db = fixture.open_readonly()?;
+    let options = QueryOptions::default();
+    let threads = db.search_threads("tag:inbox", &options)?;
+    assert!(threads.len() >= 3);
+    let ids = [
+        threads[1].thread_id.clone(),
+        threads[2].thread_id.clone(),
+        "absent-thread".to_string(),
+    ]
+    .into_iter()
+    .collect();
+    let positions = db.thread_positions(
+        "tag:inbox",
+        &QueryOptions {
+            offset: 100,
+            limit: 1,
+            ..options.clone()
+        },
+        &ids,
+        || false,
+    )?;
+    assert_eq!(positions.len(), 2);
+    assert_eq!(positions[&threads[1].thread_id], 1);
+    assert_eq!(positions[&threads[2].thread_id], 2);
+    assert!(matches!(
+        db.thread_positions("tag:inbox", &options, &ids, || true),
+        Err(notm_notmuch::Error::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted
+    ));
+    assert!(matches!(
+        db.search_threads_with_cancel("tag:inbox", &options, || true),
+        Err(notm_notmuch::Error::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted
+    ));
+    Ok(())
+}
+
+#[test]
 fn searches_fixture_threads() -> anyhow::Result<()> {
     let fixture = notm_test_support::FixtureDatabase::create()?;
     let db = fixture.open_readonly()?;

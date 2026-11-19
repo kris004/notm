@@ -96,6 +96,539 @@ fn select_first_result(driver: &mut UiDriver, query: &str) -> anyhow::Result<()>
     Ok(())
 }
 
+fn position_fixture(root: &Path) -> anyhow::Result<(notm_test_support::FixtureDatabase, PathBuf)> {
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let db = fixture.open_readwrite()?;
+    for index in 0..96 {
+        let path = fixture.maildir.join(format!("new/position-{index}"));
+        fs::write(
+            &path,
+            format!(
+                "From: sender@example.test\r\nTo: reader@example.test\r\n\
+             Subject: Position message {index:03}\r\nMessage-ID: <position-{index}@example.test>\r\n\
+             Date: {} Nov 2026 {:02}:00:00 +0000\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\r\nPosition fixture message {index}.\r\n",
+                1 + index / 24,
+                index % 24,
+            ),
+        )?;
+        db.index_file_with_tags(&path, &["inbox", "unread", "position-test"])?;
+    }
+    drop(db);
+    let config = write_config(root, &fixture)?;
+    let mut text = fs::read_to_string(&config)?;
+    text.push_str("\n[ui]\npage_size = 20\nlayout = \"columns\"\n");
+    fs::write(&config, text)?;
+    Ok((fixture, config))
+}
+
+fn position_snapshot(driver: &mut UiDriver) -> anyhow::Result<(Value, Value)> {
+    let viewport = driver.command("thread_selection_view_state", json!({}))?;
+    let state = driver.command("app_state", json!({}))?;
+    Ok((state, viewport))
+}
+
+fn assert_position_preserved(driver: &mut UiDriver, before: &(Value, Value)) -> anyhow::Result<()> {
+    let old_rows = before.0["state"]["thread_list_items"]
+        .as_array()
+        .context("old rows")?;
+    let anchor = before.1["anchor_index"]
+        .as_u64()
+        .context("visible anchor")? as usize;
+    let anchor_id = &old_rows[anchor]["thread_id"];
+    let top = before.1["anchor_top"].as_f64().context("anchor offset")?;
+    // Sample repeatedly: delayed selection/scroll callbacks must not snap back
+    // after an initially correct result.
+    for _ in 0..3 {
+        let (state, viewport) = position_snapshot(driver)?;
+        assert_eq!(
+            state["state"]["selected_thread"]["thread_id"],
+            before.0["state"]["selected_thread"]["thread_id"],
+            "cursor moved: {viewport}"
+        );
+        let rows = state["state"]["thread_list_items"]
+            .as_array()
+            .context("new rows")?;
+        let index = rows
+            .iter()
+            .position(|row| &row["thread_id"] == anchor_id)
+            .context("anchor lost")?;
+        let layout = driver.command("thread_row_layout", json!({"index": index}))?;
+        let y = layout["row"]["y"]
+            .as_f64()
+            .context("anchor no longer visible")?;
+        ensure!(
+            (y - top).abs() <= 1.0,
+            "viewport moved: before={}, after={viewport}, row={layout}",
+            before.1
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn external_refresh_preserves_read_cursor_and_viewport_beyond_first_page() -> anyhow::Result<()> {
+    if gtk_display_environment()?.is_none() {
+        eprintln!(
+            "SKIP external_refresh_preserves_read_cursor_and_viewport_beyond_first_page: no display"
+        );
+        return Ok(());
+    }
+    let root = tempfile::tempdir()?;
+    let (fixture, config) = position_fixture(root.path())?;
+    let bus = PrivateBus::start()?;
+    let mut app = launch(&root.path().join("app"), &config, &bus, false)?;
+    let mut driver = app.connect("refresh-test")?;
+    select_first_result(&mut driver, "tag:position-test")?;
+    driver.command("resize_window", json!({"width": 1100, "height": 500}))?;
+    // Cover an appended window and a directly located later page.
+    for located in [false, true] {
+        if located {
+            let selected = driver.command("select_thread_absolute", json!({"index": 80}))?;
+            assert_eq!(selected["ok"], true, "{selected}");
+            driver.wait_for_search(STARTUP_TIMEOUT)?;
+        } else {
+            for _ in 0..2 {
+                driver.command("load_more_threads", json!({"select_last": false}))?;
+                driver.wait_for_search(STARTUP_TIMEOUT)?;
+            }
+        }
+        driver.command(
+            "select_thread_by_index",
+            json!({"index": if located {8} else {38}}),
+        )?;
+        wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+        // Scroll independently of the cursor, including a partial-row offset.
+        let scrolled = driver.command("scroll_thread_list_lines", json!({"lines": 4.25}))?;
+        assert_eq!(scrolled["ok"], true, "{scrolled}");
+        let before = position_snapshot(&mut driver)?;
+        ensure!(
+            before.1["scroll_value"].as_f64().unwrap_or_default() > 0.0,
+            "{before:?}"
+        );
+        let tagged = driver.command("mark_read_selected", json!({}))?;
+        assert_eq!(tagged["ok"], true, "{tagged}");
+        wait_for_tag(&mut driver, STARTUP_TIMEOUT)?;
+        assert_position_preserved(&mut driver, &before).with_context(|| app.logs())?;
+
+        // A new message preceding this window changes absolute positions.
+        let path = fixture
+            .maildir
+            .join(format!("new/position-arrival-{located}"));
+        fs::write(
+            &path,
+            format!(
+                "From: new@example.test\r\nTo: reader@example.test\r\nSubject: New arrival\r\n\
+             Message-ID: <arrival-{located}@example.test>\r\nDate: 29 Nov 2026 00:00:00 +0000\r\n\r\nArrival.\r\n"
+            ),
+        )?;
+        fixture
+            .open_readwrite()?
+            .index_file_with_tags(&path, &["inbox", "unread", "position-test"])?;
+        completed_refresh(&bus, true, 1)?;
+        assert_position_preserved(&mut driver, &before).with_context(|| app.logs())?;
+
+        let sync = driver.command("run_manual_sync", json!({}))?;
+        assert_eq!(sync["ok"], true, "{sync}");
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            let state = driver.command("app_state", json!({}))?;
+            if state["state"]["sync_in_progress"] == false {
+                break;
+            }
+            ensure!(Instant::now() < deadline, "sync did not complete: {state}");
+            thread::sleep(STARTUP_POLL_INTERVAL);
+        }
+        assert_position_preserved(&mut driver, &before).with_context(|| app.logs())?;
+        if located {
+            // A reply can move the selected later-page thread to position zero,
+            // outside the original window. It must not be treated as deleted.
+            let message_id = before.0["state"]["selected_message"]["message_id"]
+                .as_str()
+                .context("selected message before promotion")?;
+            let path = fixture.maildir.join("new/position-promoted-reply");
+            fs::write(
+                &path,
+                format!(
+                    "From: sender@example.test\r\nTo: reader@example.test\r\n\
+                     Subject: Re: Position message\r\nMessage-ID: <promoted-reply@example.test>\r\n\
+                     In-Reply-To: <{message_id}>\r\nReferences: <{message_id}>\r\n\
+                     Date: 30 Nov 2026 00:00:00 +0000\r\n\r\nPromoted thread reply.\r\n"
+                ),
+            )?;
+            fixture
+                .open_readwrite()?
+                .index_file_with_tags(&path, &["inbox", "unread", "position-test"])?;
+            let sorted = fixture
+                .open_readonly()?
+                .search_threads("tag:position-test", &notm_notmuch::QueryOptions::default())?;
+            assert_eq!(
+                sorted[0].thread_id,
+                before.0["state"]["selected_thread"]["thread_id"]
+                    .as_str()
+                    .unwrap(),
+                "fixture did not promote the selected thread"
+            );
+            completed_refresh(&bus, true, 1)?;
+            wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+            assert_position_preserved(&mut driver, &before).with_context(|| app.logs())?;
+            let state = driver.command("app_state", json!({}))?;
+            assert_eq!(state["state"]["thread_window_offset"], 0);
+            assert_eq!(state["state"]["selected_message"]["message_id"], message_id);
+            assert_eq!(state["state"]["messages"].as_array().unwrap().len(), 2);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn external_refresh_removed_unread_row_keeps_neighbour_and_viewport() -> anyhow::Result<()> {
+    if gtk_display_environment()?.is_none() {
+        eprintln!(
+            "SKIP external_refresh_removed_unread_row_keeps_neighbour_and_viewport: no display"
+        );
+        return Ok(());
+    }
+    let root = tempfile::tempdir()?;
+    let (_fixture, config) = position_fixture(root.path())?;
+    let bus = PrivateBus::start()?;
+    let mut app = launch(&root.path().join("app"), &config, &bus, false)?;
+    let mut driver = app.connect("refresh-test")?;
+    select_first_result(&mut driver, "tag:position-test and tag:unread")?;
+    driver.command("resize_window", json!({"width": 1100, "height": 500}))?;
+    driver.command("select_thread_by_index", json!({"index": 10}))?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    driver.command("focus_search", json!({}))?;
+    let mut before = position_snapshot(&mut driver)?;
+    let next = before.0["state"]["thread_list_items"][11].clone();
+    driver.command("mark_read_selected", json!({}))?;
+    wait_for_tag(&mut driver, STARTUP_TIMEOUT)?;
+    completed_refresh(&bus, true, 1)?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    before.0["state"]["selected_thread"] = next;
+    assert_position_preserved(&mut driver, &before).with_context(|| app.logs())?;
+    assert_eq!(
+        driver.command("entry_state", json!({}))?["search_has_focus"],
+        true,
+        "loading the surviving neighbour stole focus"
+    );
+    let state = driver.command("app_state", json!({}))?;
+    assert_eq!(state["state"]["thread_total_count"], 95);
+    assert_eq!(
+        state["state"]["selected_message"]["thread_id"],
+        state["state"]["selected_thread"]["thread_id"]
+    );
+    let message_id = state["state"]["selected_message"]["message_id"]
+        .as_str()
+        .context("selected message")?;
+    select_first_result(&mut driver, &format!("id:{message_id} and tag:unread"))?;
+    driver.command("mark_read_selected", json!({}))?;
+    wait_for_tag(&mut driver, STARTUP_TIMEOUT)?;
+    completed_refresh(&bus, true, 1)?;
+    let empty = driver.command("app_state", json!({}))?;
+    assert_eq!(empty["state"]["thread_total_count"], 0);
+    assert!(empty["state"]["selected_thread"].is_null());
+    let viewport = driver.command("thread_selection_view_state", json!({}))?;
+    assert!(viewport["selected_local"].is_null());
+    Ok(())
+}
+
+#[test]
+fn external_refresh_sync_reloads_retained_content_without_changing_message() -> anyhow::Result<()> {
+    if gtk_display_environment()?.is_none() {
+        eprintln!(
+            "SKIP external_refresh_sync_reloads_retained_content_without_changing_message: no display"
+        );
+        return Ok(());
+    }
+    let root = tempfile::tempdir()?;
+    let (fixture, config) = position_fixture(root.path())?;
+    let bus = PrivateBus::start()?;
+    let mut app = launch(&root.path().join("app"), &config, &bus, false)?;
+    let mut driver = app.connect("refresh-test")?;
+    select_first_thread(&mut driver, "id:position-80@example.test")?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    driver.command("focus_search", json!({}))?;
+    let before = position_snapshot(&mut driver)?;
+    let path = fixture.maildir.join("new/position-reply");
+    fs::write(
+        &path,
+        "From: sender@example.test\r\nTo: reader@example.test\r\n\
+         Subject: Re: Position message 080\r\nMessage-ID: <position-reply@example.test>\r\n\
+         In-Reply-To: <position-80@example.test>\r\nReferences: <position-80@example.test>\r\n\
+         Date: 29 Nov 2026 00:00:00 +0000\r\n\r\nNew reply received during sync.\r\n",
+    )?;
+    fixture
+        .open_readwrite()?
+        .index_file_with_tags(&path, &["inbox", "unread"])?;
+    assert_eq!(driver.command("run_manual_sync", json!({}))?["ok"], true);
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let state = driver.command("app_state", json!({}))?;
+        if state["state"]["sync_in_progress"] == false {
+            break;
+        }
+        ensure!(Instant::now() < deadline, "sync did not complete: {state}");
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_position_preserved(&mut driver, &before).with_context(|| app.logs())?;
+    let state = driver.command("app_state", json!({}))?;
+    assert_eq!(state["state"]["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        state["state"]["selected_message"]["message_id"], "position-80@example.test",
+        "refresh switched from the message being read to the new reply"
+    );
+    assert_eq!(
+        driver.command("entry_state", json!({}))?["search_has_focus"],
+        true,
+        "background content reload stole focus"
+    );
+    assert_eq!(driver.command("show_raw_source", json!({}))?["ok"], true);
+    let text = driver.command("message_view_text", json!({}))?;
+    ensure!(
+        text["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Position fixture message 80."))
+    );
+    let reply = driver.command("reply_selected", json!({}))?;
+    assert_eq!(
+        reply["ok"], true,
+        "retained reply content unavailable: {reply}"
+    );
+    assert_eq!(reply["pending"], true, "{reply}");
+    wait_for_composer_preparation_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let state = driver.command("app_state", json!({}))?;
+    ensure!(
+        state["state"]["compose_fields"]["body"]
+            .as_str()
+            .is_some_and(|body| body.contains("Position fixture message 80."))
+    );
+    Ok(())
+}
+
+#[test]
+fn external_refresh_sync_honors_message_navigation_during_reload() -> anyhow::Result<()> {
+    if gtk_display_environment()?.is_none() {
+        eprintln!("SKIP external_refresh_sync_honors_message_navigation_during_reload: no display");
+        return Ok(());
+    }
+    let root = tempfile::tempdir()?;
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let config = write_config(root.path(), &fixture)?;
+    let bus = PrivateBus::start()?;
+    let mut app = launch(&root.path().join("app"), &config, &bus, false)?;
+    let mut driver = app.connect("refresh-test")?;
+    select_first_thread(&mut driver, "id:thread-root-three-message@fixture.test")?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let selected = driver.command("select_message_by_index", json!({"index": 0}))?;
+    assert_eq!(
+        selected["selected_message"]["message_id"],
+        "thread-root-three-message@fixture.test"
+    );
+    assert_eq!(
+        driver.command("set_fixture_thread_delay", json!({"milliseconds": 1500}))?["ok"],
+        true
+    );
+    assert_eq!(driver.command("run_manual_sync", json!({}))?["ok"], true);
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let state = driver.command("app_state", json!({}))?;
+        let load = driver.command("thread_load_status", json!({}))?;
+        if state["state"]["sync_in_progress"] == false && load["busy"] == true {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "background reload did not start: {state}, {load}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+    let queued = driver.command("select_message_by_index", json!({"index": 1}))?;
+    assert_eq!(queued["ok"], true, "{queued}");
+    assert_eq!(
+        queued["selected_message"]["message_id"], "thread-root-three-message@fixture.test",
+        "selection was not queued during the reload"
+    );
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let state = driver.command("app_state", json!({}))?;
+    assert_eq!(
+        state["state"]["selected_message"]["message_id"],
+        "thread-reply1-three-message@fixture.test",
+        "background reload discarded the queued message selection"
+    );
+    let text = driver.command("message_view_text", json!({}))?;
+    ensure!(
+        text["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Reply one body.")),
+        "queued message was not rendered: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn external_refresh_sync_keeps_pending_thread_navigation() -> anyhow::Result<()> {
+    if gtk_display_environment()?.is_none() {
+        eprintln!("SKIP external_refresh_sync_keeps_pending_thread_navigation: no display");
+        return Ok(());
+    }
+    let root = tempfile::tempdir()?;
+    let (_fixture, config) = position_fixture(root.path())?;
+    let bus = PrivateBus::start()?;
+    let mut app = launch(&root.path().join("app"), &config, &bus, false)?;
+    let mut driver = app.connect("refresh-test")?;
+    select_first_result(&mut driver, "tag:position-test")?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let original = driver.command("app_state", json!({}))?;
+    let expected = original["state"]["thread_list_items"][12]["thread_id"].clone();
+    assert_eq!(
+        driver.command("set_fixture_thread_delay", json!({"milliseconds": 1500}))?["ok"],
+        true
+    );
+    assert_eq!(
+        driver.command("run_manual_sync", json!({"test_refresh_delay_ms": 600}))?["ok"],
+        true
+    );
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    while driver.command("app_state", json!({}))?["state"]["search_loading"] != true {
+        ensure!(Instant::now() < deadline, "refresh did not start");
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+    assert_eq!(
+        driver.command("select_thread_by_index", json!({"index": 12}))?["ok"],
+        true
+    );
+    let pending = driver.command("thread_load_status", json!({}))?;
+    assert_eq!(pending["busy"], true, "{pending}");
+    let during = driver.command("app_state", json!({}))?;
+    assert_ne!(during["state"]["selected_thread"]["thread_id"], expected);
+    while driver.command("app_state", json!({}))?["state"]["sync_in_progress"] == true {
+        ensure!(Instant::now() < deadline, "refresh did not complete");
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+    let completed = wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    assert_eq!(
+        completed["submitted"], pending["submitted"],
+        "refresh replaced the pending navigation"
+    );
+    assert_eq!(
+        completed["cancelled"], pending["cancelled"],
+        "refresh cancelled the pending navigation"
+    );
+    let state = driver.command("app_state", json!({}))?;
+    assert_eq!(state["state"]["selected_thread"]["thread_id"], expected);
+    assert_eq!(
+        driver.command("thread_selection_view_state", json!({}))?["selected_local"],
+        12
+    );
+    Ok(())
+}
+
+#[test]
+fn external_refresh_preserves_html_message_scroll() -> anyhow::Result<()> {
+    if gtk_display_environment()?.is_none() {
+        eprintln!("SKIP external_refresh_preserves_html_message_scroll: no display");
+        return Ok(());
+    }
+    let root = tempfile::tempdir()?;
+    let fixture = notm_test_support::FixtureDatabase::create()?;
+    let config = write_config(root.path(), &fixture)?;
+    let bus = PrivateBus::start()?;
+    let mut app = launch(&root.path().join("app"), &config, &bus, false)?;
+    let mut driver = app.connect("refresh-test")?;
+    select_first_thread(&mut driver, "id:long-html-message@fixture.test")?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    driver.command("resize_window", json!({"width": 1100, "height": 600}))?;
+    assert_eq!(driver.command("show_visual_html", json!({}))?["ok"], true);
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let html = driver.command("html_scroll_state", json!({}))?;
+        if html["ready"] == true && html["scroll"]["canScroll"] == true {
+            break;
+        }
+        ensure!(Instant::now() < deadline, "HTML not ready: {html}");
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+    driver.command("scroll_html_view_lines", json!({"lines": 8}))?;
+    let before = loop {
+        let html = driver.command("html_scroll_state", json!({}))?;
+        if html["pending"] == false && html["scroll"]["y"].as_f64().is_some_and(|y| y > 100.0) {
+            break html;
+        }
+        ensure!(Instant::now() < deadline, "HTML did not scroll: {html}");
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+    completed_refresh(&bus, true, 1)?;
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    let after = loop {
+        let html = driver.command("html_scroll_state", json!({}))?;
+        if html["ready"] == true
+            && html["pending"] == false
+            && html["generation"].as_u64() > before["generation"].as_u64()
+        {
+            break html;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "HTML reload did not finish: {html}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    };
+    ensure!(
+        (after["scroll"]["y"].as_f64().context("reloaded scroll")?
+            - before["scroll"]["y"].as_f64().context("original scroll")?)
+        .abs()
+            < 2.0,
+        "HTML reading position moved: before={before}, after={after}"
+    );
+    Ok(())
+}
+
+#[test]
+fn external_refresh_sync_keeps_navigation_made_during_worker() -> anyhow::Result<()> {
+    if gtk_display_environment()?.is_none() {
+        eprintln!("SKIP external_refresh_sync_keeps_navigation_made_during_worker: no display");
+        return Ok(());
+    }
+    let root = tempfile::tempdir()?;
+    let (_fixture, config) = position_fixture(root.path())?;
+    let bus = PrivateBus::start()?;
+    let mut app = launch(&root.path().join("app"), &config, &bus, false)?;
+    let mut driver = app.connect("refresh-test")?;
+    select_first_result(&mut driver, "tag:position-test")?;
+    driver.command("resize_window", json!({"width": 1100, "height": 500}))?;
+    let sync = driver.command("run_manual_sync", json!({"test_refresh_delay_ms": 1500}))?;
+    assert_eq!(sync["ok"], true, "{sync}");
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let state = driver.command("app_state", json!({}))?;
+        if state["state"]["search_loading"] == true {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "sync never started refresh: {state}"
+        );
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+    let selected = driver.command("select_thread_by_index", json!({"index": 12}))?;
+    assert_eq!(selected["ok"], true, "{selected}");
+    wait_for_thread_load_idle(&mut driver, STARTUP_TIMEOUT)?;
+    driver.command("scroll_thread_list_lines", json!({"lines": 4.25}))?;
+    let before = position_snapshot(&mut driver)?;
+    loop {
+        let state = driver.command("app_state", json!({}))?;
+        if state["state"]["sync_in_progress"] == false {
+            break;
+        }
+        ensure!(Instant::now() < deadline, "sync did not finish: {state}");
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+    assert_position_preserved(&mut driver, &before).with_context(|| app.logs())?;
+    Ok(())
+}
+
 #[test]
 fn external_refresh_normal_instance_without_test_harness() -> anyhow::Result<()> {
     if gtk_display_environment()?.is_none() {

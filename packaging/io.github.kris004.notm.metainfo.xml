@@ -35,6 +35,15 @@
     <name>notm contributors</name>
   </developer>
   <releases>
+    <release version="0.1.4" date="2026-11-18">
+      <description>
+        <p>
+          Preserve the mail-list cursor and viewport during refresh and sync,
+          show original HTML in replies, and improve compact thread metadata
+          and keyboard scrolling in short composer panes.
+        </p>
+      </description>
+    </release>
     <release version="0.1.3" date="2026-09-16">
       <description>
         <p>

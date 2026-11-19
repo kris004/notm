@@ -178,7 +178,18 @@ D-Bus method. The optional developer harness is used only to arrange and inspect
 test state; the normal-instance smoke explicitly has no harness. They cover
 freshly indexed search results in two instances, query/selection/draft/focus
 preservation, no writes or external sync, and in-flight search/tag ordering.
-Each smoke creates its own bus and disposable database:
+Position regressions also cover marking read, external arrivals, manual sync,
+appended and directly located later pages, partial-row viewport offsets,
+selection removal in unread-only searches, empty results, a later-page selected
+thread promoted to the top by a new reply, and navigation during a delayed
+refresh. They inspect actual GTK row geometry repeatedly so delayed
+scroll callbacks cannot hide a jump. Each smoke creates its own bus and
+disposable database. Content-reload coverage checks that newly synced replies
+are loaded without changing the message being read, stealing focus, or losing
+Raw Source / Reply functionality. Additional regressions cover navigation whose
+thread preparation is still pending when refresh completes, message selections
+queued during the background reload, and retaining a scrolled Visual HTML
+message's reading position:
 
 ```sh
 tests/run_with_headless_weston.sh dbus-run-session -- \

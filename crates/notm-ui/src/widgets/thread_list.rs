@@ -81,6 +81,61 @@ pub(crate) struct SearchPageRequest {
     pub(crate) select_first: bool,
     pub(crate) delay: Duration,
     pub(crate) cache_policy: SearchCachePolicy,
+    pub(crate) refresh_window: Option<RefreshWindow>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RefreshWindow {
+    pub(crate) offset: usize,
+    pub(crate) thread_ids: Vec<String>,
+}
+
+impl RefreshWindow {
+    fn refreshed_offset(&self, positions: &BTreeMap<String, usize>, total: usize) -> usize {
+        // Keep the same loaded window, even when arrivals/removals shift its
+        // absolute position. A surviving neighbour anchors a deleted first row.
+        self.thread_ids
+            .iter()
+            .enumerate()
+            .find_map(|(index, id)| {
+                positions
+                    .get(id)
+                    .map(|position| position.saturating_sub(index))
+            })
+            .unwrap_or(self.offset)
+            .min(total.saturating_sub(self.thread_ids.len().max(1)))
+    }
+
+    fn refreshed_range(
+        &self,
+        positions: &BTreeMap<String, usize>,
+        total: usize,
+        page_size: usize,
+    ) -> std::ops::Range<usize> {
+        let offset = self.refreshed_offset(positions, total);
+        // A reply can promote a selected/visible thread far ahead of the old
+        // page. Include every surviving loaded ID, not just the first one:
+        // cursor and viewport anchors can be independent, and navigation can
+        // change while this worker runs. Keep the window contiguous so absolute
+        // navigation and visual-selection ranges still describe the real query.
+        let start = positions
+            .values()
+            .copied()
+            .min()
+            .unwrap_or(offset)
+            .min(offset);
+        let end = offset
+            .saturating_add(self.thread_ids.len().max(page_size))
+            .max(
+                positions
+                    .values()
+                    .copied()
+                    .max()
+                    .map_or(0, |index| index + 1),
+            )
+            .min(total);
+        start..end
+    }
 }
 
 pub(crate) struct SearchPageResponse {
@@ -311,15 +366,7 @@ impl SearchPageCoordinator {
     pub(crate) fn new(open_config: OpenConfig, runtime: SearchRuntimeProvider) -> Self {
         let worker = SearchWorkerService::new(Arc::new(move |request, runtime, cancelled| {
             sleep_search_delay(request.delay, cancelled)?;
-            execute_search_page_with_cancel(
-                &open_config,
-                &request.query,
-                request.offset,
-                runtime.page_size,
-                runtime.excluded_tags,
-                request.cache_policy,
-                cancelled,
-            )
+            execute_search_request(&open_config, request, runtime, cancelled)
         }));
         Self { runtime, worker }
     }
@@ -439,6 +486,7 @@ pub(crate) struct ThreadSearchStateSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThreadModelUpdate {
     Replace,
+    Refresh,
     Append { start: usize, count: usize },
 }
 
@@ -693,6 +741,13 @@ pub(crate) struct ThreadModelSnapshot {
     pub(crate) marked_indices: BTreeSet<usize>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ThreadViewport {
+    pub(crate) index: usize,
+    pub(crate) top: f64,
+    interaction: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ThreadModelRuntimeSnapshot {
     pub(crate) generation: u64,
@@ -738,7 +793,10 @@ pub(crate) struct ThreadListController {
     model: gtk::StringList,
     selection: gtk::SingleSelection,
     selection_refreshing: Rc<Cell<bool>>,
+    selection_generation: Rc<Cell<u64>>,
     scroll_generation: Rc<Cell<u64>>,
+    interaction_generation: Rc<Cell<u64>>,
+    pending_viewport: Rc<Cell<Option<(u64, ThreadViewport)>>>,
     model_update_generation: Rc<Cell<u64>>,
     refresh_request_generation: Rc<Cell<u64>>,
     model_update_metrics: Rc<ThreadModelUpdateMetrics>,
@@ -764,6 +822,39 @@ impl ThreadListController {
             .vexpand(true)
             .child(&list)
             .build();
+        let scroll_generation = Rc::new(Cell::new(0_u64));
+        let interaction_generation = Rc::new(Cell::new(0_u64));
+        // A deferred layout correction must never undo newer user input.
+        let scroll_events =
+            gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+        scroll_events.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let generation = scroll_generation.clone();
+        let interaction = interaction_generation.clone();
+        scroll_events.connect_scroll(move |_, _, _| {
+            generation.set(generation.get().saturating_add(1));
+            interaction.set(interaction.get().saturating_add(1));
+            gtk::glib::Propagation::Proceed
+        });
+        scrolled.add_controller(scroll_events);
+        let clicks = gtk::GestureClick::new();
+        clicks.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let generation = scroll_generation.clone();
+        let interaction = interaction_generation.clone();
+        clicks.connect_pressed(move |_, _, _, _| {
+            generation.set(generation.get().saturating_add(1));
+            interaction.set(interaction.get().saturating_add(1));
+        });
+        scrolled.add_controller(clicks);
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let generation = scroll_generation.clone();
+        let interaction = interaction_generation.clone();
+        keys.connect_key_pressed(move |_, _, _, _| {
+            generation.set(generation.get().saturating_add(1));
+            interaction.set(interaction.get().saturating_add(1));
+            gtk::glib::Propagation::Proceed
+        });
+        scrolled.add_controller(keys);
 
         let result_label = gtk::Label::new(Some("No results loaded"));
         result_label.set_widget_name("notm-thread-result-label");
@@ -788,7 +879,10 @@ impl ThreadListController {
             model,
             selection,
             selection_refreshing: Rc::new(Cell::new(false)),
-            scroll_generation: Rc::new(Cell::new(0)),
+            selection_generation: Rc::new(Cell::new(0)),
+            scroll_generation,
+            interaction_generation,
+            pending_viewport: Rc::new(Cell::new(None)),
             model_update_generation: Rc::new(Cell::new(0)),
             refresh_request_generation: Rc::new(Cell::new(0)),
             model_update_metrics: Rc::new(ThreadModelUpdateMetrics::default()),
@@ -854,8 +948,10 @@ impl ThreadListController {
         F: Fn(Option<usize>) + 'static,
     {
         let selection_refreshing = self.selection_refreshing.clone();
+        let selection_generation = self.selection_generation.clone();
         self.selection.connect_selected_notify(move |selection| {
             if !selection_refreshing.get() {
+                selection_generation.set(selection_generation.get().saturating_add(1));
                 let selected = selection
                     .selected_item()
                     .and_downcast::<gtk::StringObject>()
@@ -1118,8 +1214,13 @@ impl ThreadListController {
         self.model_update_metrics.last_rows_applied.set(0);
 
         let replacing = matches!(update, ThreadModelUpdate::Replace);
+        let refreshing = matches!(update, ThreadModelUpdate::Refresh);
         let (mut next_add, end_add, refresh_end) = match update {
             ThreadModelUpdate::Replace => (0, snapshot.len, 0),
+            ThreadModelUpdate::Refresh => {
+                let retained = self.model_len().min(snapshot.len);
+                (retained, snapshot.len, retained)
+            }
             ThreadModelUpdate::Append { start, count } => (
                 start,
                 start.saturating_add(count).min(snapshot.len),
@@ -1147,6 +1248,13 @@ impl ThreadListController {
 
             let mut budget = THREAD_MODEL_ROWS_PER_UPDATE;
             let mut applied = 0_usize;
+            // A user selection between chunks supersedes the original cursor.
+            let selected = if refreshing {
+                let position = selection.selected();
+                (position != gtk::INVALID_LIST_POSITION).then_some(position)
+            } else {
+                selected
+            };
             selection_refreshing.set(true);
             if removing && budget > 0 {
                 let count = (model.n_items() as usize).min(budget);
@@ -1156,6 +1264,12 @@ impl ThreadListController {
                     budget -= count;
                 }
                 removing = model.n_items() > 0;
+            }
+            if refreshing && model.n_items() as usize > snapshot.len && budget > 0 {
+                let count = (model.n_items() as usize - snapshot.len).min(budget);
+                model.splice(snapshot.len as u32, count as u32, &[]);
+                applied += count;
+                budget -= count;
             }
 
             if !removing && next_add < end_add && budget > 0 {
@@ -1181,9 +1295,10 @@ impl ThreadListController {
                     continue;
                 }
                 let token = thread_row_token(index, snapshot.display);
-                if model
-                    .string(position)
-                    .is_none_or(|current| current.as_str() != token)
+                if refreshing
+                    || model
+                        .string(position)
+                        .is_none_or(|current| current.as_str() != token)
                 {
                     model.splice(position, 1, &[token.as_str()]);
                 }
@@ -1197,7 +1312,11 @@ impl ThreadListController {
             selection_refreshing.set(false);
             metrics.record_iteration(applied);
 
-            if removing || next_add < end_add || next_refresh < refresh_end {
+            if removing
+                || next_add < end_add
+                || next_refresh < refresh_end
+                || (refreshing && model.n_items() as usize > snapshot.len)
+            {
                 gtk::glib::ControlFlow::Continue
             } else {
                 metrics.busy.set(false);
@@ -1213,6 +1332,8 @@ impl ThreadListController {
     }
 
     pub(crate) fn cancel_model_update(&self) {
+        self.scroll_generation
+            .set(self.scroll_generation.get().saturating_add(1));
         self.model_update_generation
             .set(self.model_update_generation.get().saturating_add(1));
         if self.model_update_metrics.busy.replace(false) {
@@ -1249,6 +1370,10 @@ impl ThreadListController {
             .and_then(|item| thread_index_from_model_token(&item.string()))
     }
 
+    pub(crate) fn selection_generation(&self) -> u64 {
+        self.selection_generation.get()
+    }
+
     fn selected_position(&self) -> Option<u32> {
         let position = self.selection.selected();
         (position != gtk::INVALID_LIST_POSITION && position < self.model.n_items())
@@ -1265,6 +1390,7 @@ impl ThreadListController {
         if index >= self.model_len() {
             return;
         }
+        self.user_navigation();
         self.selection.set_selected(index as u32);
         self.scroll_into_view(index);
         self.focus();
@@ -1274,10 +1400,143 @@ impl ThreadListController {
         if index >= self.model_len() {
             return;
         }
-        self.selection_refreshing.set(true);
-        self.selection.set_selected(index as u32);
-        self.selection_refreshing.set(false);
+        self.restore_selection(Some(index));
         self.scroll_into_view(index);
+    }
+
+    /// Reconcile the cursor without turning it into a navigation/scroll action.
+    pub(crate) fn restore_selection(&self, index: Option<usize>) {
+        self.selection_refreshing.set(true);
+        self.selection.set_selected(
+            index
+                .filter(|index| *index < self.model_len())
+                .map_or(gtk::INVALID_LIST_POSITION, |index| index as u32),
+        );
+        self.selection_refreshing.set(false);
+    }
+
+    pub(crate) fn viewport(&self) -> Option<ThreadViewport> {
+        fn visit(
+            widget: &gtk::Widget,
+            relative_to: &gtk::Widget,
+            best: &mut Option<ThreadViewport>,
+        ) {
+            if !widget.is_mapped() {
+                return;
+            }
+            if let Some(index) = widget
+                .widget_name()
+                .strip_prefix("notm-thread-row-")
+                .and_then(|index| index.parse().ok())
+                && let Some(bounds) = widget.compute_bounds(relative_to)
+                && bounds.height() > 0.0
+                && bounds.y() + bounds.height() > 0.0
+                && bounds.y() < relative_to.height() as f32
+            {
+                let top = f64::from(bounds.y());
+                if best.is_none_or(|best| top < best.top) {
+                    *best = Some(ThreadViewport {
+                        index,
+                        top,
+                        interaction: 0,
+                    });
+                }
+                return;
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                visit(&widget, relative_to, best);
+                child = widget.next_sibling();
+            }
+        }
+        let mut viewport = None;
+        visit(
+            self.list.upcast_ref(),
+            self.scrolled.upcast_ref(),
+            &mut viewport,
+        );
+        viewport.map(|mut viewport| {
+            viewport.interaction = self.interaction_generation.get();
+            viewport
+        })
+    }
+
+    pub(crate) fn user_navigation(&self) {
+        self.interaction_generation
+            .set(self.interaction_generation.get().saturating_add(1));
+        self.scroll_generation
+            .set(self.scroll_generation.get().saturating_add(1));
+    }
+
+    pub(crate) fn latest_viewport(&self, saved: Option<ThreadViewport>) -> Option<ThreadViewport> {
+        saved
+            .filter(|saved| saved.interaction == self.interaction_generation.get())
+            .or_else(|| self.viewport_checkpoint())
+    }
+
+    pub(crate) fn viewport_checkpoint(&self) -> Option<ThreadViewport> {
+        // Back-to-back refreshes can arrive before GTK has allocated the first
+        // result. Carry its intended anchor forward instead of saving that
+        // temporary intermediate layout as the user's new position.
+        self.pending_viewport
+            .get()
+            .filter(|(generation, viewport)| {
+                *generation == self.scroll_generation.get()
+                    && viewport.interaction == self.interaction_generation.get()
+            })
+            .map(|(_, viewport)| viewport)
+            .or_else(|| self.viewport())
+    }
+
+    pub(crate) fn restore_viewport(&self, viewport: Option<ThreadViewport>) {
+        let Some(viewport) = viewport.filter(|viewport| viewport.index < self.model_len()) else {
+            return;
+        };
+        let generation = self.scroll_generation.get().saturating_add(1);
+        self.scroll_generation.set(generation);
+        self.pending_viewport.set(Some((generation, viewport)));
+        let controller = self.clone();
+        let frames = Cell::new(0);
+        let stable = Cell::new(0);
+        // GtkListView computes variable row heights during allocation. Correct
+        // the anchor on frame ticks, not a wall-clock timeout that can fire after
+        // the user has moved on. New model updates/navigation cancel this work.
+        self.list.add_tick_callback(move |list, _| {
+            if controller.scroll_generation.get() != generation
+                || controller.interaction_generation.get() != viewport.interaction
+                || frames.get() >= 12
+            {
+                if controller.scroll_generation.get() == generation {
+                    controller.pending_viewport.set(None);
+                }
+                return gtk::glib::ControlFlow::Break;
+            }
+            frames.set(frames.get() + 1);
+            if let Some((top, _)) = realized_thread_row_bounds_relative(
+                list,
+                controller.scrolled.upcast_ref(),
+                viewport.index,
+            ) {
+                let adjustment = controller.scrolled.vadjustment();
+                let value = adjustment.value();
+                let max = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+                let target = (value + top - viewport.top).clamp(adjustment.lower(), max);
+                if (target - value).abs() < 0.5 {
+                    stable.set(stable.get() + 1);
+                    if stable.get() >= 2 {
+                        controller.pending_viewport.set(None);
+                        return gtk::glib::ControlFlow::Break;
+                    }
+                } else {
+                    stable.set(0);
+                    adjustment.set_value(target);
+                }
+            } else {
+                scroll_thread_index_into_view_once(list, viewport.index);
+            }
+            gtk::glib::ControlFlow::Continue
+        });
+        self.list.queue_allocate();
     }
 
     pub(crate) fn clear_selection_silently(&self) {
@@ -1353,6 +1612,8 @@ impl ThreadListController {
         };
         json!({
             "ok": true,
+            "anchor_index": self.viewport().map(|anchor| anchor.index),
+            "anchor_top": self.viewport().map(|anchor| anchor.top),
             "selected_local": selected_local,
             "selected_abs": selected_absolute,
             "scroll_value": value,
@@ -1402,31 +1663,43 @@ pub(crate) fn execute_search_page(
     cache_policy: SearchCachePolicy,
 ) -> anyhow::Result<SearchData> {
     let cancelled = AtomicBool::new(false);
-    execute_search_page_with_cancel(
+    execute_search_request(
         open_config,
-        query,
-        offset,
-        limit,
-        excluded_tags,
-        cache_policy,
+        &SearchPageRequest {
+            query: query.to_string(),
+            generation: 0,
+            offset,
+            select_first: false,
+            delay: Duration::ZERO,
+            cache_policy,
+            refresh_window: None,
+        },
+        SearchRuntimeSnapshot {
+            page_size: limit,
+            excluded_tags,
+        },
         &cancelled,
     )
 }
 
-fn execute_search_page_with_cancel(
+fn execute_search_request(
     open_config: &OpenConfig,
-    query: &str,
-    offset: usize,
-    limit: usize,
-    excluded_tags: Vec<String>,
-    cache_policy: SearchCachePolicy,
+    request: &SearchPageRequest,
+    runtime: SearchRuntimeSnapshot,
     cancelled: &AtomicBool,
 ) -> anyhow::Result<SearchData> {
+    let query = &request.query;
+    let limit = runtime.page_size;
+    let cache_policy = if request.refresh_window.is_some() {
+        SearchCachePolicy::Bypass
+    } else {
+        request.cache_policy
+    };
     anyhow::ensure!(
         (1..=MAX_SEARCH_PAGE_SIZE).contains(&limit),
         "search page size must be between 1 and {MAX_SEARCH_PAGE_SIZE}; got {limit}"
     );
-    let excluded_tags = canonical_excluded_tags(excluded_tags);
+    let excluded_tags = canonical_excluded_tags(runtime.excluded_tags);
     ensure_search_not_cancelled(cancelled)?;
     // Capture the epoch before opening the database. A mutation that commits
     // afterward bumps the epoch, so this worker cannot publish its older
@@ -1436,12 +1709,31 @@ fn execute_search_page_with_cancel(
     ensure_search_not_cancelled(cancelled)?;
     let revision = db.revision();
     let db_path = db.path();
+    let mut offset = request.offset;
+    let mut window_limit = limit;
+    if let Some(window) = &request.refresh_window {
+        let options = QueryOptions {
+            excluded_tags: excluded_tags.clone(),
+            ..QueryOptions::default()
+        };
+        let total = db.count_threads(query, &options)? as usize;
+        let positions = db.thread_positions(
+            query,
+            &options,
+            &window.thread_ids.iter().cloned().collect(),
+            || cancelled.load(Ordering::Acquire),
+        )?;
+        ensure_search_not_cancelled(cancelled)?;
+        let range = window.refreshed_range(&positions, total, limit);
+        offset = range.start;
+        window_limit = range.len();
+    }
     let key = search_cache_key(
         query,
         &db_path,
         &revision,
         offset,
-        limit,
+        window_limit,
         excluded_tags.clone(),
         cache_epoch,
     );
@@ -1461,12 +1753,13 @@ fn execute_search_page_with_cancel(
     ensure_search_not_cancelled(cancelled)?;
     tags.truncate(MAX_VISIBLE_SEARCH_TAGS);
     let options = QueryOptions {
-        limit,
+        limit: window_limit,
         offset,
         sort: SortOrder::NewestFirst,
         excluded_tags: excluded_tags.clone(),
     };
-    let threads = db.search_threads(query, &options)?;
+    let threads =
+        db.search_threads_with_cancel(query, &options, || cancelled.load(Ordering::Acquire))?;
     ensure_search_not_cancelled(cancelled)?;
     let count = match cache_policy {
         SearchCachePolicy::Use => db
@@ -1943,6 +2236,9 @@ fn realized_thread_row_bounds_relative(
 ) -> Option<(f64, f64)> {
     let root = list.clone().upcast::<gtk::Widget>();
     let row = find_widget_by_name(&root, &format!("notm-thread-row-{index}"))?;
+    if !row.is_mapped() {
+        return None;
+    }
     let bounds = row.compute_bounds(relative_to)?;
     let top = bounds.y() as f64;
     let bottom = top + bounds.height() as f64;
@@ -2208,6 +2504,37 @@ mod tests {
     use super::*;
     use std::{fs, time::Instant};
 
+    #[test]
+    fn refresh_window_follows_surviving_ids_and_clamps_after_removal() {
+        let window = RefreshWindow {
+            offset: 40,
+            thread_ids: ["a", "b", "c"].map(str::to_string).to_vec(),
+        };
+        let positions = |entries: &[(&str, usize)]| {
+            entries
+                .iter()
+                .map(|(id, index)| (id.to_string(), *index))
+                .collect()
+        };
+        assert_eq!(
+            window.refreshed_offset(&positions(&[("a", 42), ("b", 43), ("c", 44)]), 80),
+            42
+        );
+        assert_eq!(
+            window.refreshed_offset(&positions(&[("b", 41), ("c", 42)]), 80),
+            40
+        );
+        assert_eq!(window.refreshed_offset(&BTreeMap::new(), 80), 40);
+        assert_eq!(window.refreshed_offset(&BTreeMap::new(), 2), 0);
+        assert_eq!(window.refreshed_offset(&BTreeMap::new(), 0), 0);
+        assert_eq!(
+            window.refreshed_range(&positions(&[("a", 41), ("b", 0), ("c", 42)]), 80, 3),
+            0..44,
+            "a promoted thread must remain in the same contiguous loaded window"
+        );
+        assert_eq!(window.refreshed_range(&BTreeMap::new(), 0, 20), 0..0);
+    }
+
     fn test_revision(uuid: &str, revision: u64) -> Revision {
         Revision {
             uuid: uuid.to_string(),
@@ -2295,6 +2622,7 @@ mod tests {
             select_first: true,
             delay: Duration::ZERO,
             cache_policy: SearchCachePolicy::Use,
+            refresh_window: None,
         };
         let runtime = SearchRuntimeSnapshot {
             page_size: 100,

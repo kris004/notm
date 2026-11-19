@@ -155,17 +155,23 @@ fn poll_refresh(
                 .map_err(|error| ("SearchFailed", error)),
         );
     }
+    // A selected-thread reload is read-only and does not invalidate a completed
+    // search. Wait for preparation before dispatch, but do not advance the
+    // required generation for a refresh's own background content reload.
+    if widgets
+        .thread_load_coordinator
+        .borrow()
+        .active_generation()
+        .is_some()
+    {
+        return None;
+    }
 
     // Use the completed active query, not unfinished text in the search entry.
-    // Retain an exact selected thread where the first refreshed page contains
-    // it. Existing reconciliation preserves composer fields and active drafts;
-    // it deliberately clears visual/multi-selection and stale message caches.
+    // Preserve the loaded window, cursor and viewport independently. The shared
+    // refresh path still clears stale selection ranges and prepared payloads.
     let query = state.borrow().current_query.clone();
-    let selected_thread_id = selected_thread_id_for_tag_refresh(&state.borrow(), false);
-    let generation = schedule_search(options, widgets, state, &query, false, Duration::ZERO);
-    widgets
-        .refresh_selected_thread_id
-        .replace(selected_thread_id.map(|thread_id| (generation, thread_id)));
+    let generation = schedule_refresh(options, widgets, state, &query, false, Duration::ZERO, None);
     widgets.external_refresh_generation.set(Some(generation));
     None
 }
@@ -183,11 +189,6 @@ fn writers_or_preparation_busy(widgets: &Widgets, state: &SharedState) -> bool {
             .named_draft_io_coordinator
             .borrow()
             .migration_in_progress()
-        || widgets
-            .thread_load_coordinator
-            .borrow()
-            .active_generation()
-            .is_some()
         || widgets
             .composer_preparation_coordinator
             .borrow()
